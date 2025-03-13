@@ -1,7 +1,7 @@
-# ffmpeg : 7:4.4.2-0ubuntu0.22.04.1.root.io.1
+# ffmpeg : 7:4.4.2-0ubuntu0.22.04.1
 
-This patch is based on ffmpeg version 7:4.4.2-0ubuntu0.22.04.1.root.io.1, which is available at:
-https://launchpad.net/ubuntu/+source/ffmpeg/7:4.4.2-0ubuntu0.22.04.1/
+This patch is based on ffmpeg version 7:4.4.2-0ubuntu0.22.04.1, which is available at:
+unknown
 
 ## Affected CVEs:
 - CVE-2024-7055

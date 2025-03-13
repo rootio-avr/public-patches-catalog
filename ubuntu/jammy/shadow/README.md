@@ -1,7 +1,7 @@
-# shadow : 1:4.8.1-2ubuntu2.2.root.io.2
+# shadow : 1:4.8.1-2ubuntu2.2
 
-This patch is based on shadow version 1:4.8.1-2ubuntu2.2.root.io.2, which is available at:
-https://launchpad.net/ubuntu/+source/shadow/1:4.8.1-2ubuntu2.2/
+This patch is based on shadow version 1:4.8.1-2ubuntu2.2, which is available at:
+unknown
 
 ## Affected CVEs:
 - CVE-2023-29383

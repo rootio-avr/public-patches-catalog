@@ -1,7 +1,7 @@
-# less : 590-r10071
+# less : 590
 
-This patch is based on less version 590-r10071, which is available at:
-https://www.greenwoodsoftware.com/less/less-590.tar.gz
+This patch is based on less version 590, which is available at:
+unknown
 
 ## Affected CVEs:
 - CVE-2022-46663
