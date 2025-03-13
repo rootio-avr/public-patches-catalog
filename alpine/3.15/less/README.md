@@ -1,6 +1,6 @@
-# less : 590-r10071
+# less : 590-r1
 
-This patch is based on less version 590-r10071, which is available at:
+This patch is based on less version 590-r1, which is available at:
 https://www.greenwoodsoftware.com/less/less-590.tar.gz
 
 ## Affected CVEs:
