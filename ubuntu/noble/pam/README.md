@@ -1,7 +1,7 @@
 # pam : 1.5.3-5ubuntu5.1
 
 This patch is based on pam version 1.5.3-5ubuntu5.1, which is available at:
-unknown
+https://launchpad.net/ubuntu/+source/pam/1.5.3-5ubuntu5.1/
 
 ## Affected CVEs:
 - CVE-2024-10963

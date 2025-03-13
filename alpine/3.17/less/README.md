@@ -1,7 +1,7 @@
 # less : 608
 
 This patch is based on less version 608, which is available at:
-unknown
+https://www.greenwoodsoftware.com/less/less-608.tar.gz
 
 ## Affected CVEs:
 - CVE-2022-46663

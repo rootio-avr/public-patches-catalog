@@ -1,7 +1,7 @@
 # shadow : 1:4.13+dfsg1-1
 
 This patch is based on shadow version 1:4.13+dfsg1-1, which is available at:
-unknown
+https://sources.debian.org/src/shadow/1:4.13+dfsg1-1/
 
 ## Affected CVEs:
 - CVE-2023-4641

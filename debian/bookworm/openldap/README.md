@@ -1,7 +1,7 @@
 # openldap : 2.5.13+dfsg-5
 
 This patch is based on openldap version 2.5.13+dfsg-5, which is available at:
-unknown
+https://sources.debian.org/src/openldap/2.5.13+dfsg-5/
 
 ## Affected CVEs:
 - CVE-2023-2953

@@ -1,7 +1,7 @@
 # libsndfile : 1.2.0-1
 
 This patch is based on libsndfile version 1.2.0-1, which is available at:
-unknown
+https://sources.debian.org/src/libsndfile/1.2.0-1 /
 
 ## Affected CVEs:
 - CVE-2022-33065
