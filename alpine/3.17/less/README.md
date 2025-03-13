@@ -1,6 +1,6 @@
-# less : 608
+# less : 608-r10071
 
-This patch is based on less version 608, which is available at:
+This patch is based on less version 608-r10071, which is available at:
 https://www.greenwoodsoftware.com/less/less-608.tar.gz
 
 ## Affected CVEs:
