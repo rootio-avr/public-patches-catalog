@@ -1,7 +1,7 @@
 # wget : 1.21.3-1
 
 This patch is based on wget version 1.21.3-1, which is available at:
-https://sources.debian.org/src/wget/1.21.3-1/
+unknown
 
 ## Affected CVEs:
 - CVE-2024-38428

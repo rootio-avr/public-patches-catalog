@@ -1,7 +1,7 @@
 # pam : 1.5.2-6+deb12u1
 
 This patch is based on pam version 1.5.2-6+deb12u1, which is available at:
-https://sources.debian.org/src/pam/1.5.2-6+deb12u1/
+unknown
 
 ## Affected CVEs:
 - CVE-2024-22365

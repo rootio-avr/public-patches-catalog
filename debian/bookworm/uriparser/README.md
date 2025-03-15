@@ -1,7 +1,7 @@
 # uriparser : 0.9.7+dfsg-2
 
 This patch is based on uriparser version 0.9.7+dfsg-2, which is available at:
-https://sources.debian.org/src/uriparser/0.9.7+dfsg-2/
+unknown
 
 ## Affected CVEs:
 - CVE-2024-34403

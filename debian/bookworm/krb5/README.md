@@ -1,7 +1,7 @@
 # krb5 : 1.20.1-2+deb12u2
 
 This patch is based on krb5 version 1.20.1-2+deb12u2, which is available at:
-https://sources.debian.org/src/krb5/1.20.1-2+deb12u2/
+unknown
 
 ## Affected CVEs:
 - CVE-2024-26462
