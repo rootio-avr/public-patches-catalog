@@ -1,7 +1,7 @@
 # harfbuzz : 6.0.0+dfsg-3
 
 This patch is based on harfbuzz version 6.0.0+dfsg-3, which is available at:
-unknown
+https://sources.debian.org/src/harfbuzz/6.0.0+dfsg-3/
 
 ## Affected CVEs:
 - CVE-2023-25193
