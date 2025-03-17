@@ -1,6 +1,6 @@
 # <img src="./assets/Asset 3.png" alt="drawing" width="30"/> Public Patches Catalog
 This is a public catalog of patches that [root.io](https://root.io) provides for various open source projects.\
-These patches are being used by the root.io platform which is a platform to auto-remediate vulnerabilities in container images.
+These patches are used by the root.io platform which is a platform to auto-remediate vulnerabilities in container images.
 
 ## 🛠️ Inside the Catalog
 The catalog is structured in the following way:
