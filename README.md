@@ -21,7 +21,7 @@ root/
 
 ## ✅ Project Status
 This catalog is maintained by the root.io team.\
-If you have any questions or need help, please reach out to us at 🌱 [root.io](https://root.io).
+If you have any questions or need help, please reach out to us at 🌱 support@root.io
 
 ---
 <img src="assets/Asset 2.svg" alt="drawing" width="300"/>
