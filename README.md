@@ -1,4 +1,4 @@
-# <img src="./assests/Asset 3.png" alt="drawing" width="30"/> Public Patches Catalog
+# <img src="./assets/Asset 3.png" alt="drawing" width="30"/> Public Patches Catalog
 This is a public catalog of patches that [root.io](https://root.io) provides for various open source projects.\
 These patches are being used by the root.io platform which is a platform to auto-remediate vulnerabilities in container images.
 
@@ -24,4 +24,4 @@ This catalog is maintained by the root.io team.\
 If you have any questions or need help, please reach out to us at 🌱 [root.io](https://root.io).
 
 ---
-<img src="./assests/Asset 2.svg" alt="drawing" width="300"/>
+<img src="assets/Asset 2.svg" alt="drawing" width="300"/>
