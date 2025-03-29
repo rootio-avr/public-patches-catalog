@@ -1,10 +1,10 @@
-# wget : 1.21.3-1
+# wget : 1.21.3-1+deb12u1
 
-This patch is based on wget version 1.21.3-1, which is available at:
-https://sources.debian.org/src/wget/1.21.3-1/
+This patch is based on wget version 1.21.3-1+deb12u1, which is available at:
+https://sources.debian.org/src/wget/1.21.3-1+deb12u1/
 
 ## Affected CVEs:
-- CVE-2024-38428
+- CVE-2024-10524
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source wget`
