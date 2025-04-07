@@ -5,6 +5,7 @@ https://sources.debian.org/src/wget/1.21.3-1+deb12u1/
 
 ## Affected CVEs:
 - CVE-2024-10524
+- CVE-2024-38428
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source wget`
