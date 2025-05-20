@@ -1,7 +1,7 @@
-# perl : 5.36.0-7+deb12u1
+# perl : 5.36.0-7+deb12u2
 
-This patch is based on perl version 5.36.0-7+deb12u1, which is available at:
-https://sources.debian.org/src/perl/5.36.0-7+deb12u1/
+This patch is based on perl version 5.36.0-7+deb12u2, which is available at:
+https://sources.debian.org/src/perl/5.36.0-7+deb12u2/
 
 ## Affected CVEs:
 - CVE-2023-31484
