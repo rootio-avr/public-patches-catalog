@@ -4,7 +4,12 @@ This patch is based on nodejs version 18.19.0+dfsg-6~deb12u2, which is available
 unknown
 
 ## Affected CVEs:
+- CVE-2024-21892
 - CVE-2023-46809
+- CVE-2024-22019
+- CVE-2024-27983
+- CVE-2025-23166
+- CVE-2025-23083
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source nodejs`
