@@ -1,15 +1,14 @@
-# pam : 1.5.2-6+deb12u1
+# jq : 1.6-2.1
 
-This patch is based on pam version 1.5.2-6+deb12u1, which is available at:
-https://sources.debian.org/src/pam/1.5.2-6+deb12u1/
+This patch is based on jq version 1.6-2.1, which is available at:
+unknown
 
 ## Affected CVEs:
-- CVE-2024-22365
-- CVE-2024-10041
-- CVE-2025-6020
+- CVE-2024-53427
+- CVE-2025-48060
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source pam`
+1. Download the original Debian source package: `apt source jq`
 2. Apply the patch: `patch -p1 < diff.patch`
 3. Build the package: `dpkg-buildpackage -b`
 
