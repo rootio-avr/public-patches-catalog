@@ -7,6 +7,7 @@ unknown
 - CVE-2023-52969
 - CVE-2025-30722
 - CVE-2025-30693
+- CVE-2023-52971
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source mariadb`
