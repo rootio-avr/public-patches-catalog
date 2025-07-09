@@ -7,9 +7,13 @@ unknown
 - CVE-2024-21892
 - CVE-2023-46809
 - CVE-2024-22019
+- CVE-2024-22020
 - CVE-2024-27983
 - CVE-2025-23166
 - CVE-2025-23083
+- CVE-2024-22025
+- CVE-2025-23085
+- CVE-2024-27982
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source nodejs`

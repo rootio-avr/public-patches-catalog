@@ -8,6 +8,7 @@ unknown
 - CVE-2025-25473
 - CVE-2024-36618
 - CVE-2025-0518
+- CVE-2024-31582
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source ffmpeg`
