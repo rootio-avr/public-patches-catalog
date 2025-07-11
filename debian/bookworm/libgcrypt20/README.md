@@ -5,6 +5,7 @@ https://sources.debian.org/src/libgcrypt20/1.10.1-3/
 
 ## Affected CVEs:
 - CVE-2024-2236
+- CVE-2018-6829
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source libgcrypt20`

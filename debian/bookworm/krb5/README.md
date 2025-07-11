@@ -7,6 +7,7 @@ https://sources.debian.org/src/krb5/1.20.1-2+deb12u2/
 - CVE-2025-3576
 - CVE-2024-26461
 - CVE-2024-26458
+- CVE-2018-5709
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source krb5`

@@ -5,6 +5,7 @@ https://sources.debian.org/src/openldap/2.5.13+dfsg-5/
 
 ## Affected CVEs:
 - CVE-2023-2953
+- CVE-2017-17740
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source openldap`

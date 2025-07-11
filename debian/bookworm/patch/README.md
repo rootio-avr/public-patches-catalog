@@ -1,17 +1,14 @@
-# glibc : 2.36-9+deb12u10
+# patch : 2.7.6-7
 
-This patch is based on glibc version 2.36-9+deb12u10, which is available at:
-https://sources.debian.org/src/glibc/2.36-9+deb12u10/
+This patch is based on patch version 2.7.6-7, which is available at:
+unknown
 
 ## Affected CVEs:
-- CVE-2025-4802
-- CVE-2018-20796
-- CVE-2019-9192
-- CVE-2019-1010022
-- CVE-2019-1010023
+- CVE-2018-6952
+- CVE-2018-6951
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source glibc`
+1. Download the original Debian source package: `apt source patch`
 2. Apply the patch: `patch -p1 < diff.patch`
 3. Build the package: `dpkg-buildpackage -b`
 
