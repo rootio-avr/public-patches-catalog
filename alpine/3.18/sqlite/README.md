@@ -1,14 +1,13 @@
-# krb5 : 1.20.2-r1
+# sqlite : 3.41.2-r3
 
-This patch is based on krb5 version 1.20.2-r1, which is available at:
+This patch is based on sqlite version 3.41.2-r3, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2000-0546
-- CVE-2000-0547
+- CVE-2025-29087
 
 ## How to Apply:
-1. Obtain the APKBUILD file and source code: `apk source krb5`
+1. Obtain the APKBUILD file and source code: `apk source sqlite`
 2. Apply the patch: `patch -p1 < diff.patch`
 3. Build the package: `abuild -r`
 
