@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2000-0546
 - CVE-2000-0547
+- CVE-2000-0548
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source krb5`
