@@ -4,7 +4,7 @@ This patch is based on indent version 2.2.13-r2, which is available at:
 https://ftp.gnu.org/gnu/indent/indent-2.2.13.tar.xz
 
 ## Affected CVEs:
-- CVE-2024-0911
+- CVE-2023-40305
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source indent`
