@@ -1,14 +1,13 @@
-# xorg-server : 2:21.1.7-3+deb12u10
+# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u3
 
-This patch is based on xorg-server version 2:21.1.7-3+deb12u10, which is available at:
-https://sources.debian.org/src/xorg-server/2:21.1.7-3+deb12u9/
+This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u3, which is available at:
+unknown
 
 ## Affected CVEs:
-- CVE-2023-5574
-- CVE-2022-49737
+- CVE-2025-53101
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source xorg-server`
+1. Download the original Debian source package: `apt source imagemagick`
 2. Apply the patch: `patch -p1 < diff.patch`
 3. Build the package: `dpkg-buildpackage -b`
 
