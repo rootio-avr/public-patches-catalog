@@ -5,6 +5,7 @@ https://sources.debian.org/src/libsndfile/1.2.0-1 /
 
 ## Affected CVEs:
 - CVE-2022-33065
+- CVE-2024-50612
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source libsndfile`
