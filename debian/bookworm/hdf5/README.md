@@ -1,13 +1,15 @@
-# libheif : 1.15.1-1+deb12u1
+# hdf5 : 1.10.8+repack1-1
 
-This patch is based on libheif version 1.15.1-1+deb12u1, which is available at:
+This patch is based on hdf5 version 1.10.8+repack1-1, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2023-49463
+- CVE-2019-8396
+- CVE-2019-8398
+- CVE-2024-32622
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source libheif`
+1. Download the original Debian source package: `apt source hdf5`
 2. Apply the patch: `patch -p1 < diff.patch`
 3. Build the package: `dpkg-buildpackage -b`
 

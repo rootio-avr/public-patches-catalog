@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-42516
+- CVE-2024-47252
+- CVE-2007-0086
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source apache2`

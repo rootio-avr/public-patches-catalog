@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-0840
+- CVE-2025-1182
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source binutils`
