@@ -7,6 +7,7 @@ unknown
 - CVE-2019-8396
 - CVE-2019-8398
 - CVE-2024-32622
+- CVE-2024-32606
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source hdf5`
