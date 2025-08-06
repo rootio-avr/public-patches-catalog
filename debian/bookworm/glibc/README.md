@@ -9,6 +9,7 @@ https://sources.debian.org/src/glibc/2.36-9+deb12u10/
 - CVE-2019-9192
 - CVE-2019-1010022
 - CVE-2019-1010023
+- CVE-2025-8058
 
 ## How to Apply:
 1. Download the original Debian source package: `apt source glibc`
