@@ -1,10 +1,11 @@
-# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u3.root.io.5
+# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u3.root.io.4
 
-This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u3.root.io.5, which is available at:
+This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u3.root.io.4, which is available at:
 https://sources.debian.org/src/imagemagick/8:6.9.11.60+dfsg-1.6+deb12u3/
 
 ## Affected CVEs:
 - CVE-2025-53101
+- CVE-2025-53014
 - CVE-2025-53019
 - CVE-2023-34152
 
