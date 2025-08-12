@@ -1,6 +1,6 @@
-# hdf5 : 1.10.8+repack1-1.root.io.6
+# hdf5 : 1.10.8+repack1-1.root.io.7
 
-This patch is based on hdf5 version 1.10.8+repack1-1.root.io.6, which is available at:
+This patch is based on hdf5 version 1.10.8+repack1-1.root.io.7, which is available at:
 https://sources.debian.org/src/hdf5/1.10.8+repack1-1/
 
 ## Affected CVEs:
@@ -10,6 +10,7 @@ https://sources.debian.org/src/hdf5/1.10.8+repack1-1/
 - CVE-2024-32606
 - CVE-2021-46242
 - CVE-2018-14031
+- CVE-2018-16438
 
 ## How to Apply:
 1. Obtain the source package: `apt source hdf5`
