@@ -1,6 +1,6 @@
-# glibc : 2.36-9+deb12u10
+# glibc : 2.36-9+deb12u10.root.io.4
 
-This patch is based on glibc version 2.36-9+deb12u10, which is available at:
+This patch is based on glibc version 2.36-9+deb12u10.root.io.4, which is available at:
 https://sources.debian.org/src/glibc/2.36-9+deb12u10/
 
 ## Affected CVEs:
@@ -12,9 +12,9 @@ https://sources.debian.org/src/glibc/2.36-9+deb12u10/
 - CVE-2025-8058
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source glibc`
+1. Obtain the source package: `apt source glibc`
 2. Apply the patch: `patch -p1 < diff.patch`
-3. Build the package: `dpkg-buildpackage -b`
+3. Build the package: `dpkg-buildpackage -us -uc`
 
 ## License:
 This patch is provided under GPLv3, in compliance with the original license of the package.
