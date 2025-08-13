@@ -12,6 +12,7 @@ https://sources.debian.org/src/hdf5/1.10.8+repack1-1/
 - CVE-2018-14031
 - CVE-2018-16438
 - CVE-2018-14033
+- CVE-2021-37501
 
 ## How to Apply:
 1. Obtain the source package: `apt source hdf5`
