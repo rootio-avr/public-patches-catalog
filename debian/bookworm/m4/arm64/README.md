@@ -1,9 +1,10 @@
-# m4 : 1.4.19-3.root.io.1
+# m4 : 1.4.19-3.root.io.2
 
-This patch is based on m4 version 1.4.19-3.root.io.1, which is available at:
+This patch is based on m4 version 1.4.19-3.root.io.2, which is available at:
 https://sources.debian.org/src/m4/1.4.19-3/
 
 ## Affected CVEs:
+- CVE-2008-1687
 - CVE-2008-1688
 
 ## How to Apply:
