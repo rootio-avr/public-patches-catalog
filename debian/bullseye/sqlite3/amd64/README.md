@@ -1,10 +1,11 @@
-# sqlite3 : 3.34.1-3.root.io.1
+# sqlite3 : 3.34.1-3.root.io.2
 
-This patch is based on sqlite3 version 3.34.1-3.root.io.1, which is available at:
+This patch is based on sqlite3 version 3.34.1-3.root.io.2, which is available at:
 https://sources.debian.org/src/sqlite3/3.34.1-3/
 
 ## Affected CVEs:
 - CVE-2025-6965
+- CVE-2025-29088
 
 ## How to Apply:
 1. Obtain the source package: `apt source sqlite3`
