@@ -1,6 +1,6 @@
-# hdf5 : 1.10.8+repack1-1.root.io.7
+# hdf5 : 1.10.8+repack1-1.root.io.8
 
-This patch is based on hdf5 version 1.10.8+repack1-1.root.io.7, which is available at:
+This patch is based on hdf5 version 1.10.8+repack1-1.root.io.8, which is available at:
 https://sources.debian.org/src/hdf5/1.10.8+repack1-1/
 
 ## Affected CVEs:
