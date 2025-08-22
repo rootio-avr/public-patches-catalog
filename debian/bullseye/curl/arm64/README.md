@@ -1,11 +1,12 @@
-# curl : 7.74.0-1.3+deb11u13.root.io.2
+# curl : 7.74.0-1.3+deb11u13.root.io.3
 
-This patch is based on curl version 7.74.0-1.3+deb11u13.root.io.2, which is available at:
+This patch is based on curl version 7.74.0-1.3+deb11u13.root.io.3, which is available at:
 https://sources.debian.org/src/curl/7.74.0-1.3+deb11u13/
 
 ## Affected CVEs:
 - CVE-2022-42916
 - CVE-2022-43551
+- CVE-2023-23914
 
 ## How to Apply:
 1. Obtain the source package: `apt source curl`
