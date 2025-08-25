@@ -1,10 +1,11 @@
-# postgresql-15 : 15.13-0+deb12u1.root.io.1
+# postgresql-15 : 15.13-0+deb12u1.root.io.2
 
-This patch is based on postgresql-15 version 15.13-0+deb12u1.root.io.1, which is available at:
+This patch is based on postgresql-15 version 15.13-0+deb12u1.root.io.2, which is available at:
 https://sources.debian.org/src/postgresql-15/15.13-0+deb12u1/
 
 ## Affected CVEs:
 - CVE-2025-8714
+- CVE-2025-8715
 
 ## How to Apply:
 1. Obtain the source package: `apt source postgresql-15`
