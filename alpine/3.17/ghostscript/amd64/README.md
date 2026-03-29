@@ -1,7 +1,7 @@
-# ghostscript : 10.01.2-r0
+# ghostscript : 10.01.2-r00073
 
-This patch is based on ghostscript version 10.01.2-r0, which is available at:
-https://github.com/ArtifexSoftware/ghostpdl-downloads/releases/download/gs10012/ghostscript-10.01.2.tar.gz
+This patch is based on ghostscript version 10.01.2-r00073, which is available at:
+unknown
 
 ## Affected CVEs:
 - CVE-2024-33871
