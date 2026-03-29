@@ -1,6 +1,6 @@
-# gnutls : 3.8.8-r00076
+# gnutls : 3.8.8-r00077
 
-This patch is based on gnutls version 3.8.8-r00076, which is available at:
+This patch is based on gnutls version 3.8.8-r00077, which is available at:
 unknown
 
 ## Affected CVEs:
