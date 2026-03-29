@@ -1,7 +1,7 @@
-# samba : 4.18.11-r0
+# samba : 4.18.11-r00073
 
-This patch is based on samba version 4.18.11-r0, which is available at:
-https://download.samba.org/pub/samba/stable/samba-4.18.11.tar.gz
+This patch is based on samba version 4.18.11-r00073, which is available at:
+unknown
 
 ## Affected CVEs:
 - CVE-2023-5568
