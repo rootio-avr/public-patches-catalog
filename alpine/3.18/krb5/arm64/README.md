@@ -1,6 +1,6 @@
-# krb5 : 1.20.2-r10076
+# krb5 : 1.20.2-r10077
 
-This patch is based on krb5 version 1.20.2-r10076, which is available at:
+This patch is based on krb5 version 1.20.2-r10077, which is available at:
 unknown
 
 ## Affected CVEs:
