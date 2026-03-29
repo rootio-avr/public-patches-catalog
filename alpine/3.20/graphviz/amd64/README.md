@@ -1,7 +1,7 @@
-# graphviz : 9.0.0-r2
+# graphviz : 9.0.0-r20074
 
-This patch is based on graphviz version 9.0.0-r2, which is available at:
-https://gitlab.com/api/v4/projects/4207231/packages/generic/graphviz-releases/9.0.0/graphviz-9.0.0.tar.xz
+This patch is based on graphviz version 9.0.0-r20074, which is available at:
+unknown
 
 ## Affected CVEs:
 - CVE-2023-46045
