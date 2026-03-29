@@ -1,6 +1,6 @@
-# linux-pam : 1.5.2-r100073
+# linux-pam : 1.5.2-r100074
 
-This patch is based on linux-pam version 1.5.2-r100073, which is available at:
+This patch is based on linux-pam version 1.5.2-r100074, which is available at:
 unknown
 
 ## Affected CVEs:
