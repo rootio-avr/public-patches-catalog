@@ -1,7 +1,7 @@
-# indent : 2.2.13-r2
+# indent : 2.2.13-r20074
 
-This patch is based on indent version 2.2.13-r2, which is available at:
-https://ftp.gnu.org/gnu/indent/indent-2.2.13.tar.xz
+This patch is based on indent version 2.2.13-r20074, which is available at:
+unknown
 
 ## Affected CVEs:
 - CVE-2023-40305
