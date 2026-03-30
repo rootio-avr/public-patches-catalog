@@ -1,6 +1,6 @@
-# curl : 8.14.1-2+deb13u2.root.io.7
+# curl : 8.14.1-2+deb13u2.root.io.8
 
-This patch is based on curl version 8.14.1-2+deb13u2.root.io.7, which is available at:
+This patch is based on curl version 8.14.1-2+deb13u2.root.io.8, which is available at:
 https://sources.debian.org/src/curl/8.14.1-2+deb13u2/
 
 ## Affected CVEs:
@@ -11,6 +11,9 @@ https://sources.debian.org/src/curl/8.14.1-2+deb13u2/
 - CVE-2026-3784
 - CVE-2025-14819
 - CVE-2025-14524
+- CVE-2025-14017
+- CVE-2025-15079
+- CVE-2025-10966
 
 ## How to Apply:
 1. Obtain the source package: `apt source curl`
