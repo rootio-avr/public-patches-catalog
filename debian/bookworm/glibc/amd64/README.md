@@ -1,15 +1,17 @@
-# glibc : 2.36-9+deb12u10.root.io.4
+# glibc : 2.36-9+deb12u13.root.io.14
 
-This patch is based on glibc version 2.36-9+deb12u10.root.io.4, which is available at:
-https://sources.debian.org/src/glibc/2.36-9+deb12u10/
+This patch is based on glibc version 2.36-9+deb12u13.root.io.14, which is available at:
+https://sources.debian.org/src/glibc/2.36-9+deb12u13/
 
 ## Affected CVEs:
-- CVE-2025-4802
 - CVE-2018-20796
 - CVE-2019-9192
 - CVE-2019-1010022
 - CVE-2019-1010023
-- CVE-2025-8058
+- CVE-2026-0915
+- CVE-2026-0861
+- CVE-2025-15281
+- CVE-2026-4437
 
 ## How to Apply:
 1. Obtain the source package: `apt source glibc`
