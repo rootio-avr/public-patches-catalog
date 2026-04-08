@@ -1,10 +1,11 @@
-# glibc : 2.41-12+deb13u2.root.io.5
+# glibc : 2.41-12+deb13u2.root.io.6
 
-This patch is based on glibc version 2.41-12+deb13u2.root.io.5, which is available at:
+This patch is based on glibc version 2.41-12+deb13u2.root.io.6, which is available at:
 https://sources.debian.org/src/glibc/2.41-12+deb13u2/
 
 ## Affected CVEs:
 - CVE-2026-4046
+- CVE-2026-4437
 
 ## How to Apply:
 1. Obtain the source package: `apt source glibc`
