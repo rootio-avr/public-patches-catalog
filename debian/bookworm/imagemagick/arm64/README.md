@@ -1,6 +1,6 @@
-# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u8.root.io.43
+# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u8.root.io.44
 
-This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u8.root.io.43, which is available at:
+This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u8.root.io.44, which is available at:
 https://sources.debian.org/src/imagemagick/8:6.9.11.60+dfsg-1.6+deb12u8/
 
 ## Affected CVEs:
