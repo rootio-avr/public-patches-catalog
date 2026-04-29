@@ -1,10 +1,11 @@
-# tar : 1.35+dfsg-3.1.root.io.1
+# tar : 1.35+dfsg-3.1.root.io.2
 
-This patch is based on tar version 1.35+dfsg-3.1.root.io.1, which is available at:
+This patch is based on tar version 1.35+dfsg-3.1.root.io.2, which is available at:
 https://sources.debian.org/src/tar/1.35+dfsg-3.1/
 
 ## Affected CVEs:
 - CVE-2005-2541
+- CVE-2026-5704
 
 ## How to Apply:
 1. Obtain the source package: `apt source tar`
