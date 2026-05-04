@@ -1,6 +1,6 @@
-# glibc : 2.36-9+deb12u13.root.io.16
+# glibc : 2.36-9+deb12u13.root.io.17
 
-This patch is based on glibc version 2.36-9+deb12u13.root.io.16, which is available at:
+This patch is based on glibc version 2.36-9+deb12u13.root.io.17, which is available at:
 https://sources.debian.org/src/glibc/2.36-9+deb12u13/
 
 ## Affected CVEs:
@@ -14,6 +14,7 @@ https://sources.debian.org/src/glibc/2.36-9+deb12u13/
 - CVE-2026-4437
 - CVE-2026-4438
 - CVE-2026-5928
+- CVE-2026-4046
 
 ## How to Apply:
 1. Obtain the source package: `apt source glibc`
