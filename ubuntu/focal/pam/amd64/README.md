@@ -1,6 +1,6 @@
-# pam : 1.3.1-5ubuntu4.7.root.io.3
+# pam : 1.3.1-5ubuntu4.7.root.io.4
 
-This patch is based on pam version 1.3.1-5ubuntu4.7.root.io.3, which is available at:
+This patch is based on pam version 1.3.1-5ubuntu4.7.root.io.4, which is available at:
 https://sources.debian.org/src/pam/1.3.1-5ubuntu4.7/
 
 ## Affected CVEs:
