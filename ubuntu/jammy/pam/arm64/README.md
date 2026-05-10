@@ -1,6 +1,6 @@
-# pam : 1.4.0-11ubuntu2.6.root.io.5
+# pam : 1.4.0-11ubuntu2.6.root.io.7
 
-This patch is based on pam version 1.4.0-11ubuntu2.6.root.io.5, which is available at:
+This patch is based on pam version 1.4.0-11ubuntu2.6.root.io.7, which is available at:
 https://sources.debian.org/src/pam/1.4.0-11ubuntu2.6/
 
 ## Affected CVEs:
