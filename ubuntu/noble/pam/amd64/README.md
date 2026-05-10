@@ -1,6 +1,6 @@
-# pam : 1.5.3-5ubuntu5.5.root.io.3
+# pam : 1.5.3-5ubuntu5.5.root.io.5
 
-This patch is based on pam version 1.5.3-5ubuntu5.5.root.io.3, which is available at:
+This patch is based on pam version 1.5.3-5ubuntu5.5.root.io.5, which is available at:
 https://sources.debian.org/src/pam/1.5.3-5ubuntu5.5/
 
 ## Affected CVEs:
