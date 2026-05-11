@@ -1,10 +1,11 @@
-# gnutls28 : 3.7.9-2+deb12u6.root.io.3
+# gnutls28 : 3.7.9-2+deb12u6.root.io.4
 
-This patch is based on gnutls28 version 3.7.9-2+deb12u6.root.io.3, which is available at:
+This patch is based on gnutls28 version 3.7.9-2+deb12u6.root.io.4, which is available at:
 https://sources.debian.org/src/gnutls28/3.7.9-2+deb12u6/
 
 ## Affected CVEs:
 - CVE-2026-33846
+- CVE-2026-42010
 
 ## How to Apply:
 1. Obtain the source package: `apt source gnutls28`
