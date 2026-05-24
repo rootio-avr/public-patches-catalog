@@ -1,15 +1,17 @@
-# libheif : 1.15.1-1+deb12u1
+# libheif : 1.15.1-1+deb12u1.root.io.6
 
-This patch is based on libheif version 1.15.1-1+deb12u1, which is available at:
-unknown
+This patch is based on libheif version 1.15.1-1+deb12u1.root.io.6, which is available at:
+https://sources.debian.org/src/libheif/1.15.1-1+deb12u1/
 
 ## Affected CVEs:
 - CVE-2023-49463
+- CVE-2025-68431
+- CVE-2026-32741
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source libheif`
+1. Obtain the source package: `apt source libheif`
 2. Apply the patch: `patch -p1 < diff.patch`
-3. Build the package: `dpkg-buildpackage -b`
+3. Build the package: `dpkg-buildpackage -us -uc`
 
 ## License:
 This patch is provided under GPLv3, in compliance with the original license of the package.
