@@ -1,11 +1,12 @@
-# util-linux : 2.41-5.root.io.2
+# util-linux : 2.41-5.root.io.3
 
-This patch is based on util-linux version 2.41-5.root.io.2, which is available at:
+This patch is based on util-linux version 2.41-5.root.io.3, which is available at:
 https://sources.debian.org/src/util-linux/2.41-5/
 
 ## Affected CVEs:
 - CVE-2025-14104
 - CVE-2026-27456
+- CVE-2026-3184
 
 ## How to Apply:
 1. Obtain the source package: `apt source util-linux`
