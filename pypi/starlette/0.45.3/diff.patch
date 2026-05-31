@@ -1,0 +1,288 @@
+--- a/starlette/datastructures.py
++++ b/starlette/datastructures.py
+@@ -424,6 +424,10 @@ class UploadFile:
+         self.size = size
+         self.headers = headers or Headers()
+
++        # Capture max size from SpooledTemporaryFile if one is provided. This slightly speeds up future checks.
++        # Note 0 means unlimited mirroring SpooledTemporaryFile's __init__
++        self._max_mem_size = getattr(self.file, "_max_size", 0)
++
+     @property
+     def content_type(self) -> str | None:
+         return self.headers.get("content-type", None)
+@@ -434,14 +438,24 @@ class UploadFile:
+         rolled_to_disk = getattr(self.file, "_rolled", True)
+         return not rolled_to_disk
+
++    def _will_roll(self, size_to_add: int) -> bool:
++        # If we're not in_memory then we will always roll
++        if not self._in_memory:
++            return True
++
++        # Check for SpooledTemporaryFile._max_size
++        future_size = self.file.tell() + size_to_add
++        return bool(future_size > self._max_mem_size) if self._max_mem_size else False
++
+     async def write(self, data: bytes) -> None:
++        new_data_len = len(data)
+         if self.size is not None:
+-            self.size += len(data)
++            self.size += new_data_len
+
+-        if self._in_memory:
+-            self.file.write(data)
+-        else:
++        if self._will_roll(new_data_len):
+             await run_in_threadpool(self.file.write, data)
++        else:
++            self.file.write(data)
+
+     async def read(self, size: int = -1) -> bytes:
+         if self._in_memory:
+--- a/tests/test_formparsers.py
++++ b/tests/test_formparsers.py
+@@ -2,9 +2,15 @@ from __future__ import annotations
+
+ import os
++import threading
+ import typing
++from collections.abc import Generator
+ from contextlib import nullcontext as does_not_raise
++from io import BytesIO
+ from pathlib import Path
++from tempfile import SpooledTemporaryFile
++from typing import ClassVar
++from unittest import mock
+
+ import pytest
+
+ from starlette.applications import Starlette
+@@ -11,7 +17,7 @@ import pytest
+ from starlette.datastructures import UploadFile
+-from starlette.formparsers import MultiPartException, _user_safe_decode
++from starlette.formparsers import MultiPartException, MultiPartParser, _user_safe_decode
+ from starlette.requests import Request
+ from starlette.responses import JSONResponse
+ from starlette.routing import Mount
+ from starlette.types import ASGIApp, Receive, Scope, Send
+ from tests.types import TestClientFactory
+@@ -104,6 +110,22 @@ async def app_read_body(scope: Scope, receive: Receive, send: Send) -> None:
+     await response(scope, receive, send)
+
+
++async def app_monitor_thread(scope: Scope, receive: Receive, send: Send) -> None:
++    """Helper app to monitor what thread the app was called on.
++
++    This can later be used to validate thread/event loop operations.
++    """
++    request = Request(scope, receive)
++
++    # Make sure we parse the form
++    await request.form()
++    await request.close()
++
++    # Send back the current thread id
++    response = JSONResponse({"thread_ident": threading.current_thread().ident})
++    await response(scope, receive, send)
++
++
+ def make_app_max_parts(max_files: int = 1000, max_fields: int = 1000, max_part_size: int = 1024 * 1024) -> ASGIApp:
+     async def app(scope: Scope, receive: Receive, send: Send) -> None:
+         request = Request(scope, receive)
+@@ -303,6 +325,47 @@ def test_multipart_request_mixed_files_and_data(tmpdir: Path, test_client_facto
+     }
+
+
++class ThreadTrackingSpooledTemporaryFile(SpooledTemporaryFile[bytes]):
++    """Helper class to track which threads performed the rollover operation.
++
++    This is not threadsafe/multi-test safe.
++    """
++
++    rollover_threads: ClassVar[set[int | None]] = set()
++
++    def rollover(self) -> None:
++        ThreadTrackingSpooledTemporaryFile.rollover_threads.add(threading.current_thread().ident)
++        super().rollover()
++
++
++@pytest.fixture
++def mock_spooled_temporary_file() -> Generator[None]:
++    try:
++        with mock.patch("starlette.formparsers.SpooledTemporaryFile", ThreadTrackingSpooledTemporaryFile):
++            yield
++    finally:
++        ThreadTrackingSpooledTemporaryFile.rollover_threads.clear()
++
++
++def test_multipart_request_large_file_rollover_in_background_thread(
++    mock_spooled_temporary_file: None, test_client_factory: TestClientFactory
++) -> None:
++    """Test that Spooled file rollovers happen in background threads."""
++    data = BytesIO(b" " * (MultiPartParser.spool_max_size + 1))
++
++    client = test_client_factory(app_monitor_thread)
++    response = client.post("/", files=[("test_large", data)])
++    assert response.status_code == 200
++
++    # Parse the event thread id from the API response and ensure we have one
++    app_thread_ident = response.json().get("thread_ident")
++    assert app_thread_ident is not None
++
++    # Ensure the app thread was not the same as the rollover one and that a rollover thread exists
++    assert app_thread_ident not in ThreadTrackingSpooledTemporaryFile.rollover_threads
++    assert len(ThreadTrackingSpooledTemporaryFile.rollover_threads) == 1
++
++
+ def test_multipart_request_with_charset_for_filename(tmpdir: Path, test_client_factory: TestClientFactory) -> None:
+     client = test_client_factory(app)
+     response = client.post(
+
+--- a/starlette/responses.py
++++ b/starlette/responses.py
+@@ -4,7 +4,6 @@ import hashlib
+ import http.cookies
+ import json
+ import os
+-import re
+ import stat
+ import typing
+ import warnings
+@@ -281,9 +280,6 @@ class RangeNotSatisfiable(Exception):
+         self.max_size = max_size
+
+
+-_RANGE_PATTERN = re.compile(r"(\d*)-(\d*)")
+-
+-
+ class FileResponse(Response):
+     chunk_size = 64 * 1024
+
+@@ -441,8 +437,8 @@ class FileResponse(Response):
+     def _should_use_range(self, http_if_range: str) -> bool:
+         return http_if_range == self.headers["last-modified"] or http_if_range == self.headers["etag"]
+
+-    @staticmethod
+-    def _parse_range_header(http_range: str, file_size: int) -> list[tuple[int, int]]:
++    @classmethod
++    def _parse_range_header(cls, http_range: str, file_size: int) -> list[tuple[int, int]]:
+         ranges: list[tuple[int, int]] = []
+         try:
+             units, range_ = http_range.split("=", 1)
+@@ -454,14 +450,7 @@ class FileResponse(Response):
+         if units != "bytes":
+             raise MalformedRangeHeader("Only support bytes range")
+
+-        ranges = [
+-            (
+-                int(_[0]) if _[0] else file_size - int(_[1]),
+-                int(_[1]) + 1 if _[0] and _[1] and int(_[1]) < file_size else file_size,
+-            )
+-            for _ in _RANGE_PATTERN.findall(range_)
+-            if _ != ("", "")
+-        ]
++        ranges = cls._parse_ranges(range_, file_size)
+
+         if len(ranges) == 0:
+             raise MalformedRangeHeader("Range header: range must be requested")
+@@ -493,6 +482,35 @@ class FileResponse(Response):
+
+         return result
+
++    @classmethod
++    def _parse_ranges(cls, range_: str, file_size: int) -> list[tuple[int, int]]:
++        ranges: list[tuple[int, int]] = []
++
++        for part in range_.split(","):
++            part = part.strip()
++
++            # If the range is empty or a single dash, we ignore it.
++            if not part or part == "-":
++                continue
++
++            # If the range is not in the format "start-end", we ignore it.
++            if "-" not in part:
++                continue
++
++            start_str, end_str = part.split("-", 1)
++            start_str = start_str.strip()
++            end_str = end_str.strip()
++
++            try:
++                start = int(start_str) if start_str else file_size - int(end_str)
++                end = int(end_str) + 1 if start_str and end_str and int(end_str) < file_size else file_size
++                ranges.append((start, end))
++            except ValueError:
++                # If the range is not numeric, we ignore it.
++                continue
++
++        return ranges
++
+     def generate_multipart(
+         self,
+         ranges: typing.Sequence[tuple[int, int]],
+
+--- a/starlette/datastructures.py
++++ b/starlette/datastructures.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+
++import re
+ import typing
+ from shlex import shlex
+ from urllib.parse import SplitResult, parse_qsl, urlencode, urlsplit
+@@ -19,6 +20,9 @@ _KeyType = typing.TypeVar("_KeyType")
+ # that is, you can't do `Mapping[str, Animal]()["fido"] = Dog()`
+ _CovariantValueType = typing.TypeVar("_CovariantValueType", covariant=True)
+
++# Rejects Host header chars (/, ?, #, @, ...) that would let urlsplit produce a path differing from scope["path"].
++_HOST_RE = re.compile(r"^([a-z0-9.-]+|\[[a-f0-9]*:[a-f0-9.:]+\])(?::[0-9]+)?$", re.IGNORECASE)
++
+
+ class URL:
+     def __init__(
+@@ -41,7 +45,7 @@ class URL:
+                     host_header = value.decode("latin-1")
+                     break
+
+-            if host_header is not None:
++            if host_header is not None and _HOST_RE.fullmatch(host_header):
+                 url = f"{scheme}://{host_header}{path}"
+             elif server is None:
+                 url = path
+--- a/tests/test_datastructures.py
++++ b/tests/test_datastructures.py
+@@ -159,6 +159,32 @@ def test_url_from_scope() -> None:
+     assert repr(u) == "URL('http://example.com:8000/some/path?query=string')"
+
+
++@pytest.mark.parametrize(
++    "host",
++    [
++        pytest.param(b"foo/?x=", id="question-mark"),
++        pytest.param(b"foo/#", id="hash"),
++        pytest.param(b"foo/bar", id="slash"),
++        pytest.param(b"user@foo", id="at-sign"),
++        pytest.param(b"foo\\bar", id="backslash"),
++        pytest.param(b"foo bar", id="space"),
++    ],
++)
++def test_url_from_scope_with_invalid_host(host: bytes) -> None:
++    """An invalid Host header should be ignored, falling back to the server tuple."""
++    u = URL(
++        scope={
++            "scheme": "http",
++            "server": ("example.com", 80),
++            "path": "/admin",
++            "query_string": b"",
++            "headers": [(b"host", host)],
++        }
++    )
++    assert u.path == "/admin"
++    assert u.netloc == "example.com"
++
++
+ def test_headers() -> None:
+     h = Headers(raw=[(b"a", b"123"), (b"a", b"456"), (b"b", b"789")])
+     assert "a" in h
