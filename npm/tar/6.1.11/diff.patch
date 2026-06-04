@@ -1,0 +1,299 @@
+--- a/lib/unpack.js
++++ b/lib/unpack.js
+@@ -32,6 +32,7 @@ const SYMLINK = Symbol('symlink')
+ const HARDLINK = Symbol('hardlink')
+ const UNSUPPORTED = Symbol('unsupported')
+ const CHECKPATH = Symbol('checkPath')
++const STRIPABSOLUTEPATH = Symbol('stripAbsolutePath')
+ const MKDIR = Symbol('mkdir')
+ const ONERROR = Symbol('onError')
+ const PENDING = Symbol('pending')
+@@ -229,6 +230,43 @@ class Unpack extends Parser {
+     }
+   }
+ 
++  // return false if we need to skip this file
++  // return true if the field was successfully sanitized
++  [STRIPABSOLUTEPATH] (entry, field) {
++    const p = entry[field]
++    if (!p || this.preservePaths) return true
++
++    const parts = p.split('/')
++    if (
++      parts.includes('..') ||
++      /* istanbul ignore next */
++      (isWindows && /^[a-z]:\.\.$/i.test(parts[0]))
++    ) {
++      this.warn('TAR_ENTRY_ERROR', `${field} contains '..'`, {
++        entry,
++        [field]: p,
++      })
++      // not ok!
++      return false
++    }
++
++    // strip off the root
++    const [root, stripped] = stripAbsolutePath(p)
++    if (root) {
++      // ok, but triggers warning about stripping root
++      entry[field] = stripped
++      this.warn(
++        'TAR_ENTRY_INFO',
++        `stripping ${root} from absolute ${field}`,
++        {
++          entry,
++          [field]: p,
++        },
++      )
++    }
++    return true
++  }
++
+   [CHECKPATH] (entry) {
+     if (this.strip) {
+       const parts = normPath(entry.path).split('/')
+@@ -245,26 +283,11 @@ class Unpack extends Parser {
+       }
+     }
+ 
+-    if (!this.preservePaths) {
+-      const p = normPath(entry.path)
+-      const parts = p.split('/')
+-      if (parts.includes('..') || isWindows && /^[a-z]:\.\.$/i.test(parts[0])) {
+-        this.warn('TAR_ENTRY_ERROR', `path contains '..'`, {
+-          entry,
+-          path: p,
+-        })
+-        return false
+-      }
+-
+-      // strip off the root
+-      const [root, stripped] = stripAbsolutePath(p)
+-      if (root) {
+-        entry.path = stripped
+-        this.warn('TAR_ENTRY_INFO', `stripping ${root} from absolute path`, {
+-          entry,
+-          path: p,
+-        })
+-      }
++    if (
++      !this[STRIPABSOLUTEPATH](entry, 'path') ||
++      !this[STRIPABSOLUTEPATH](entry, 'linkpath')
++    ) {
++      return false
+     }
+ 
+     if (path.isAbsolute(entry.path))
+
+--- a/lib/normalize-unicode.js
++++ b/lib/normalize-unicode.js
+@@ -3,9 +3,33 @@
+ // within npm install on large package trees.
+ // Do not edit without careful benchmarking.
+ const normalizeCache = Object.create(null)
+-const {hasOwnProperty} = Object.prototype
++
++// Limit the size of this. Very low-sophistication LRU cache
++const MAX = 10000
++const cache = new Set()
+ module.exports = s => {
+-  if (!hasOwnProperty.call(normalizeCache, s))
+-    normalizeCache[s] = s.normalize('NFKD')
+-  return normalizeCache[s]
++  if (!cache.has(s)) {
++    // shake out identical accents and ligatures
++    normalizeCache[s] = s
++      .normalize('NFD')
++      .toLocaleLowerCase('en')
++      .toLocaleUpperCase('en')
++  } else {
++    cache.delete(s)
++  }
++  cache.add(s)
++
++  const ret = normalizeCache[s]
++
++  let i = cache.size - MAX
++  // only prune when we're 10% over the max
++  if (i > MAX / 10) {
++    for (const s of cache) {
++      cache.delete(s)
++      delete normalizeCache[s]
++      if (--i <= 0) break
++    }
++  }
++
++  return ret
+ }
+--- a/lib/path-reservations.js
++++ b/lib/path-reservations.js
+@@ -117,7 +117,7 @@
+     // effectively removing all parallelization on windows.
+     paths = isWindows ? ['win32 parallelization disabled'] : paths.map(p => {
+       // don't need normPath, because we skip this entirely for windows
+-      return normalize(stripSlashes(join(p))).toLowerCase()
++      return normalize(stripSlashes(join(p)))
+     })
+ 
+     const dirs = new Set(
+
+--- a/lib/unpack.js
++++ b/lib/unpack.js
+@@ -283,6 +283,17 @@ class Unpack extends Parser {
+       }
+     }
+ 
++    if (!this.preservePaths && entry.type === 'Link' && entry.linkpath) {
++      const lp = normPath(entry.linkpath)
++      if (lp.split('/').includes('..')) {
++        this.warn('TAR_ENTRY_ERROR', `linkpath contains '..'`, {
++          entry,
++          path: lp,
++        })
++        return false
++      }
++    }
++
+     if (
+       !this[STRIPABSOLUTEPATH](entry, 'path') ||
+       !this[STRIPABSOLUTEPATH](entry, 'linkpath')
+
+--- a/lib/unpack.js
++++ b/lib/unpack.js
+@@ -30,6 +30,7 @@
+ const LINK = Symbol('link')
+ const SYMLINK = Symbol('symlink')
+ const HARDLINK = Symbol('hardlink')
++const ENSURE_NO_SYMLINK = Symbol('ensureNoSymlink')
+ const UNSUPPORTED = Symbol('unsupported')
+ const CHECKPATH = Symbol('checkPath')
+ const MKDIR = Symbol('mkdir')
+@@ -93,6 +94,19 @@
+   : b === b >>> 0 ? b
+   : c
+ 
++class SymlinkError extends Error {
++  constructor (symlink, path) {
++    super('TAR_SYMLINK_ERROR: Cannot extract through symbolic link')
++    this.path = path
++    this.symlink = symlink
++    this.code = 'TAR_SYMLINK_ERROR'
++  }
++
++  get name () {
++    return 'SymlinkError'
++  }
++}
++
+ // clear the cache if it's a case-insensitive unicode-squashing match.
+ // we can't know if the current file system is case-sensitive or supports
+ // unicode fully, so we check for similarity on the maximally compatible
+@@ -503,14 +517,57 @@
+   }
+ 
+   [SYMLINK] (entry, done) {
+-    this[LINK](entry, entry.linkpath, 'symlink', done)
++    const parts = normPath(
++      path.relative(
++        this.cwd,
++        path.resolve(
++          path.dirname(entry.absolute),
++          String(entry.linkpath),
++        ),
++      ),
++    ).split('/')
++    this[ENSURE_NO_SYMLINK](
++      entry,
++      this.cwd,
++      parts,
++      () => this[LINK](entry, entry.linkpath, 'symlink', done),
++      er => {
++        this[ONERROR](er, entry)
++        done()
++      },
++    )
+   }
+ 
+   [HARDLINK] (entry, done) {
+     const linkpath = normPath(path.resolve(this.cwd, entry.linkpath))
+-    this[LINK](entry, linkpath, 'link', done)
++    const parts = normPath(String(entry.linkpath)).split('/')
++    this[ENSURE_NO_SYMLINK](
++      entry,
++      this.cwd,
++      parts,
++      () => this[LINK](entry, linkpath, 'link', done),
++      er => {
++        this[ONERROR](er, entry)
++        done()
++      },
++    )
+   }
+ 
++  [ENSURE_NO_SYMLINK] (entry, cwd, parts, done, onError) {
++    const p = parts.shift()
++    if (this.preservePaths || p === undefined) return done()
++    const t = path.resolve(cwd, p)
++    fs.lstat(t, (er, st) => {
++      if (er) return done()
++      if (st && st.isSymbolicLink()) {
++        return onError(
++          new SymlinkError(t, path.resolve(t, parts.join('/')))
++        )
++      }
++      this[ENSURE_NO_SYMLINK](entry, t, parts, done, onError)
++    })
++  }
++
+   [PEND] () {
+     this[PENDING]++
+   }
+@@ -860,6 +917,22 @@
+     } catch (er) {
+       return er
+     }
++  }
++
++  [ENSURE_NO_SYMLINK] (entry, cwd, parts, done, onError) {
++    if (this.preservePaths || !parts.length) return done()
++    let t = cwd
++    for (const p of parts) {
++      t = path.resolve(t, p)
++      const [er, st] = callSync(() => fs.lstatSync(t))
++      if (er) return done()
++      if (st.isSymbolicLink()) {
++        return onError(
++          new SymlinkError(t, path.resolve(t, parts.join('/')))
++        )
++      }
++    }
++    done()
+   }
+ 
+   [LINK] (entry, linkpath, link, done) {
+
+--- a/lib/unpack.js
++++ b/lib/unpack.js
+@@ -250,7 +250,11 @@ class Unpack extends Parser {
+     const p = entry[field]
+     if (!p || this.preservePaths) return true
+ 
+-    const parts = p.split('/')
++    const np = normPath(String(p))
++
++    // strip off the root before checking for '..'
++    const [root, stripped] = stripAbsolutePath(np)
++    const parts = stripped.replace(/\\/g, '/').split('/')
+     if (
+       parts.includes('..') ||
+       /* istanbul ignore next */
+@@ -263,9 +267,6 @@ class Unpack extends Parser {
+       // not ok!
+       return false
+     }
+-
+-    // strip off the root
+-    const [root, stripped] = stripAbsolutePath(p)
+     if (root) {
+       // ok, but triggers warning about stripping root
+       entry[field] = stripped
