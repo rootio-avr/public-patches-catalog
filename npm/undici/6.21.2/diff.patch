@@ -1,0 +1,616 @@
+--- a/lib/core/request.js
++++ b/lib/core/request.js
+@@ -360,13 +360,19 @@ function processHeader (request, key, val) {
+     val = `${val}`
+   }
+
+-  if (request.host === null && headerName === 'host') {
++  if (headerName === 'host') {
++    if (request.host !== null) {
++      throw new InvalidArgumentError('duplicate host header')
++    }
+     if (typeof val !== 'string') {
+       throw new InvalidArgumentError('invalid host header')
+     }
+     // Consumed by Client
+     request.host = val
+-  } else if (request.contentLength === null && headerName === 'content-length') {
++  } else if (headerName === 'content-length') {
++    if (request.contentLength !== null) {
++      throw new InvalidArgumentError('duplicate content-length header')
++    }
+     request.contentLength = parseInt(val, 10)
+     if (!Number.isFinite(request.contentLength)) {
+       throw new InvalidArgumentError('invalid content-length header')
+
+--- a/lib/core/errors.js
++++ b/lib/core/errors.js
+@@ -217,6 +217,15 @@ class SecureProxyConnectionError extends UndiciError {
+   }
+ }
+
++class MessageSizeExceededError extends UndiciError {
++  constructor (message) {
++    super(message)
++    this.name = 'MessageSizeExceededError'
++    this.message = message || 'Max decompressed message size exceeded'
++    this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
++  }
++}
++
+ module.exports = {
+   AbortError,
+   HTTPParserError,
+@@ -241,4 +250,5 @@ module.exports = {
+   RequestRetryError,
+   ResponseError,
+-  SecureProxyConnectionError
++  SecureProxyConnectionError,
++  MessageSizeExceededError
+ }
+--- a/lib/web/websocket/permessage-deflate.js
++++ b/lib/web/websocket/permessage-deflate.js
+@@ -2,20 +2,38 @@
+
+ const { createInflateRaw, Z_DEFAULT_WINDOWBITS } = require('node:zlib')
+ const { isValidClientWindowBits } = require('./util')
++const { MessageSizeExceededError } = require('../../core/errors')
+
+ const tail = Buffer.from([0x00, 0x00, 0xff, 0xff])
+ const kBuffer = Symbol('kBuffer')
+ const kLength = Symbol('kLength')
+
++// Default maximum decompressed message size: 4 MB
++const kDefaultMaxDecompressedSize = 4 * 1024 * 1024
++
+ class PerMessageDeflate {
+   /** @type {import('node:zlib').InflateRaw} */
+   #inflate
+
+   #options = {}
+
+-  constructor (extensions) {
++  /** @type {number} */
++  #maxDecompressedSize
++
++  /** @type {boolean} */
++  #aborted = false
++
++  /** @type {Function|null} */
++  #currentCallback = null
++
++  /**
++   * @param {Map<string, string>} extensions
++   * @param {{ maxDecompressedMessageSize?: number }} [options]
++   */
++  constructor (extensions, options = {}) {
+     this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover')
+     this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
++    this.#maxDecompressedSize = options.maxDecompressedMessageSize ?? kDefaultMaxDecompressedSize
+   }
+
+   decompress (chunk, fin, callback) {
+@@ -24,6 +42,11 @@
+     //     payload of the message.
+     // 2.  Decompress the resulting data using DEFLATE.
+
++    if (this.#aborted) {
++      callback(new MessageSizeExceededError())
++      return
++    }
++
+     if (!this.#inflate) {
+       let windowBits = Z_DEFAULT_WINDOWBITS
+
+@@ -41,8 +64,27 @@
+       this.#inflate[kLength] = 0
+
+       this.#inflate.on('data', (data) => {
+-        this.#inflate[kBuffer].push(data)
++        if (this.#aborted) {
++          return
++        }
++
+         this.#inflate[kLength] += data.length
++
++        if (this.#inflate[kLength] > this.#maxDecompressedSize) {
++          this.#aborted = true
++          this.#inflate.removeAllListeners()
++          this.#inflate.destroy()
++          this.#inflate = null
++
++          if (this.#currentCallback) {
++            const cb = this.#currentCallback
++            this.#currentCallback = null
++            cb(new MessageSizeExceededError())
++          }
++          return
++        }
++
++        this.#inflate[kBuffer].push(data)
+       })
+
+       this.#inflate.on('error', (err) => {
+@@ -51,16 +93,22 @@
+       })
+     }
+
++    this.#currentCallback = callback
+     this.#inflate.write(chunk)
+     if (fin) {
+       this.#inflate.write(tail)
+     }
+
+     this.#inflate.flush(() => {
++      if (this.#aborted || !this.#inflate) {
++        return
++      }
++
+       const full = Buffer.concat(this.#inflate[kBuffer], this.#inflate[kLength])
+
+       this.#inflate[kBuffer].length = 0
+       this.#inflate[kLength] = 0
++      this.#currentCallback = null
+
+       callback(null, full)
+     })
+--- a/lib/web/websocket/receiver.js
++++ b/lib/web/websocket/receiver.js
+@@ -18,6 +18,7 @@
+ const { WebsocketFrameSend } = require('./frame')
+ const { closeWebSocketConnection } = require('./connection')
+ const { PerMessageDeflate } = require('./permessage-deflate')
++const { MessageSizeExceededError } = require('../../core/errors')
+
+ // This code was influenced by ws released under the MIT license.
+ // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
+@@ -37,14 +38,23 @@
+   /** @type {Map<string, PerMessageDeflate>} */
+   #extensions
+
+-  constructor (ws, extensions) {
++  /** @type {{ maxDecompressedMessageSize?: number }} */
++  #options
++
++  /**
++   * @param {import('./websocket').WebSocket} ws
++   * @param {Map<string, string>|null} extensions
++   * @param {{ maxDecompressedMessageSize?: number }} [options]
++   */
++  constructor (ws, extensions, options = {}) {
+     super()
+
+     this.ws = ws
+     this.#extensions = extensions == null ? new Map() : extensions
++    this.#options = options
+
+     if (this.#extensions.has('permessage-deflate')) {
+-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
++      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
+     }
+   }
+
+@@ -223,7 +233,9 @@
+           } else {
+             this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
+               if (error) {
+-                closeWebSocketConnection(this.ws, 1007, error.message, error.message.length)
++                // Use 1009 (Message Too Big) for decompression size limit errors
++                const code = error instanceof MessageSizeExceededError ? 1009 : 1007
++                closeWebSocketConnection(this.ws, code, error.message, error.message.length)
+                 return
+               }
+
+--- a/lib/web/websocket/websocket.js
++++ b/lib/web/websocket/websocket.js
+@@ -44,6 +44,9 @@
+   /** @type {SendQueue} */
+   #sendQueue
+
++  /** @type {{ maxDecompressedMessageSize?: number }} */
++  #options
++
+   /**
+    * @param {string} url
+    * @param {string|string[]} protocols
+@@ -117,6 +120,11 @@
+     // 10. Set this's url to urlRecord.
+     this[kWebSocketURL] = new URL(urlRecord.href)
+
++    // Store options for later use (e.g., maxDecompressedMessageSize)
++    this.#options = {
++      maxDecompressedMessageSize: options.maxDecompressedMessageSize
++    }
++
+     // 11. Let client be this's relevant settings object.
+     const client = environmentSettingsObject.settingsObject
+
+@@ -436,6 +444,6 @@
+     this[kResponse] = response
+
+-    const parser = new ByteParser(this, parsedExtensions)
++    const parser = new ByteParser(this, parsedExtensions, this.#options)
+     parser.on('drain', onParserDrain)
+     parser.on('error', onParserError.bind(this))
+
+@@ -538,7 +546,20 @@
+   {
+     key: 'headers',
+     converter: webidl.nullableConverter(webidl.converters.HeadersInit)
+-  }
++  },
++  {
++    key: 'maxDecompressedMessageSize',
++    converter: webidl.nullableConverter((V) => {
++      V = webidl.converters['unsigned long long'](V)
++      if (V <= 0) {
++        throw webidl.errors.exception({
++          header: 'WebSocket constructor',
++          message: 'maxDecompressedMessageSize must be greater than 0'
++        })
++      }
++      return V
++    })
++  }
+ ])
+
+ webidl.converters['DOMString or sequence<DOMString> or WebSocketInit'] = function (V) {
+--- a/types/errors.d.ts
++++ b/types/errors.d.ts
+@@ -146,4 +146,10 @@
+     name: 'SecureProxyConnectionError';
+     code: 'UND_ERR_PRX_TLS';
+   }
++
++  /** WebSocket decompressed message exceeded maximum size. */
++  export class MessageSizeExceededError extends UndiciError {
++    name: 'MessageSizeExceededError'
++    code: 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
++  }
+ }
+--- a/types/websocket.d.ts
++++ b/types/websocket.d.ts
+@@ -146,5 +146,12 @@
+ interface WebSocketInit {
+   protocols?: string | string[],
+   dispatcher?: Dispatcher,
+-  headers?: HeadersInit
++  headers?: HeadersInit,
++  /**
++   * Maximum size in bytes for decompressed WebSocket messages.
++   * When a message exceeds this limit during decompression, the connection
++   * will be closed with status code 1009 (Message Too Big).
++   * @default 4194304 (4 MB)
++   */
++  maxDecompressedMessageSize?: number
+ }
+
+--- a/lib/core/request.js
++++ b/lib/core/request.js
+@@ -66,6 +66,10 @@
+       throw new InvalidArgumentError('upgrade must be a string')
+     }
+ 
++    if (upgrade && !isValidHeaderValue(upgrade)) {
++      throw new InvalidArgumentError('invalid upgrade header')
++    }
++
+     if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
+       throw new InvalidArgumentError('invalid headersTimeout')
+     }
+
+--- a/lib/web/websocket/receiver.js
++++ b/lib/web/websocket/receiver.js
+@@ -179,6 +179,7 @@
+
+         const buffer = this.consume(8)
+         const upper = buffer.readUInt32BE(0)
++        const lower = buffer.readUInt32BE(4)
+
+         // 2^31 is the maximum bytes an arraybuffer can contain
+         // on 32-bit systems. Although, on 64-bit systems, this is
+@@ -186,14 +187,12 @@
+         // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Errors/Invalid_array_length
+         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/common/globals.h;drc=1946212ac0100668f14eb9e2843bdd846e510a1e;bpv=1;bpt=1;l=1275
+         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-array-buffer.h;l=34;drc=1946212ac0100668f14eb9e2843bdd846e510a1e
+-        if (upper > 2 ** 31 - 1) {
++        if (upper !== 0 || lower > 2 ** 31 - 1) {
+           failWebsocketConnection(this.ws, 'Received payload length > 2^31 bytes.')
+           return
+         }
+
+-        const lower = buffer.readUInt32BE(4)
+-
+-        this.#info.payloadLength = (upper << 8) + lower
++        this.#info.payloadLength = lower
+         this.#state = parserStates.READ_DATA
+       } else if (this.#state === parserStates.READ_DATA) {
+         if (this.#byteOffset < this.#info.payloadLength) {
+
+--- a/lib/web/websocket/permessage-deflate.js
++++ b/lib/web/websocket/permessage-deflate.js
+@@ -36,7 +36,12 @@
+         windowBits = Number.parseInt(this.#options.serverMaxWindowBits)
+       }
+
+-      this.#inflate = createInflateRaw({ windowBits })
++      try {
++        this.#inflate = createInflateRaw({ windowBits })
++      } catch (err) {
++        callback(err)
++        return
++      }
+       this.#inflate[kBuffer] = []
+       this.#inflate[kLength] = 0
+
+--- a/lib/web/websocket/util.js
++++ b/lib/web/websocket/util.js
+@@ -266,6 +266,12 @@
+  * @param {string} value
+  */
+ function isValidClientWindowBits (value) {
++  // Must have at least one character
++  if (value.length === 0) {
++    return false
++  }
++
++  // Check all characters are ASCII digits
+   for (let i = 0; i < value.length; i++) {
+     const byte = value.charCodeAt(i)
+
+@@ -274,7 +280,9 @@
+     }
+   }
+
+-  return true
++  // Check numeric range: zlib requires windowBits in range 8-15
++  const num = Number.parseInt(value, 10)
++  return num >= 8 && num <= 15
+ }
+
+ // https://nodejs.org/api/intl.html#detecting-internationalization-support
+--- /dev/null
++++ b/test/websocket/permessage-deflate-windowbits.js
+@@ -0,0 +1,242 @@
++'use strict'
++
++const { describe, test, after } = require('node:test')
++const { once } = require('node:events')
++const http = require('node:http')
++const crypto = require('node:crypto')
++const zlib = require('node:zlib')
++const { WebSocket } = require('../..')
++const { isValidClientWindowBits } = require('../../lib/web/websocket/util')
++
++/**
++ * Creates a minimal WebSocket server that responds with a custom
++ * server_max_window_bits value and sends a compressed frame.
++ */
++function createMaliciousServer (windowBitsValue) {
++  const server = http.createServer()
++  const sockets = new Set()
++
++  server.on('upgrade', (req, socket) => {
++    sockets.add(socket)
++    socket.on('close', () => sockets.delete(socket))
++
++    const key = req.headers['sec-websocket-key']
++    const accept = crypto
++      .createHash('sha1')
++      .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
++      .digest('base64')
++
++    const headers = [
++      'HTTP/1.1 101 Switching Protocols',
++      'Upgrade: websocket',
++      'Connection: Upgrade',
++      `Sec-WebSocket-Accept: ${accept}`,
++      `Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=${windowBitsValue}`,
++      '', ''
++    ]
++
++    socket.write(headers.join('\r\n'))
++
++    // Send a compressed frame to trigger decompression
++    setTimeout(() => {
++      if (!socket.destroyed) {
++        const payload = zlib.deflateRawSync(Buffer.from('Hello'))
++        // Remove trailing 00 00 ff ff if present
++        const trimmed = payload.subarray(0, payload.length - 4)
++        const frame = makeWsFrame({ opcode: 2, rsv1: true, payload: trimmed })
++        socket.write(frame)
++      }
++    }, 50)
++  })
++
++  // Override close to also destroy sockets
++  const originalClose = server.close.bind(server)
++  server.close = (cb) => {
++    for (const socket of sockets) {
++      socket.destroy()
++    }
++    sockets.clear()
++    originalClose(cb)
++  }
++
++  return server
++}
++
++/**
++ * Creates a WebSocket frame (server-to-client, unmasked)
++ */
++function makeWsFrame ({ opcode, rsv1, payload }) {
++  const fin = 1
++  const b0 = (fin << 7) | ((rsv1 ? 1 : 0) << 6) | (opcode & 0x0f)
++  const len = payload.length
++
++  let header
++  if (len <= 125) {
++    header = Buffer.from([b0, len])
++  } else if (len <= 0xffff) {
++    header = Buffer.alloc(4)
++    header[0] = b0
++    header[1] = 126
++    header.writeUInt16BE(len, 2)
++  } else {
++    header = Buffer.alloc(10)
++    header[0] = b0
++    header[1] = 127
++    header.writeUInt32BE(0, 2)
++    header.writeUInt32BE(len, 6)
++  }
++
++  return Buffer.concat([header, payload])
++}
++
++describe('isValidClientWindowBits', () => {
++  test('rejects empty string', (t) => {
++    t.assert.strictEqual(isValidClientWindowBits(''), false)
++  })
++
++  test('rejects values below 8', (t) => {
++    t.assert.strictEqual(isValidClientWindowBits('0'), false)
++    t.assert.strictEqual(isValidClientWindowBits('1'), false)
++    t.assert.strictEqual(isValidClientWindowBits('7'), false)
++  })
++
++  test('accepts values 8-15', (t) => {
++    for (let i = 8; i <= 15; i++) {
++      t.assert.strictEqual(isValidClientWindowBits(String(i)), true, `${i} should be valid`)
++    }
++  })
++
++  test('rejects values above 15', (t) => {
++    t.assert.strictEqual(isValidClientWindowBits('16'), false)
++    t.assert.strictEqual(isValidClientWindowBits('100'), false)
++    t.assert.strictEqual(isValidClientWindowBits('1000'), false)
++    t.assert.strictEqual(isValidClientWindowBits('999999'), false)
++  })
++
++  test('rejects non-numeric values', (t) => {
++    t.assert.strictEqual(isValidClientWindowBits('abc'), false)
++    t.assert.strictEqual(isValidClientWindowBits('12a'), false)
++    t.assert.strictEqual(isValidClientWindowBits('-1'), false)
++    t.assert.strictEqual(isValidClientWindowBits('8.5'), false)
++  })
++})
++
++describe('permessage-deflate server_max_window_bits', () => {
++  test('server_max_window_bits=8 works correctly', async (t) => {
++    const server = createMaliciousServer('8')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => server.close())
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    const [event] = await once(client, 'message')
++    t.assert.ok(event.data)
++    client.close()
++  })
++
++  test('server_max_window_bits=15 works correctly', async (t) => {
++    const server = createMaliciousServer('15')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => server.close())
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    const [event] = await once(client, 'message')
++    t.assert.ok(event.data)
++    client.close()
++  })
++
++  test('server_max_window_bits=0 is rejected gracefully', async (t) => {
++    const server = createMaliciousServer('0')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => server.close())
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    const [event] = await once(client, 'error')
++    t.assert.ok(event.error instanceof Error)
++  })
++
++  test('server_max_window_bits=7 is rejected gracefully', async (t) => {
++    const server = createMaliciousServer('7')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => server.close())
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    const [event] = await once(client, 'error')
++    t.assert.ok(event.error instanceof Error)
++  })
++
++  test('server_max_window_bits=16 is rejected gracefully', async (t) => {
++    const server = createMaliciousServer('16')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => server.close())
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    const [event] = await once(client, 'error')
++    t.assert.ok(event.error instanceof Error)
++  })
++
++  test('server_max_window_bits=1000 is rejected gracefully (PoC attack)', async (t) => {
++    const server = createMaliciousServer('1000')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => server.close())
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    const [event] = await once(client, 'error')
++    // The key assertion: we got an error event instead of crashing
++    t.assert.ok(event.error instanceof Error, 'Should receive an Error')
++  })
++
++  test('no uncaught exception with invalid windowBits', async (t) => {
++    let uncaughtException = false
++
++    const handler = () => {
++      uncaughtException = true
++    }
++    process.on('uncaughtException', handler)
++
++    const server = createMaliciousServer('1000')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => {
++      server.close()
++      process.off('uncaughtException', handler)
++    })
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    await Promise.race([
++      once(client, 'error'),
++      once(client, 'close'),
++      new Promise(resolve => setTimeout(resolve, 1000))
++    ])
++
++    t.assert.strictEqual(uncaughtException, false, 'No uncaught exception should occur')
++  })
++
++  test('invalid windowBits closes connection without crashing process', async (t) => {
++    const server = createMaliciousServer('999999')
++    await new Promise(resolve => server.listen(0, resolve))
++    after(() => server.close())
++
++    const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
++
++    // Wait for either error or close event
++    const result = await Promise.race([
++      once(client, 'error').then(([e]) => ({ type: 'error', event: e })),
++      once(client, 'close').then(([e]) => ({ type: 'close', event: e }))
++    ])
++
++    // Either error or close is acceptable, as long as we didn't crash
++    t.assert.ok(
++      result.type === 'error' || result.type === 'close',
++      'Connection should close gracefully'
++    )
++
++    // This assertion is reached = process did not crash
++    t.assert.ok(true, 'Process did not crash')
++  })
++})
