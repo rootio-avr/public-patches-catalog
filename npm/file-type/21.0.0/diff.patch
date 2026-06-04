@@ -1,0 +1,193 @@
+--- a/core.js
++++ b/core.js
+@@ -1338,6 +1338,7 @@
+ 			await tokenizer.ignore(30);
+ 			// Search for header should be in first 1KB of file.
+ 			while (tokenizer.position + 24 < tokenizer.fileInfo.size) {
++				const previousPosition = tokenizer.position;
+ 				const header = await readHeader();
+ 				let payload = header.size - 24;
+ 				if (_check(header.id, [0x91, 0x07, 0xDC, 0xB7, 0xB7, 0xA9, 0xCF, 0x11, 0x8E, 0xE6, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65])) {
+@@ -1365,6 +1366,11 @@
+ 				}
+
+ 				await tokenizer.ignore(payload);
++
++				// Safeguard against malformed files: break if the position did not advance.
++				if (tokenizer.position <= previousPosition) {
++					break;
++				}
+ 			}
+
+ 			// Default to ASF generic extension
+
+--- a/core.js
++++ b/core.js
+@@ -15,6 +15,66 @@
+ 
+ export const reasonableDetectionSizeInBytes = 4100; // A fair amount of file-types are detectable within this range.
+ 
++// CVE-2026-32630: Keep defensive limits small enough to avoid accidental memory spikes from untrusted inputs.
++const maximumZipEntrySizeInBytes = 1024 * 1024;
++const maximumZipEntryCount = 1024;
++const maximumUntrustedSkipSizeInBytes = 16 * 1024 * 1024;
++const maximumId3HeaderSizeInBytes = maximumUntrustedSkipSizeInBytes;
++const maximumAsfHeaderObjectCount = 512;
++const maximumPngChunkCount = 512;
++const maximumDetectionReentryCount = 256;
++
++// CVE-2026-32630: Override the default inflate to enforce decompression size limits,
++// since @tokenizer/inflate does not expose a configuration hook for this.
++ZipHandler.prototype.inflate = async function (zipHeader, fileData, callback) {
++	if (zipHeader.compressedMethod === 0) {
++		return callback(fileData);
++	}
++
++	if (zipHeader.compressedMethod !== 8) {
++		throw new Error(`Unsupported ZIP compression method: ${zipHeader.compressedMethod}`);
++	}
++
++	const input = new ReadableStream({
++		start(controller) {
++			controller.enqueue(fileData);
++			controller.close();
++		},
++	});
++	const output = input.pipeThrough(new DecompressionStream('deflate-raw'));
++	const reader = output.getReader();
++	const chunks = [];
++	let totalLength = 0;
++
++	try {
++		for (;;) {
++			const {done, value} = await reader.read();
++			if (done) {
++				break;
++			}
++
++			totalLength += value.length;
++			if (totalLength > maximumZipEntrySizeInBytes) {
++				await reader.cancel();
++				throw new Error(`ZIP entry decompressed data exceeds ${maximumZipEntrySizeInBytes} bytes`);
++			}
++
++			chunks.push(value);
++		}
++	} finally {
++		reader.releaseLock();
++	}
++
++	const uncompressedData = new Uint8Array(totalLength);
++	let offset = 0;
++	for (const chunk of chunks) {
++		uncompressedData.set(chunk, offset);
++		offset += chunk.length;
++	}
++
++	return callback(uncompressedData);
++};
++
+ export async function fileTypeFromStream(stream, options) {
+ 	return new FileTypeParser(options).fromStream(stream);
+ }
+@@ -201,6 +261,7 @@
+ 		this.tokenizerOptions = {
+ 			abortSignal: options?.signal,
+ 		};
++		this.detectionReentryCount = 0;
+ 	}
+ 
+ 	async fromTokenizer(tokenizer) {
+@@ -388,8 +449,13 @@
+ 		// -- 3-byte signatures --
+ 
+ 		if (this.check([0xEF, 0xBB, 0xBF])) { // UTF-8-BOM
++			if (this.detectionReentryCount >= maximumDetectionReentryCount) {
++				return;
++			}
++
++			this.detectionReentryCount++;
+ 			// Strip off UTF-8-BOM
+-			this.tokenizer.ignore(3);
++			await this.tokenizer.ignore(3);
+ 			return this.detectConfident(tokenizer);
+ 		}
+ 
+@@ -424,6 +490,14 @@
+ 		if (this.checkString('ID3')) {
+ 			await tokenizer.ignore(6); // Skip ID3 header until the header size
+ 			const id3HeaderLength = await tokenizer.readToken(uint32SyncSafeToken);
++			if (
++				!Number.isFinite(id3HeaderLength)
++				|| id3HeaderLength < 0
++				|| id3HeaderLength > maximumId3HeaderSizeInBytes
++			) {
++				return;
++			}
++
+ 			if (tokenizer.position + id3HeaderLength > tokenizer.fileInfo.size) {
+ 				// Guess file type based on ID3 header for backward compatibility
+ 				return {
+@@ -518,7 +592,17 @@
+ 		// Need to be before the `zip` check
+ 		if (this.check([0x50, 0x4B, 0x3, 0x4])) { // Local file header signature
+ 			let fileType;
+-			await new ZipHandler(tokenizer).unzip(zipHeader => {
++			let zipEntryCount = 0;
++			await new ZipHandler(tokenizer).unzip(async zipHeader => {
++				zipEntryCount++;
++				if (zipEntryCount > maximumZipEntryCount) {
++					return {stop: true};
++				}
++
++				if (zipHeader.compressedSize > maximumZipEntrySizeInBytes) {
++					return {stop: true};
++				}
++
+ 				switch (zipHeader.filename) {
+ 					case 'META-INF/mozilla.rsa':
+ 						fileType = {
+@@ -1152,6 +1236,7 @@
+ 				};
+ 			}
+ 
++			let pngChunkCount = 0;
+ 			do {
+ 				const chunk = await readChunkHeader();
+ 				if (chunk.length < 0) {
+@@ -1172,6 +1257,11 @@
+ 					default:
+ 						await tokenizer.ignore(chunk.length + 4); // Ignore chunk-data + CRC
+ 				}
++
++				pngChunkCount++;
++				if (pngChunkCount >= maximumPngChunkCount) {
++					break;
++				}
+ 			} while (tokenizer.position + 8 < tokenizer.fileInfo.size);
+ 
+ 			return {
+@@ -1337,10 +1427,23 @@
+ 
+ 			await tokenizer.ignore(30);
+ 			// Search for header should be in first 1KB of file.
++			let asfHeaderObjectCount = 0;
+ 			while (tokenizer.position + 24 < tokenizer.fileInfo.size) {
++				asfHeaderObjectCount++;
++				if (asfHeaderObjectCount > maximumAsfHeaderObjectCount) {
++					break;
++				}
++
+ 				const previousPosition = tokenizer.position;
+ 				const header = await readHeader();
+ 				let payload = header.size - 24;
++				if (
++					!Number.isFinite(payload)
++					|| payload < 0
++				) {
++					break;
++				}
++
+ 				if (_check(header.id, [0x91, 0x07, 0xDC, 0xB7, 0xB7, 0xA9, 0xCF, 0x11, 0x8E, 0xE6, 0x00, 0xC0, 0x0C, 0x20, 0x53, 0x65])) {
+ 					// Sync on Stream-Properties-Object (B7DC0791-A9B7-11CF-8EE6-00C00C205365)
+ 					const typeId = new Uint8Array(16);
