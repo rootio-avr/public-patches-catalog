@@ -1,0 +1,526 @@
+--- a/lib/core/request.js
++++ b/lib/core/request.js
+@@ -420,22 +420,26 @@
+     return
+   }
+
+   if (
+-    request.host === null &&
+     key.length === 4 &&
+     key.toLowerCase() === 'host'
+   ) {
++    if (request.host !== null) {
++      throw new InvalidArgumentError('duplicate host header')
++    }
+     if (headerCharRegex.exec(val) !== null) {
+       throw new InvalidArgumentError(`invalid ${key} header`)
+     }
+     // Consumed by Client
+     request.host = val
+   } else if (
+-    request.contentLength === null &&
+     key.length === 14 &&
+     key.toLowerCase() === 'content-length'
+   ) {
++    if (request.contentLength !== null) {
++      throw new InvalidArgumentError('duplicate content-length header')
++    }
+     request.contentLength = parseInt(val, 10)
+     if (!Number.isFinite(request.contentLength)) {
+       throw new InvalidArgumentError('invalid content-length header')
+     }
+
+--- a/lib/websocket/receiver.js
++++ b/lib/websocket/receiver.js
+@@ -16,6 +16,10 @@
+ channels.ping = diagnosticsChannel.channel('undici:websocket:ping')
+ channels.pong = diagnosticsChannel.channel('undici:websocket:pong')
+ 
++// Maximum total received message size (256 MiB) to prevent memory exhaustion
++// from accumulated fragments or large single frames (CVE-2026-1526).
++const DEFAULT_MAX_RECEIVED_MESSAGE_SIZE = 256 * 1024 * 1024
++
+ class ByteParser extends Writable {
+   #buffers = []
+   #byteOffset = 0
+@@ -24,11 +28,16 @@
+ 
+   #info = {}
+   #fragments = []
++  #fragmentsSize = 0
++  #maxReceivedMessageSize = DEFAULT_MAX_RECEIVED_MESSAGE_SIZE
+ 
+-  constructor (ws) {
++  constructor (ws, options = {}) {
+     super()
+ 
+     this.ws = ws
++    if (options.maxReceivedMessageSize != null) {
++      this.#maxReceivedMessageSize = options.maxReceivedMessageSize
++    }
+   }
+ 
+   /**
+@@ -212,7 +221,12 @@
+ 
+         const lower = buffer.readUInt32BE(4)
+ 
+-        this.#info.payloadLength = (upper << 8) + lower
++        // Fix: use multiplication instead of bitwise shift to correctly
++        // combine upper and lower 32-bit halves into a 64-bit value.
++        // Bitwise operators in JS operate on 32-bit signed integers,
++        // so (upper << 8) was incorrect and caused overflow for large
++        // but valid payload lengths.
++        this.#info.payloadLength = (upper * (2 ** 32)) + lower
+         this.#state = parserStates.READ_DATA
+       } else if (this.#state === parserStates.READ_DATA) {
+         if (this.#byteOffset < this.#info.payloadLength) {
+@@ -223,6 +237,16 @@
+ 
+           const body = this.consume(this.#info.payloadLength)
+ 
++          // Track accumulated message size and enforce maximum limit
++          // to prevent memory exhaustion from many fragments or large payloads.
++          this.#fragmentsSize += body.length
++          if (this.#fragmentsSize > this.#maxReceivedMessageSize) {
++            failWebsocketConnection(this.ws, 'Received message size exceeds limit.')
++            this.#fragments.length = 0
++            this.#fragmentsSize = 0
++            return
++          }
++
+           this.#fragments.push(body)
+ 
+           // If the frame is unfragmented, or a fragmented frame was terminated,
+@@ -234,6 +258,7 @@
+ 
+             this.#info = {}
+             this.#fragments.length = 0
++            this.#fragmentsSize = 0
+           }
+ 
+           this.#state = parserStates.INFO
+
+--- a/lib/core/request.js
++++ b/lib/core/request.js
+@@ -87,6 +87,10 @@
+     if (upgrade && typeof upgrade !== 'string') {
+       throw new InvalidArgumentError('upgrade must be a string')
+     }
+
++    if (upgrade && headerCharRegex.exec(upgrade) !== null) {
++      throw new InvalidArgumentError('invalid upgrade header')
++    }
++
+     if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
+       throw new InvalidArgumentError('invalid headersTimeout')
+     }
+--- /dev/null
++++ b/test/upgrade-crlf.js
+@@ -0,0 +1,188 @@
++'use strict'
++
++const { tspl } = require('@matteo.collina/tspl')
++const { test, after } = require('node:test')
++const { Client, errors } = require('..')
++const net = require('node:net')
++
++test('CRLF injection in upgrade header via CRLF sequence', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\r\n\r\nSET pwned true'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade header via lone CR', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\rinjected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade header via lone LF', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\ninjected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade header via null byte', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\0injected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade option via client.request', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.request({
++        path: '/',
++        method: 'GET',
++        upgrade: 'websocket\r\n\r\nGET /smuggled HTTP/1.1'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('valid upgrade value is accepted', async (t) => {
++  t = tspl(t, { plan: 1 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    const { socket } = await client.upgrade({
++      path: '/',
++      method: 'GET',
++      protocol: 'websocket'
++    })
++    t.ok(socket)
++    socket.destroy()
++  })
++
++  await t.completed
++})
+
+diff --git a/ROOT-SECURITY-RELEASE.md b/ROOT-SECURITY-RELEASE.md
+new file mode 100644
+index 00000000..e9fd6b1b
+--- /dev/null
++++ b/ROOT-SECURITY-RELEASE.md
+@@ -0,0 +1,195 @@
++# False Positive Analysis: CVE-2026-2229 in undici v5.29.0
++
++## Summary
++
++**CVE-2026-2229 does not affect undici v5.29.0.**
++
++Any security scanner flagging undici v5.29.0 for CVE-2026-2229 is producing a **false positive**. The vulnerability requires the `permessage-deflate` WebSocket compression extension to be implemented and active in the client. In v5.29.0, this feature was explicitly not implemented — it was a documented TODO stub with all relevant code commented out. The attack surface described in the CVE does not exist in the v5 release line.
++
++---
++
++## CVE Overview
++
++| Field              | Value                                                      |
++|--------------------|------------------------------------------------------------|
++| CVE ID             | CVE-2026-2229                                              |
++| GHSA ID            | GHSA-v9p9-hfj2-hcw8                                        |
++| Package            | npm: `undici`                                              |
++| Severity           | Moderate                                                   |
++| CVSS Score         | 5.9 / 10 (CVSS:3.1/AV:N/AC:H/PR:N/UI:N/S:U/C:N/I:N/A:H) |
++| CWE                | CWE-248 (Uncaught Exception), CWE-1284 (Improper Validation of Specified Quantity in Input) |
++| **Affected range** | `< 6.24.0` AND `>= 7.0.0, < 7.24.0`                      |
++| **Patched in**     | v6.24.0, v7.24.0                                           |
++| Fix commit (main)  | `cb79c5704ac47e42ce01a72269994fc70e377536`                 |
++| Fix commit (v6.x)  | `e9e2997ed18bff6ae389712d5f0e169f8a6546a0`                 |
++
++---
++
++## Vulnerability Description
++
++The CVE describes a Denial-of-Service (DoS) vulnerability in the undici WebSocket client. When the client connects to a WebSocket server that supports `permessage-deflate` compression (RFC 7692), the server negotiates compression parameters during the opening handshake. One of those parameters is `server_max_window_bits`, which controls the zlib decompression window size. The valid range per the RFC and zlib is **8 to 15 inclusive**.
++
++The vulnerability has two root causes in affected versions:
++
++**Root Cause 1 — Insufficient range validation in `isValidClientWindowBits()`:**
++
++In affected versions, the function `isValidClientWindowBits()` (located in `lib/web/websocket/util.js`) only verified that the value consisted of ASCII digit characters. It did not validate whether the numeric value fell within zlib's valid range of 8–15. This meant a value such as `"1000"` would pass the validation check.
++
++```js
++// VULNERABLE code in affected versions (v6.x before v6.24.0)
++function isValidClientWindowBits (value) {
++  return /^[0-9]+$/.test(value)  // only checks digits, not range 8-15
++}
++```
++
++**Root Cause 2 — Unhandled exception in `createInflateRaw()`:**
++
++In `lib/web/websocket/permessage-deflate.js`, the call to Node.js's `zlib.createInflateRaw({ windowBits })` was not wrapped in a try-catch block. When `windowBits` was out of range, zlib threw a synchronous `RangeError` that propagated unhandled up the call stack, terminating the Node.js process immediately.
++
++**Attack Scenario:**
++
++1. Client connects to a malicious WebSocket server.
++2. The client advertises `permessage-deflate` support in the `Sec-WebSocket-Extensions` request header.
++3. The malicious server responds with `server_max_window_bits=1000` (or any value outside 8–15) in its `Sec-WebSocket-Extensions` response header.
++4. The client's `isValidClientWindowBits("1000")` returns `true` (digits-only check passes).
++5. When the server sends a compressed frame, the client calls `zlib.createInflateRaw({ windowBits: 1000 })`, which throws an uncaught `RangeError`.
++6. The Node.js process crashes.
++
++**The fix (commit `cb79c570`)** made two changes:
++1. Updated `isValidClientWindowBits()` to enforce the valid range 8–15.
++2. Wrapped `createInflateRaw()` in a try-catch as defense-in-depth.
++
++---
++
++## Why v5.29.0 Is Not Affected
++
++### Reason 1: permessage-deflate was never implemented in v5
++
++The permessage-deflate extension — the entire feature that contains the vulnerability — **did not exist in any v5.x release of undici**. It was introduced for the first time in commit `5a564bd9ec8f3ced5e0a750f701f5b7374971178`, authored on **2024-05-20**, which was released in **v6.18.0**. The v5 release line was already in maintenance at that point and never received this feature.
++
++You can verify this by examining the file tree of v5.29.0:
++
++```
++$ git ls-tree -r v5.29.0 --name-only | grep -i "permessage\|deflate"
++(no output)
++```
++
++There is no `permessage-deflate.js` file, no `isValidClientWindowBits()` function, and no `createInflateRaw()` call anywhere in the WebSocket implementation of v5.29.0. The vulnerable code path is entirely absent.
++
++---
++
++### Reason 2: The `Sec-WebSocket-Extensions` header was explicitly disabled (TODO stub)
++
++In v5.29.0, the WebSocket handshake code in `lib/websocket/connection.js` contained a stub for permessage-deflate that was deliberately disabled with a TODO comment and the relevant header append line commented out:
++
++```js
++// lib/websocket/connection.js (v5.29.0, lines 93–101)
++
++// 9. Let permessageDeflate be a user-agent defined
++//    "permessage-deflate" extension header value.
++// https://github.com/mozilla/gecko-dev/blob/ce78234f5e...
++// TODO: enable once permessage-deflate is supported
++const permessageDeflate = '' // 'permessage-deflate; 15'
++
++// 10. Append (`Sec-WebSocket-Extensions`, permessageDeflate) to
++//     request's header list.
++// request.headersList.append('sec-websocket-extensions', permessageDeflate)
++```
++
++Because `permessageDeflate` is always an empty string and the `headersList.append(...)` line is commented out, **the `Sec-WebSocket-Extensions` request header is never sent to the server** in v5.29.0. This means:
++
++- The client never advertises compression support.
++- A server (even a malicious one) cannot negotiate `server_max_window_bits` with this client.
++- The negotiation path that leads to `createInflateRaw()` is never entered.
++
++Even if a server were to send a `Sec-WebSocket-Extensions` response header containing a `permessage-deflate` value unprompted, the v5.29.0 connection code would detect a mismatch (since `permessageDeflate === ''`) and immediately call `failWebsocketConnection()`, closing the connection safely:
++
++```js
++// lib/websocket/connection.js (v5.29.0, lines 165–174)
++const secExtension = response.headersList.get('Sec-WebSocket-Extensions')
++
++if (secExtension !== null && secExtension !== permessageDeflate) {
++  failWebsocketConnection(ws, 'Received different permessage-deflate than the one set.')
++  return
++}
++```
++
++This acts as an additional inadvertent defence: any server attempting to force compression extension negotiation onto a v5.29.0 client will simply have its connection rejected.
++
++---
++
++### Reason 3: The receiver has no decompression logic
++
++The frame parser in `lib/websocket/receiver.js` (v5.29.0) processes incoming WebSocket frames entirely without any decompression step. There is no reference to `zlib`, `inflate`, `deflate`, or any compression library anywhere in the file. Frames are read directly as raw bytes and dispatched to message handlers. There is no code path through which a zlib `RangeError` could be triggered.
++
++---
++
++### Reason 4: The advisory's affected version range is semver-imprecise
++
++The official advisory states the affected range as `< 6.24.0`, which — taken literally as a semver expression — technically includes all v5.x and v4.x versions. However, this range describes versions in which the vulnerable feature exists and is unpatched, not versions in which the feature was never built. The v5.x line predates the introduction of permessage-deflate entirely.
++
++This type of overly broad semver range in security advisories is a known cause of false positives in automated scanners. The intent of the `< 6.24.0` bound is to capture v6.0.0 through v6.23.x, where the feature was present but unpatched. It does not imply that every version numerically below 6.24.0 is vulnerable.
++
++---
++
++## Timeline
++
++| Date           | Event                                                                                   |
++|----------------|-----------------------------------------------------------------------------------------|
++| — (v5 era)     | undici v5.x ships WebSocket support with permessage-deflate as a disabled TODO stub     |
++| 2024-05-20     | Commit `5a564bd9` introduces permessage-deflate implementation for the first time       |
++| 2024-06-xx     | v6.18.0 released — **first version to ship permessage-deflate**                         |
++| 2026-01-16     | Commit `cb79c570` fixes CVE-2026-2229 (range validation + try-catch)                   |
++| 2026-01-xx     | v6.24.0 and v7.24.0 released with the fix                                               |
++| 2026-03-12     | CVE-2026-2229 publicly disclosed                                                        |
++
++v5.29.0 was released well before permessage-deflate was ever implemented. It was never in scope for this vulnerability.
++
++---
++
++## Proof: File-Level Diff Between v5.29.0 and v6.18.0
++
++The table below shows the permessage-deflate related files that were added in v6.18.0 and are completely absent from v5.29.0:
++
++| File                                     | v5.29.0 | v6.18.0+ |
++|------------------------------------------|---------|----------|
++| `lib/websocket/permessage-deflate.js`    | absent  | present  |
++| `isValidClientWindowBits()` in util.js   | absent  | present  |
++| `createInflateRaw()` calls               | absent  | present  |
++| `Sec-WebSocket-Extensions` header sent   | never   | yes      |
++| zlib dependency in WebSocket receiver    | absent  | present  |
++
++To independently verify, run:
++
++```bash
++git ls-tree -r v5.29.0 --name-only | grep permessage
++# (no output)
++
++git show v5.29.0:lib/websocket/util.js | grep -c "isValidClientWindowBits"
++# 0
++
++git show v5.29.0:lib/websocket/receiver.js | grep -c "inflate\|zlib\|deflate"
++# 0
++```
++
++---
++
++## Recommendation
++
++No remediation action is required for undici v5.29.0 with respect to CVE-2026-2229.
++
++If your dependency scanner reports this CVE against v5.29.0, you can suppress or dismiss the finding with the following justification:
++
++> CVE-2026-2229 requires the permessage-deflate WebSocket compression extension (introduced in undici v6.18.0). This feature does not exist in v5.29.0. The `Sec-WebSocket-Extensions` header is never sent, no permessage-deflate negotiation occurs, and no decompression code path exists in this version. The advisory's semver range `< 6.24.0` is imprecise and produces a false positive against the v5 line.
++
++If you wish to upgrade undici regardless, the patched versions are **v6.24.0** and **v7.24.0**.
++
++---
++
++## References
++
++- [GitHub Security Advisory GHSA-v9p9-hfj2-hcw8](https://github.com/nodejs/undici/security/advisories/GHSA-v9p9-hfj2-hcw8)
++- [NVD - CVE-2026-2229](https://nvd.nist.gov/vuln/detail/CVE-2026-2229)
++- [Fix commit cb79c570](https://github.com/nodejs/undici/commit/cb79c5704ac47e42ce01a72269994fc70e377536)
++- [permessage-deflate introduction commit 5a564bd9](https://github.com/nodejs/undici/commit/5a564bd9ec8f3ced5e0a750f701f5b7374971178)
++- [RFC 7692 — Compression Extensions for WebSocket](https://datatracker.ietf.org/doc/html/rfc7692)
+
+--- a/lib/fetch/index.js
++++ b/lib/fetch/index.js
+@@ -2033,6 +2033,12 @@
+
+           // https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Content-Encoding
+           if (request.method !== 'HEAD' && request.method !== 'CONNECT' && !nullBodyStatus.includes(status) && !willFollow) {
++            // Limit the number of content-encodings to prevent resource exhaustion
++            // attacks where a malicious server sends thousands of encodings causing
++            // excessive CPU and memory usage creating decompressors (CVE-2026-22036)
++            if (codings.length > 5) {
++              codings.length = 0
++            }
+             for (const coding of codings) {
+               // https://www.rfc-editor.org/rfc/rfc9112.html#section-7.2
+               if (coding === 'x-gzip' || coding === 'gzip') {
