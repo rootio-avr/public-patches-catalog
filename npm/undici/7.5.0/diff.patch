@@ -1,0 +1,572 @@
+--- a/lib/core/request.js
++++ b/lib/core/request.js
+@@ -362,13 +362,19 @@
+     val = `${val}`
+   }
+ 
+-  if (request.host === null && headerName === 'host') {
++  if (headerName === 'host') {
++    if (request.host !== null) {
++      throw new InvalidArgumentError('duplicate host header')
++    }
+     if (typeof val !== 'string') {
+       throw new InvalidArgumentError('invalid host header')
+     }
+     // Consumed by Client
+     request.host = val
+-  } else if (request.contentLength === null && headerName === 'content-length') {
++  } else if (headerName === 'content-length') {
++    if (request.contentLength !== null) {
++      throw new InvalidArgumentError('duplicate content-length header')
++    }
+     request.contentLength = parseInt(val, 10)
+     if (!Number.isFinite(request.contentLength)) {
+       throw new InvalidArgumentError('invalid content-length header')
+
+--- a/lib/core/errors.js
++++ b/lib/core/errors.js
+@@ -217,6 +217,15 @@ class SecureProxyConnectionError extends UndiciError {
+   }
+ }
+ 
++class MessageSizeExceededError extends UndiciError {
++  constructor (message) {
++    super(message)
++    this.name = 'MessageSizeExceededError'
++    this.message = message || 'Max decompressed message size exceeded'
++    this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
++  }
++}
++
+ module.exports = {
+   AbortError,
+   HTTPParserError,
+@@ -240,5 +249,6 @@ module.exports = {
+   ResponseExceededMaxSizeError,
+   RequestRetryError,
+   ResponseError,
+-  SecureProxyConnectionError
++  SecureProxyConnectionError,
++  MessageSizeExceededError
+ }
+--- a/lib/web/websocket/permessage-deflate.js
++++ b/lib/web/websocket/permessage-deflate.js
+@@ -2,20 +2,34 @@
+ 
+ const { createInflateRaw, Z_DEFAULT_WINDOWBITS } = require('node:zlib')
+ const { isValidClientWindowBits } = require('./util')
++const { MessageSizeExceededError } = require('../../core/errors')
+ 
+ const tail = Buffer.from([0x00, 0x00, 0xff, 0xff])
+ const kBuffer = Symbol('kBuffer')
+ const kLength = Symbol('kLength')
+ 
++// Default maximum decompressed message size: 4 MB
++const kDefaultMaxDecompressedSize = 4 * 1024 * 1024
++
+ class PerMessageDeflate {
+   /** @type {import('node:zlib').InflateRaw} */
+   #inflate
+ 
+   #options = {}
+ 
+-  constructor (extensions) {
++  /** @type {number} */
++  #maxDecompressedSize
++
++  /** @type {boolean} */
++  #aborted = false
++
++  /** @type {Function|null} */
++  #currentCallback = null
++
++  constructor (extensions, options = {}) {
+     this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover')
+     this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
++    this.#maxDecompressedSize = options.maxDecompressedMessageSize ?? kDefaultMaxDecompressedSize
+   }
+ 
+   decompress (chunk, fin, callback) {
+@@ -24,6 +38,11 @@ class PerMessageDeflate {
+     //     payload of the message.
+     // 2.  Decompress the resulting data using DEFLATE.
+ 
++    if (this.#aborted) {
++      callback(new MessageSizeExceededError())
++      return
++    }
++
+     if (!this.#inflate) {
+       let windowBits = Z_DEFAULT_WINDOWBITS
+ 
+@@ -41,8 +60,27 @@ class PerMessageDeflate {
+       this.#inflate[kLength] = 0
+ 
+       this.#inflate.on('data', (data) => {
+-        this.#inflate[kBuffer].push(data)
++        if (this.#aborted) {
++          return
++        }
++
+         this.#inflate[kLength] += data.length
++
++        if (this.#inflate[kLength] > this.#maxDecompressedSize) {
++          this.#aborted = true
++          this.#inflate.removeAllListeners()
++          this.#inflate.destroy()
++          this.#inflate = null
++
++          if (this.#currentCallback) {
++            const cb = this.#currentCallback
++            this.#currentCallback = null
++            cb(new MessageSizeExceededError())
++          }
++          return
++        }
++
++        this.#inflate[kBuffer].push(data)
+       })
+ 
+       this.#inflate.on('error', (err) => {
+@@ -51,16 +89,22 @@ class PerMessageDeflate {
+       })
+     }
+ 
++    this.#currentCallback = callback
+     this.#inflate.write(chunk)
+     if (fin) {
+       this.#inflate.write(tail)
+     }
+ 
+     this.#inflate.flush(() => {
++      if (this.#aborted || !this.#inflate) {
++        return
++      }
++
+       const full = Buffer.concat(this.#inflate[kBuffer], this.#inflate[kLength])
+ 
+       this.#inflate[kBuffer].length = 0
+       this.#inflate[kLength] = 0
++      this.#currentCallback = null
+ 
+       callback(null, full)
+     })
+--- a/lib/web/websocket/receiver.js
++++ b/lib/web/websocket/receiver.js
+@@ -16,6 +16,7 @@ const {
+ const { failWebsocketConnection } = require('./connection')
+ const { WebsocketFrameSend } = require('./frame')
+ const { PerMessageDeflate } = require('./permessage-deflate')
++const { MessageSizeExceededError } = require('../../core/errors')
+ 
+ // This code was influenced by ws released under the MIT license.
+ // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
+@@ -39,14 +40,18 @@ class ByteParser extends Writable {
+   /** @type {import('./websocket').Handler} */
+   #handler
+ 
+-  constructor (handler, extensions) {
++  /** @type {{ maxDecompressedMessageSize?: number }} */
++  #options
++
++  constructor (handler, extensions, options = {}) {
+     super()
+ 
+     this.#handler = handler
+     this.#extensions = extensions == null ? new Map() : extensions
++    this.#options = options
+ 
+     if (this.#extensions.has('permessage-deflate')) {
+-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
++      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
+     }
+   }
+ 
+@@ -223,7 +228,9 @@ class ByteParser extends Writable {
+           } else {
+             this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
+               if (error) {
+-                failWebsocketConnection(this.#handler, 1007, error.message)
++                // Use 1009 (Message Too Big) for decompression size limit errors
++                const code = error instanceof MessageSizeExceededError ? 1009 : 1007
++                failWebsocketConnection(this.#handler, code, error.message)
+                 return
+               }
+ 
+--- a/lib/web/websocket/websocket.js
++++ b/lib/web/websocket/websocket.js
+@@ -91,6 +91,8 @@ class WebSocket extends EventTarget {
+   #binaryType
+   /** @type {import('./receiver').ByteParser} */
+   #parser
++  /** @type {{ maxDecompressedMessageSize?: number }} */
++  #options
+ 
+   /**
+    * @param {string} url
+@@ -136,6 +138,11 @@ class WebSocket extends EventTarget {
+     // 5. Set this's url to urlRecord.
+     this.#url = new URL(urlRecord.href)
+ 
++    // Store options for later use (e.g., maxDecompressedMessageSize)
++    this.#options = {
++      maxDecompressedMessageSize: options.maxDecompressedMessageSize
++    }
++
+     // 6. Let client be this's relevant settings object.
+     const client = environmentSettingsObject.settingsObject
+ 
+@@ -265,7 +272,7 @@ class WebSocket extends EventTarget {
+       // described by the ArrayBuffer object that data references. Any
+       // invocation of this method with this kind of argument that does
+       // not throw an exception must increase the bufferedAmount attribute
+-      // by the length of data’s buffer in bytes.
++      // by the length of data's buffer in bytes.
+ 
+       this.#bufferedAmount += data.byteLength
+       this.#sendQueue.add(data, () => {
+@@ -281,7 +288,7 @@ class WebSocket extends EventTarget {
+       // to be sent is the raw data represented by the Blob object. Any
+       // invocation of this method with a Blob argument that does not throw
+       // an exception must increase the bufferedAmount attribute by the size
+-      // of the Blob object’s raw data, in bytes.
++      // of the Blob object's raw data, in bytes.
+ 
+       this.#bufferedAmount += data.size
+       this.#sendQueue.add(data, () => {
+@@ -426,11 +433,11 @@ class WebSocket extends EventTarget {
+    * @see https://websockets.spec.whatwg.org/#feedback-from-the-protocol
+    */
+   #onConnectionEstablished (response, parsedExtensions) {
+-    // processResponse is called when the "response’s header list has been received and initialized."
++    // processResponse is called when the "response's header list has been received and initialized."
+     // once this happens, the connection is open
+     this.#handler.socket = response.socket
+ 
+-    const parser = new ByteParser(this.#handler, parsedExtensions)
++    const parser = new ByteParser(this.#handler, parsedExtensions, this.#options)
+     parser.on('drain', () => this.#handler.onParserDrain())
+     parser.on('error', (err) => this.#handler.onParserError(err))
+ 
+@@ -440,7 +447,7 @@ class WebSocket extends EventTarget {
+     // 1. Change the ready state to OPEN (1).
+     this.#handler.readyState = states.OPEN
+ 
+-    // 2. Change the extensions attribute’s value to the extensions in use, if
++    // 2. Change the extensions attribute's value to the extensions in use, if
+     //    it is not the null value.
+     // https://datatracker.ietf.org/doc/html/rfc6455#section-9.1
+     const extensions = response.headersList.get('sec-websocket-extensions')
+@@ -449,7 +456,7 @@ class WebSocket extends EventTarget {
+       this.#extensions = extensions
+     }
+ 
+-    // 3. Change the protocol attribute’s value to the subprotocol in use, if
++    // 3. Change the protocol attribute's value to the subprotocol in use, if
+     //    it is not the null value.
+     // https://datatracker.ietf.org/doc/html/rfc6455#section-1.9
+     const protocol = response.headersList.get('sec-websocket-protocol')
+@@ -516,7 +523,7 @@ class WebSocket extends EventTarget {
+ 
+     // 3. Fire an event named message at the WebSocket object, using MessageEvent,
+     //    with the origin attribute initialized to the serialization of the WebSocket
+-    //    object’s url's origin, and the data attribute initialized to dataForEvent.
++    //    object's url's origin, and the data attribute initialized to dataForEvent.
+     fireEvent('message', this, createFastMessageEvent, {
+       origin: this.#url.origin,
+       data: dataForEvent
+@@ -656,6 +663,19 @@ webidl.converters.WebSocketInit = webidl.dictionaryConverter([
+   {
+     key: 'headers',
+     converter: webidl.nullableConverter(webidl.converters.HeadersInit)
++  },
++  {
++    key: 'maxDecompressedMessageSize',
++    converter: webidl.nullableConverter((V) => {
++      V = webidl.converters['unsigned long long'](V)
++      if (V <= 0) {
++        throw webidl.errors.exception({
++          header: 'WebSocket constructor',
++          message: 'maxDecompressedMessageSize must be greater than 0'
++        })
++      }
++      return V
++    })
+   }
+ ])
+
+--- a/lib/core/request.js
++++ b/lib/core/request.js
+@@ -65,6 +65,10 @@
+       throw new InvalidArgumentError('upgrade must be a string')
+     }
+
++    if (upgrade && !isValidHeaderValue(upgrade)) {
++      throw new InvalidArgumentError('invalid upgrade header')
++    }
++
+     if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
+       throw new InvalidArgumentError('invalid headersTimeout')
+     }
+--- /dev/null
++++ b/test/upgrade-crlf.js
+@@ -0,0 +1,188 @@
++'use strict'
++
++const { tspl } = require('@matteo.collina/tspl')
++const { test, after } = require('node:test')
++const { Client, errors } = require('..')
++const net = require('node:net')
++
++test('CRLF injection in upgrade header via CRLF sequence', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\r\n\r\nSET pwned true'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade header via lone CR', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\rinjected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade header via lone LF', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\ninjected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade header via null byte', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\0injected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('CRLF injection in upgrade option via client.request', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.request({
++        path: '/',
++        method: 'GET',
++        upgrade: 'websocket\r\n\r\nGET /smuggled HTTP/1.1'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
++  })
++
++  await t.completed
++})
++
++test('valid upgrade value is accepted', async (t) => {
++  t = tspl(t, { plan: 1 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    const { socket } = await client.upgrade({
++      path: '/',
++      method: 'GET',
++      protocol: 'websocket'
++    })
++    t.ok(socket)
++    socket.destroy()
++  })
++
++  await t.completed
++})
+
+--- a/lib/web/websocket/receiver.js
++++ b/lib/web/websocket/receiver.js
+@@ -180,21 +180,20 @@
+         }
+
+         const buffer = this.consume(8)
+         const upper = buffer.readUInt32BE(0)
++        const lower = buffer.readUInt32BE(4)
+
+         // 2^31 is the maximum bytes an arraybuffer can contain
+         // on 32-bit systems. Although, on 64-bit systems, this is
+         // 2^53-1 bytes.
+         // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Errors/Invalid_array_length
+         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/common/globals.h;drc=1946212ac0100668f14eb9e2843bdd846e510a1e;bpv=1;bpt=1;l=1275
+         // https://source.chromium.org/chromium/chromium/src/+/main:v8/src/objects/js-array-buffer.h;l=34;drc=1946212ac0100668f14eb9e2843bdd846e510a1e
+-        if (upper > 2 ** 31 - 1) {
++        if (upper !== 0 || lower > 2 ** 31 - 1) {
+           failWebsocketConnection(this.#handler, 1009, 'Received payload length > 2^31 bytes.')
+           return
+         }
+
+-        const lower = buffer.readUInt32BE(4)
+-
+-        this.#info.payloadLength = (upper << 8) + lower
++        this.#info.payloadLength = lower
+         this.#state = parserStates.READ_DATA
+       } else if (this.#state === parserStates.READ_DATA) {
+
+--- a/lib/web/websocket/permessage-deflate.js
++++ b/lib/web/websocket/permessage-deflate.js
+@@ -36,6 +36,11 @@
+         windowBits = Number.parseInt(this.#options.serverMaxWindowBits)
+       }
+
+-      this.#inflate = createInflateRaw({ windowBits })
++      try {
++        this.#inflate = createInflateRaw({ windowBits })
++      } catch (err) {
++        callback(err)
++        return
++      }
+       this.#inflate[kBuffer] = []
+       this.#inflate[kLength] = 0
+--- a/lib/web/websocket/util.js
++++ b/lib/web/websocket/util.js
+@@ -225,7 +225,13 @@
+  * @param {string} value
+  * @returns {boolean}
+  */
+ function isValidClientWindowBits (value) {
++  // Must have at least one character
++  if (value.length === 0) {
++    return false
++  }
++
++  // Check all characters are ASCII digits
+   for (let i = 0; i < value.length; i++) {
+     const byte = value.charCodeAt(i)
+
+@@ -234,7 +240,9 @@
+     }
+   }
+
+-  return true
++  // Check numeric range: zlib requires windowBits in range 8-15
++  const num = Number.parseInt(value, 10)
++  return num >= 8 && num <= 15
+ }
+
+ /**
