@@ -1,6 +1,6 @@
-# perl : 5.40.1-6.root.io.1
+# perl : 5.40.1-6.root.io.2
 
-This patch is based on perl version 5.40.1-6.root.io.1, which is available at:
+This patch is based on perl version 5.40.1-6.root.io.2, which is available at:
 https://sources.debian.org/src/perl/5.40.1-6/
 
 ## Affected CVEs:
@@ -8,6 +8,7 @@ https://sources.debian.org/src/perl/5.40.1-6/
 - CVE-2026-9538
 - CVE-2026-8376
 - CVE-2026-42497
+- CVE-2026-48962
 
 ## How to Apply:
 1. Obtain the source package: `apt source perl`
