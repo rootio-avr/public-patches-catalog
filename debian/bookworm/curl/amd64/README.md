@@ -1,6 +1,6 @@
-# curl : 7.88.1-10+deb12u14.root.io.8
+# curl : 7.88.1-10+deb12u14.root.io.9
 
-This patch is based on curl version 7.88.1-10+deb12u14.root.io.8, which is available at:
+This patch is based on curl version 7.88.1-10+deb12u14.root.io.9, which is available at:
 https://sources.debian.org/src/curl/7.88.1-10+deb12u14/
 
 ## Affected CVEs:
@@ -20,6 +20,7 @@ https://sources.debian.org/src/curl/7.88.1-10+deb12u14/
 - CVE-2026-5773
 - CVE-2026-6253
 - CVE-2026-6429
+- CVE-2026-6276
 
 ## How to Apply:
 1. Obtain the source package: `apt source curl`
