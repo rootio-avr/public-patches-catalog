@@ -8,6 +8,7 @@ unknown
 - GHSA-6v7q-wjvx-w8wg
 - GHSA-rp42-5vxx-qpwr
 - CVE-2026-44240
+- CVE-2026-41324
 
 ## How to Apply:
 1. Clone or download the source code for basic-ftp
