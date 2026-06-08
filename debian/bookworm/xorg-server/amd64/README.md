@@ -1,16 +1,21 @@
-# xorg-server : 2:21.1.7-3+deb12u10
+# xorg-server : 2:21.1.7-3+deb12u11.root.io.5
 
-This patch is based on xorg-server version 2:21.1.7-3+deb12u10, which is available at:
-https://sources.debian.org/src/xorg-server/2:21.1.7-3+deb12u9/
+This patch is based on xorg-server version 2:21.1.7-3+deb12u11.root.io.5, which is available at:
+https://sources.debian.org/src/xorg-server/2:21.1.7-3+deb12u11/
 
 ## Affected CVEs:
 - CVE-2023-5574
 - CVE-2022-49737
+- CVE-2026-50259
+- CVE-2026-50256
+- CVE-2026-50261
+- CVE-2026-50264
+- CVE-2026-50257
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source xorg-server`
+1. Obtain the source package: `apt source xorg-server`
 2. Apply the patch: `patch -p1 < diff.patch`
-3. Build the package: `dpkg-buildpackage -b`
+3. Build the package: `dpkg-buildpackage -us -uc`
 
 ## License:
 This patch is provided under GPLv3, in compliance with the original license of the package.
