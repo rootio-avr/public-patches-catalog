@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-23897
+- GHSA-9q82-xgwf-vj6h
 
 ## How to Apply:
 1. Clone or download the source code for @apollo/server
