@@ -13,6 +13,9 @@ unknown
 - CVE-2026-42043
 - CVE-2026-42035
 - CVE-2026-42033
+- CVE-2026-44495
+- CVE-2026-44494
+- CVE-2026-44492
 
 ## How to Apply:
 1. Clone or download the source code for axios
