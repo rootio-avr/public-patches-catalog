@@ -4,7 +4,16 @@ This patch is based on axios version 1.14.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2025-62718
 - CVE-2026-0000
+- CVE-2026-42033
+- CVE-2026-42038
+- CVE-2026-42039
+- CVE-2026-42043
+- CVE-2026-42044
+- CVE-2026-42264
+- CVE-2026-44494
+- CVE-2026-44495
 
 ## How to Apply:
 1. Clone or download the source code for axios
