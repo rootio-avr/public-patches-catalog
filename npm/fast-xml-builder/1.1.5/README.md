@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-44665
+- CVE-2026-44664
 
 ## How to Apply:
 1. Clone or download the source code for fast-xml-builder
