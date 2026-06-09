@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2021-23337
+- CVE-2026-4800
 
 ## How to Apply:
 1. Clone or download the source code for lodash.template
