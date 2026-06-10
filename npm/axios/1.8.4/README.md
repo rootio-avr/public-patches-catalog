@@ -4,18 +4,19 @@ This patch is based on axios version 1.8.4, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-25639
-- CVE-2026-40175
-- CVE-2026-39865
-- CVE-2026-42264
 - CVE-2025-58754
 - CVE-2025-62718
-- CVE-2026-42043
-- CVE-2026-42035
+- CVE-2026-25639
+- CVE-2026-39865
+- CVE-2026-40175
 - CVE-2026-42033
-- CVE-2026-44495
-- CVE-2026-44494
+- CVE-2026-42035
+- CVE-2026-42043
+- CVE-2026-42264
+- CVE-2026-44487
 - CVE-2026-44492
+- CVE-2026-44494
+- CVE-2026-44495
 
 ## How to Apply:
 1. Clone or download the source code for axios
