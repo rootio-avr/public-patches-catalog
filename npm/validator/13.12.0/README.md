@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-12758
+- CVE-2025-56200
 
 ## How to Apply:
 1. Clone or download the source code for validator
