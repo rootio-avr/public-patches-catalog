@@ -1,0 +1,2184 @@
+--- a/lib/builtin.js
++++ b/lib/builtin.js
+@@ -37,10 +37,11 @@
+ 	return vm.readonly(copy);
+ }
+ 
+-// SECURITY (GHSA-947f-4v7f-x2v8): Some Node builtins are sandbox-bypass primitives
+-// by design -- their primary capability is to reach host code regardless of the
+-// vm2 builtin allowlist. They must NEVER be reachable from the sandbox, even when
+-// the user requests `'*'` or explicitly names them in `builtin`.
++// SECURITY (GHSA-947f-4v7f-x2v8, GHSA-rp36-8xq3-r6c4): Some Node builtins are
++// sandbox-bypass primitives by design -- their primary capability is to reach
++// host code regardless of the vm2 builtin allowlist. They must NEVER be
++// reachable from the sandbox, even when the user requests `'*'` or explicitly
++// names them in `builtin`.
+ //
+ //   - module          : exposes `Module._load`, `Module._resolveFilename`,
+ //                       `Module._cache`, `createRequire` -- loads ANY host
+@@ -55,13 +56,30 @@
+ //                       attached to host streams; low utility for sandboxed
+ //                       code, high host-RCE potential.
+ //   - inspector       : the inspector protocol can attach a debugger to the
+-//                       host process, exposing arbitrary host state.
++//                       host process, exposing arbitrary host state. Covers
++//                       the subpath family `inspector/promises` as well.
++//   - process         : `process.getBuiltinModule(name)` (Node 22+) reloads
++//                       ANY core module regardless of the embedder's
++//                       allow/deny configuration. `process.binding`,
++//                       `process.dlopen`, `process._linkedBinding`, and the
++//                       raw host `process.env` are equally fatal. The
++//                       sandbox global `process` is a sanitized shim defined
++//                       in `setup-node-sandbox.js`; `require('process')`
++//                       returns the raw host module and is never safe.
+ //
+ // This denylist is enforced at the `BUILTIN_MODULES` source (so the `'*'`
+ // wildcard never expands to them) AND inside `addDefaultBuiltin` (so explicit
+ // `builtin: ['module']` / `makeBuiltins(['module'])` requests are rejected).
+ // `SPECIAL_MODULES` and `overrides` can still register safe replacements under
+ // these names if a user genuinely needs one.
++//
++// Matching is family-based: any builtin whose path is `<family>/...` where
++// `<family>` is listed below is also blocked. This covers
++// `inspector/promises` today and any future subpath such as
++// `inspector/foo`, `process/foo`, `module/foo`. The `node:` URL-style
++// prefix is stripped before matching so neither `require('node:process')`
++// nor `require('node:inspector/promises')` can bypass via the alternative
++// spelling.
+ const DANGEROUS_BUILTINS = new Set([
+ 	'module',
+ 	'worker_threads',
+@@ -69,6 +87,7 @@
+ 	'vm',
+ 	'repl',
+ 	'inspector',
++	'process',
+ 	// Host-process abort DoS: `trace_events.createTracing({categories: [...]})`
+ 	// asserts `args[0]->IsArray()` in C++; the array crosses the bridge as a
+ 	// Proxy, which fails the assertion and aborts the entire host process.
+@@ -83,8 +102,33 @@
+ 	'wasi'
+ ]);
+ 
++// SECURITY (GHSA-rp36-8xq3-r6c4): Family-prefix denylist check. `inspector` and
++// `inspector/promises` must share fate; same for any future subpath under a
++// dangerous family. Also strips the `node:` URL-style prefix so
++// `node:process` and `node:inspector/promises` cannot bypass via spelling.
++function isDangerousBuiltin(key) {
++	if (typeof key !== 'string') return false;
++	if (key.startsWith('node:')) key = key.slice(5);
++	if (DANGEROUS_BUILTINS.has(key)) return true;
++	const slash = key.indexOf('/');
++	if (slash > 0 && DANGEROUS_BUILTINS.has(key.slice(0, slash))) return true;
++	return false;
++}
++
++// SECURITY (GHSA-r9pm-gxmw-wv6p): Underscored builtins (_http_client,
++// _http_server, _http_agent, _http_common, _http_incoming, _http_outgoing,
++// _tls_common, _tls_wrap, _stream_*) are Node's private implementation
++// modules backing http/https/tls/streams. They are listed by
++// `require('module').builtinModules` but are not documented public API and
++// expose network primitives directly (`_http_client.ClientRequest`,
++// `_http_server.Server`). Filtering them at the `BUILTIN_MODULES` source
++// removes them from `'*'` wildcard expansion, so the documented
++// `builtin: ['*', '-http', '-https', '-net', '-tls', ...]` pattern is
++// once again coherent. Explicit opt-in (`builtin: ['_http_client']`) and
++// `mock`/`override` registrations remain functional via `addDefaultBuiltin`
++// -- power users who genuinely need an internal sibling can still name it.
+ const BUILTIN_MODULES = (nmod.builtinModules || Object.getOwnPropertyNames(process.binding('natives')))
+-	.filter(s=>!s.startsWith('internal/') && !DANGEROUS_BUILTINS.has(s));
++	.filter(s=>!s.startsWith('internal/') && !s.startsWith('_') && !isDangerousBuiltin(s));
+ 
+ let EventEmitterReferencingAsyncResourceClass = null;
+ if (EventEmitter.EventEmitterAsyncResource) {
+@@ -133,17 +177,20 @@
+ function addDefaultBuiltin(builtins, key, hostRequire) {
+ 	if (builtins.has(key)) return;
+ 	const special = SPECIAL_MODULES[key];
+-	// SECURITY (GHSA-947f-4v7f-x2v8): Defense-in-depth. Reject sandbox-bypass
+-	// primitives even when the caller explicitly names them (e.g.
+-	// `builtin: ['module']` or `makeBuiltins(['worker_threads'])`). A non-special
+-	// dangerous builtin would otherwise be wrapped in a readonly proxy whose
+-	// `apply` trap forwards every method call to the host realm -- handing the
+-	// sandbox a primitive that loads ANY other builtin (`Module._load`),
+-	// spawns processes (`cluster.fork`), runs unsandboxed code
+-	// (`new Worker(src, {eval:true})`), or evaluates host-realm code
+-	// (`vm.runInThisContext`). The `SPECIAL_MODULES` escape hatch above is
+-	// still honoured -- a future safe wrapper can be registered there.
+-	if (!special && DANGEROUS_BUILTINS.has(key)) return;
++	// SECURITY (GHSA-947f-4v7f-x2v8, GHSA-rp36-8xq3-r6c4): Defense-in-depth.
++	// Reject sandbox-bypass primitives even when the caller explicitly names
++	// them (e.g. `builtin: ['module']`, `builtin: ['process']`,
++	// `makeBuiltins(['inspector/promises'])`). A non-special dangerous builtin
++	// would otherwise be wrapped in a readonly proxy whose `apply` trap
++	// forwards every method call to the host realm -- handing the sandbox a
++	// primitive that loads ANY other builtin (`Module._load`,
++	// `process.getBuiltinModule`), spawns processes (`cluster.fork`), runs
++	// unsandboxed code (`new Worker(src, {eval:true})`,
++	// `inspector/promises Session.post('Runtime.evaluate')`), or evaluates
++	// host-realm code (`vm.runInThisContext`). The `SPECIAL_MODULES` escape
++	// hatch above is still honoured -- a future safe wrapper can be
++	// registered there.
++	if (!special && isDangerousBuiltin(key)) return;
+ 	builtins.set(key, special ? special : vm => vm.readonly(hostRequire(key)));
+ }
+ 
+--- /dev/null
++++ b/test/ghsa/GHSA-r9pm-gxmw-wv6p/repro.js
+@@ -0,0 +1,202 @@
++/**
++ * GHSA-r9pm-gxmw-wv6p — NodeVM network builtin exclusions bypass via internal _http_client / _http_server
++ *
++ *
++ * ## Vulnerability
++ * `BUILTIN_MODULES` in `lib/builtin.js` is sourced from
++ * `require('module').builtinModules` filtered by `s => !s.startsWith('internal/') &&
++ * !DANGEROUS_BUILTINS.has(s)`. This source feeds the `'*'` wildcard expansion in
++ * `makeBuiltinsFromLegacyOptions` — so every Node builtin that survives the filter
++ * is implicitly handed to the sandbox.
++ *
++ * Node exposes a parallel family of underscored builtins (`_http_client`,
++ * `_http_server`, `_http_agent`, `_http_common`, `_http_incoming`,
++ * `_http_outgoing`, `_tls_common`, `_tls_wrap`, `_stream_*`). These are the
++ * private implementation modules that back `http`, `https`, and `tls`. They are
++ * not documented public API but they ARE in `require('module').builtinModules`
++ * and they DO expose the network primitives directly:
++ *
++ *   require('_http_client').ClientRequest(opts)  -> outbound HTTP request
++ *   require('_http_server').Server(...).listen() -> listening HTTP socket
++ *
++ * Pre-fix, `builtin: ['*', '-http', '-https', '-net', '-dgram', '-tls',
++ * '-dns', '-dns/promises', '-http2']` — the documented "allow everything
++ * except network" pattern — silently allowed every `_http_*` and `_tls_*`
++ * sibling, fully bypassing the embedder's network restriction. SSRF-class
++ * impact (CVSS 8.6: localhost services, cloud metadata endpoints, internal
++ * admin panels).
++ *
++ * ## Fix
++ * Filter out modules whose name starts with `_` from `BUILTIN_MODULES`. The
++ * `'*'` wildcard no longer expands to any underscored sibling, so excluding
++ * `http` / `net` / `tls` via `-name` is once again coherent. Explicit
++ * opt-in (`builtin: ['_http_client']`) and `mock`/`override` registrations
++ * remain functional — power users who genuinely need an internal sibling
++ * can still name it. The `node:_http_client` form also stops working under
++ * the wildcard because the builtins map is the single source of truth and
++ * `loadBuiltinModule` returns undefined for any key not in the map.
++ *
++ * Invariant enforced: "The `'*'` wildcard expands only to documented public
++ * Node builtins. Undocumented underscored siblings of network modules MUST
++ * NOT be reachable from sandbox code under the wildcard expansion."
++ */
++
++'use strict';
++
++const assert = require('assert');
++const {NodeVM} = require('../../../lib/main.js');
++const {makeBuiltins} = require('../../../lib/builtin.js');
++
++// Underscored builtins that wrap public network modules. These must never be
++// reachable from the sandbox under the `'*'` wildcard expansion.
++const UNDERSCORED_NETWORK = [
++	'_http_agent',
++	'_http_client',
++	'_http_common',
++	'_http_incoming',
++	'_http_outgoing',
++	'_http_server',
++	'_tls_common',
++	'_tls_wrap'
++];
++
++function runRequire(vm, name) {
++	return vm.run(`
++		try {
++			const m = require(${JSON.stringify(name)});
++			module.exports = {ok: true, hasClientRequest: typeof (m && m.ClientRequest) === 'function', hasServer: typeof (m && m.Server) === 'function'};
++		} catch (e) {
++			module.exports = {ok: false, code: e && e.code, message: e && e.message};
++		}
++	`);
++}
++
++describe('GHSA-r9pm-gxmw-wv6p -- underscored network builtins bypass via wildcard', () => {
++
++	describe('underscored network builtins are blocked under wildcard', () => {
++
++		it("`builtin: ['*']` does NOT expose _http_client", () => {
++			const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++			const r = runRequire(vm, '_http_client');
++			assert.strictEqual(r.ok, false, `_http_client must NOT load, got ${JSON.stringify(r)}`);
++		});
++
++		it("`builtin: ['*']` does NOT expose _http_server", () => {
++			const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++			const r = runRequire(vm, '_http_server');
++			assert.strictEqual(r.ok, false, `_http_server must NOT load, got ${JSON.stringify(r)}`);
++		});
++
++		it("`builtin: ['*', '-http', '-https', '-net', '-tls']` does NOT expose any _http_*/_tls_* sibling (canonical PoC scenario)", () => {
++			const vm = new NodeVM({
++				require: {
++					builtin: ['*', '-http', '-https', '-net', '-dgram', '-tls', '-dns', '-dns/promises', '-http2'],
++					external: false
++				}
++			});
++			for (const name of UNDERSCORED_NETWORK) {
++				const r = runRequire(vm, name);
++				assert.strictEqual(r.ok, false, `${name} must NOT load under network-excluded wildcard, got ${JSON.stringify(r)}`);
++			}
++		});
++
++		it("`builtin: ['*']` does NOT expose underscored network builtins via the `node:` prefix", () => {
++			const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++			for (const name of UNDERSCORED_NETWORK) {
++				const r = runRequire(vm, `node:${name}`);
++				assert.strictEqual(r.ok, false, `node:${name} must NOT load, got ${JSON.stringify(r)}`);
++			}
++		});
++
++		it('underscored stream internals are also excluded from the wildcard', () => {
++			const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++			for (const name of ['_stream_readable', '_stream_writable', '_stream_duplex', '_stream_transform', '_stream_wrap']) {
++				const r = runRequire(vm, name);
++				assert.strictEqual(r.ok, false, `${name} must NOT load under wildcard, got ${JSON.stringify(r)}`);
++			}
++		});
++
++	});
++
++	describe('canonical PoC: ClientRequest / Server primitives are unreachable', () => {
++
++		// Direct reproduction of the canonical PoC: load _http_client and
++		// verify the `ClientRequest` constructor — the actual escape primitive
++		// — is not handed to the sandbox.
++		it('_http_client.ClientRequest is not callable from the sandbox', () => {
++			const vm = new NodeVM({
++				require: {
++					builtin: ['*', '-http', '-https', '-net', '-dgram', '-tls', '-dns', '-dns/promises', '-http2'],
++					external: false
++				}
++			});
++			const r = runRequire(vm, '_http_client');
++			assert.strictEqual(r.ok, false);
++		});
++
++		it('_http_server.Server is not callable from the sandbox', () => {
++			const vm = new NodeVM({
++				require: {
++					builtin: ['*', '-http', '-https', '-net', '-dgram', '-tls', '-dns', '-dns/promises', '-http2'],
++					external: false
++				}
++			});
++			const r = runRequire(vm, '_http_server');
++			assert.strictEqual(r.ok, false);
++		});
++
++	});
++
++	describe('low-level makeBuiltins API', () => {
++
++		// Wildcard expansion happens in makeBuiltinsFromLegacyOptions. The
++		// invariant is enforced at the source list, so a wildcard-equivalent
++		// caller building from `BUILTIN_MODULES` should never receive an
++		// underscored entry. We test the observable surface: `makeBuiltins`
++		// with the underscored names still produces an entry (explicit opt-in
++		// is preserved), but the wildcard-style `builtin: ['*']` path does not.
++		it('explicit opt-in via makeBuiltins still works (power-user escape hatch)', () => {
++			// SECURITY: do not over-block. A user who explicitly types
++			// `builtin: ['_http_client']` is opting in knowingly. Only the
++			// wildcard expansion is tightened.
++			const map = makeBuiltins(['_http_client'], require);
++			assert.strictEqual(map.has('_http_client'), true);
++		});
++
++	});
++
++	describe('non-underscored builtins still load under wildcard', () => {
++
++		it("fs loads under ['*']", () => {
++			const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++			assert.strictEqual(vm.run("module.exports = typeof require('fs').readFileSync"), 'function');
++		});
++
++		it("path loads under ['*']", () => {
++			const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++			assert.strictEqual(vm.run("module.exports = typeof require('path').join"), 'function');
++		});
++
++		it("events loads under ['*']", () => {
++			const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++			assert.strictEqual(vm.run("module.exports = typeof require('events').EventEmitter"), 'function');
++		});
++
++	});
++
++	describe('mocks/overrides escape hatch is preserved for underscored names', () => {
++
++		it('mock _http_client is honored', () => {
++			const vm = new NodeVM({
++				require: {
++					builtin: ['*'],
++					external: false,
++					mock: {_http_client: {safe: 7}}
++				}
++			});
++			assert.strictEqual(vm.run("module.exports = require('_http_client').safe"), 7);
++		});
++
++	});
++
++});
+
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -167,16 +167,33 @@
+ // uses Symbol.for('nodejs.util.promisify.custom') as a hook. If sandbox code
+ // could ever provide a host-recognised version of this symbol on an object
+ // passed to `util.promisify(...)`, Node would invoke the sandbox-defined
+-// promisifier — likely with host-realm arguments. No live exploit today, but
+-// the surface mirrors `nodejs.util.inspect.custom` closely enough that
+-// pre-emptive denial is cheap.
++// promisifier — likely with host-realm arguments. GHSA-m5q2-4fm3-vfqp later
++// turned this from a theoretical concern into a verified live exploit.
+ const thisSymbolNodeJSUtilPromisifyCustom = Symbol.for('nodejs.util.promisify.custom');
++// SECURITY (GHSA-m5q2-4fm3-vfqp): the four stream brand symbols control Node's
++// duck typing for `Stream.is{Readable,Writable,Duplex,Transform}` checks; the
++// two webstream symbols expose internal hooks (closed-promise resolution and
++// controller error dispatch). Sandbox code installing any of these on a host
++// object steers host-side control flow. The setup-sandbox.js dangerous-symbol
++// set must stay in sync with this list.
++const thisSymbolNodeJSStreamReadable = Symbol.for('nodejs.stream.readable');
++const thisSymbolNodeJSStreamWritable = Symbol.for('nodejs.stream.writable');
++const thisSymbolNodeJSStreamDuplex = Symbol.for('nodejs.stream.duplex');
++const thisSymbolNodeJSStreamTransform = Symbol.for('nodejs.stream.transform');
++const thisSymbolNodeJSWebstreamIsClosedPromise = Symbol.for('nodejs.webstream.isClosedPromise');
++const thisSymbolNodeJSWebstreamControllerErrorFunction = Symbol.for('nodejs.webstream.controllerErrorFunction');
+ 
+ function isDangerousCrossRealmSymbol(key) {
+ 	return (
+ 		key === thisSymbolNodeJSUtilInspectCustom ||
+ 		key === thisSymbolNodeJSRejection ||
+-		key === thisSymbolNodeJSUtilPromisifyCustom
++		key === thisSymbolNodeJSUtilPromisifyCustom ||
++		key === thisSymbolNodeJSStreamReadable ||
++		key === thisSymbolNodeJSStreamWritable ||
++		key === thisSymbolNodeJSStreamDuplex ||
++		key === thisSymbolNodeJSStreamTransform ||
++		key === thisSymbolNodeJSWebstreamIsClosedPromise ||
++		key === thisSymbolNodeJSWebstreamControllerErrorFunction
+ 	);
+ }
+ 
+@@ -488,6 +505,9 @@
+ 		reflectOwnKeys: thisReflectOwnKeys,
+ 		reflectEnumerate: thisReflectEnumerate,
+ 		reflectGetPrototypeOf: thisReflectGetPrototypeOf,
++		// SECURITY (GHSA-v6mx-mf47-r5wg): expose so the *other* bridge can
++		// identify this host-realm function in its dangerous-proto-mutator set.
++		reflectSetPrototypeOf: thisReflectSetPrototypeOf,
+ 		reflectIsExtensible: thisReflectIsExtensible,
+ 		reflectPreventExtensions: thisReflectPreventExtensions,
+ 		objectHasOwnProperty: thisObjectHasOwnProperty,
+@@ -643,6 +663,163 @@
+ 		}
+ 	}
+ 
++	// SECURITY (GHSA-v6mx-mf47-r5wg): Identity set of every host-realm function
++	// whose invocation would mutate (or could install code that mutates) the
++	// [[Prototype]] of an arbitrary object. The bridge's `set` / `defineProperty`
++	// / `setPrototypeOf` proxy traps already block direct mutation of host
++	// objects from the sandbox, but the apply trap let sandbox code invoke these
++	// intrinsics *as functions* with a wrapped host object as `this`, which
++	// bypasses every write trap because the actual mutation happens inside the
++	// host-realm intrinsic, not through a proxy.
++	//
++	// Even non-protected host prototypes (Node-internal `NodeError.prototype`,
++	// per-instance `[[Prototype]]`s, etc.) being severed is enough to break
++	// downstream bridge invariants — once a host-realm chain is truncated,
++	// `thisFromOtherWithFactory`'s proto-walk no longer finds a registered
++	// mapping and the value can fall through unwrapped (see the read-side
++	// hardening in `thisEnsureThis` below). Closing the write side here is the
++	// upstream chokepoint that prevents the underlying primitive from being
++	// invoked at all.
++	//
++	// Intrinsics covered:
++	//   - host `Object.prototype.__proto__` setter
++	//     (PoC: `Buffer.call.call({}.__lookupSetter__, Buffer, "__proto__")`)
++	//   - host `Object.setPrototypeOf`
++	//   - host `Reflect.setPrototypeOf`
++	//   - host `Object.prototype.__defineSetter__` (would install a new __proto__
++	//     setter / data property on a host target, indirect mutation path)
++	//   - host `Object.prototype.__defineGetter__` (symmetric: redefines property
++	//     accessors on a host target)
++	const dangerousHostProtoMutators = new ThisWeakMap();
++	function addDangerousHostProtoMutator(value) {
++		if (value === null || typeof value !== 'function') return;
++		try {
++			thisReflectApply(thisWeakMapSet, dangerousHostProtoMutators, [value, true]);
++		} catch (e) {
++			/* best effort */
++		}
++	}
++	// SECURITY (GHSA-v6mx-mf47-r5wg): host `Function.prototype.call` /
++	// `Function.prototype.apply` / `Function.prototype.bind` — the canonical
++	// indirection primitives. When the apply-trap target is one of these,
++	// `context` is the *underlying* function being applied, and `args[0]` (for
++	// .call) / `args[0]` (for .apply, as a list) is its `this`. We need to
++	// inspect `context` to determine whether the underlying call is dangerous.
++	const applyIndirectionPrimitives = new ThisWeakMap();
++	function addApplyIndirectionPrimitive(value) {
++		if (value === null || typeof value !== 'function') return;
++		try {
++			thisReflectApply(thisWeakMapSet, applyIndirectionPrimitives, [value, true]);
++		} catch (e) {
++			/* best effort */
++		}
++	}
++	function isApplyIndirectionPrimitive(value) {
++		if (value === null || typeof value !== 'function') return false;
++		try {
++			return thisReflectApply(thisWeakMapHas, applyIndirectionPrimitives, [value]) === true;
++		} catch (e) {
++			return false;
++		}
++	}
++	// host `Reflect.apply` / `Reflect.construct` — same idea but the underlying
++	// function is `args[0]` rather than `context`.
++	const reflectApplyPrimitives = new ThisWeakMap();
++	function addReflectApplyPrimitive(value) {
++		if (value === null || typeof value !== 'function') return;
++		try {
++			thisReflectApply(thisWeakMapSet, reflectApplyPrimitives, [value, true]);
++		} catch (e) {
++			/* best effort */
++		}
++	}
++	function isReflectApplyPrimitive(value) {
++		if (value === null || typeof value !== 'function') return false;
++		try {
++			return thisReflectApply(thisWeakMapHas, reflectApplyPrimitives, [value]) === true;
++		} catch (e) {
++			return false;
++		}
++	}
++	try {
++		// host Object.prototype.__proto__ setter
++		const protoDesc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Object, '__proto__');
++		if (protoDesc) {
++			addDangerousHostProtoMutator(protoDesc.set);
++			// Note: we intentionally do NOT add the getter — reading a host
++			// prototype is not, by itself, a privilege escalation primitive, and
++			// blocking the getter would break legitimate `instanceof` and
++			// inspection paths.
++		}
++		// Cache host `Function.prototype.call` / `Function.prototype.apply` as
++		// the canonical indirection primitives. The canonical PoC reaches host
++		// `__proto__` setter via `setProto.call(tp, null)`, where the apply
++		// trap target is `Function.prototype.call` (sandbox-side `.call` is
++		// `connect()`ed to host's). Tracking these lets us peel one indirection
++		// layer in the apply trap and inspect the *underlying* function for
++		// dangerousness.
++		if (otherGlobalPrototypes.Function) {
++			const callDesc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Function, 'call');
++			if (callDesc && callDesc.value) addApplyIndirectionPrimitive(callDesc.value);
++			const applyDesc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Function, 'apply');
++			if (applyDesc && applyDesc.value) addApplyIndirectionPrimitive(applyDesc.value);
++			const bindDesc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Function, 'bind');
++			if (bindDesc && bindDesc.value) addApplyIndirectionPrimitive(bindDesc.value);
++		}
++		// host Reflect.apply — `otherInit.reflectApply` (already exported).
++		if (typeof otherInit.reflectApply === 'function') {
++			addReflectApplyPrimitive(otherInit.reflectApply);
++		}
++		if (typeof otherInit.reflectConstruct === 'function') {
++			addReflectApplyPrimitive(otherInit.reflectConstruct);
++		}
++		// host Object.prototype.__defineSetter__ / __defineGetter__
++		const defSetterDesc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Object, '__defineSetter__');
++		if (defSetterDesc && defSetterDesc.value) addDangerousHostProtoMutator(defSetterDesc.value);
++		const defGetterDesc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Object, '__defineGetter__');
++		if (defGetterDesc && defGetterDesc.value) addDangerousHostProtoMutator(defGetterDesc.value);
++		// host Object.setPrototypeOf — reach via otherGlobalPrototypes.Object.constructor
++		// (which is host `Object`).
++		const ctorDesc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Object, 'constructor');
++		if (ctorDesc && ctorDesc.value) {
++			const hostObjectCtor = ctorDesc.value;
++			const ospDesc = otherSafeGetOwnPropertyDescriptor(hostObjectCtor, 'setPrototypeOf');
++			if (ospDesc && ospDesc.value) addDangerousHostProtoMutator(ospDesc.value);
++			// host Object.defineProperty / defineProperties — used to install a
++			// new __proto__ accessor on a host target. Same write-side concern
++			// as Object.setPrototypeOf when the first argument unwraps to a
++			// host-realm object.
++			const dpDesc = otherSafeGetOwnPropertyDescriptor(hostObjectCtor, 'defineProperty');
++			if (dpDesc && dpDesc.value) addDangerousHostProtoMutator(dpDesc.value);
++			const dpsDesc = otherSafeGetOwnPropertyDescriptor(hostObjectCtor, 'defineProperties');
++			if (dpsDesc && dpsDesc.value) addDangerousHostProtoMutator(dpsDesc.value);
++		}
++		// host Reflect.setPrototypeOf — the bridge result already exposes the
++		// host-side Reflect helpers via `otherInit.reflectGetPrototypeOf` etc.
++		// Host `Reflect.setPrototypeOf` is `otherInit.reflectSetPrototypeOf`
++		// when exported (added by this fix). Fall back to nothing if the host
++		// bridge build is older than this fix.
++		if (typeof otherInit.reflectSetPrototypeOf === 'function') {
++			addDangerousHostProtoMutator(otherInit.reflectSetPrototypeOf);
++		}
++		// host Reflect.defineProperty — analogous to Object.defineProperty.
++		if (typeof otherInit.reflectDefineProperty === 'function') {
++			addDangerousHostProtoMutator(otherInit.reflectDefineProperty);
++		}
++	} catch (e) {
++		/* best effort */
++	}
++
++	function isDangerousHostProtoMutator(value) {
++		if (isHost) return false;
++		if (value === null || typeof value !== 'function') return false;
++		try {
++			return thisReflectApply(thisWeakMapHas, dangerousHostProtoMutators, [value]) === true;
++		} catch (e) {
++			return false;
++		}
++	}
++
+ 	function isHostPromiseThen(value) {
+ 		return otherPromiseThen !== undefined && value === otherPromiseThen;
+ 	}
+@@ -1075,16 +1252,27 @@
+ 		// any own property keyed by a dangerous cross-realm symbol. Using the
+ 		// host's Reflect.deleteProperty avoids any proxy invariants that apply
+ 		// to the sandbox-local descriptor filter.
+-		try {
+-			otherReflectDeleteProperty(ret, thisSymbolNodeJSUtilInspectCustom);
+-		} catch (e) {
+-			/* best effort */
++		// SECURITY (GHSA-m5q2-4fm3-vfqp): scrub every known dangerous nodejs.*
++		// symbol. Iterate the cached list so adding a new symbol to
++		// isDangerousCrossRealmSymbol automatically extends this scrub.
++		const dangerousSyms = [
++			thisSymbolNodeJSUtilInspectCustom,
++			thisSymbolNodeJSRejection,
++			thisSymbolNodeJSUtilPromisifyCustom,
++			thisSymbolNodeJSStreamReadable,
++			thisSymbolNodeJSStreamWritable,
++			thisSymbolNodeJSStreamDuplex,
++			thisSymbolNodeJSStreamTransform,
++			thisSymbolNodeJSWebstreamIsClosedPromise,
++			thisSymbolNodeJSWebstreamControllerErrorFunction,
++		];
++		for (let i = 0; i < dangerousSyms.length; i++) {
++			try {
++				otherReflectDeleteProperty(ret, dangerousSyms[i]);
++			} catch (e) {
++				/* best effort */
++			}
+ 		}
+-		try {
+-			otherReflectDeleteProperty(ret, thisSymbolNodeJSRejection);
+-		} catch (e) {
+-			/* best effort */
+-		}
+ 	}
+ 
+ 	function thisDefaultGet(handler, object, key, desc) {
+@@ -1237,6 +1425,18 @@
+ 			// Covers C1 (plain assignment), C2 (Reflect.set), and C5
+ 			// (Object.assign) because all of them funnel through this trap.
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
++			// SECURITY (GHSA-m5q2-4fm3-vfqp): refuse sandbox-originated writes
++			// whose key is a known dangerous Node.js cross-realm symbol. Even
++			// if the read-direction filter (thisFromOtherWithFactory) and the
++			// sandbox-side Symbol.for override should both prevent the sandbox
++			// from ever surfacing such a symbol primitive, this trap is the
++			// structural last line of defense. Without this check, a future
++			// extraction-path bypass would let the sandbox install host-side
++			// hooks (util.promisify, stream brand, webstream controller, ...)
++			// on any non-protected host object exposed to it.
++			if (!isHost && typeof key === 'symbol' && isDangerousCrossRealmSymbol(key)) {
++				throw new VMError(OPNA);
++			}
+ 			if (key === '__proto__' && !thisOtherHasOwnProperty(object, key)) {
+ 				return this.setPrototypeOf(target, value);
+ 			}
+@@ -1275,6 +1475,50 @@
+ 			// Note: target@this(unsafe) context@this(unsafe) args@this(safe-array) throws@this(unsafe)
+ 			validateHandlerTarget(this, target); // SECURITY (GHSA-qcp4-v2jj-fjx8)
+ 			const object = getHandlerObject(this); // @other(unsafe)
++			// SECURITY (GHSA-v6mx-mf47-r5wg): Invariant A — sandbox-applied host
++			// functions must not mutate any host-realm object's prototype chain
++			// via the bridge. The `set` / `defineProperty` / `setPrototypeOf`
++			// proxy traps already block direct mutation of host-realm objects
++			// (see `isProtectedHostObject`), but if sandbox code obtains a
++			// reference to a host-realm prototype-mutating intrinsic and applies
++			// it directly (e.g.
++			// `Buffer.call.call({}.__lookupSetter__, Buffer, "__proto__")` →
++			// host `Object.prototype.__proto__` setter), the actual prototype
++			// mutation happens inside the intrinsic with `this` = an unwrapped
++			// host object, bypassing every write trap. Refuse the call upstream.
++			//
++			// We refuse before unwrapping `context` / `args` so the host
++			// intrinsic is never reached with attacker-controlled inputs. The
++			// VMError mirrors the response from `isProtectedHostObject` callers
++			// (set/defineProperty/deleteProperty/preventExtensions).
++			if (!isHost) {
++				// SECURITY (GHSA-v6mx-mf47-r5wg): direct invocation check.
++				if (isDangerousHostProtoMutator(object)) throw new VMError(OPNA);
++				// SECURITY (GHSA-v6mx-mf47-r5wg): peel one indirection layer.
++				// When the apply target is host `Function.prototype.call` /
++				// `Function.prototype.apply` / `Function.prototype.bind`,
++				// `context` is the *underlying* function. The canonical PoC
++				// reaches host `__proto__` setter via
++				// `setProto.call(tp, null)`, where the apply target is
++				// `Function.prototype.call` (sandbox `.call` is `connect()`ed
++				// to host's), `context` is `setProto`, and `args = [tp, null]`.
++				// Unwrap `context` first (it may be a sandbox proxy of the
++				// host setter) and check the underlying.
++				if (isApplyIndirectionPrimitive(object)) {
++					let underlying;
++					try { underlying = otherFromThis(context); } catch (e) {}
++					if (isDangerousHostProtoMutator(underlying)) throw new VMError(OPNA);
++				}
++				// When the apply target is host `Reflect.apply` /
++				// `Reflect.construct`, the underlying function is `args[0]`.
++				if (isReflectApplyPrimitive(object)) {
++					if (args && args.length > 0) {
++						let underlying;
++						try { underlying = otherFromThis(args[0]); } catch (e) {}
++						if (isDangerousHostProtoMutator(underlying)) throw new VMError(OPNA);
++					}
++				}
++			}
+ 			// SECURITY (GHSA-55hx): if the host function being applied is one of
+ 			// host's Promise.prototype.then/catch/finally, wrap the sandbox-supplied
+ 			// callbacks so their argument values flow through handleException /
+@@ -1432,6 +1676,11 @@
+ 			// defineProperty calls targeting any host-realm intrinsic
+ 			// prototype or constructor. Covers C3 (Object.defineProperty).
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
++			// SECURITY (GHSA-m5q2-4fm3-vfqp): mirror the set trap — refuse
++			// dangerous-symbol-keyed property installation on any host object.
++			if (!isHost && typeof prop === 'symbol' && isDangerousCrossRealmSymbol(prop)) {
++				throw new VMError(OPNA);
++			}
+ 			if (!thisReflectSetPrototypeOf(desc, null)) throw thisUnexpected();
+ 
+ 			// Intercept defineProperty for constructor on host arrays.
+@@ -1500,6 +1749,15 @@
+ 			// otherwise remove `hasOwnProperty`, `toString`, etc. from every
+ 			// host object of that class.
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
++			// SECURITY (GHSA-m5q2-4fm3-vfqp): refuse sandbox-originated
++			// deletes whose key is a dangerous cross-realm symbol. Without
++			// this, sandbox code can strip host-set hooks (e.g. delete a
++			// Node-installed `nodejs.util.inspect.custom` from a host object)
++			// and substitute its own behavior or break host code that relies
++			// on the host-set property.
++			if (!isHost && typeof prop === 'symbol' && isDangerousCrossRealmSymbol(prop)) {
++				throw new VMError(OPNA);
++			}
+ 			try {
+ 				return otherReflectDeleteProperty(object, prop) === true;
+ 			} catch (e) {
+@@ -1805,6 +2063,29 @@
+ 				}
+ 			// fallthrough
+ 			case 'function':
++				// SECURITY (GHSA-v6mx-mf47-r5wg): Invariant B — no host-realm
++				// object reaches sandbox code unwrapped. Cache check FIRST,
++				// before the proto-chain walk: if `other` has ever crossed the
++				// bridge as a host-realm value (`mappingOtherToThis` tracks
++				// every host-realm value the bridge has wrapped), return the
++				// existing proxy. This catches host-realm values whose
++				// prototype chain was subsequently tampered with — the cache
++				// lookup is independent of the prototype chain and so cannot
++				// be defeated by mutating it.
++				//
++				// Note: we deliberately do NOT wrap on the fall-through paths
++				// below (null proto, or walked-off the chain without finding a
++				// mapping). Wrapping there would re-introduce GHSA-9vg3-4rfj-wgcm
++				// — a sandbox-realm `{__proto__: null}` value passed to
++				// handleException would be turned into a host-treating proxy
++				// whose `set` trap unwraps sandbox-side proxies of host
++				// references onto the underlying object, recreating the very
++				// escape that fix closed. The write-side defense in the apply
++				// trap above (Invariant A) prevents the canonical attack from
++				// reaching a state where a fresh, never-bridged host object
++				// surfaces here through a tampered proto chain.
++				const ensureCached = thisReflectApply(thisWeakMapGet, mappingOtherToThis, [other]);
++				if (ensureCached) return ensureCached;
+ 				let proto = thisReflectGetPrototypeOf(other);
+ 				if (!proto) {
+ 					return other;
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -30,6 +30,11 @@
+ const localObjectGetOwnPropertySymbols = localObject.getOwnPropertySymbols;
+ const localObjectGetOwnPropertyDescriptors = localObject.getOwnPropertyDescriptors;
+ const localObjectAssign = localObject.assign;
++// SECURITY (GHSA-m5q2-4fm3-vfqp): captured at module load before sandbox code
++// can run, so prefix-matching `Symbol.for` keys against the `nodejs.` namespace
++// (see below) cannot be subverted by an attacker who later monkey-patches
++// `String.prototype.startsWith` from inside the sandbox.
++const localStringStartsWith = global.String.prototype.startsWith;
+ 
+ const speciesSymbol = Symbol.species;
+ const globalPromise = global.Promise;
+@@ -87,6 +92,24 @@
+ 		if (!localPromiseInSwallowTail) {
+ 			localPromiseInSwallowTail = true;
+ 			try {
++				// SECURITY (GHSA-76w7-j9cq-rx2j): the cached host then()
++				// resolves the downstream child via the species protocol
++				// (`this.constructor[Symbol.species]`). Without this reset
++				// a sandbox subclass — `class F extends Promise { static
++				// get [Symbol.species](){ return ct } }` — hijacks species
++				// to a user function `ct` which is then `Construct`ed with
++				// V8's internal `(resolve, reject)` executor. The user can
++				// reassign V8's resolve/reject, redirect rejection to a
++				// sandbox collector, and receive a raw host-realm Error
++				// (e.g. RangeError from `e.stack` after deep recursion)
++				// whose `.constructor.constructor` is the host `Function`
++				// constructor → RCE. Pinning the species back to
++				// `localPromise` forces the downstream child through our
++				// own wrapped executor where the species cannot be
++				// hijacked. The sandbox-side `then`/`catch`/`Reflect.apply`
++				// overrides already call this; the swallow-tail call here
++				// was the missed site.
++				resetPromiseSpecies(this);
+ 				apply(globalPromisePrototypeThen, this, [undefined, localPromiseSwallow]);
+ 			} catch (e) {
+ 				// best effort — never let the swallow itself crash the executor
+@@ -121,23 +144,54 @@
+  * - 'nodejs.rejection': Called by EventEmitter on promise rejection with captureRejections enabled.
+  *   The handler receives error objects that could potentially leak host context.
+  *
+- * Fix: Override Symbol.for to return sandbox-local symbols for dangerous keys instead of cross-realm
+- * symbols. This prevents Node.js internals from recognizing sandbox-defined symbol properties while
+- * preserving cross-realm behavior for other symbols.
++ * - 'nodejs.util.promisify.custom': Hook util.promisify(fn) calls when present on `fn`. If a
++ *   sandbox-installed function is invoked here, host code that relies on promisified behavior
++ *   gets sandbox-controlled return values. (GHSA-m5q2-4fm3-vfqp)
++ *
++ * - 'nodejs.stream.{readable,writable,duplex,transform}': Brand symbols Node's stream subsystem
++ *   uses for duck typing. Sandbox-installed brands confuse host-side `Stream.is{Readable,Writable}`
++ *   checks. (GHSA-m5q2-4fm3-vfqp)
++ *
++ * - 'nodejs.webstream.{isClosedPromise,controllerErrorFunction}': WebStream internals — a
++ *   sandbox-installed handler executes in host realm with host arguments. (GHSA-m5q2-4fm3-vfqp)
++ *
++ * Fix: Override Symbol.for to return a sandbox-local symbol for any key in the `nodejs.` namespace
++ * instead of the real cross-realm symbol. The `nodejs.` prefix is reserved by Node for internal
++ * cross-realm hooks; sandbox code has no legitimate reason to register symbols under it. Each
++ * unique `nodejs.*` key is mapped to a stable sandbox-local symbol so that repeated `Symbol.for`
++ * calls inside the sandbox preserve identity (matching the spec's registry semantics for the
++ * sandbox's own consumption), while never crossing the realm boundary.
+  */
+ const originalSymbolFor = Symbol.for;
+ const blockedSymbolCustomInspect = Symbol('nodejs.util.inspect.custom');
+ const blockedSymbolRejection = Symbol('nodejs.rejection');
+ 
++// Per-key cache for unknown `nodejs.*` symbols so `Symbol.for(k) === Symbol.for(k)` still holds
++// inside the sandbox. Built via the cached Reflect primitives so a sandbox-side override of
++// `Object.prototype` / proxies cannot intercept reads or writes here.
++const blockedNodejsSymbolCache = { __proto__: null };
++localReflectDefineProperty(blockedNodejsSymbolCache, 'nodejs.util.inspect.custom', {
++	__proto__: null, value: blockedSymbolCustomInspect, writable: true, enumerable: false, configurable: false,
++});
++localReflectDefineProperty(blockedNodejsSymbolCache, 'nodejs.rejection', {
++	__proto__: null, value: blockedSymbolRejection, writable: true, enumerable: false, configurable: false,
++});
++
+ Symbol.for = function (key) {
+ 	// Convert to string once to prevent toString/toPrimitive bypass and TOCTOU attacks
+ 	const keyStr = '' + key;
+-	if (keyStr === 'nodejs.util.inspect.custom') {
+-		return blockedSymbolCustomInspect;
++	// SECURITY (GHSA-m5q2-4fm3-vfqp): deny the entire `nodejs.` namespace. The prior allowlist
++	// of two specific keys missed seven other dangerous Node-internal symbols and would miss any
++	// future addition. The `nodejs.` prefix is owned by Node for internal cross-realm hooks.
++	if (apply(localStringStartsWith, keyStr, ['nodejs.'])) {
++		const cached = blockedNodejsSymbolCache[keyStr];
++		if (typeof cached === 'symbol') return cached;
++		const fresh = Symbol(keyStr);
++		localReflectDefineProperty(blockedNodejsSymbolCache, keyStr, {
++			__proto__: null, value: fresh, writable: true, enumerable: false, configurable: false,
++		});
++		return fresh;
+ 	}
+-	if (keyStr === 'nodejs.rejection') {
+-		return blockedSymbolRejection;
+-	}
+ 	return originalSymbolFor(keyStr);
+ };
+ 
+@@ -153,9 +207,27 @@
+  */
+ const realSymbolCustomInspect = originalSymbolFor('nodejs.util.inspect.custom');
+ const realSymbolRejection = originalSymbolFor('nodejs.rejection');
++// SECURITY (GHSA-m5q2-4fm3-vfqp): pre-cache every known dangerous `nodejs.*` cross-realm symbol so
++// `isDangerousSymbol` can identify them in extraction paths (Reflect.ownKeys, Object.assign, ...).
++// Identity check against these references is the structural test — `description`-string matching
++// is forgeable from sandbox code. Adding new entries here automatically extends every filter.
++const realDangerousSymbols = [
++	realSymbolCustomInspect,
++	realSymbolRejection,
++	originalSymbolFor('nodejs.util.promisify.custom'),
++	originalSymbolFor('nodejs.stream.readable'),
++	originalSymbolFor('nodejs.stream.writable'),
++	originalSymbolFor('nodejs.stream.duplex'),
++	originalSymbolFor('nodejs.stream.transform'),
++	originalSymbolFor('nodejs.webstream.isClosedPromise'),
++	originalSymbolFor('nodejs.webstream.controllerErrorFunction'),
++];
+ 
+ function isDangerousSymbol(sym) {
+-	return sym === realSymbolCustomInspect || sym === realSymbolRejection;
++	for (let i = 0; i < realDangerousSymbols.length; i++) {
++		if (sym === realDangerousSymbols[i]) return true;
++	}
++	return false;
+ }
+ 
+ localObject.getOwnPropertySymbols = function getOwnPropertySymbols(obj) {
+@@ -202,8 +274,11 @@
+  */
+ localObject.getOwnPropertyDescriptors = function getOwnPropertyDescriptors(obj) {
+ 	const descs = apply(localObjectGetOwnPropertyDescriptors, localObject, [obj]);
+-	localReflectDeleteProperty(descs, realSymbolCustomInspect);
+-	localReflectDeleteProperty(descs, realSymbolRejection);
++	// SECURITY (GHSA-m5q2-4fm3-vfqp): drop every known dangerous cross-realm symbol slot,
++	// not just the original two. Iterates `realDangerousSymbols` so additions stay in sync.
++	for (let i = 0; i < realDangerousSymbols.length; i++) {
++		localReflectDeleteProperty(descs, realDangerousSymbols[i]);
++	}
+ 	return descs;
+ };
+ 
+@@ -598,16 +673,29 @@
+ 		header = 'Error';
+ 	}
+ 
+-	// Format each call site safely
+-	const lines = [header];
++	// SECURITY (GHSA-q3fm-4wcw-g57x): build the result via primitive string
++	// concatenation rather than `lines[lines.length] = X` + `lines.join('\n')`.
++	// The former is the GHSA-9qj6-qjgg-37qq pattern in a different file: an index
++	// assignment on a fresh sandbox-realm array walks the prototype chain when
++	// no own slot exists, so a sandbox-installed setter on `Array.prototype[N]`
++	// would observe each appended frame. The latter dispatches `Array.prototype.join`
++	// through the prototype chain, so a sandbox override would intercept the
++	// assembled stack string on the way out. Both violate Defense Invariant #11
++	// ("bridge-internal containers must not invoke sandbox code"). Folding the
++	// frames straight into a string accumulator removes the container entirely,
++	// so no `Array.prototype` slot — getter, setter, or method — is reachable
++	// from this codepath.
++	let result = header;
+ 	for (let i = 0; i < callSites.length; i++) {
++		let frame;
+ 		try {
+-			lines[lines.length] = '    at ' + callSites[i];
++			frame = '    at ' + callSites[i];
+ 		} catch (e) {
+-			lines[lines.length] = '    at <error formatting frame>';
++			frame = '    at <error formatting frame>';
+ 		}
++		result += '\n' + frame;
+ 	}
+-	return lines.join('\n');
++	return result;
+ }
+ 
+ let currentPrepareStackTrace = LocalError.prepareStackTrace;
+@@ -637,7 +725,18 @@
+ 	LocalError.prepareStackTrace = undefined;
+ 
+ 	function makeCallSiteGetters(list) {
++		// SECURITY (GHSA-q3fm-4wcw-g57x): install each entry as an own data
++		// property via localReflectDefineProperty rather than `callSiteGetters[N] = …`.
++		// This loop runs at sandbox init before user code can install a setter
++		// on `Array.prototype[N]`, so the prototype-walking index assignment is
++		// safe today — the change is for symmetry with the defaultSandboxPrepareStackTrace
++		// fix and to keep Defense Invariant #11 ("bridge-internal containers must
++		// not invoke sandbox code") uniform across this file. Indexed reads at
++		// the consumers (applyCallSiteGetters, the prototype-population loop
++		// below) then land on own data slots and cannot be intercepted by a
++		// later sandbox-installed getter on `Array.prototype[N]`.
+ 		const callSiteGetters = [];
++		let callSiteGettersLen = 0;
+ 		for (let i = 0; i < list.length; i++) {
+ 			const name = list[i];
+ 			const func = OriginalCallSite.prototype[name];
+@@ -646,14 +745,21 @@
+ 			// Skip missing entries so applyCallSiteGetters doesn't apply
+ 			// `undefined` and throw "Function.prototype.apply was called on undefined".
+ 			if (typeof func !== 'function') continue;
+-			callSiteGetters[callSiteGetters.length] = {
++			localReflectDefineProperty(callSiteGetters, callSiteGettersLen, {
+ 				__proto__: null,
+-				name,
+-				propName: '_' + name,
+-				func: thiz => {
+-					return localReflectApply(func, thiz, []);
++				value: {
++					__proto__: null,
++					name,
++					propName: '_' + name,
++					func: thiz => {
++						return localReflectApply(func, thiz, []);
++					},
+ 				},
+-			};
++				writable: true,
++				enumerable: true,
++				configurable: true,
++			});
++			callSiteGettersLen++;
+ 		}
+ 		return callSiteGetters;
+ 	}
+--- /dev/null
++++ b/test/ghsa/GHSA-m5q2-4fm3-vfqp/repro.js
+@@ -0,0 +1,318 @@
++/**
++ * GHSA-m5q2-4fm3-vfqp — Sandbox escape via unblocked cross-realm Symbol.for keys
++ *                       + missing bridge write-trap symbol checks
++ *
++ * ## Vulnerability class
++ * Sandbox code obtains real cross-realm Node.js symbols via two paths the
++ * existing defenses do not cover:
++ *
++ *   1. `Symbol.for('nodejs.<anything>')` — only `nodejs.util.inspect.custom`
++ *      and `nodejs.rejection` were blocked. Other Node-internal symbols
++ *      (`nodejs.util.promisify.custom`, the four stream brand symbols, the
++ *      two webstream symbols) passed straight through and returned the real
++ *      cross-realm symbol the host's Node internals look up.
++ *
++ *   2. Even when the sandbox cannot produce the symbol, the bridge's `set`,
++ *      `defineProperty`, and `deleteProperty` traps did NOT screen the
++ *      property key for `isDangerousCrossRealmSymbol(...)`. The `get`,
++ *      `has`, `ownKeys`, and `getOwnPropertyDescriptor` traps did. So sandbox
++ *      code could write or delete dangerous-symbol-keyed properties on any
++ *      host object exposed to it — installing host-side hooks
++ *      (`util.promisify.custom`), altering brand-style duck typing on
++ *      streams, or deleting host-set symbol properties.
++ *
++ * ## Fix
++ * 1. `lib/setup-sandbox.js` — `Symbol.for(key)` now returns a sandbox-local
++ *    symbol whenever `key.startsWith('nodejs.')`, denying the entire family
++ *    of cross-realm Node internals at the source. The 9 known dangerous
++ *    `nodejs.*` symbols are pre-cached and `isDangerousSymbol(sym)` (which
++ *    drives the `getOwnPropertySymbols`, `Reflect.ownKeys`,
++ *    `getOwnPropertyDescriptors`, and `Object.assign` overrides) checks
++ *    membership against the full set rather than only two.
++ *
++ * 2. `lib/bridge.js` — `BaseHandler.{set, defineProperty, deleteProperty}`
++ *    now reject any operation whose key is `isDangerousCrossRealmSymbol(...)`
++ *    when the call originates in the sandbox (`!isHost`). The dangerous-symbol
++ *    list in bridge.js is expanded to match setup-sandbox's set so
++ *    `isDangerousCrossRealmSymbol` recognises every host-side hook key.
++ *
++ * The invariant restored:
++ *   - **Read direction**: a dangerous cross-realm symbol must never reach
++ *     sandbox code as a usable symbol value (Category 8 / GHSA-47x8 closed
++ *     this for `nodejs.util.inspect.custom` and `nodejs.rejection`; this
++ *     fix extends the set to all 9 known dangerous `nodejs.*` symbols).
++ *   - **Write direction**: even if the sandbox somehow obtains a dangerous
++ *     symbol primitive (e.g. a future bypass), it must not be able to use
++ *     that symbol as a key against any bridge-wrapped host object. The
++ *     write traps are the structural chokepoint.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const util = require('util');
++const { VM } = require('../../../lib/main.js');
++
++if (typeof it.cond !== 'function') {
++	it.cond = function (name, cond, fn) { return cond ? it(name, fn) : it.skip(name, fn); };
++}
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++// `util.promisify.custom` exists since Node 8 with the symbol form added in 8.0.
++// Stream brand symbols (`nodejs.stream.readable` etc.) are 16+; webstream symbols
++// land later still. Gate the symbol-set check accordingly.
++const HAS_STREAM_BRAND_SYMBOLS = NODE_MAJOR >= 16;
++
++function safeRun(code) {
++	const vm = new VM();
++	try {
++		return vm.run('(function () { try { ' + code + ' } catch (_) { return undefined; } })()');
++	} catch (_) {
++		return undefined;
++	}
++}
++
++describe('GHSA-m5q2-4fm3-vfqp (cross-realm Symbol.for + bridge write-trap leak)', function () {
++
++	// ---- PRIMARY POC: util.promisify hijack ------------------------------------------
++
++	it('blocks PoC: sandbox cannot install nodejs.util.promisify.custom on host fn', function () {
++		// Host function the sandbox is allowed to mutate (a regular host function,
++		// not a protected intrinsic — this is the case the write-trap check covers).
++		const hostFn = function readFile(path, cb) { cb(null, 'real data'); };
++		const vm = new VM();
++		vm.setGlobals = vm.setGlobals || function (g) { for (const k in g) this.sandbox[k] = g[k]; };
++		vm.sandbox.hostFn = hostFn;
++
++		// Sandbox attempts to install a custom promisifier on the host function.
++		// Two paths must be blocked:
++		//   - Symbol.for('nodejs.util.promisify.custom') returns a sandbox-local
++		//     symbol that the host doesn't recognise. So even if the assignment
++		//     went through, host's util.promisify would not invoke the sandbox fn.
++		//   - The sandbox could try to extract the real symbol via Category-8
++		//     paths (closed). If it did, the bridge write-trap rejects the write.
++		try {
++			vm.run(`
++				const kPromisify = Symbol.for('nodejs.util.promisify.custom');
++				hostFn[kPromisify] = function (path) {
++					return Promise.resolve('HIJACKED by sandbox');
++				};
++			`);
++		} catch (_) { /* either Symbol.for returned a safe symbol or write trap threw */ }
++
++		// Host-side check: util.promisify must use Node's default behavior, NOT
++		// any sandbox-installed custom promisifier.
++		const asyncRead = util.promisify(hostFn);
++		return asyncRead('/etc/passwd').then(function (result) {
++			assert.notStrictEqual(result, 'HIJACKED by sandbox', 'sandbox hijacked util.promisify');
++			assert.strictEqual(result, 'real data', 'host function executed normally');
++		});
++	});
++
++	// ---- Symbol.for source-side denial -----------------------------------------------
++
++	it('Symbol.for("nodejs.util.promisify.custom") returns sandbox-local symbol', function () {
++		const isSandboxLocal = safeRun(`
++			const sandboxLocal = Symbol.for('nodejs.util.promisify.custom');
++			// Sandbox-local symbols are NOT the same as the host's real registered symbol.
++			// We can detect the structural identity by reading the symbol from a known
++			// host object (Buffer.prototype carries no promisify symbol, but we can
++			// register one fresh in the host registry — Symbol.for on the host always
++			// returns the same identity for a given key). The test harness can't reach
++			// the host registry, but we CAN ensure that the description matches AND that
++			// our sandbox symbol is brand-new (a sandbox Symbol() not the registry one).
++			// The structural test: a registered cross-realm symbol survives a round-trip
++			// through Symbol.keyFor; a sandbox-local one does NOT.
++			return Symbol.keyFor(sandboxLocal) === undefined;
++		`);
++		assert.strictEqual(isSandboxLocal, true, 'Symbol.for returned a real cross-realm symbol');
++	});
++
++	it.cond('Symbol.for("nodejs.stream.readable") returns sandbox-local symbol', HAS_STREAM_BRAND_SYMBOLS, function () {
++		const isSandboxLocal = safeRun(`
++			return Symbol.keyFor(Symbol.for('nodejs.stream.readable')) === undefined;
++		`);
++		assert.strictEqual(isSandboxLocal, true, 'nodejs.stream.readable leaked');
++	});
++
++	it.cond('Symbol.for("nodejs.stream.writable") returns sandbox-local symbol', HAS_STREAM_BRAND_SYMBOLS, function () {
++		const isSandboxLocal = safeRun(`
++			return Symbol.keyFor(Symbol.for('nodejs.stream.writable')) === undefined;
++		`);
++		assert.strictEqual(isSandboxLocal, true, 'nodejs.stream.writable leaked');
++	});
++
++	it.cond('Symbol.for("nodejs.stream.duplex") returns sandbox-local symbol', HAS_STREAM_BRAND_SYMBOLS, function () {
++		const isSandboxLocal = safeRun(`
++			return Symbol.keyFor(Symbol.for('nodejs.stream.duplex')) === undefined;
++		`);
++		assert.strictEqual(isSandboxLocal, true, 'nodejs.stream.duplex leaked');
++	});
++
++	it.cond('Symbol.for("nodejs.stream.transform") returns sandbox-local symbol', HAS_STREAM_BRAND_SYMBOLS, function () {
++		const isSandboxLocal = safeRun(`
++			return Symbol.keyFor(Symbol.for('nodejs.stream.transform')) === undefined;
++		`);
++		assert.strictEqual(isSandboxLocal, true, 'nodejs.stream.transform leaked');
++	});
++
++	it('Symbol.for any "nodejs.<future-internal>" key returns sandbox-local symbol', function () {
++		// Forward-compat: any future Node-internal symbol introduced under the
++		// nodejs.* namespace must be denied without code changes.
++		const allSandboxLocal = safeRun(`
++			const probes = [
++				'nodejs.future.feature1',
++				'nodejs.unknown',
++				'nodejs.zalgo',
++			];
++			for (let i = 0; i < probes.length; i++) {
++				if (Symbol.keyFor(Symbol.for(probes[i])) !== undefined) return false;
++			}
++			return true;
++		`);
++		assert.strictEqual(allSandboxLocal, true, 'a forward-compat nodejs.* key leaked');
++	});
++
++	it('Symbol.for keeps non-"nodejs." keys cross-realm (no over-denial)', function () {
++		// Regression guard: legitimate cross-realm Symbol.for usage (any key NOT
++		// starting with "nodejs.") must still produce a registered cross-realm
++		// symbol so that legitimate intra-process symbol sharing still works.
++		const stillCrossRealm = safeRun(`
++			const s = Symbol.for('user.app.event');
++			return Symbol.keyFor(s) === 'user.app.event';
++		`);
++		assert.strictEqual(stillCrossRealm, true, 'legitimate Symbol.for over-denied');
++	});
++
++	// ---- Bridge write-trap denial ----------------------------------------------------
++	//
++	// Even if the sandbox somehow obtains a real dangerous cross-realm symbol
++	// (via a future bypass, or by reading it back via a host-side path), the
++	// write traps must reject any operation that would install or delete it
++	// on a host-realm object.
++
++	it('set trap: sandbox assignment with dangerous symbol key on host obj is denied', function () {
++		// We can't easily forge a real host symbol from inside the sandbox under
++		// the current defenses (that's exactly what Category 8 closed). But we
++		// can validate the bridge layer directly: pass in the host's real symbol
++		// via setGlobal, then attempt the assignment.
++		const realSym = Symbol.for('nodejs.util.promisify.custom');
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try {
++			vm.run(`hostObj[realSym] = function () { return 'pwned'; };`);
++		} catch (_) { /* expected: VMError(OPNA) */ }
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, realSym),
++			false,
++			'set trap installed dangerous symbol key on host object'
++		);
++	});
++
++	it('defineProperty trap: dangerous symbol key cannot be installed on host obj', function () {
++		const realSym = Symbol.for('nodejs.util.promisify.custom');
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try {
++			vm.run(`Object.defineProperty(hostObj, realSym, { value: 'pwned' });`);
++		} catch (_) { /* expected */ }
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, realSym),
++			false,
++			'defineProperty trap installed dangerous symbol key on host object'
++		);
++	});
++
++	it('deleteProperty trap: dangerous symbol key on host obj cannot be deleted', function () {
++		const realSym = Symbol.for('nodejs.util.promisify.custom');
++		const hostObj = {};
++		// Host pre-installs the symbol — sandbox must not be able to delete it.
++		hostObj[realSym] = function () { return 'host-set'; };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try {
++			vm.run(`delete hostObj[realSym];`);
++		} catch (_) { /* expected */ }
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, realSym),
++			true,
++			'deleteProperty trap removed dangerous symbol from host object'
++		);
++	});
++
++	it('write traps: nodejs.rejection symbol also denied across all three traps', function () {
++		const realSym = Symbol.for('nodejs.rejection');
++		const hostObj = { [realSym]: 'host-set' };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`hostObj[realSym] = 'set';`); } catch (_) {}
++		try { vm.run(`Object.defineProperty(hostObj, realSym, { value: 'def' });`); } catch (_) {}
++		try { vm.run(`delete hostObj[realSym];`); } catch (_) {}
++		assert.strictEqual(hostObj[realSym], 'host-set', 'nodejs.rejection write/delete leaked through bridge');
++	});
++
++	it('write traps: nodejs.util.inspect.custom symbol also denied', function () {
++		const realSym = Symbol.for('nodejs.util.inspect.custom');
++		const hostObj = { [realSym]: 'host-set' };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`hostObj[realSym] = 'set';`); } catch (_) {}
++		try { vm.run(`Object.defineProperty(hostObj, realSym, { value: 'def' });`); } catch (_) {}
++		try { vm.run(`delete hostObj[realSym];`); } catch (_) {}
++		assert.strictEqual(hostObj[realSym], 'host-set', 'nodejs.util.inspect.custom write/delete leaked');
++	});
++
++	// ---- Stream brand pollution ------------------------------------------------------
++
++	it.cond('write traps: stream brand symbol assignment denied', HAS_STREAM_BRAND_SYMBOLS, function () {
++		const realSym = Symbol.for('nodejs.stream.readable');
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try {
++			vm.run(`hostObj[realSym] = true;`);
++		} catch (_) {}
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, realSym),
++			false,
++			'sandbox installed stream brand on host object'
++		);
++	});
++
++	// ---- Sandbox-side enumeration filters --------------------------------------------
++
++	it('isDangerousSymbol covers full nodejs.* set: extracted symbols are filtered', function () {
++		// Even if a host object has a dangerous cross-realm symbol as an own key,
++		// sandbox-side getOwnPropertySymbols / Reflect.ownKeys must filter ALL
++		// 9 known dangerous symbols, not just the original 2.
++		const found = safeRun(`
++			const target = {};
++			// Plant the host-registered symbols on a sandbox object via the
++			// (now-blocked) Symbol.for path. After the fix, Symbol.for returns
++			// a sandbox-local symbol — so this exercise validates that the FULL
++			// pipeline (Symbol.for source-deny + ownKeys filter + descriptor filter)
++			// can never surface the real registry symbols. We don't try to forge
++			// them; we just verify Symbol.for cannot produce them.
++			const probes = [
++				'nodejs.util.inspect.custom',
++				'nodejs.rejection',
++				'nodejs.util.promisify.custom',
++			];
++			const leaked = [];
++			for (let i = 0; i < probes.length; i++) {
++				const s = Symbol.for(probes[i]);
++				if (Symbol.keyFor(s) === probes[i]) leaked.push(probes[i]);
++			}
++			return leaked;
++		`);
++		assert.deepStrictEqual(found, [], 'one or more dangerous symbols leaked: ' + JSON.stringify(found));
++	});
++});
+
+--- a/lib/nodevm.js
++++ b/lib/nodevm.js
+@@ -289,6 +289,58 @@
+ 			allowAsync,
+ 			bufferAllocLimit
+ 		} = options;
++
++		// SECURITY (GHSA-m4wx-m65x-ghrr, supersedes GHSA-8hg8-63c5-gwmx):
++		// A truthy `nesting` injects a NESTING_OVERRIDE builtin that exposes
++		// `vm2` to the sandbox. When `requireOpts` is not a real require-config
++		// object, `makeResolverFromLegacyOptions` produces a resolver whose ONLY
++		// builtin is `vm2` — a pure escape primitive (sandbox does
++		// `require('vm2')`, builds an inner NodeVM with attacker-chosen
++		// `require` config, reaches `child_process` for host RCE).
++		//
++		// The guard mirrors the actual reachability of that insecure resolver
++		// on two axes:
++		//
++		// 1. `nesting` truthiness, not strict `=== true`. The override is gated
++		//    a few lines below by `nesting && NESTING_OVERRIDE`, which fires for
++		//    ANY truthy value (`1`, `'yes'`, `{}`, `[]`, etc.). The check must
++		//    cover every truthy `nesting` value the override gate accepts.
++		//
++		// 2. `requireOpts` must be an actual require-config object (or a
++		//    `Resolver` instance), not just "truthy". `makeResolverFromLegacyOptions`
++		//    destructures every primitive/function value to all-`undefined` and
++		//    falls into the same NESTING_OVERRIDE-only `if (!options)` branch as
++		//    falsy values do. The shapes that collapse to the insecure resolver:
++		//      - `require: false` / `undefined` / `null` / `0` / `''`
++		//          → falsy → `if (!options)` branch
++		//      - `require: true` / `1` / `'yes'` / `Symbol()` / `function(){}`
++		//          → truthy non-object → destructured to all-undefined →
++		//             `makeBuiltinsFromLegacyOptions(undefined, …, override)` →
++		//             same NESTING_OVERRIDE-only resolver
++		//    The documented escape hatch (a truthy `nesting` + an explicit
++		//    `require` config object, even `{}`) continues to work — a non-null
++		//    object counts as the developer's deliberate acknowledgment of the
++		//    tradeoff. A custom `Resolver` instance is also accepted (the
++		//    `customResolver` path below bypasses `makeResolverFromLegacyOptions`
++		//    entirely, so NESTING_OVERRIDE is never injected into it).
++		const hasRealRequireConfig =
++			requireOpts instanceof Resolver
++			|| (typeof requireOpts === 'object' && requireOpts !== null);
++		if (nesting && !hasRealRequireConfig) {
++			throw new VMError(
++				'NodeVM `nesting` requires an explicit `require` config object. '
++				+ '`nesting` is an escape hatch that exposes `vm2` to the '
++				+ 'sandbox (sandbox code can `require(\'vm2\')` and construct nested '
++				+ 'VMs unconstrained by the outer config). With `require` set to '
++				+ 'anything other than a config object (`false`, omitted, `true`, '
++				+ 'a number, a string, a function), the resolver exposes ONLY '
++				+ '`vm2` — a pure escape primitive. To deny all requires, remove '
++				+ '`nesting`. To allow nested VMs, pass an explicit `require` '
++				+ 'config (e.g. `require: { builtin: [] }`) so the tradeoff is '
++				+ 'visible. See README "`nesting: true` is an escape hatch". '
++				+ 'Context: GHSA-m4wx-m65x-ghrr (supersedes GHSA-8hg8-63c5-gwmx).'
++			);
++		}
+ 
+ 		// Throw this early
+ 		if (sandbox && 'object' !== typeof sandbox) {
+--- /dev/null
++++ b/test/ghsa/GHSA-m4wx-m65x-ghrr/repro.js
+@@ -0,0 +1,231 @@
++/**
++ * GHSA-m4wx-m65x-ghrr — GHSA-8hg8-63c5-gwmx patch bypass: NodeVM `nesting`
++ * combined with anything other than a real `require` config object produces
++ * a NESTING_OVERRIDE-only resolver → host RCE.
++ *
++ * ## Vulnerability
++ *
++ * A truthy `nesting` injects a NESTING_OVERRIDE builtin exposing `vm2` to
++ * sandbox code. When `requireOpts` is not a real require-config object,
++ * `makeResolverFromLegacyOptions` produces a resolver whose ONLY builtin is
++ * `vm2` — a pure escape primitive. Sandbox code does `require('vm2')`,
++ * constructs an inner `NodeVM({ require: { builtin: ['child_process'] } })`
++ * whose config is *not* constrained by the outer VM, and reaches
++ * `child_process.execSync` for full host RCE.
++ *
++ * Three input-shape classes all collapse to the same insecure resolver:
++ *
++ *   A. **Falsy / omitted `require`** (`false`, `undefined`, `null`, `0`,
++ *      `''`, or field omitted entirely) — `makeResolverFromLegacyOptions`
++ *      hits its `if (!options)` branch.
++ *
++ *   B. **Truthy non-object `require`** (`true`, `1`, `'yes'`, `Symbol()`,
++ *      `function(){}`) — destructures to all-`undefined`, then calls
++ *      `makeBuiltinsFromLegacyOptions(undefined, …, NESTING_OVERRIDE)` —
++ *      the same call shape the falsy branch produces.
++ *
++ *   C. **Truthy non-`true` `nesting`** (`1`, `'yes'`, `{}`, `[]`,
++ *      `function(){}`) — the override gate below is
++ *      `nesting && NESTING_OVERRIDE`, which fires for ANY truthy value,
++ *      so any "I didn't really mean `true`" assignment still injects
++ *      the override.
++ *
++ * GHSA-8hg8-63c5-gwmx's original check `options.require === false` only
++ * caught one syntactic shape from class A. The structural check below
++ * matches the actual reachability of the insecure resolver.
++ *
++ * ## Fix
++ *
++ *     const hasRealRequireConfig =
++ *         requireOpts instanceof Resolver
++ *         || (typeof requireOpts === 'object' && requireOpts !== null);
++ *     if (nesting && !hasRealRequireConfig) throw VMError(...)
++ *
++ * - `nesting` checked as truthy — matches the `nesting && NESTING_OVERRIDE`
++ *   gate that decides whether `vm2` is exposed.
++ * - `requireOpts` must be a non-null object (or a custom `Resolver`).
++ *   Primitives and functions all destructure to all-undefined inside
++ *   `makeResolverFromLegacyOptions` and produce the insecure resolver.
++ * - The documented escape hatch (a truthy `nesting` + an explicit `require`
++ *   config object, even `{}` or `Object.create(null)`) keeps working —
++ *   non-null object means the developer acknowledged the tradeoff.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const {NodeVM, VMError} = require('../../../lib/main.js');
++
++describe('GHSA-m4wx-m65x-ghrr — nesting:true without explicit require still RCE', () => {
++
++	it('rejects { nesting: true } alone (require omitted → defaults to false)', () => {
++		// The literal PoC config from the advisory.
++		assert.throws(
++			() => new NodeVM({nesting: true}),
++			err => err instanceof VMError
++				&& /nesting/.test(err.message)
++				&& /require/.test(err.message)
++				&& /GHSA-m4wx-m65x-ghrr/.test(err.message),
++			'construction must fail with a VMError citing nesting, require, and the advisory'
++		);
++	});
++
++	it('rejects { nesting: true, require: undefined } (explicit undefined)', () => {
++		assert.throws(
++			() => new NodeVM({nesting: true, require: undefined}),
++			err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message)
++		);
++	});
++
++	it('rejects { nesting: true, require: null } (null → falsy, same insecure resolver)', () => {
++		// makeResolverFromLegacyOptions(null, NESTING_OVERRIDE) hits the
++		// `if (!options)` branch the same way `false` does.
++		assert.throws(
++			() => new NodeVM({nesting: true, require: null}),
++			err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message)
++		);
++	});
++
++	it('rejects { nesting: true, require: 0 } (other falsy values)', () => {
++		assert.throws(
++			() => new NodeVM({nesting: true, require: 0}),
++			err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message)
++		);
++	});
++
++	it('rejects { nesting: true, require: false } (still covers the original GHSA-8hg8 case)', () => {
++		// Regression guard for the prior fix — must continue to throw.
++		assert.throws(
++			() => new NodeVM({nesting: true, require: false}),
++			err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message)
++		);
++	});
++
++	it('full PoC cannot reach require(\'vm2\') — construction throws before vm.run', () => {
++		// Without the fix this prints the host `id` output; with the fix the
++		// outer NodeVM never gets to vm.run().
++		assert.throws(() => {
++			const vm = new NodeVM({nesting: true}); // <-- bare PoC config
++			vm.run(`
++				const { NodeVM: NVM } = require('vm2');
++				const inner = new NVM({ require: { builtin: ['child_process'] } });
++				module.exports = inner.run('module.exports = require("child_process").execSync("id").toString()');
++			`);
++		}, err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message));
++	});
++
++	it('accepts { nesting: true, require: { builtin: [] } } (explicit empty allowlist — escape hatch)', () => {
++		// Legitimate use: the developer explicitly opted into the documented
++		// "nesting is an escape hatch" trade-off by providing a require config.
++		assert.doesNotThrow(() => new NodeVM({nesting: true, require: {builtin: []}}));
++	});
++
++	it('accepts { nesting: true, require: {} } (empty object is a deliberate config)', () => {
++		// `require: {}` is truthy and counts as the developer having made an
++		// explicit choice (even if it permits nothing beyond the NESTING_OVERRIDE).
++		assert.doesNotThrow(() => new NodeVM({nesting: true, require: {}}));
++	});
++
++	it('accepts { require: false } alone (no nesting — deny-all stays valid)', () => {
++		// Regression guard: require:false without nesting must continue to work.
++		assert.doesNotThrow(() => new NodeVM({require: false}));
++	});
++
++	it('accepts { } (default constructor)', () => {
++		// The default config has nesting:false, so the new guard does not fire.
++		assert.doesNotThrow(() => new NodeVM());
++	});
++
++	// ─── Truthy non-true `nesting` must reject ──────────────────────────────
++	//
++	// The override gate is `nesting && NESTING_OVERRIDE`, which fires for any
++	// truthy value. The guard matches that, so every truthy `nesting` paired
++	// with a non-config `require` rejects at construction.
++
++	const TRUTHY_NESTING = [
++		['number',  1],
++		['string',  'yes'],
++		['object',  {}],
++		['array',   []],
++		['fn',      function(){}]
++	];
++
++	for (const [label, value] of TRUTHY_NESTING) {
++		it(`rejects { nesting: <${label}>, require: false } (truthy non-true nesting)`, () => {
++			assert.throws(
++				() => new NodeVM({nesting: value, require: false}),
++				err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message),
++				`truthy nesting=${label} must reject — override gate is truthy, not ===true`
++			);
++		});
++	}
++
++	it('truthy-nesting PoC (nesting:1) cannot reach require(\'vm2\')', () => {
++		// Full chained PoC for the truthy-nesting class — construction throws
++		// so vm.run never executes.
++		assert.throws(() => {
++			const vm = new NodeVM({nesting: 1, require: false});
++			vm.run(`
++				const { NodeVM: NVM } = require('vm2');
++				const inner = new NVM({ require: { builtin: ['child_process'] } });
++				module.exports = inner.run('module.exports = require("child_process").execSync("echo PWN").toString().trim()');
++			`);
++		}, err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message));
++	});
++
++	// ─── Truthy non-object `require` must reject ────────────────────────────
++	//
++	// Primitives and functions destructure to all-undefined inside
++	// `makeResolverFromLegacyOptions`, producing the same
++	// NESTING_OVERRIDE-only resolver as the falsy branch. The guard requires
++	// a non-null object (or a `Resolver` instance) to count as a real config.
++
++	const TRUTHY_NONOBJECT_REQUIRE = [
++		['true',     true],
++		['number',   1],
++		['string',   'truthy'],
++		['symbol',   Symbol('x')],
++		['function', function(){}]
++	];
++
++	for (const [label, value] of TRUTHY_NONOBJECT_REQUIRE) {
++		it(`rejects { nesting: true, require: <${label}> } (truthy non-object require)`, () => {
++			assert.throws(
++				() => new NodeVM({nesting: true, require: value}),
++				err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message),
++				`require=${label} destructures to all-undefined → same insecure resolver`
++			);
++		});
++	}
++
++	it('truthy-require PoC (require:true) cannot reach require(\'vm2\')', () => {
++		// Full chained PoC for the truthy-non-object-require class —
++		// construction throws so vm.run never executes.
++		assert.throws(() => {
++			const vm = new NodeVM({nesting: true, require: true});
++			vm.run(`
++				const { NodeVM: NVM } = require('vm2');
++				const inner = new NVM({ require: { builtin: ['child_process'] } });
++				module.exports = inner.run('module.exports = require("child_process").execSync("echo PWN").toString().trim()');
++			`);
++		}, err => err instanceof VMError && /GHSA-m4wx-m65x-ghrr/.test(err.message));
++	});
++
++	// ─── Regression guards: legitimate configs continue to work ─────────────
++
++	it('accepts { nesting: true, require: Object.create(null) } (null-proto config object)', () => {
++		// A plain object with a null prototype is still a non-null object
++		// — counts as deliberate acknowledgment of the escape hatch.
++		assert.doesNotThrow(() => new NodeVM({nesting: true, require: Object.create(null)}));
++	});
++
++	it('accepts { nesting: true, require: <Resolver> } (custom resolver path)', () => {
++		// `customResolver = requireOpts instanceof Resolver` short-circuits
++		// `makeResolverFromLegacyOptions`, so NESTING_OVERRIDE is never even
++		// injected into a custom Resolver — the guard must not reject it.
++		const { makeResolverFromLegacyOptions } = require('../../../lib/main.js');
++		const customResolver = makeResolverFromLegacyOptions({builtin: []});
++		assert.doesNotThrow(() => new NodeVM({nesting: true, require: customResolver}));
++	});
++
++});
+
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -1250,6 +1250,30 @@
+ 				thisReflectSet(target, key, value);
+ 				return true;
+ 			}
++			// SECURITY (GHSA-c4cf-2hgv-2qv6): honour ECMA-262 9.5.9 [[Set]]
++			// receiver semantics. When sandbox writes via an object that
++			// *inherits* from this proxy (e.g. `Object.create(proxy).x = v`)
++			// or supplies a forged receiver (`Reflect.set(proxy, k, v, child)`),
++			// V8 invokes this trap with `receiver` set to the child — not the
++			// proxy itself. The pre-fix trap ignored `receiver` and wrote
++			// through to the host object, letting attacker-controlled writes
++			// silently land on host-side properties the sandbox should never
++			// reach. Mirror ReadOnlyHandler.set's install-on-receiver shape,
++			// gated on receiver !== canonical proxy so the legitimate direct
++			// `proxy.x = v` write path (embedder contract) remains unchanged.
++			// `mappingOtherToThis` already stores the canonical sandbox-facing
++			// proxy per host object (populated in thisProxyOther for both the
++			// !isHost inner-proxy and isHost outer-proxy2 branches).
++			const canonicalProxy = thisReflectApply(thisWeakMapGet, mappingOtherToThis, [object]);
++			if (receiver !== canonicalProxy) {
++				return thisReflectDefineProperty(receiver, key, {
++					__proto__: null,
++					value: value,
++					writable: true,
++					enumerable: true,
++					configurable: true,
++				}) === true;
++			}
+ 			try {
+ 				value = otherFromThis(value);
+ 				return otherReflectSet(object, key, value) === true;
+--- a/test/ghsa/GHSA-c4cf-2hgv-2qv6/repro.js
++++ b/test/ghsa/GHSA-c4cf-2hgv-2qv6/repro.js
+@@ -0,0 +1,222 @@
++/**
++ * GHSA-c4cf-2hgv-2qv6 — Bridge `set` trap ignores `receiver`, leaking
++ * prototype-inheriting writes through to the wrapped host object.
++ *
++ * ## Vulnerability class
++ *
++ * Per ECMA-262 9.5.9 `[[Set]] (P, V, Receiver)`, when sandbox code writes
++ * to an object that *inherits* from a bridge proxy (rather than to the
++ * proxy itself), the proxy's `set` trap is invoked with `receiver` set to
++ * the original recipient — not to the proxy. The spec-correct behaviour
++ * is to install the property on `receiver` (or refuse), NOT on the proxy
++ * target. `BaseHandler.set` in `lib/bridge.js` historically ignored the
++ * `receiver` argument and unconditionally wrote through to the host
++ * object via `otherReflectSet(object, key, value)`. The consequence: any
++ * sandbox-side child built via `Object.create(hostObj)` becomes a write
++ * channel onto the host object, bypassing any write-side hardening
++ * keyed on the direct-assignment path.
++ *
++ * ## Canonical PoC (from the advisory)
++ *
++ *     const kCustom = Symbol.for('nodejs.util.promisify.custom');
++ *     const child   = Object.create(hostFn);
++ *     child[kCustom] = function () { return Promise.resolve('HIJACKED'); };
++ *     // Host side: util.promisify(hostFn) now returns the sandbox's fn.
++ *
++ * No proxy trap on the host side intervenes because the write went via
++ * the proxy's `set` trap with `receiver === child`, and the trap blindly
++ * called `otherReflectSet(hostFn, kCustom, hijackedFn)`.
++ *
++ * ## Fix (lib/bridge.js)
++ *
++ * `BaseHandler.set` records the canonical sandbox-facing proxy at
++ * construction time and, when invoked, refuses to write through to the
++ * host target unless `receiver` is one of the bridge's own proxies for
++ * that target. For any other receiver — a sandbox-side `Object.create`
++ * child, an arbitrary `Reflect.set(..., custom)` receiver — the property
++ * is installed on `receiver` itself via `Reflect.defineProperty`, which
++ * matches both the ECMA-262 [[Set]] semantics and the existing
++ * `ReadOnlyHandler.set` shape. The host object is never mutated for
++ * non-proxy receivers.
++ *
++ * ## Invariant
++ *
++ * "Sandbox writes reach a host-realm object only through the canonical
++ * bridge proxy for that object." Restated: the bridge `set` trap MUST
++ * honour the spec `receiver`; child-of-proxy writes never cross the
++ * realm boundary.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const util = require('util');
++const { VM } = require('../../../lib/main.js');
++
++if (typeof it.cond !== 'function') {
++	it.cond = function (name, cond, fn) {
++		return cond ? it(name, fn) : it.skip(name, fn);
++	};
++}
++
++describe('GHSA-c4cf-2hgv-2qv6 (set trap receiver ignored — write-through via Object.create child)', function () {
++	// ---- PRIMARY POC ----------------------------------------------------------
++
++	it('blocks PoC: Object.create(hostFn) + child[Symbol.for(...)]=fn must NOT install on host', function () {
++		const hostFn = function api(cb) {
++			cb(null, 'ok');
++		};
++		const vm = new VM();
++		vm.sandbox.hostFn = hostFn;
++
++		try {
++			vm.run(`
++				const kCustom = Symbol.for('nodejs.util.promisify.custom');
++				const child = Object.create(hostFn);
++				child[kCustom] = function () {
++					return Promise.resolve('HIJACKED-VIA-RECEIVER-BUG');
++				};
++			`);
++		} catch (_) {
++			/* either trap threw or symbol stripped — both acceptable */
++		}
++
++		// Host-side: no own property must have leaked onto hostFn, regardless of
++		// whether the key materialised as the dangerous host-realm symbol or as
++		// a sandbox-local symbol.
++		const ownSyms = Object.getOwnPropertySymbols(hostFn);
++		for (const s of ownSyms) {
++			const desc = String(s);
++			assert.notStrictEqual(
++				desc,
++				'Symbol(nodejs.util.promisify.custom)',
++				'host fn must not carry a sandbox-installed nodejs.util.promisify.custom symbol',
++			);
++		}
++
++		// And util.promisify must use Node's default behaviour, not the sandbox fn.
++		const promisified = util.promisify(hostFn);
++		return promisified().then(v => {
++			assert.strictEqual(v, 'ok', 'promisify must not be hijacked');
++		});
++	});
++
++	// ---- VARIANTS -------------------------------------------------------------
++
++	it('blocks variant: plain string-key write on Object.create child must NOT leak to host', function () {
++		const hostObj = { tag: 'host-original' };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		try {
++			vm.run(`
++				const child = Object.create(hostObj);
++				child.injectedString = 'sandbox-value';
++				child.tag = 'overwritten-by-sandbox';
++			`);
++		} catch (_) {
++			/* trap-refusal is also acceptable */
++		}
++
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, 'injectedString'),
++			false,
++			'host object must not gain an injected own property via Object.create-child write',
++		);
++		assert.strictEqual(hostObj.tag, 'host-original', 'host object existing property must be unchanged');
++	});
++
++	it('blocks variant: Reflect.set(hostObj, k, v, customReceiver) must NOT leak to host', function () {
++		const hostObj = function () {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		try {
++			vm.run(`
++				const customReceiver = { __proto__: null };
++				Reflect.set(hostObj, 'reflectInjected', 'sandbox-value', customReceiver);
++				Reflect.set(hostObj, Symbol.for('nodejs.util.promisify.custom'),
++					function () { return Promise.resolve('HIJACK-VIA-REFLECT'); },
++					customReceiver);
++			`);
++		} catch (_) {
++			/* trap-refusal acceptable */
++		}
++
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, 'reflectInjected'),
++			false,
++			'Reflect.set with explicit receiver must not leak to host',
++		);
++		const ownSyms = Object.getOwnPropertySymbols(hostObj);
++		for (const s of ownSyms) {
++			assert.notStrictEqual(
++				String(s),
++				'Symbol(nodejs.util.promisify.custom)',
++				'Reflect.set with explicit receiver must not install dangerous symbol on host',
++			);
++		}
++	});
++
++	it('blocks variant: nested Object.create chain (grandchild → child → host) must NOT leak', function () {
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		try {
++			vm.run(`
++				const child = Object.create(hostObj);
++				const grand = Object.create(child);
++				grand.depthInjected = 'leaked';
++			`);
++		} catch (_) {
++			/* acceptable */
++		}
++
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, 'depthInjected'),
++			false,
++			'deep proto-chain writes must not surface on the host object',
++		);
++	});
++
++	it('blocks variant: Object.assign(child, src) where child inherits from host must NOT leak', function () {
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		try {
++			vm.run(`
++				const child = Object.create(hostObj);
++				Object.assign(child, { assignedKey: 'leaked' });
++			`);
++		} catch (_) {
++			/* acceptable */
++		}
++
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, 'assignedKey'),
++			false,
++			'Object.assign onto Object.create-child must not leak to host',
++		);
++	});
++
++	// ---- NEGATIVE CONTROL -----------------------------------------------------
++	// Sanity: legitimate proxy writes still work — direct property assignment on
++	// a host object handed to the sandbox should still mutate the host object.
++	// (Without this, our fix has gone too far and broken the embedder contract.)
++
++	it('negative-control: direct write proxy.x = v still mutates host object', function () {
++		const hostObj = { existing: 1 };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		vm.run(`hostObj.newField = 42;`);
++
++		assert.strictEqual(
++			hostObj.newField,
++			42,
++			'direct sandbox-side writes to the proxy must still mutate the host object',
++		);
++	});
++});
+
+--- /dev/null
++++ b/test/ghsa/GHSA-76w7-j9cq-rx2j/repro.js
+@@ -0,0 +1,188 @@
++'use strict';
++
++/**
++ * GHSA-76w7-j9cq-rx2j — Sandbox breakout via Promise species in localPromise
++ *                       swallow-tail.
++ *
++ * ## Vulnerability
++ * The `localPromise` constructor (added in GHSA-hw58-p9xv-2mjh) attaches a
++ * benign swallow tail via the cached host `then`:
++ *
++ *     apply(globalPromisePrototypeThen, this, [undefined, localPromiseSwallow]);
++ *
++ * The host `Promise.prototype.then` resolves the promise to use for the
++ * downstream chain via the **species protocol**: it reads
++ * `this.constructor[Symbol.species]` and `Construct`s a new promise with
++ * that. The sandbox-side `then` / `catch` / `Reflect.apply` overrides call
++ * `resetPromiseSpecies(this)` first to clobber `constructor` so species
++ * resolution always yields `localPromise` — but the swallow-tail call inside
++ * the constructor itself does NOT, because at construction time the
++ * `resetPromiseSpecies` symbol is in the temporal dead zone.
++ *
++ * Attack: build `class FakePromise extends Promise { static get
++ * [Symbol.species]() { return ct; } }` where `ct` is a user function. Then
++ * `new FakePromise(r => r())` enters the swallow-tail path → host `then`
++ * does `new ct(internalExecutor)` → the user-controlled `ct` receives V8's
++ * internal `(resolve, reject)` executor and reassigns them. When V8's
++ * `PromiseResolveThenableJob` rejects the downstream chain with a host-
++ * realm `RangeError` (triggered by a deep-recursion `e.stack` access), the
++ * raw host Error reaches sandbox code unbridged. Reading
++ * `ex.constructor.constructor` returns the host `Function` constructor →
++ * `Function("return process")()` → RCE.
++ *
++ * ## Fix
++ * Reset the promise species on `this` inside the `localPromise` constructor
++ * before invoking the host `then` for the swallow tail. With species pinned
++ * back to `localPromise`, the downstream child is constructed via our own
++ * wrapped executor — V8's reject path is bridged through `handleException`
++ * and the species-resolved constructor cannot be hijacked.
++ *
++ * ## Variants covered
++ * 1. Canonical PoC (binary-search RangeError via deep recursion).
++ * 2. Direct: any synchronously-rejected `new FakePromise()` whose species
++ *    is a user function — verify it cannot extract a host value.
++ * 3. `new FakePromise(reject-throws)`: the inner executor synchronously
++ *    throws a host-typed error; verify the rejection delivered to sandbox
++ *    `.catch()` is a sandbox-realm value, not host.
++ * 4. Stacked subclass: `class A extends FakePromise extends Promise`
++ *    — species walks the constructor inheritance chain; the reset must win
++ *    regardless of subclass depth.
++ */
++
++const assert = require('assert');
++const { VM } = require('../../../lib/main.js');
++
++if (typeof it.cond !== 'function') {
++	it.cond = function (name, cond, fn) {
++		return cond ? it(name, fn) : it.skip(name, fn);
++	};
++}
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++// Promise.withResolvers landed in Node 22; the canonical PoC uses it.
++const HAS_WITH_RESOLVERS = typeof Promise.withResolvers === 'function';
++
++describe('GHSA-76w7-j9cq-rx2j (Promise species swallow-tail breakout)', function () {
++	this.timeout(15000);
++
++	it.cond('canonical PoC: stack-overflow RangeError cannot reach sandbox unbridged', HAS_WITH_RESOLVERS, function (done) {
++		const vm = new VM({ timeout: 12000 });
++		try {
++			vm.run(`
++				class E extends Error {}
++				function so(d) {
++					if (d > 0) so(d-1);
++					const e = new E();
++					e.stack;
++					throw e;
++				}
++				let ex, ct;
++				class FakePromise extends Promise {
++					static get [Symbol.species](){return ct;}
++				}
++				function doCatch(f) {
++					ex=undefined;
++					const p=Promise.withResolvers();
++					ct = function(e){e(f, v=>{ex=v;p.resolve();})};
++					new FakePromise(r=>r());
++					return p.promise;
++				}
++				(async function f(s) {
++					let min = s;
++					let max = 100000;
++					while (min<max) {
++						const mid = (min+max)>>1;
++						await doCatch(()=>so(mid));
++						if (ex && ex.name==="RangeError" && !(ex instanceof RangeError)) {
++							// Escape succeeded: record the leak.
++							globalThis.__ghsa76w7_escape = true;
++							try {
++								globalThis.__ghsa76w7_procType =
++									typeof ex.constructor.constructor("return process")();
++							} catch(_) { /* still an escape even if Function ctor is blocked */ }
++							return;
++						}
++						if (ex instanceof E) {
++							min = mid+1;
++						} else {
++							max = mid;
++						}
++					}
++					if (s < 32) f(s+1);
++				})(0);
++			`);
++		} catch (e) {
++			// Synchronous throw is acceptable — that is the sandbox refusing.
++		}
++
++		// Give the binary search time to run.
++		setTimeout(function () {
++			const escaped = vm.run('globalThis.__ghsa76w7_escape === true');
++			const leakedProcessType = vm.run('globalThis.__ghsa76w7_procType');
++			assert.strictEqual(escaped, false, 'sandbox obtained a host-realm RangeError reference');
++			assert.notStrictEqual(leakedProcessType, 'object', 'sandbox extracted host process via Function constructor');
++			done();
++		}, 9000);
++	});
++
++	it.cond('species hijack via subclass cannot bind a user constructor as downstream species', HAS_WITH_RESOLVERS, function (done) {
++		// Variant: confirm that the species protocol invoked by the swallow
++		// tail does NOT pass through a sandbox-supplied `ct`. If our fix is
++		// effective, the species protocol resolves to `localPromise` and `ct`
++		// is never invoked at all.
++		const vm = new VM({ timeout: 5000 });
++		const ctCalled = vm.run(`
++			let ctInvocations = 0;
++			class FakePromise extends Promise {
++				static get [Symbol.species](){
++					return function(executor){
++						ctInvocations++;
++						executor(function(){}, function(){});
++					};
++				}
++			}
++			new FakePromise(function(r){ r(1); });
++			ctInvocations;
++		`);
++		assert.strictEqual(ctCalled, 0, 'species protocol invoked attacker-supplied constructor in swallow tail');
++		setTimeout(done, 300);
++	});
++
++	it.cond('deeply nested subclass cannot hijack species in the swallow tail', HAS_WITH_RESOLVERS, function (done) {
++		const vm = new VM({ timeout: 5000 });
++		const ctCalled = vm.run(`
++			let ctInvocations = 0;
++			class Fake1 extends Promise {
++				static get [Symbol.species](){
++					return function(executor){
++						ctInvocations++;
++						executor(function(){}, function(){});
++					};
++				}
++			}
++			class Fake2 extends Fake1 {}
++			class Fake3 extends Fake2 {}
++			new Fake3(function(r){ r(1); });
++			ctInvocations;
++		`);
++		assert.strictEqual(ctCalled, 0, 'subclass chain reached attacker-supplied species in swallow tail');
++		setTimeout(done, 300);
++	});
++
++	it('legitimate sandbox Promise subclass still works (no regression)', function (done) {
++		const vm = new VM({ timeout: 5000 });
++		// A benign subclass with no species override should chain normally.
++		const ok = vm.run(`
++			class MyPromise extends Promise {}
++			const p = new MyPromise(function(r){ r(42); });
++			p.then(function(v){ globalThis.__benign = v; });
++			true;
++		`);
++		assert.strictEqual(ok, true);
++		setTimeout(function () {
++			const v = vm.run('globalThis.__benign');
++			assert.strictEqual(v, 42, 'benign subclass chain did not deliver value');
++			done();
++		}, 300);
++	});
++});
+
+--- a/test/ghsa/GHSA-rp36-8xq3-r6c4/repro.js
++++ b/test/ghsa/GHSA-rp36-8xq3-r6c4/repro.js
+@@ -0,0 +1,175 @@
++'use strict';
++
++/**
++ * GHSA-rp36-8xq3-r6c4 — NodeVM builtin denylist bypass via `process` and `inspector/promises`
++ *
++ * ## Vulnerability
++ *
++ * The DANGEROUS_BUILTINS denylist in `lib/builtin.js` blocks `inspector`,
++ * `module`, `worker_threads`, `cluster`, `vm`, `repl`, `trace_events`, `wasi`.
++ *
++ * Two families are missed:
++ *   - `process`              — exposes `process.getBuiltinModule(name)`, which
++ *                              reloads ANY core module (including ones the
++ *                              embedder explicitly excluded with `-name`),
++ *                              plus `process.binding(...)`, `process.dlopen(...)`,
++ *                              and the host `process.env`.
++ *   - `inspector/promises`   — exact-match denylist on `inspector` does not
++ *                              cover subpath builtins; `Session().post(
++ *                              'Runtime.evaluate', { expression })` evaluates
++ *                              attacker JS in the host realm.
++ *
++ * Both are reachable as soon as the embedder allows them — typically via
++ * `builtin: ['*']` or an explicit allow-list that does not enumerate the
++ * subpath variant.
++ *
++ * ## Fix
++ *
++ * 1. Add `process` to DANGEROUS_BUILTINS (host process module is never safe
++ *    to expose; it carries `getBuiltinModule`, `binding`, `dlopen`, etc.).
++ * 2. Treat the denylist as a *family* check: any key whose `<family>/...`
++ *    prefix names a dangerous builtin is also blocked. This covers
++ *    `inspector/promises`, future `inspector/*` subpaths, and any future
++ *    subpaths under other dangerous families (`module/*`, `vm/*`, ...).
++ * 3. Normalize the optional `node:` prefix before checking, so
++ *    `require('node:process')` and `require('node:inspector/promises')`
++ *    cannot bypass via the alternative spelling.
++ */
++
++const assert = require('assert');
++const {NodeVM} = require('../../../');
++
++describe('GHSA-rp36-8xq3-r6c4 — NodeVM builtin denylist bypass', () => {
++
++	function makeVm() {
++		return new NodeVM({
++			require: {
++				external: false,
++				// The advisory's threat model: embedder allows the broad builtin
++				// surface and tries to surgically subtract the obviously-dangerous
++				// pieces.  The denylist must hold even under '*'.
++				builtin: ['*']
++			}
++		});
++	}
++
++	function expectBlocked(vm, expr, label) {
++		const result = vm.run(`
++			try {
++				const m = ${expr};
++				module.exports = { ok: false, type: typeof m };
++			} catch (e) {
++				module.exports = { ok: true, message: e && e.message };
++			}
++		`);
++		assert.strictEqual(result.ok, true,
++			`${label}: expected require to be blocked, but got module of type ${result.type}`);
++	}
++
++	it('require("process") is blocked', () => {
++		expectBlocked(makeVm(), "require('process')", "require('process')");
++	});
++
++	it('require("node:process") is blocked', () => {
++		expectBlocked(makeVm(), "require('node:process')", "require('node:process')");
++	});
++
++	it('require("inspector/promises") is blocked', () => {
++		expectBlocked(makeVm(), "require('inspector/promises')", "require('inspector/promises')");
++	});
++
++	it('require("node:inspector/promises") is blocked', () => {
++		expectBlocked(makeVm(), "require('node:inspector/promises')", "require('node:inspector/promises')");
++	});
++
++	it('require("inspector") remains blocked (regression guard)', () => {
++		expectBlocked(makeVm(), "require('inspector')", "require('inspector')");
++	});
++
++	it('process.getBuiltinModule bypass to child_process does not return a usable module', () => {
++		const vm = new NodeVM({
++			require: {
++				external: false,
++				builtin: ['*', '-child_process', '-inspector']
++			}
++		});
++		const result = vm.run(`
++			let processBlocked = false;
++			let bypassReached = false;
++			let execSyncReachable = false;
++			try {
++				const p = require('process');
++				try {
++					const cp = p.getBuiltinModule('child_process');
++					bypassReached = true;
++					execSyncReachable = typeof cp.execSync === 'function';
++				} catch (e) {}
++			} catch (e) {
++				processBlocked = true;
++			}
++			module.exports = { processBlocked, bypassReached, execSyncReachable };
++		`);
++		assert.strictEqual(result.processBlocked, true,
++			"require('process') must be blocked so the getBuiltinModule pivot cannot run");
++		assert.strictEqual(result.bypassReached, false,
++			"sandbox code must not reach process.getBuiltinModule()");
++		assert.strictEqual(result.execSyncReachable, false,
++			"sandbox code must not obtain a callable host child_process.execSync");
++	});
++
++	it('inspector/promises Session().post("Runtime.evaluate") is not reachable', () => {
++		const vm = new NodeVM({
++			require: {
++				external: false,
++				builtin: ['*', '-child_process', '-inspector']
++			}
++		});
++		const result = vm.run(`
++			let inspectorBlocked = false;
++			let sessionType = null;
++			try {
++				const ip = require('inspector/promises');
++				sessionType = typeof ip.Session;
++			} catch (e) {
++				inspectorBlocked = true;
++			}
++			module.exports = { inspectorBlocked, sessionType };
++		`);
++		assert.strictEqual(result.inspectorBlocked, true,
++			"require('inspector/promises') must be blocked");
++		assert.strictEqual(result.sessionType, null,
++			"sandbox must not obtain inspector/promises Session");
++	});
++
++	it('explicit allow-list naming a dangerous builtin is rejected', () => {
++		// makeBuiltins([...]) path: even if the embedder writes
++		// builtin: ['process'] explicitly, the denylist must still hold.
++		const vm = new NodeVM({
++			require: {
++				external: false,
++				builtin: ['process', 'inspector/promises']
++			}
++		});
++		expectBlocked(vm, "require('process')", "explicit process allowlist");
++		expectBlocked(vm, "require('inspector/promises')", "explicit inspector/promises allowlist");
++	});
++
++	it('safe builtins still load under "*"', () => {
++		// Regression guard: the family-prefix check must not break sibling
++		// builtins like fs/promises, dns/promises, stream/promises, etc.
++		const vm = makeVm();
++		const result = vm.run(`
++			const fsp = require('fs/promises');
++			const dnsp = require('dns/promises');
++			const sp = require('stream/promises');
++			module.exports = {
++				fsp: typeof fsp.readFile,
++				dnsp: typeof dnsp.lookup,
++				sp: typeof sp.pipeline
++			};
++		`);
++		assert.strictEqual(result.fsp, 'function');
++		assert.strictEqual(result.dnsp, 'function');
++		assert.strictEqual(result.sp, 'function');
++	});
++});
