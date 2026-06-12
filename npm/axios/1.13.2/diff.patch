@@ -472,8 +472,6 @@
  ].forEach(code => {
    descriptors[code] = {value: code};
 
-
-
 --- a/lib/helpers/resolveConfig.js
 +++ b/lib/helpers/resolveConfig.js
 @@ -44,10 +44,18 @@
@@ -807,3 +805,366 @@
      if (validator) {
        const value = options[opt];
        const result = value === undefined || validator(value, opt, options);
+
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index a5ec91b..39076e0 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -179,7 +179,7 @@ function dispatchBeforeRedirect(options, responseDetails) {
+  *
+  * @returns {http.ClientRequestArgs}
+  */
+-function setProxy(options, configProxy, location) {
++function setProxy(options, configProxy, location, isRedirect) {
+   let proxy = configProxy;
+   if (!proxy && proxy !== false) {
+     const proxyUrl = proxyFromEnv.getProxyForUrl(location);
+@@ -189,6 +189,17 @@ function setProxy(options, configProxy, location) {
+       }
+     }
+   }
++  // On redirect re-invocation, strip any stale Proxy-Authorization header carried
++  // over from the prior request (e.g. new target no longer uses a proxy, or uses
++  // a different proxy). Skip on the initial request so user-supplied headers are
++  // preserved. Header names are case-insensitive, so remove every case variant.
++  if (isRedirect && options.headers) {
++    for (const name of Object.keys(options.headers)) {
++      if (name.toLowerCase() === 'proxy-authorization') {
++        delete options.headers[name];
++      }
++    }
++  }
+   if (proxy) {
+     // Basic proxy authorization
+     if (proxy.username) {
+@@ -221,7 +232,7 @@ function setProxy(options, configProxy, location) {
+   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
+     // Configure proxy for redirected request, passing the original config proxy to apply
+     // the exact same logic as if the redirected request was performed by axios directly.
+-    setProxy(redirectOptions, configProxy, redirectOptions.href);
++    setProxy(redirectOptions, configProxy, redirectOptions.href, true);
+   };
+ }
+ 
+
+diff --git a/lib/adapters/fetch.js b/lib/adapters/fetch.js
+index e2e90f6..d38a028 100644
+--- a/lib/adapters/fetch.js
++++ b/lib/adapters/fetch.js
+@@ -7,6 +7,7 @@ import AxiosHeaders from "../core/AxiosHeaders.js";
+ import {progressEventReducer, progressEventDecorator, asyncDecorator} from "../helpers/progressEventReducer.js";
+ import resolveConfig from "../helpers/resolveConfig.js";
+ import settle from "../core/settle.js";
++import estimateDataURLDecodedBytes from "../helpers/estimateDataURLDecodedBytes.js";
+ 
+ const DEFAULT_CHUNK_SIZE = 64 * 1024;
+ 
+@@ -135,9 +136,14 @@ const factory = (env) => {
+       responseType,
+       headers,
+       withCredentials = 'same-origin',
+-      fetchOptions
++      fetchOptions,
++      maxContentLength,
++      maxBodyLength
+     } = resolveConfig(config);
+ 
++    const hasMaxContentLength = utils.isNumber(maxContentLength) && maxContentLength > -1;
++    const hasMaxBodyLength = utils.isNumber(maxBodyLength) && maxBodyLength > -1;
++
+     let _fetch = envFetch || fetch;
+ 
+     responseType = responseType ? (responseType + '').toLowerCase() : 'text';
+@@ -153,6 +159,38 @@ const factory = (env) => {
+     let requestContentLength;
+ 
+     try {
++      // Enforce maxContentLength for data: URLs up-front so we never materialize
++      // an oversized payload. The HTTP adapter applies the same check (see http.js
++      // "if (protocol === 'data:')" branch).
++      if (hasMaxContentLength && typeof url === 'string' && url.startsWith('data:')) {
++        const estimated = estimateDataURLDecodedBytes(url);
++        if (estimated > maxContentLength) {
++          throw new AxiosError(
++            'maxContentLength size of ' + maxContentLength + ' exceeded',
++            AxiosError.ERR_BAD_RESPONSE,
++            config,
++            request
++          );
++        }
++      }
++
++      // Enforce maxBodyLength against the outbound request body before dispatch.
++      if (hasMaxBodyLength && method !== 'get' && method !== 'head') {
++        const outboundLength = await resolveBodyLength(headers, data);
++        if (
++          typeof outboundLength === 'number' &&
++          isFinite(outboundLength) &&
++          outboundLength > maxBodyLength
++        ) {
++          throw new AxiosError(
++            'Request body larger than maxBodyLength limit',
++            AxiosError.ERR_BAD_REQUEST,
++            config,
++            request
++          );
++        }
++      }
++
+       if (
+         onUploadProgress && supportsRequestStream && method !== 'get' && method !== 'head' &&
+         (requestContentLength = await resolveBodyLength(headers, data)) !== 0
+@@ -201,9 +239,24 @@ const factory = (env) => {
+ 
+       let response = await (isRequestSupported ? _fetch(request, fetchOptions) : _fetch(url, resolvedOptions));
+ 
++      if (hasMaxContentLength) {
++        const declaredLength = utils.toFiniteNumber(response.headers.get('content-length'));
++        if (declaredLength != null && declaredLength > maxContentLength) {
++          throw new AxiosError(
++            'maxContentLength size of ' + maxContentLength + ' exceeded',
++            AxiosError.ERR_BAD_RESPONSE,
++            config,
++            request
++          );
++        }
++      }
++
+       const isStreamResponse = supportsResponseStream && (responseType === 'stream' || responseType === 'response');
+ 
+-      if (supportsResponseStream && (onDownloadProgress || (isStreamResponse && unsubscribe))) {
++      if (
++        supportsResponseStream && response.body &&
++        (onDownloadProgress || hasMaxContentLength || (isStreamResponse && unsubscribe))
++      ) {
+         const options = {};
+ 
+         ['status', 'statusText', 'headers'].forEach(prop => {
+@@ -218,7 +271,24 @@ const factory = (env) => {
+         ) || [];
+ 
+         response = new Response(
+-          trackStream(response.body, DEFAULT_CHUNK_SIZE, onProgress, () => {
++        let bytesRead = 0;
++        const onChunkProgress = (loadedBytes) => {
++          if (hasMaxContentLength) {
++            bytesRead = loadedBytes;
++            if (bytesRead > maxContentLength) {
++              throw new AxiosError(
++                'maxContentLength size of ' + maxContentLength + ' exceeded',
++                AxiosError.ERR_BAD_RESPONSE,
++                config,
++                request
++              );
++            }
++          }
++          onProgress && onProgress(loadedBytes);
++        };
++
++        response = new Response(
++          trackStream(response.body, DEFAULT_CHUNK_SIZE, onChunkProgress, () => {
+             flush && flush();
+             unsubscribe && unsubscribe();
+           }),
+@@ -230,6 +300,30 @@ const factory = (env) => {
+ 
+       let responseData = await resolvers[utils.findKey(resolvers, responseType) || 'text'](response, config);
+ 
++      if (hasMaxContentLength && !supportsResponseStream && !isStreamResponse) {
++        let materializedSize;
++        if (responseData != null) {
++          if (typeof responseData.byteLength === 'number') {
++            materializedSize = responseData.byteLength;
++          } else if (typeof responseData.size === 'number') {
++            materializedSize = responseData.size;
++          } else if (typeof responseData === 'string') {
++            materializedSize =
++              typeof TextEncoder === 'function'
++                ? new TextEncoder().encode(responseData).byteLength
++                : responseData.length;
++          }
++        }
++        if (typeof materializedSize === 'number' && materializedSize > maxContentLength) {
++          throw new AxiosError(
++            'maxContentLength size of ' + maxContentLength + ' exceeded',
++            AxiosError.ERR_BAD_RESPONSE,
++            config,
++            request
++          );
++        }
++      }
++
+       !isStreamResponse && unsubscribe && unsubscribe();
+ 
+       return await new Promise((resolve, reject) => {
+diff --git a/lib/helpers/estimateDataURLDecodedBytes.js b/lib/helpers/estimateDataURLDecodedBytes.js
+index f29a817..5e2c497 100644
+--- a/lib/helpers/estimateDataURLDecodedBytes.js
++++ b/lib/helpers/estimateDataURLDecodedBytes.js
+@@ -69,5 +69,28 @@ export default function estimateDataURLDecodedBytes(url) {
+     return bytes > 0 ? bytes : 0;
+   }
+ 
+-  return Buffer.byteLength(body, 'utf8');
++  if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') {
++    return Buffer.byteLength(body, 'utf8');
++  }
++
++  let bytes = 0;
++  for (let i = 0, len = body.length; i < len; i++) {
++    const c = body.charCodeAt(i);
++    if (c < 0x80) {
++      bytes += 1;
++    } else if (c < 0x800) {
++      bytes += 2;
++    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < len) {
++      const next = body.charCodeAt(i + 1);
++      if (next >= 0xdc00 && next <= 0xdfff) {
++        bytes += 4;
++        i++;
++      } else {
++        bytes += 3;
++      }
++    } else {
++      bytes += 3;
++    }
++  }
++  return bytes;
+ }
+
+diff --git a/lib/helpers/shouldBypassProxy.js b/lib/helpers/shouldBypassProxy.js
+index 95a85e1..802fdf2 100644
+--- a/lib/helpers/shouldBypassProxy.js
++++ b/lib/helpers/shouldBypassProxy.js
+@@ -45,6 +45,27 @@ const isLoopback = (host) => {
+   return isIPv6Loopback(host);
+ };
+ 
++
++const IPV4_MAPPED_DOTTED_RE = /^(?:::|(?:0{1,4}:){1,4}:|(?:0{1,4}:){5})ffff:(\d+\.\d+\.\d+\.\d+)$/i;
++const IPV4_MAPPED_HEX_RE = /^(?:::|(?:0{1,4}:){1,4}:|(?:0{1,4}:){5})ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i;
++
++function unmapIPv4MappedIPv6(hostname) {
++  if (typeof hostname !== 'string' || hostname.indexOf(':') === -1) {
++    return hostname;
++  }
++  const dotted = hostname.match(IPV4_MAPPED_DOTTED_RE);
++  if (dotted) {
++    return dotted[1];
++  }
++  const hex = hostname.match(IPV4_MAPPED_HEX_RE);
++  if (hex) {
++    const high = parseInt(hex[1], 16);
++    const low = parseInt(hex[2], 16);
++    return ((high >> 8) & 0xff) + '.' + (high & 0xff) + '.' + ((low >> 8) & 0xff) + '.' + (low & 0xff);
++  }
++  return hostname;
++}
++
+ const DEFAULT_PORTS = {
+   http: 80,
+   https: 443,
+@@ -96,7 +117,7 @@ const normalizeNoProxyHost = (hostname) => {
+     hostname = hostname.slice(1, -1);
+   }
+ 
+-  return hostname.replace(/\.+$/, '');
++  return unmapIPv4MappedIPv6(hostname.replace(/\.+$/, ''));
+ };
+ 
+ export default function shouldBypassProxy(location) {
+
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+index 39076e0..53fce3a 100755
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -201,31 +201,40 @@ function setProxy(options, configProxy, location, isRedirect) {
+     }
+   }
+   if (proxy) {
+-    // Basic proxy authorization
+-    if (proxy.username) {
+-      proxy.auth = (proxy.username || '') + ':' + (proxy.password || '');
++    const isProxyURL = proxy instanceof URL;
++    const readProxyField = (key) =>
++      isProxyURL || utils.hasOwnProp(proxy, key) ? proxy[key] : undefined;
++
++    const proxyUsername = readProxyField('username');
++    const proxyPassword = readProxyField('password');
++    let proxyAuth = utils.hasOwnProp(proxy, 'auth') ? proxy.auth : undefined;
++
++    if (proxyUsername) {
++      proxyAuth = (proxyUsername || '') + ':' + (proxyPassword || '');
+     }
+ 
+-    if (proxy.auth) {
+-      // Support proxy auth object form
+-      if (proxy.auth.username || proxy.auth.password) {
+-        proxy.auth = (proxy.auth.username || '') + ':' + (proxy.auth.password || '');
++    if (proxyAuth) {
++      const authIsObject = typeof proxyAuth === 'object';
++      const authUsername = authIsObject && utils.hasOwnProp(proxyAuth, 'username') ? proxyAuth.username : undefined;
++      const authPassword = authIsObject && utils.hasOwnProp(proxyAuth, 'password') ? proxyAuth.password : undefined;
++      if (authUsername || authPassword) {
++        proxyAuth = (authUsername || '') + ':' + (authPassword || '');
+       }
+       const base64 = Buffer
+-        .from(proxy.auth, 'utf8')
++        .from(proxyAuth, 'utf8')
+         .toString('base64');
+       options.headers['Proxy-Authorization'] = 'Basic ' + base64;
+     }
+ 
+     options.headers.host = options.hostname + (options.port ? ':' + options.port : '');
+-    const proxyHost = proxy.hostname || proxy.host;
++    const proxyHost = readProxyField('hostname') || readProxyField('host');
+     options.hostname = proxyHost;
+-    // Replace 'host' since options is not a URL object
+     options.host = proxyHost;
+-    options.port = proxy.port;
++    options.port = readProxyField('port');
+     options.path = location;
+-    if (proxy.protocol) {
+-      options.protocol = proxy.protocol.includes(':') ? proxy.protocol : `${proxy.protocol}:`;
++    const proxyProtocol = readProxyField('protocol');
++    if (proxyProtocol) {
++      options.protocol = proxyProtocol.includes(':') ? proxyProtocol : `${proxyProtocol}:`;
+     }
+   }
+ 
+diff --git a/lib/core/mergeConfig.js b/lib/core/mergeConfig.js
+index 4a1f1ec..9cc0113 100644
+--- a/lib/core/mergeConfig.js
++++ b/lib/core/mergeConfig.js
+@@ -113,7 +113,9 @@ export default function mergeConfig(config1, config2) {
+       return;
+     }
+     const merge = utils.hasOwnProp(mergeMap, prop) ? mergeMap[prop] : mergeDeepProperties;
+-    const configValue = merge(config1[prop], config2[prop], prop);
++    const a = utils.hasOwnProp(config1, prop) ? config1[prop] : undefined;
++    const b = utils.hasOwnProp(config2, prop) ? config2[prop] : undefined;
++    const configValue = merge(a, b, prop);
+     (utils.isUndefined(configValue) && merge !== mergeDirectKeys) || (config[prop] = configValue);
+   });
+ 
+diff --git a/lib/helpers/resolveConfig.js b/lib/helpers/resolveConfig.js
+index c9f0c39..22fec17 100644
+--- a/lib/helpers/resolveConfig.js
++++ b/lib/helpers/resolveConfig.js
+@@ -20,13 +20,15 @@ export default (config) => {
+   const xsrfCookieName = own('xsrfCookieName');
+   let headers = own('headers');
+   const auth = own('auth');
++  const params = utils.hasOwnProp(config, 'params') ? config.params : undefined;
++  const paramsSerializer = utils.hasOwnProp(config, 'paramsSerializer') ? config.paramsSerializer : undefined;
+   const baseURL = own('baseURL');
+   const allowAbsoluteUrls = own('allowAbsoluteUrls');
+   const url = own('url');
+ 
+   newConfig.headers = headers = AxiosHeaders.from(headers);
+ 
+-  newConfig.url = buildURL(buildFullPath(baseURL, url, allowAbsoluteUrls), config.params, config.paramsSerializer);
++  newConfig.url = buildURL(buildFullPath(baseURL, url, allowAbsoluteUrls), params, paramsSerializer);
+ 
+   // HTTP basic authentication
+   if (auth) {
