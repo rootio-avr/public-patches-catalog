@@ -4,12 +4,14 @@ This patch is based on vm2 version 3.11.3, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-47139
+- CVE-2026-47131
 - CVE-2026-47135
 - CVE-2026-47137
-- CVE-2026-47209
-- CVE-2026-47208
+- CVE-2026-47139
 - CVE-2026-47140
+- CVE-2026-47208
+- CVE-2026-47209
+- CVE-2026-47210
 
 ## How to Apply:
 1. Clone or download the source code for vm2
