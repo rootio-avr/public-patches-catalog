@@ -1,0 +1,802 @@
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/ProducerBatch.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/ProducerBatch.java
+@@ -72,6 +72,9 @@
+     private final AtomicInteger attempts = new AtomicInteger(0);
+     private final boolean isSplitBatch;
+     private final AtomicReference<FinalState> finalState = new AtomicReference<>(null);
++    private boolean bufferDeallocated = false;
++    // Tracks if the batch has been sent to the NetworkClient
++    private boolean inflight = false;
+ 
+     int recordCount;
+     int maxRecordSize;
+@@ -555,6 +558,22 @@
+         return reopened;
+     }
+ 
++    public boolean isBufferDeallocated() {
++        return bufferDeallocated;
++    }
++
++    public void markBufferDeallocated() {
++        bufferDeallocated = true;
++    }
++
++    public boolean isInflight() {
++        return inflight;
++    }
++
++    public void setInflight(boolean inflight) {
++        this.inflight = inflight;
++    }
++
+     // VisibleForTesting
+     OptionalInt currentLeaderEpoch() {
+         return currentLeaderEpoch;
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
+@@ -1045,14 +1045,39 @@
+     }
+ 
+     /**
+-     * Deallocate the record batch
++     * Complete and deallocate the record batch
++     */
++    public void completeAndDeallocateBatch(ProducerBatch batch) {
++        completeBatch(batch);
++        deallocate(batch);
++    }
++
++    /**
++     * Only perform deallocation (and not removal from the incomplete set)
+      */
+     public void deallocate(ProducerBatch batch) {
+-        incomplete.remove(batch);
+         // Only deallocate the batch if it is not a split batch because split batch are allocated outside the
+         // buffer pool.
+-        if (!batch.isSplitBatch())
+-            free.deallocate(batch.buffer(), batch.initialCapacity());
++        if (!batch.isSplitBatch()) {
++            if (batch.isBufferDeallocated()) {
++                log.warn("Skipping deallocating a batch that has already been deallocated. Batch is {}, created time is {}", batch, batch.createdMs);
++            } else {
++                batch.markBufferDeallocated();
++                if (batch.isInflight()) {
++                    // Create a fresh ByteBuffer to give to BufferPool to reuse since we can't safely call deallocate with the ProduceBatch's buffer
++                    free.deallocate(ByteBuffer.allocate(batch.initialCapacity()));
++                    throw new IllegalStateException("Attempting to deallocate a batch that is inflight. Batch is " + batch);
++                }
++                free.deallocate(batch.buffer(), batch.initialCapacity());
++            }
++        }
++    }
++
++    /**
++     * Remove from the incomplete list but do not free memory yet
++     */
++    public void completeBatch(ProducerBatch batch) {
++        incomplete.remove(batch);
+     }
+ 
+     /**
+@@ -1140,7 +1165,14 @@
+                 dq.remove(batch);
+             }
+             batch.abort(reason);
+-            deallocate(batch);
++            if (batch.isInflight()) {
++                // KAFKA-19012: if the batch has been sent it might still be in use by the network client so we cannot allow it to be reused yet.
++                // We skip deallocating it now. When the request in network client completes with a response, either Sender.completeBatch() or
++                // Sender.failBatch() will be called with deallocateBatch=true. The buffer associated with the batch will be deallocated then.
++                completeBatch(batch);
++            } else {
++                completeAndDeallocateBatch(batch);
++            }
+         }
+     }
+ 
+@@ -1164,7 +1196,7 @@
+             }
+             if (aborted) {
+                 batch.abort(reason);
+-                deallocate(batch);
++                completeAndDeallocateBatch(batch);
+             }
+         }
+     }
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
+@@ -178,7 +178,12 @@
+ 
+     private void maybeRemoveAndDeallocateBatch(ProducerBatch batch) {
+         maybeRemoveFromInflightBatches(batch);
+-        this.accumulator.deallocate(batch);
++        this.accumulator.completeAndDeallocateBatch(batch);
++    }
++
++    private void maybeRemoveAndDeallocateBatchLater(ProducerBatch batch) {
++        maybeRemoveFromInflightBatches(batch);
++        this.accumulator.completeBatch(batch);
+     }
+ 
+     /**
+@@ -362,6 +367,23 @@
+         return false;
+     }
+ 
++    private void failExpiredBatches(List<ProducerBatch> expiredBatches, long now, boolean deallocateBuffer) {
++        // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
++        // for expired batches. see the documentation of @TransactionState.resetIdempotentProducerId to understand why
++        // we need to reset the producer id here.
++        if (!expiredBatches.isEmpty())
++            log.trace("Expired {} batches in accumulator", expiredBatches.size());
++        for (ProducerBatch expiredBatch : expiredBatches) {
++            String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
++                + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation";
++            failBatch(expiredBatch, new TimeoutException(errorMessage), false, deallocateBuffer);
++            if (transactionManager != null && expiredBatch.inRetry()) {
++                // This ensures that no new batches are drained until the current in flight batches are fully resolved.
++                transactionManager.markSequenceUnresolved(expiredBatch);
++            }
++        }
++    }
++
+     private long sendProducerData(long now) {
+         MetadataSnapshot metadataSnapshot = metadata.fetchMetadataSnapshot();
+         // get the list of partitions with data ready to send
+@@ -413,22 +436,10 @@
+         accumulator.resetNextBatchExpiryTime();
+         List<ProducerBatch> expiredInflightBatches = getExpiredInflightBatches(now);
+         List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(now);
+-        expiredBatches.addAll(expiredInflightBatches);
+ 
+-        // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
+-        // for expired batches. see the documentation of @TransactionState.resetIdempotentProducerId to understand why
+-        // we need to reset the producer id here.
+-        if (!expiredBatches.isEmpty())
+-            log.trace("Expired {} batches in accumulator", expiredBatches.size());
+-        for (ProducerBatch expiredBatch : expiredBatches) {
+-            String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
+-                + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation";
+-            failBatch(expiredBatch, new TimeoutException(errorMessage), false);
+-            if (transactionManager != null && expiredBatch.inRetry()) {
+-                // This ensures that no new batches are drained until the current in flight batches are fully resolved.
+-                transactionManager.markSequenceUnresolved(expiredBatch);
+-            }
+-        }
++        failExpiredBatches(expiredBatches, now, true);
++        failExpiredBatches(expiredInflightBatches, now, false);
++
+         sensors.updateProduceRequestMetrics(batches);
+ 
+         // If we have any nodes that are ready to send + have sendable data, poll with 0 timeout so this can immediately
+@@ -537,6 +556,7 @@
+     private void maybeAbortBatches(RuntimeException exception) {
+         if (accumulator.hasIncomplete()) {
+             log.error("Aborting producer batches due to fatal error", exception);
+             accumulator.abortBatches(exception);
++            inFlightBatches.clear();
+         }
+     }
+@@ -664,5 +684,6 @@
+     private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response, long correlationId,
+                                long now, Map<TopicPartition, Metadata.LeaderIdAndEpoch> partitionsWithUpdatedLeaderInfo) {
++        batch.setInflight(false);
+         Errors error = response.error;
+ 
+         if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && !batch.isDone() &&
+@@ -703,7 +724,7 @@
+                 // tell the user the result of their request. We only adjust sequence numbers if the batch didn't exhaust
+                 // its retries -- if it did, we don't know whether the sequence number was accepted or not, and
+                 // thus it is not safe to reassign the sequence.
+-                failBatch(batch, response, batch.attempts() < this.retries);
++                failBatch(batch, response, batch.attempts() < this.retries, true);
+             }
+             if (error.exception() instanceof InvalidMetadataException) {
+                 if (error.exception() instanceof UnknownTopicOrPartitionException) {
+@@ -748,12 +769,16 @@
+ 
+         if (batch.complete(response.baseOffset, response.logAppendTime)) {
+             maybeRemoveAndDeallocateBatch(batch);
++        } else {
++            // Always safe to call deallocate because the batch keeps track of whether or not it was deallocated yet
++            this.accumulator.deallocate(batch);
+         }
+     }
+ 
+     private void failBatch(ProducerBatch batch,
+                            ProduceResponse.PartitionResponse response,
+-                           boolean adjustSequenceNumbers) {
++                           boolean adjustSequenceNumbers,
++                           boolean deallocateBatch) {
+         final RuntimeException topLevelException;
+         if (response.error == Errors.TOPIC_AUTHORIZATION_FAILED)
+             topLevelException = new TopicAuthorizationException(Collections.singleton(batch.topicPartition.topic()));
+@@ -770,6 +795,6 @@
+ 
+         if (response.recordErrors == null || response.recordErrors.isEmpty()) {
+-            failBatch(batch, topLevelException, adjustSequenceNumbers);
++            failBatch(batch, topLevelException, adjustSequenceNumbers, deallocateBatch);
+         } else {
+             Map<Integer, RuntimeException> recordErrorMap = new HashMap<>(response.recordErrors.size());
+             for (ProduceResponse.RecordError recordError : response.recordErrors) {
+@@ -809,23 +834,25 @@
+                 }
+             };
+ 
+-            failBatch(batch, topLevelException, recordExceptions, adjustSequenceNumbers);
++            failBatch(batch, topLevelException, recordExceptions, adjustSequenceNumbers, deallocateBatch);
+         }
+     }
+ 
+     private void failBatch(
+         ProducerBatch batch,
+         RuntimeException topLevelException,
+-        boolean adjustSequenceNumbers
++        boolean adjustSequenceNumbers,
++        boolean deallocateBatch
+     ) {
+-        failBatch(batch, topLevelException, batchIndex -> topLevelException, adjustSequenceNumbers);
++        failBatch(batch, topLevelException, batchIndex -> topLevelException, adjustSequenceNumbers, deallocateBatch);
+     }
+ 
+     private void failBatch(
+         ProducerBatch batch,
+         RuntimeException topLevelException,
+         Function<Integer, RuntimeException> recordExceptions,
+-        boolean adjustSequenceNumbers
++        boolean adjustSequenceNumbers,
++        boolean deallocateBatch
+     ) {
+         this.sensors.recordErrors(batch.topicPartition.topic(), batch.recordCount);
+ 
+@@ -839,7 +866,20 @@
+                     log.debug("Encountered error when transaction manager was handling a failed batch", e);
+                 }
+             }
+-            maybeRemoveAndDeallocateBatch(batch);
++            if (deallocateBatch) {
++                maybeRemoveAndDeallocateBatch(batch);
++            } else {
++                // Fix for KAFKA-19012
++                // The pooled ByteBuffer associated with this batch might still be in use by the network client so we
++                // cannot allow it to be reused yet. We skip deallocating it now. When the request in the network client
++                // completes with a response, either completeBatch() or failBatch() will be called with deallocateBatch=true.
++                // The buffer associated with the batch will be deallocated then.
++                maybeRemoveAndDeallocateBatchLater(batch);
++            }
++        } else {
++            if (deallocateBatch) {
++                this.accumulator.deallocate(batch);
++            }
+         }
+     }
+ 
+@@ -899,7 +939,8 @@
+             tpData.partitionData().add(new ProduceRequestData.PartitionProduceData()
+                     .setIndex(tp.partition())
+                     .setRecords(records));
+             recordsByPartition.put(tp, batch);
++            batch.setInflight(true);
+         }
+ 
+         String transactionalId = null;
+--- a/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java
++++ b/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java
+@@ -402,7 +402,7 @@
+                 for (ProducerBatch batch : batches) {
+                     for (Record record : batch.records().records())
+                         read++;
+-                    accum.deallocate(batch);
++                    accum.completeAndDeallocateBatch(batch);
+                 }
+             }
+         }
+@@ -666,7 +666,7 @@
+ 
+         for (List<ProducerBatch> batches: results.values())
+             for (ProducerBatch batch: batches)
+-                accum.deallocate(batch);
++                accum.completeAndDeallocateBatch(batch);
+ 
+         // should be complete with no unsent records.
+         accum.awaitFlushCompletion();
+@@ -1631,6 +1631,6 @@
+         ProducerBatch batch = batches.values().iterator().next().get(0);
+         int numSplitBatches = accum.splitAndReenqueue(batch);
+-        accum.deallocate(batch);
++        accum.completeAndDeallocateBatch(batch);
+ 
+         return numSplitBatches;
+     }
+@@ -1655,7 +1655,7 @@
+                     } else {
+                         batch.complete(0L, 0L);
+                     }
+-                    accum.deallocate(batch);
++                    accum.completeAndDeallocateBatch(batch);
+                 }
+             }
+         } while (batchDrained);
+--- a/clients/src/test/java/org/apache/kafka/clients/producer/internals/SenderTest.java
++++ b/clients/src/test/java/org/apache/kafka/clients/producer/internals/SenderTest.java
+@@ -124,4 +124,5 @@
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNotSame;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertSame;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+@@ -2243,7 +2244,10 @@
+     public void testCancelInFlightRequestAfterFatalError() throws Exception {
+         final long producerId = 343434L;
+         TransactionManager transactionManager = createTransactionManager();
+-        setupWithTransactionState(transactionManager);
++        long totalSize = 1024 * 1024;
++        String metricGrpName = "producer-custom-metrics";
++        MatchingBufferPool pool = new MatchingBufferPool(totalSize, batchSize, metrics, time, metricGrpName);
++        setupWithTransactionState(transactionManager, false, pool);
+ 
+         prepareAndReceiveInitProducerId(producerId, Errors.NONE);
+         assertTrue(transactionManager.hasProducerId());
+@@ -2255,6 +2259,8 @@
+         Future<RecordMetadata> future2 = appendToAccumulator(tp1);
+         sender.runOnce();
+ 
++        assertFalse(pool.allMatch());
++
+         client.respond(
+             body -> body instanceof ProduceRequest && RequestTestUtils.hasIdempotentRecords((ProduceRequest) body),
+             produceResponse(tp0, -1, Errors.CLUSTER_AUTHORIZATION_FAILED, 0));
+@@ -2265,12 +2271,14 @@
+ 
+         sender.runOnce();
+         assertFutureFailure(future2, ClusterAuthorizationException.class);
++        assertFalse(pool.allMatch(), "Batch should not be deallocated before the response is received");
+ 
+         // Should be fine if the second response eventually returns
+         client.respond(
+             body -> body instanceof ProduceRequest && RequestTestUtils.hasIdempotentRecords((ProduceRequest) body),
+             produceResponse(tp1, 0, Errors.NONE, 0));
+         sender.runOnce();
++        assertTrue(pool.allMatch(), "The batch should have been de-allocated");
+     }
+ 
+     @Test
+@@ -2486,12 +2494,15 @@
+             assertEquals(ApiKeys.PRODUCE, client.requests().peek().requestBuilder().apiKey());
+             Node node = new Node(Integer.parseInt(id), "localhost", 0);
+             assertEquals(1, client.inFlightRequestCount());
++            ProducerBatch inflightBatch = sender.inFlightBatches(tp).get(0);
++            assertTrue(inflightBatch.isInflight(), "Batch should be marked inflight after being sent");
+             assertTrue(client.isReady(node, time.milliseconds()), "Client ready status should be true");
+ 
+             Map<TopicPartition, ProduceResponse.PartitionResponse> responseMap = new HashMap<>();
+             responseMap.put(tp, new ProduceResponse.PartitionResponse(Errors.MESSAGE_TOO_LARGE));
+             client.respond(new ProduceResponse(responseMap));
+             sender.runOnce(); // split and reenqueue
++            assertFalse(inflightBatch.isInflight(), "Batch should be marked as not inflight after being split and re-enqueued");
+             assertEquals(2, txnManager.sequenceNumber(tp), "The next sequence should be 2");
+             // The compression ratio should have been improved once.
+             assertEquals(CompressionType.GZIP.rate - CompressionRatioEstimator.COMPRESSION_RATIO_IMPROVING_STEP,
+@@ -2549,14 +2560,16 @@
+         sender.runOnce();  // send request
+         assertEquals(1, client.inFlightRequestCount());
+         assertEquals(1, sender.inFlightBatches(tp0).size());
++        assertFalse(sender.inFlightBatches(tp0).get(0).isBufferDeallocated(), "Buffer not deallocated yet");
++        ProducerBatch inflightBatch = sender.inFlightBatches(tp0).get(0);
+ 
+         time.sleep(REQUEST_TIMEOUT);
+         assertFalse(pool.allMatch());
+ 
+-        sender.runOnce();  // expire the batch
++        sender.runOnce();  // times out the request
+         assertTrue(request1.isDone());
++        assertTrue(inflightBatch.isBufferDeallocated(), "Buffer should be deallocated after request timeout");
+         assertTrue(pool.allMatch(), "The batch should have been de-allocated");
+-        assertTrue(pool.allMatch());
+ 
+         sender.runOnce();
+         assertTrue(pool.allMatch(), "The batch should have been de-allocated");
+@@ -3523,6 +3536,38 @@
+         }
+     }
+ 
++    @Test
++    public void testNoBufferReuseWhenBatchExpires() throws Exception {
++        long totalSize = 1024 * 1024;
++        try (Metrics m = new Metrics()) {
++            BufferPool pool = new BufferPool(totalSize, batchSize, m, time, "producer-internal-metrics");
++
++            // Allocate and store a poolable buffer, then return it to the pool so the Sender can pick it up
++            ByteBuffer buffer = pool.allocate(batchSize, 0);
++            pool.deallocate(buffer);
++
++            setupWithTransactionState(null, false, pool);
++            appendToAccumulator(tp0, 0L, "key", "value");
++            sender.runOnce();  // connect
++            sender.runOnce();  // send produce request
++
++            assertEquals(1, client.inFlightRequestCount());
++            assertEquals(1, sender.inFlightBatches(tp0).size());
++
++            ProducerBatch batch = sender.inFlightBatches(tp0).get(0);
++            // Validate the backing array of the buffer is the same as the pooled one from the start
++            assertSame(buffer.array(), batch.records().buffer().array(), "Sender should have allocated the same buffer we created");
++
++            time.sleep(DELIVERY_TIMEOUT_MS + 100);
++            sender.runOnce();
++
++            ByteBuffer newBuffer = pool.allocate(batchSize, 0);
++
++            // TEST buffer should not be reused
++            assertNotSame(buffer.array(), newBuffer.array(), "Buffer should not be reused");
++        }
++    }
++
+ 
+     private void verifyErrorMessage(ProduceResponse response, String expectedMessage) throws Exception {
+         Future<RecordMetadata> future = appendToAccumulator(tp0, 0L, "key", "value");
+
+--- a/clients/src/main/java/org/apache/kafka/common/requests/AbstractRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/AbstractRequest.java
+@@ -136,7 +136,7 @@
+     }
+ 
+     @Override
+-    public final String toString() {
++    public String toString() {
+         return toString(true);
+     }
+ 
+--- a/clients/src/main/java/org/apache/kafka/common/requests/AlterConfigsRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/AlterConfigsRequest.java
+@@ -88,6 +88,11 @@
+         public AlterConfigsRequest build(short version) {
+             return new AlterConfigsRequest(data, version);
+         }
++
++        @Override
++        public String toString() {
++            return maskData(data);
++        }
+     }
+ 
+     private final AlterConfigsRequestData data;
+@@ -135,4 +140,20 @@
+     public static AlterConfigsRequest parse(ByteBuffer buffer, short version) {
+         return new AlterConfigsRequest(new AlterConfigsRequestData(new ByteBufferAccessor(buffer), version), version);
+     }
++
++    // It is not safe to print all config values
++    private static String maskData(AlterConfigsRequestData data) {
++        AlterConfigsRequestData tempData = data.duplicate();
++        tempData.resources().forEach(resource -> {
++            resource.configs().forEach(config -> {
++                config.setValue("REDACTED");
++            });
++        });
++        return tempData.toString();
++    }
++
++    @Override
++    public String toString() {
++        return maskData(data);
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/AlterUserScramCredentialsRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/AlterUserScramCredentialsRequest.java
+@@ -44,7 +44,7 @@
+ 
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
+ 
+@@ -82,4 +82,19 @@
+                         .collect(Collectors.toList());
+         return new AlterUserScramCredentialsResponse(new AlterUserScramCredentialsResponseData().setResults(results));
+     }
++
++    private static String maskData(AlterUserScramCredentialsRequestData data) {
++        AlterUserScramCredentialsRequestData tempData = data.duplicate();
++        tempData.upsertions().forEach(upsertion -> {
++            upsertion.setSalt(new byte[0]);
++            upsertion.setSaltedPassword(new byte[0]);
++        });
++        return tempData.toString();
++    }
++
++    // Do not print salt or saltedPassword
++    @Override
++    public String toString() {
++        return maskData(data);
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/CreateDelegationTokenResponse.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/CreateDelegationTokenResponse.java
+@@ -103,4 +103,13 @@
+     public boolean shouldClientThrottle(short version) {
+         return version >= 1;
+     }
++
++    // Do not print tokenId and Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        CreateDelegationTokenResponseData tempData = data.duplicate();
++        tempData.setTokenId("REDACTED");
++        tempData.setHmac(new byte[0]);
++        return tempData.toString();
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/DescribeDelegationTokenResponse.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/DescribeDelegationTokenResponse.java
+@@ -128,4 +128,15 @@
+     public boolean shouldClientThrottle(short version) {
+         return version >= 1;
+     }
++
++    // Do not print tokenId and Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        DescribeDelegationTokenResponseData tempData = data.duplicate();
++        tempData.tokens().forEach(token -> {
++            token.setTokenId("REDACTED");
++            token.setHmac(new byte[0]);
++        });
++        return tempData.toString();
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/ExpireDelegationTokenRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/ExpireDelegationTokenRequest.java
+@@ -74,7 +74,19 @@
+ 
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
++
++    private static String maskData(ExpireDelegationTokenRequestData data) {
++        ExpireDelegationTokenRequestData tempData = data.duplicate();
++        tempData.setHmac(new byte[0]);
++        return tempData.toString();
++    }
++
++    // Do not print Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        return maskData(data);
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/IncrementalAlterConfigsRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/IncrementalAlterConfigsRequest.java
+@@ -73,7 +73,7 @@
+ 
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
+ 
+@@ -107,4 +107,20 @@
+         }
+         return new IncrementalAlterConfigsResponse(response);
+     }
++
++    // It is not safe to print all config values
++    private static String maskData(IncrementalAlterConfigsRequestData data) {
++        IncrementalAlterConfigsRequestData tempData = data.duplicate();
++        tempData.resources().forEach(resource -> {
++            resource.configs().forEach(config -> {
++                config.setValue("REDACTED");
++            });
++        });
++        return tempData.toString();
++    }
++
++    @Override
++    public String toString() {
++        return maskData(data);
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/RenewDelegationTokenRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/RenewDelegationTokenRequest.java
+@@ -66,7 +66,19 @@
+ 
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
++
++    private static String maskData(RenewDelegationTokenRequestData data) {
++        RenewDelegationTokenRequestData tempData = data.duplicate();
++        tempData.setHmac(new byte[0]);
++        return tempData.toString();
++    }
++
++    // Do not print Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        return maskData(data);
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateRequest.java
+@@ -78,4 +78,12 @@
+         return new SaslAuthenticateRequest(new SaslAuthenticateRequestData(new ByteBufferAccessor(buffer), version),
+             version);
+     }
++
++    // Do not print authBytes, overwrite a temp copy of the data with empty bytes
++    @Override
++    public String toString() {
++        SaslAuthenticateRequestData tempData = data.duplicate();
++        tempData.setAuthBytes(new byte[0]);
++        return tempData.toString();
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateResponse.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateResponse.java
+@@ -80,4 +80,12 @@
+     public static SaslAuthenticateResponse parse(ByteBuffer buffer, short version) {
+         return new SaslAuthenticateResponse(new SaslAuthenticateResponseData(new ByteBufferAccessor(buffer), version));
+     }
++
++    // Do not print authBytes, overwrite a temp copy of the data with empty bytes
++    @Override
++    public String toString() {
++        SaslAuthenticateResponseData tempData = data.duplicate();
++        tempData.setAuthBytes(new byte[0]);
++        return tempData.toString();
++    }
+ }
+--- a/clients/src/test/java/org/apache/kafka/common/requests/RequestResponseTest.java
++++ b/clients/src/test/java/org/apache/kafka/common/requests/RequestResponseTest.java
+@@ -3317,7 +3317,7 @@
+     }
+ 
+     private AlterConfigsRequest createAlterConfigsRequest(short version) {
+-        Map<ConfigResource, AlterConfigsRequest.Config> configs = new HashMap<>();
++        Map<ConfigResource, AlterConfigsRequest.Config> configs = new LinkedHashMap<>();
+         List<AlterConfigsRequest.ConfigEntry> configEntries = asList(
+                 new AlterConfigsRequest.ConfigEntry("config_name", "config_value"),
+                 new AlterConfigsRequest.ConfigEntry("another_name", "another value")
+@@ -3325,7 +3325,19 @@
+         configs.put(new ConfigResource(ConfigResource.Type.BROKER, "0"), new AlterConfigsRequest.Config(configEntries));
+         configs.put(new ConfigResource(ConfigResource.Type.TOPIC, "topic"),
+                 new AlterConfigsRequest.Config(emptyList()));
+-        return new AlterConfigsRequest.Builder(configs, false).build(version);
++        AlterConfigsRequest alterConfigsRequest = new AlterConfigsRequest.Builder(configs, false).build(version);
++        assertEquals(
++                "AlterConfigsRequestData(resources=[" +
++                        "AlterConfigsResource(resourceType=" + ConfigResource.Type.BROKER.id() + ", " +
++                        "resourceName='0', " +
++                        "configs=[AlterableConfig(name='config_name', value='REDACTED'), " +
++                        "AlterableConfig(name='another_name', value='REDACTED')]), " +
++                        "AlterConfigsResource(resourceType=" + ConfigResource.Type.TOPIC.id() + ", " +
++                        "resourceName='topic', configs=[])], " +
++                        "validateOnly=false)",
++                alterConfigsRequest.toString()
++        );
++        return alterConfigsRequest;
+     }
+ 
+     private AlterConfigsResponse createAlterConfigsResponse() {
+@@ -3428,7 +3440,12 @@
+                 .setMaxTimestampMs(System.currentTimeMillis())
+                 .setTokenId("token1")
+                 .setHmac("test".getBytes());
+-        return new CreateDelegationTokenResponse(data);
++        CreateDelegationTokenResponse response = new CreateDelegationTokenResponse(data);
++
++        String responseStr = response.toString();
++        assertTrue(responseStr.contains("tokenId='REDACTED'"));
++        assertTrue(responseStr.contains("hmac=[]"));
++        return response;
+     }
+ 
+     private RenewDelegationTokenRequest createRenewTokenRequest(short version) {
+@@ -3484,7 +3501,14 @@
+         tokenList.add(new DelegationToken(tokenInfo1, "test".getBytes()));
+         tokenList.add(new DelegationToken(tokenInfo2, "test".getBytes()));
+ 
+-        return new DescribeDelegationTokenResponse(version, 20, Errors.NONE, tokenList);
++        DescribeDelegationTokenResponse response = new DescribeDelegationTokenResponse(version, 20, Errors.NONE, tokenList);
++
++        String responseStr = response.toString();
++        String[] parts = responseStr.split(",");
++        // The 2 token info should both be redacted
++        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("tokenId='REDACTED'")).count());
++        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("hmac=[]")).count());
++        return response;
+     }
+ 
+     private ElectLeadersRequest createElectLeadersRequestNullPartitions() {
+@@ -4101,4 +4125,26 @@
+                 parseRequest(SASL_AUTHENTICATE, SASL_AUTHENTICATE.latestVersion(), accessor.buffer())).getMessage();
+         assertEquals("Error reading byte array of 32767 byte(s): only 3 byte(s) available", msg);
+     }
++
++    @Test
++    public void testSaslAuthenticateRequestResponseToStringMasksSensitiveData() {
++        byte[] sensitiveAuthBytes = "sensitive-auth-token-123".getBytes(StandardCharsets.UTF_8);
++        SaslAuthenticateRequestData requestData = new SaslAuthenticateRequestData().setAuthBytes(sensitiveAuthBytes);
++        SaslAuthenticateRequest request = new SaslAuthenticateRequest(requestData, (short) 2);
++
++        String requestString = request.toString();
++
++        // Verify that the authBytes field is present but empty in the output
++        assertTrue(requestString.contains("authBytes=[]"),
++                "authBytes field should be empty in toString() output");
++
++        SaslAuthenticateResponseData responseData = new SaslAuthenticateResponseData().setAuthBytes(sensitiveAuthBytes);
++        SaslAuthenticateResponse response = new SaslAuthenticateResponse(responseData);
++
++        String responseString = response.toString();
++
++        // Verify that the authBytes field is present but empty in the output
++        assertTrue(responseString.contains("authBytes=[]"),
++                "authBytes field should be empty in toString() output");
++    }
+ }
+--- a/core/src/test/scala/unit/kafka/network/RequestChannelTest.scala
++++ b/core/src/test/scala/unit/kafka/network/RequestChannelTest.scala
+@@ -62,13 +62,23 @@
+ 
+     val sensitiveValue = "secret"
+     def verifyConfig(resource: ConfigResource, entries: Seq[ConfigEntry], expectedValues: Map[String, String]): Unit = {
+-      val alterConfigs = request(new AlterConfigsRequest.Builder(
+-          Collections.singletonMap(resource, new Config(entries.asJavaCollection)), true).build())
++      val alterConfigs = new AlterConfigsRequest.Builder(
++          Collections.singletonMap(resource, new Config(entries.asJavaCollection)), true).build()
+ 
+-      val loggableAlterConfigs = alterConfigs.loggableRequest.asInstanceOf[AlterConfigsRequest]
++      val alterConfigsString = alterConfigs.toString
++      entries.foreach { entry =>
++        if (!alterConfigsString.contains(entry.name())) {
++          fail("Config names should be in the request string")
++        }
++        if (entry.value() != null && alterConfigsString.contains(entry.value())) {
++          fail("Config values should not be in the request string")
++        }
++      }
++      val alterConfigsReq = request(alterConfigs)
++      val loggableAlterConfigs = alterConfigsReq.loggableRequest.asInstanceOf[AlterConfigsRequest]
+       val loggedConfig = loggableAlterConfigs.configs.get(resource)
+       assertEquals(expectedValues, toMap(loggedConfig))
+-      val alterConfigsDesc = RequestConvertToJson.requestDesc(alterConfigs.header, alterConfigs.requestLog, alterConfigs.isForwarded).toString
++      val alterConfigsDesc = RequestConvertToJson.requestDesc(alterConfigsReq.header, alterConfigsReq.requestLog, alterConfigsReq.isForwarded).toString
+       assertFalse(alterConfigsDesc.contains(sensitiveValue), s"Sensitive config logged $alterConfigsDesc")
+     }
+ 
+@@ -128,11 +138,21 @@
+                      op: OpType,
+                      entries: Map[String, String],
+                      expectedValues: Map[String, String]): Unit = {
+-      val alterConfigs = request(incrementalAlterConfigs(resource, entries, op))
+-      val loggableAlterConfigs = alterConfigs.loggableRequest.asInstanceOf[IncrementalAlterConfigsRequest]
++      val alterConfigs = incrementalAlterConfigs(resource, entries, op)
++      val alterConfigsString = alterConfigs.toString
++      entries.foreach { entry =>
++        if (!alterConfigsString.contains(entry._1)) {
++          fail("Config names should be in the request string")
++        }
++        if (entry._2 != null && alterConfigsString.contains(entry._2)) {
++          fail("Config values should not be in the request string")
++        }
++      }
++      val req = request(alterConfigs)
++      val loggableAlterConfigs = req.loggableRequest.asInstanceOf[IncrementalAlterConfigsRequest]
+       val loggedConfig = loggableAlterConfigs.data.resources.find(resource.`type`.id, resource.name).configs
+       assertEquals(expectedValues, toMap(loggedConfig))
+-      val alterConfigsDesc = RequestConvertToJson.requestDesc(alterConfigs.header, alterConfigs.requestLog, alterConfigs.isForwarded).toString
++      val alterConfigsDesc = RequestConvertToJson.requestDesc(req.header, req.requestLog, req.isForwarded).toString
+       assertFalse(alterConfigsDesc.contains(sensitiveValue), s"Sensitive config logged $alterConfigsDesc")
+     }
+ 
