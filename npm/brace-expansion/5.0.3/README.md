@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-33750
+- CVE-2026-45149
 
 ## How to Apply:
 1. Clone or download the source code for brace-expansion
