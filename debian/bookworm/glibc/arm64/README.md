@@ -1,6 +1,6 @@
-# glibc : 2.36-9+deb12u14.root.io.18
+# glibc : 2.36-9+deb12u14.root.io.19
 
-This patch is based on glibc version 2.36-9+deb12u14.root.io.18, which is available at:
+This patch is based on glibc version 2.36-9+deb12u14.root.io.19, which is available at:
 https://sources.debian.org/src/glibc/2.36-9+deb12u14/
 
 ## Affected CVEs:
@@ -8,7 +8,9 @@ https://sources.debian.org/src/glibc/2.36-9+deb12u14/
 - CVE-2019-9192
 - CVE-2019-1010022
 - CVE-2019-1010023
+- CVE-2026-5435
 - CVE-2026-5928
+- CVE-2026-6238
 
 ## How to Apply:
 1. Obtain the source package: `apt source glibc`
