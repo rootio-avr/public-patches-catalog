@@ -1,0 +1,908 @@
+Description: CVE-2026-34355 - Fix heap buffer overflow in mod_proxy_html
+ A buffer overflow in mod_proxy_html in Apache HTTP Server 2.4.67 and earlier
+ allows an attack by an untrusted backend. The fix simplifies the module to
+ use the ap_varbuf API: replaces buf/offset/avail in saxctxt with
+ struct ap_varbuf vb, and dump_content uses ap_varbuf_regsub for regex
+ substitutions, avoiding manual buffer resizing with preserve/memmove/memcpy
+ that could overflow.
+ .
+ Backport of upstream r1934977 (2.4.x branch) / r1934975 (trunk),
+ which shipped in Apache HTTPD 2.4.68.
+Origin: upstream, https://github.com/apache/httpd/commit/d62fc375281486c6036b007ac349b25d4e6edb4a
+Author: Joe Orton <jorton@apache.org>
+Bug: https://httpd.apache.org/security/vulnerabilities_24.html
+Bug-Debian: https://bugs.debian.org/1139340
+Last-Update: 2026-06-10
+---
+--- a/modules/filters/mod_proxy_html.c
++++ b/modules/filters/mod_proxy_html.c
+@@ -63,6 +63,7 @@
+ #include "mod_xml2enc.h"
+ #include "http_request.h"
+ #include "ap_expr.h"
++#include "util_varbuf.h"
+ 
+ /* globals set once at startup */
+ static ap_rxplus_t *old_expr;
+@@ -122,9 +123,7 @@ typedef struct {
+     proxy_html_conf *cfg;
+     htmlParserCtxtPtr parser;
+     apr_bucket_brigade *bb;
+-    char *buf;
+-    size_t offset;
+-    size_t avail;
++    struct ap_varbuf vb;
+     const char *encoding;
+     urlmap *map;
+     char rbuf[4];
+@@ -132,6 +131,7 @@ typedef struct {
+     apr_size_t rmin;
+ } saxctxt;
+ 
++#define DEFAULT_BUFSZ (8192)
+ 
+ #define NORM_LC 0x1
+ #define NORM_MSSLASH 0x2
+@@ -155,17 +155,17 @@ static const char *const xhtml_etag = " />";
+ static const char *const DEFAULT_DOCTYPE = "";
+ #define DEFAULT_ETAG html_etag
+ 
+-static void normalise(unsigned int flags, char *str)
++static void normalise(unsigned int flags, struct ap_varbuf *vb)
+ {
+-    char *p;
++    apr_size_t n;
+     if (flags & NORM_LC)
+-        for (p = str; *p; ++p)
+-            if (isupper(*p))
+-                *p = tolower(*p);
++        for (n = 0; n < vb->strlen; ++n)
++            vb->buf[n] = apr_tolower(vb->buf[n]);
+ 
+     if (flags & NORM_MSSLASH)
+-        for (p = ap_strchr(str, '\\'); p; p = ap_strchr(p+1, '\\'))
+-            *p = '/';
++        for (n = 0; n < vb->strlen; ++n)
++            if (vb->buf[n] == '\\')
++                vb->buf[n] = '/';
+ 
+ }
+ #define consume_buffer(ctx,inbuf,bytes,flag) \
+@@ -194,120 +194,97 @@ static void pcharacters(void *ctxt, const xmlChar *uchars, int length)
+     FLUSH;
+ }
+ 
+-static void preserve(saxctxt *ctx, const size_t len)
+-{
+-    char *newbuf;
+-    if (len <= (ctx->avail - ctx->offset))
+-        return;
+-    else while (len > (ctx->avail - ctx->offset))
+-        ctx->avail += ctx->cfg->bufsz;
+-
+-    newbuf = realloc(ctx->buf, ctx->avail);
+-    if (newbuf != ctx->buf) {
+-        if (ctx->buf)
+-            apr_pool_cleanup_kill(ctx->f->r->pool, ctx->buf,
+-                                  (int(*)(void*))free);
+-        apr_pool_cleanup_register(ctx->f->r->pool, newbuf,
+-                                  (int(*)(void*))free, apr_pool_cleanup_null);
+-        ctx->buf = newbuf;
+-    }
+-}
+-
+-static void pappend(saxctxt *ctx, const char *buf, const size_t len)
+-{
+-    preserve(ctx, len);
+-    memcpy(ctx->buf+ctx->offset, buf, len);
+-    ctx->offset += len;
+-}
+-
+ static void dump_content(saxctxt *ctx)
+ {
+     urlmap *m;
+     char *found;
+     size_t s_from, s_to;
+     size_t match;
+-    char c = 0;
+     int nmatch;
+     ap_regmatch_t pmatch[10];
+-    char *subs;
+     size_t len, offs;
+     urlmap *themap = ctx->map;
++    struct ap_varbuf temp;
+ #ifndef GO_FASTER
+     int verbose = APLOGrtrace1(ctx->f->r);
+ #endif
+ 
+-    pappend(ctx, &c, 1);        /* append null byte */
+-        /* parse the text for URLs */
++    /* Ensure buffer is null-terminated and strlen is set */
++    if (ctx->vb.strlen == AP_VARBUF_UNKNOWN) {
++        ctx->vb.strlen = strlen(ctx->vb.buf);
++    }
++
++    ap_varbuf_init(ctx->f->r->pool, &temp, 0);
++
++    /* parse the text for URLs */
+     for (m = themap; m; m = m->next) {
+         if (!(m->flags & M_CDATA))
+             continue;
+         if (m->flags & M_REGEX) {
++            temp.strlen = 0;
+             nmatch = 10;
+             offs = 0;
+-            while (!ap_regexec(m->from.r, ctx->buf+offs, nmatch, pmatch, 0)) {
++            while (!ap_regexec(m->from.r, ctx->vb.buf+offs, nmatch, pmatch, 0)) {
+                 match = pmatch[0].rm_so;
+                 s_from = pmatch[0].rm_eo - match;
+-                subs = ap_pregsub(ctx->f->r->pool, m->to, ctx->buf+offs,
+-                                  nmatch, pmatch);
+-                s_to = strlen(subs);
+-                len = strlen(ctx->buf);
+-                offs += match;
+                 VERBOSEB(
+                     const char *f = apr_pstrndup(ctx->f->r->pool,
+-                    ctx->buf + offs, s_from);
++                    ctx->vb.buf + offs + match, s_from);
+                     ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, ctx->f->r,
+-                                  "C/RX: match at %s, substituting %s", f, subs);
++                                  "C/RX: match at %s, substituting with pattern %s",
++                                  f, m->to);
+                 )
+-                if (s_to > s_from) {
+-                    preserve(ctx, s_to - s_from);
+-                    memmove(ctx->buf+offs+s_to, ctx->buf+offs+s_from,
+-                            len + 1 - s_from - offs);
+-                    memcpy(ctx->buf+offs, subs, s_to);
+-                }
+-                else {
+-                    memcpy(ctx->buf + offs, subs, s_to);
+-                    memmove(ctx->buf+offs+s_to, ctx->buf+offs+s_from,
+-                            len + 1 - s_from - offs);
+-                }
+-                offs += s_to;
++                /* Copy text before the match */
++                ap_varbuf_strmemcat(&temp, ctx->vb.buf+offs, match);
++                /* Append the substitution */
++                ap_varbuf_regsub(&temp, m->to, ctx->vb.buf+offs, nmatch, pmatch, 0);
++                /* Continue past the match */
++                offs += pmatch[0].rm_eo;
+             }
++            /* Copy any remaining text */
++            ap_varbuf_strcat(&temp, ctx->vb.buf+offs);
++            /* Replace the original buffer with the result */
++            ctx->vb.strlen = 0;
++            ap_varbuf_strmemcat(&ctx->vb, temp.buf, temp.strlen);
+         }
+         else {
+             s_from = strlen(m->from.c);
+             s_to = strlen(m->to);
+-            for (found = strstr(ctx->buf, m->from.c); found;
+-                 found = strstr(ctx->buf+match+s_to, m->from.c)) {
+-                match = found - ctx->buf;
++            for (found = strstr(ctx->vb.buf, m->from.c); found;
++                 found = strstr(ctx->vb.buf+match+s_to, m->from.c)) {
++                match = found - ctx->vb.buf;
+                 if ((m->flags & M_ATSTART) && (match != 0))
+                     break;
+-                len = strlen(ctx->buf);
++                len = ctx->vb.strlen;
+                 if ((m->flags & M_ATEND) && (match < (len - s_from)))
+                     continue;
+                 VERBOSE(ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0, ctx->f->r,
+                                       "C: matched %s, substituting %s",
+                                       m->from.c, m->to));
+                 if (s_to > s_from) {
+-                    preserve(ctx, s_to - s_from);
+-                    memmove(ctx->buf+match+s_to, ctx->buf+match+s_from,
++                    ap_varbuf_grow(&ctx->vb, len + s_to - s_from);
++                    memmove(ctx->vb.buf+match+s_to, ctx->vb.buf+match+s_from,
+                             len + 1 - s_from - match);
+-                    memcpy(ctx->buf+match, m->to, s_to);
++                    memcpy(ctx->vb.buf+match, m->to, s_to);
+                 }
+                 else {
+-                    memcpy(ctx->buf+match, m->to, s_to);
+-                    memmove(ctx->buf+match+s_to, ctx->buf+match+s_from,
++                    memcpy(ctx->vb.buf+match, m->to, s_to);
++                    memmove(ctx->vb.buf+match+s_to, ctx->vb.buf+match+s_from,
+                             len + 1 - s_from - match);
+                 }
++                ctx->vb.strlen = len - s_from + s_to;
+             }
+         }
+     }
+-    AP_fwrite(ctx, ctx->buf, strlen(ctx->buf), 1);
++    AP_fwrite(ctx, ctx->vb.buf, ctx->vb.strlen, 1);
++    ap_varbuf_free(&temp);
+ }
+ static void pcdata(void *ctxt, const xmlChar *uchars, int length)
+ {
+     const char *chars = (const char*) uchars;
+     saxctxt *ctx = (saxctxt*) ctxt;
+     if (ctx->cfg->extfix) {
+-        pappend(ctx, chars, length);
++        ap_varbuf_strmemcat(&ctx->vb, chars, length);
+     }
+     else {
+         /* not sure if this should force-flush
+@@ -324,9 +301,9 @@ static void pcomment(void *ctxt, const xmlChar *uchars)
+         return;
+ 
+     if (ctx->cfg->extfix) {
+-        pappend(ctx, "<!--", 4);
+-        pappend(ctx, chars, strlen(chars));
+-        pappend(ctx, "-->", 3);
++        ap_varbuf_strcat(&ctx->vb, "<!--");
++        ap_varbuf_strcat(&ctx->vb, chars);
++        ap_varbuf_strcat(&ctx->vb, "-->");
+     }
+     else {
+         ap_fputs(ctx->f->next, ctx->bb, "<!--");
+@@ -356,9 +333,9 @@ static void pendElement(void *ctxt, const xmlChar *uname)
+     /* TODO - implement HTML "allowed here" using the stack */
+     /* nah.  Keeping the stack is too much overhead */
+ 
+-    if (ctx->offset > 0) {
++    if (ctx->vb.strlen > 0) {
+         dump_content(ctx);
+-        ctx->offset = 0;        /* having dumped it, we can re-use the memory */
++        ctx->vb.strlen = 0;     /* having dumped it, we can re-use the memory */
+     }
+     if (!desc || !desc->empty) {
+         ap_fprintf(ctx->f->next, ctx->bb, "</%s>", name);
+@@ -371,7 +348,6 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+     int required_attrs;
+     int num_match;
+     size_t offs, len;
+-    char *subs;
+     rewrite_t is_uri;
+     const char** a;
+     urlmap *m;
+@@ -389,6 +365,7 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+     const char** attrs = (const char**) uattrs;
+     const htmlElemDesc* desc = htmlTagLookup(uname);
+     urlmap *themap = ctx->map;
++    struct ap_varbuf temp;
+ #ifdef HAVE_STACK
+     const void** descp;
+ #endif
+@@ -418,6 +395,8 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+     /* TODO - implement HTML "allowed here" */
+ #endif
+ 
++    ap_varbuf_init(ctx->f->r->pool, &temp, 0);
++
+     ap_fputc(ctx->f->next, ctx->bb, '<');
+     ap_fputs(ctx->f->next, ctx->bb, name);
+ 
+@@ -448,9 +427,10 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+                     break;
+                 }
+             }
+-            ctx->offset = 0;
++            ctx->vb.strlen = 0;
++            ctx->vb.buf[0] = '\0';
+             if (a[1]) {
+-                pappend(ctx, a[1], strlen(a[1])+1);
++                ap_varbuf_strcat(&ctx->vb, a[1]);
+                 is_uri = ATTR_IGNORE;
+                 if (linkattrs) {
+                     tattr *attrs = (tattr*) linkattrs->elts;
+@@ -479,59 +459,53 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+                             continue;
+                         if (m->flags & M_REGEX) {
+                             nmatch = 10;
+-                            if (!ap_regexec(m->from.r, ctx->buf, nmatch,
++                            if (!ap_regexec(m->from.r, ctx->vb.buf, nmatch,
+                                             pmatch, 0)) {
+                                 ++num_match;
+-                                offs = match = pmatch[0].rm_so;
++                                match = pmatch[0].rm_so;
+                                 s_from = pmatch[0].rm_eo - match;
+-                                subs = ap_pregsub(ctx->f->r->pool, m->to,
+-                                                  ctx->buf, nmatch, pmatch);
+                                 VERBOSE({
+                                     const char *f;
+                                     f = apr_pstrndup(ctx->f->r->pool,
+-                                                     ctx->buf + offs, s_from);
++                                                     ctx->vb.buf + match, s_from);
+                                     ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0,
+                                                   ctx->f->r,
+-                                         "H/RX: match at %s, substituting %s",
+-                                                  f, subs);
++                                         "H/RX: match at %s, substituting with pattern %s",
++                                                  f, m->to);
+                                 })
+-                                s_to = strlen(subs);
+-                                len = strlen(ctx->buf);
+-                                if (s_to > s_from) {
+-                                    preserve(ctx, s_to - s_from);
+-                                    memmove(ctx->buf+offs+s_to,
+-                                            ctx->buf+offs+s_from,
+-                                            len + 1 - s_from - offs);
+-                                    memcpy(ctx->buf+offs, subs, s_to);
+-                                }
+-                                else {
+-                                    memcpy(ctx->buf + offs, subs, s_to);
+-                                    memmove(ctx->buf+offs+s_to,
+-                                            ctx->buf+offs+s_from,
+-                                            len + 1 - s_from - offs);
+-                                }
++                                temp.strlen = 0;
++                                /* Copy text before match */
++                                ap_varbuf_strmemcat(&temp, ctx->vb.buf, match);
++                                /* Append substitution */
++                                ap_varbuf_regsub(&temp, m->to, ctx->vb.buf, nmatch, pmatch, 0);
++                                /* Copy text after match */
++                                ap_varbuf_strcat(&temp, ctx->vb.buf + pmatch[0].rm_eo);
++                                /* Replace buffer */
++                                ctx->vb.strlen = 0;
++                                ap_varbuf_strmemcat(&ctx->vb, temp.buf, temp.strlen);
+                             }
+                         } else {
+                             s_from = strlen(m->from.c);
+-                            if (!strncasecmp(ctx->buf, m->from.c, s_from)) {
++                            if (!strncasecmp(ctx->vb.buf, m->from.c, s_from)) {
+                                 ++num_match;
+                                 s_to = strlen(m->to);
+-                                len = strlen(ctx->buf);
++                                len = ctx->vb.strlen;
+                                 VERBOSE(ap_log_rerror(APLOG_MARK, APLOG_TRACE3,
+                                                       0, ctx->f->r,
+                                               "H: matched %s, substituting %s",
+                                                       m->from.c, m->to));
+                                 if (s_to > s_from) {
+-                                    preserve(ctx, s_to - s_from);
+-                                    memmove(ctx->buf+s_to, ctx->buf+s_from,
++                                    ap_varbuf_grow(&ctx->vb, len + s_to - s_from);
++                                    memmove(ctx->vb.buf+s_to, ctx->vb.buf+s_from,
+                                             len + 1 - s_from);
+-                                    memcpy(ctx->buf, m->to, s_to);
++                                    memcpy(ctx->vb.buf, m->to, s_to);
+                                 }
+                                 else {     /* it fits in the existing space */
+-                                    memcpy(ctx->buf, m->to, s_to);
+-                                    memmove(ctx->buf+s_to, ctx->buf+s_from,
++                                    memcpy(ctx->vb.buf, m->to, s_to);
++                                    memmove(ctx->vb.buf+s_to, ctx->vb.buf+s_from,
+                                             len + 1 - s_from);
+                                 }
++                                ctx->vb.strlen = len - s_from + s_to;
+                                 break;
+                             }
+                         }
+@@ -546,79 +520,73 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+                         if (!(m->flags & M_EVENTS))
+                             continue;
+                         if (m->flags & M_REGEX) {
++                            temp.strlen = 0;
+                             nmatch = 10;
+                             offs = 0;
+-                            while (!ap_regexec(m->from.r, ctx->buf+offs,
++                            while (!ap_regexec(m->from.r, ctx->vb.buf+offs,
+                                                nmatch, pmatch, 0)) {
+                                 match = pmatch[0].rm_so;
+                                 s_from = pmatch[0].rm_eo - match;
+-                                subs = ap_pregsub(ctx->f->r->pool, m->to, ctx->buf+offs,
+-                                                    nmatch, pmatch);
+                                 VERBOSE({
+                                     const char *f;
+                                     f = apr_pstrndup(ctx->f->r->pool,
+-                                                     ctx->buf + offs, s_from);
++                                                     ctx->vb.buf + offs + match, s_from);
+                                     ap_log_rerror(APLOG_MARK, APLOG_TRACE3, 0,
+                                                   ctx->f->r,
+-                                           "E/RX: match at %s, substituting %s",
+-                                                  f, subs);
++                                           "E/RX: match at %s, substituting with pattern %s",
++                                                  f, m->to);
+                                 })
+-                                s_to = strlen(subs);
+-                                offs += match;
+-                                len = strlen(ctx->buf);
+-                                if (s_to > s_from) {
+-                                    preserve(ctx, s_to - s_from);
+-                                    memmove(ctx->buf+offs+s_to,
+-                                            ctx->buf+offs+s_from,
+-                                            len + 1 - s_from - offs);
+-                                    memcpy(ctx->buf+offs, subs, s_to);
+-                                }
+-                                else {
+-                                    memcpy(ctx->buf + offs, subs, s_to);
+-                                    memmove(ctx->buf+offs+s_to,
+-                                            ctx->buf+offs+s_from,
+-                                            len + 1 - s_from - offs);
+-                                }
+-                                offs += s_to;
++                                /* Copy text before match */
++                                ap_varbuf_strmemcat(&temp, ctx->vb.buf+offs, match);
++                                /* Append substitution */
++                                ap_varbuf_regsub(&temp, m->to, ctx->vb.buf+offs, nmatch, pmatch, 0);
++                                /* Continue past the match */
++                                offs += pmatch[0].rm_eo;
+                                 ++num_match;
+                             }
++                            /* Copy any remaining text */
++                            ap_varbuf_strcat(&temp, ctx->vb.buf+offs);
++                            /* Replace buffer */
++                            ctx->vb.strlen = 0;
++                            ap_varbuf_strmemcat(&ctx->vb, temp.buf, temp.strlen);
+                         }
+                         else {
+-                            found = strstr(ctx->buf, m->from.c);
+-                            if ((m->flags & M_ATSTART) && (found != ctx->buf))
++                            found = strstr(ctx->vb.buf, m->from.c);
++                            if ((m->flags & M_ATSTART) && (found != ctx->vb.buf))
+                                 continue;
+                             while (found) {
+                                 s_from = strlen(m->from.c);
+                                 s_to = strlen(m->to);
+-                                match = found - ctx->buf;
++                                match = found - ctx->vb.buf;
+                                 if ((s_from < strlen(found))
+                                     && (m->flags & M_ATEND)) {
+-                                    found = strstr(ctx->buf+match+s_from,
++                                    found = strstr(ctx->vb.buf+match+s_from,
+                                                    m->from.c);
+                                     continue;
+                                 }
+                                 else {
+-                                    found = strstr(ctx->buf+match+s_to,
++                                    found = strstr(ctx->vb.buf+match+s_to,
+                                                    m->from.c);
+                                 }
+                                 VERBOSE(ap_log_rerror(APLOG_MARK, APLOG_TRACE3,
+                                                       0, ctx->f->r,
+                                               "E: matched %s, substituting %s",
+                                                       m->from.c, m->to));
+-                                len = strlen(ctx->buf);
++                                len = ctx->vb.strlen;
+                                 if (s_to > s_from) {
+-                                    preserve(ctx, s_to - s_from);
+-                                    memmove(ctx->buf+match+s_to,
+-                                            ctx->buf+match+s_from,
++                                    ap_varbuf_grow(&ctx->vb, len + s_to - s_from);
++                                    memmove(ctx->vb.buf+match+s_to,
++                                            ctx->vb.buf+match+s_from,
+                                             len + 1 - s_from - match);
+-                                    memcpy(ctx->buf+match, m->to, s_to);
++                                    memcpy(ctx->vb.buf+match, m->to, s_to);
+                                 }
+                                 else {
+-                                    memcpy(ctx->buf+match, m->to, s_to);
+-                                    memmove(ctx->buf+match+s_to,
+-                                            ctx->buf+match+s_from,
++                                    memcpy(ctx->vb.buf+match, m->to, s_to);
++                                    memmove(ctx->vb.buf+match+s_to,
++                                            ctx->vb.buf+match+s_from,
+                                             len + 1 - s_from - match);
+                                 }
++                                ctx->vb.strlen = len - s_from + s_to;
+                                 ++num_match;
+                             }
+                         }
+@@ -635,18 +603,18 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+             else {
+ 
+                 if (ctx->cfg->flags != 0)
+-                    normalise(ctx->cfg->flags, ctx->buf);
++                    normalise(ctx->cfg->flags, &ctx->vb);
+ 
+                 /* write the attribute, using pcharacters to html-escape
+                    anything that needs it in the value.
+                 */
+                 ap_fputstrs(ctx->f->next, ctx->bb, " ", a[0], "=\"", NULL);
+-                pcharacters(ctx, (const xmlChar*)ctx->buf, strlen(ctx->buf));
++                pcharacters(ctx, (const xmlChar*)ctx->vb.buf, ctx->vb.strlen);
+                 ap_fputc(ctx->f->next, ctx->bb, '"');
+             }
+         }
+     }
+-    ctx->offset = 0;
++    ctx->vb.strlen = 0;
+     if (desc && desc->empty)
+         ap_fputs(ctx->f->next, ctx->bb, ctx->cfg->etag);
+     else
+@@ -658,6 +626,7 @@ static void pstartElement(void *ctxt, const xmlChar *uname,
+                       "HTML element %s is missing %d required attributes",
+                       name, required_attrs);
+     }
++    ap_varbuf_free(&temp);
+ }
+ 
+ static meta *metafix(request_rec *r, const char *buf, apr_size_t len)
+@@ -826,6 +795,8 @@ static saxctxt *check_filter_init (ap_filter_t *f)
+         proxy_html_conf *cfg;
+         const char *force;
+         const char *errmsg = NULL;
++        apr_size_t bufsz;
++
+         cfg = ap_get_module_config(f->r->per_dir_config, &proxy_html_module);
+         force = apr_table_get(f->r->subprocess_env, "PROXY_HTML_FORCE");
+ 
+@@ -859,6 +830,8 @@ static saxctxt *check_filter_init (ap_filter_t *f)
+         fctx->bb = apr_brigade_create(f->r->pool,
+                                       f->r->connection->bucket_alloc);
+         fctx->cfg = cfg;
++        bufsz = (cfg->bufsz <= 0 || cfg->bufsz > (128 * 1024)) ? DEFAULT_BUFSZ : cfg->bufsz;
++        ap_varbuf_init(f->r->pool, &fctx->vb, bufsz);
+         apr_table_unset(f->r->headers_out, "Content-Length");
+ 
+         if (cfg->interp)
+@@ -1028,7 +1001,7 @@ static void *proxy_html_config(apr_pool_t *pool, char *x)
+     proxy_html_conf *ret = apr_pcalloc(pool, sizeof(proxy_html_conf));
+     ret->doctype = DEFAULT_DOCTYPE;
+     ret->etag = DEFAULT_ETAG;
+-    ret->bufsz = 8192;
++    ret->bufsz = DEFAULT_BUFSZ;
+     /* ret->interp = 1; */
+     /* don't initialise links and events until they get set/used */
+     return ret;
+Description: Fix CVE-2026-44185 OCSP request buffer pointer advance bug
+ In modules/ssl/ssl_util_ocsp.c send_request(), the write-buffer pointer
+ wbuf was being advanced by the requested byte count (remain) rather than
+ the number of bytes actually sent (wlen returned by apr_socket_send).
+ When apr_socket_send performs a short write, this causes the next loop
+ iteration to skip ahead past unsent data and re-read past the end of the
+ buffer, sending corrupted OCSP request data to the responder.
+ Increment wbuf by wlen (bytes actually sent) instead of remain.
+Origin: upstream, https://github.com/apache/httpd/commit/32b7e2e66477020ba75b78ab43fb8890ec292ad2
+Author: Joe Orton <jorton@apache.org>
+Last-Update: 2026-06-10
+---
+--- a/modules/ssl/ssl_util_ocsp.c
++++ b/modules/ssl/ssl_util_ocsp.c
+@@ -133,7 +133,7 @@ static apr_socket_t *send_request(BIO *r
+             apr_size_t wlen = remain;
+
+             rv = apr_socket_send(sd, wbuf, &wlen);
+-            wbuf += remain;
++            wbuf += wlen;
+             remain -= wlen;
+         } while (rv == APR_SUCCESS && remain > 0);
+
+Description: Fix CVE-2026-42536 accounting in fix_skipto in mod_xml2enc
+ The fix_skipto function in modules/filters/mod_xml2enc.c failed to keep
+ ctx->bblen in sync with ctx->bytes when stripping the prefix of the
+ buffer up to the first recognised start element. This accounting error
+ could be exploited to cause out-of-bounds memory access. Decrement
+ ctx->bblen by the number of skipped bytes alongside ctx->bytes.
+Origin: upstream, https://github.com/apache/httpd/commit/cb1f79c0ce66393c48657b19df754f16b79af543
+Author: Joe Orton <jorton@apache.org>
+Last-Update: 2026-06-10
+
+--- a/modules/filters/mod_xml2enc.c
++++ b/modules/filters/mod_xml2enc.c
+@@ -164,6 +164,7 @@ static void fix_skipto(request_rec* r, xml2ctx* ctx)
+                         apr_bucket_delete(b);
+                     }
+                     ctx->bytes -= (p-ctx->buf);
++                    ctx->bblen -= (p-ctx->buf);
+                     ctx->buf = p ;
+                     found = 1;
+                     ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(01428)
+Description: CVE-2026-42535 - mod_dav_fs: disallow access to DAV state directory
+ A path handling issue in mod_dav_fs in Apache HTTP Server 2.4.67 and
+ earlier allows a WebDAV content author to directly manipulate the
+ trusted DAV property/lock databases that mod_dav_fs stores under the
+ DAV_FS_STATE_DIR (".DAV") subdirectory of each DAV-enabled location.
+ By writing crafted content into those database files (or into files
+ within the state directory), an attacker with WebDAV write access can
+ corrupt mod_dav_fs's internal state and trigger child-process crashes,
+ yielding integrity and availability impact (CVSS 9.1, CWE-668).
+ .
+ This patch backports the upstream 2.4.x fix (commit 56bfb12, merging
+ trunk r1935009) to apache2 2.4.67 as shipped in Debian trixie. The
+ fix extends dav_fs_get_resource() to compute the leaf and parent
+ directory names of the resolved on-disk path and refuse any request
+ whose path is, or descends into, the DAV_FS_STATE_DIR. Such requests
+ are logged at APLOG_ERR and answered with HTTP 403 Forbidden
+ ("Access to the state directory denied."). Case-insensitive
+ comparison is used on case-blind filesystems.
+ .
+ The fix introduces no API/ABI changes: it only adds two local
+ variables, an additional include of apr_lib.h (already linked by
+ mod_dav_fs), and a self-contained guard block. All referenced
+ helpers (apr_filepath_name_get, ap_make_dirstr_parent,
+ ap_cstr_casecmp, dav_new_error, ap_log_rerror) and the
+ DAV_FS_STATE_DIR macro already exist in the target tree.
+Origin: upstream, https://github.com/apache/httpd/commit/56bfb12
+Bug: https://security-tracker.debian.org/tracker/CVE-2026-42535
+Author: Joe Orton <jorton@apache.org>
+Last-Update: 2026-06-10
+---
+--- a/modules/dav/fs/repos.c
++++ b/modules/dav/fs/repos.c
+@@ -22,6 +22,7 @@
+ #include "apr_file_io.h"
+ #include "apr_strings.h"
+ #include "apr_buckets.h"
++#include "apr_lib.h"
+ 
+ #if APR_HAVE_UNISTD_H
+ #include <unistd.h>             /* for getpid() */
+@@ -673,8 +674,8 @@ static dav_error * dav_fs_get_resource(
+ {
+     dav_resource_private *ctx;
+     dav_resource *resource;
+-    char *s;
+-    char *filename;
++    char *s, *parent;
++    const char *filename, *dirname;
+     apr_size_t len;
+ 
+     /* ### optimize this into a single allocation! */
+@@ -708,6 +709,30 @@ static dav_error * dav_fs_get_resource(
+     if (len > 1 && s[len - 1] == '/') {
+         s[len - 1] = '\0';
+     }
++
++    /* Deny any access to, or within, the state directory. */
++    filename = apr_filepath_name_get(s);
++    parent = ap_make_dirstr_parent(r->pool, s);
++    /* Strip the trailing slash and extract the leaf directory name. */
++    len = strlen(parent);
++    if (len > 1 && parent[len - 1] == '/') {
++        parent[len - 1] = '\0';
++    }
++    dirname = apr_filepath_name_get(parent);
++#ifdef CASE_BLIND_FILESYSTEM
++    if (ap_cstr_casecmp(filename, DAV_FS_STATE_DIR) == 0
++        || ap_cstr_casecmp(dirname, DAV_FS_STATE_DIR) == 0) {
++#else
++    if (strcmp(filename, DAV_FS_STATE_DIR) == 0
++        || strcmp(dirname, DAV_FS_STATE_DIR) == 0) {
++#endif
++        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, r,
++                      "access to " DAV_FS_STATE_DIR " state directory "
++                      "denied for %s", r->filename);
++        return dav_new_error(r->pool, HTTP_FORBIDDEN, 0, 0,
++                             "Access to the state directory denied.");
++    }
++
+     ctx->pathname = s;
+ 
+     /* Create resource descriptor */
+Description: CVE-2026-29167 - Fix use-after-free in mod_ldap per-directory context
+ Use After Free vulnerability in Apache HTTP Server with mod_ldap in
+ per-directory configuration. Cached LDAP connections retained pointers
+ into a potentially short-lived per-directory config pool (specifically
+ the client cert list including path and password strings), creating a
+ dangling-pointer / use-after-free hazard.
+ .
+ The fix deep-copies the client cert list (path and password strings)
+ into the long-lived connection pool in uldap_connection_find(), so the
+ cached connection no longer retains pointers into the per-dir pool.
+Origin: upstream, https://github.com/apache/httpd/commit/2cf9b3f393633f43746047e779fdf265a1ad8016
+Author: Joe Orton <jorton@apache.org>
+Bug: https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=1139340
+Last-Update: 2026-06-10
+---
+--- a/modules/ldap/util_ldap.c
++++ b/modules/ldap/util_ldap.c
+@@ -897,8 +897,23 @@ static util_ldap_connection_t *
+          */
+         l->secure = secureflag;
+ 
+-        /* save away a copy of the client cert list that is presently valid */
+-        l->client_certs = apr_array_copy_hdr(l->pool, dc->client_certs);
++        /* Deep-copy the client cert list into the connection pool so that
++         * the cached connection does not retain pointers into the
++         * (potentially short-lived) per-directory config pool.
++         */
++        l->client_certs = apr_array_copy(l->pool, dc->client_certs);
++        if (!apr_is_empty_array(l->client_certs)) {
++            int i;
++            apr_ldap_opt_tls_cert_t *certs;
++
++            certs = (apr_ldap_opt_tls_cert_t *)l->client_certs->elts;
++            for (i = 0; i < l->client_certs->nelts; i++) {
++                if (certs[i].path)
++                    certs[i].path = apr_pstrdup(l->pool, certs[i].path);
++                if (certs[i].password)
++                    certs[i].password = apr_pstrdup(l->pool, certs[i].password);
++            }
++        }
+ 
+         /* whether or not to keep this connection in the pool when it's returned */
+         l->keep = (st->connection_pool_ttl == 0) ? 0 : 1;
+Description: CVE-2026-48913 - mod_http2 use-after-free in c2_setup_io on file handle exhaustion
+ When apr_file_pipe_create_pools() fails (e.g. file descriptor exhaustion),
+ the beam send/received/consumed callbacks were already registered and
+ referenced c2/stream state that becomes invalid, leading to use-after-free.
+ Move the callback registrations to after pipe creation succeeds.
+Origin: backport, https://github.com/apache/httpd/commit/dbf1cc4dd62b681a0066271720994a047a3329ca
+Bug: https://github.com/icing/mod_h2/pull/323
+Author: Stefan Eissing <icing@apache.org>
+Last-Update: 2026-06-10
+---
+--- a/modules/http2/h2_mplx.c
++++ b/modules/http2/h2_mplx.c
+@@ -880,9 +880,6 @@ static apr_status_t c2_setup_io(h2_mplx
+     memset(&conn_ctx->pipe_in, 0, sizeof(conn_ctx->pipe_in));
+     if (stream->input) {
+         conn_ctx->beam_in = stream->input;
+-        h2_beam_on_send(stream->input, c2_beam_input_write_notify, c2);
+-        h2_beam_on_received(stream->input, c2_beam_input_read_notify, c2);
+-        h2_beam_on_consumed(stream->input, c1_input_consumed, stream);
+ #if H2_USE_PIPES
+         action = "create input write pipe";
+         rv = apr_file_pipe_create_pools(&conn_ctx->pipe_in[H2_PIPE_OUT],
+@@ -891,6 +888,9 @@ static apr_status_t c2_setup_io(h2_mplx
+                                         c2->pool, c2->pool);
+         if (APR_SUCCESS != rv) goto cleanup;
+ #endif
++        h2_beam_on_send(stream->input, c2_beam_input_write_notify, c2);
++        h2_beam_on_received(stream->input, c2_beam_input_read_notify, c2);
++        h2_beam_on_consumed(stream->input, c1_input_consumed, stream);
+         h2_beam_on_eagain(stream->input, c2_beam_input_read_eagain, c2);
+         if (!h2_beam_empty(stream->input))
+             c2_beam_input_write_notify(c2, stream->input);
+Description: CVE-2026-44631 - Heap Underflow in ap_regname via Signed Char Overflow
+ Restrict ap_regname to reasonable captures (cap at 1024) and cast offset
+ bytes to unsigned char to avoid signed-char sign extension that could
+ produce negative or oversized capture indices and cause a heap buffer
+ underwrite. Propagate the new -1 error return through dirsection,
+ urlsection and filesection in server/core.c and proxysection in
+ modules/proxy/mod_proxy.c so a malformed regex in the configuration is
+ rejected with a clear error instead of corrupting memory.
+ .
+ Backport of upstream 2.4.x branch commit 7d9f3cfb10b0fe70df7358d26d7b1f374ea1a0cb
+ (merge of trunk r1935014 / 52cb79b19e110bdd42bffc696844f801fb3c4a2d), shipped
+ in Apache HTTP Server 2.4.68.
+Origin: upstream, https://github.com/apache/httpd/commit/7d9f3cfb10b0fe70df7358d26d7b1f374ea1a0cb
+Author: Eric Covener <covener@apache.org>
+Last-Update: 2026-06-10
+
+--- a/include/ap_regex.h
++++ b/include/ap_regex.h
+@@ -204,6 +204,8 @@ AP_DECLARE(apr_size_t) ap_regerror(int errcode, const ap_regex_t *preg,
+  * @param prefix An optional prefix to add to the returned names.  AP_REG_MATCH
+  * is the recommended prefix.
+  * @param upper If non zero, uppercase the names
++ * @return number of regex backrefernces returned, -1 for error
++ *         for successful match, AP_REG_NOMATCH otherwise
+  */
+ AP_DECLARE(int) ap_regname(const ap_regex_t *preg,
+                            apr_array_header_t *names, const char *prefix,
+--- a/modules/proxy/mod_proxy.c
++++ b/modules/proxy/mod_proxy.c
+@@ -2886,7 +2886,9 @@ static const char *proxysection(cmd_parms *cmd, void *mconfig, const char *arg)
+ 
+     if (r) {
+         conf->refs = apr_array_make(cmd->pool, 8, sizeof(char *));
+-        ap_regname(r, conf->refs, AP_REG_MATCH, 1);
++        if (ap_regname(r, conf->refs, AP_REG_MATCH, 1) < 0) {
++            return "Error processing regex captures";
++        }
+     }
+ 
+     ap_add_per_proxy_conf(cmd->server, new_dir_conf);
+--- a/server/core.c
++++ b/server/core.c
+@@ -2526,7 +2526,9 @@ static const char *dirsection(cmd_parms *cmd, void *mconfig, const char *arg)
+ 
+     if (r) {
+         conf->refs = apr_array_make(cmd->pool, 8, sizeof(char *));
+-        ap_regname(r, conf->refs, AP_REG_MATCH, 1);
++        if (ap_regname(r, conf->refs, AP_REG_MATCH, 1) < 0) {
++            return "Error processing regex captures";
++        }
+     }
+ 
+     /* Make this explicit - the "/" root has 0 elements, that is, we
+@@ -2607,7 +2609,9 @@ static const char *urlsection(cmd_parms *cmd, void *mconfig, const char *arg)
+ 
+     if (r) {
+         conf->refs = apr_array_make(cmd->pool, 8, sizeof(char *));
+-        ap_regname(r, conf->refs, AP_REG_MATCH, 1);
++        if (ap_regname(r, conf->refs, AP_REG_MATCH, 1) < 0) {
++            return "Error processing regex captures";
++        }
+     }
+ 
+     ap_add_per_url_conf(cmd->server, new_url_conf);
+@@ -2694,7 +2698,9 @@ static const char *filesection(cmd_parms *cmd, void *mconfig, const char *arg)
+ 
+     if (r) {
+         conf->refs = apr_array_make(cmd->pool, 8, sizeof(char *));
+-        ap_regname(r, conf->refs, AP_REG_MATCH, 1);
++        if (ap_regname(r, conf->refs, AP_REG_MATCH, 1) < 0) {
++            return "Error processing regex captures";
++        }
+     }
+ 
+     ap_add_file_conf(cmd->pool, (core_dir_config *)mconfig, new_file_conf);
+--- a/server/util_pcre.c
++++ b/server/util_pcre.c
+@@ -521,7 +521,16 @@ AP_DECLARE(int) ap_regname(const ap_regex_t *preg,
+ 
+     for (i = 0; i < namecount; i++) {
+         const char *offset = nametable + i * nameentrysize;
+-        int capture = ((offset[0] << 8) + offset[1]);
++        int capture = (((unsigned char)offset[0] << 8) + (unsigned char)offset[1]);
++        
++        /* Sanity check: reject unreasonably large capture group numbers.
++         * PCRE allows up to 65535 groups, but such large numbers would
++         * cause excessive memory allocation. Limit to a reasonable maximum.
++         */
++        if (capture > 1024) {
++            return -1;
++        }
++        
+         while (names->nelts <= capture) {
+             apr_array_push(names);
+         }
+Description: CVE-2026-34356 - ap_proxy_cookie_reverse_map: fix dup path/domain
+ Heap-based buffer overflow in ap_proxy_cookie_reverse_map() in
+ modules/proxy/proxy_util.c. When ProxyPassReverseCookieDomain or
+ ProxyPassReverseCookiePath is configured and a malicious backend
+ returns a Set-Cookie header containing duplicate path= or domain=
+ attributes, stale newpath/newdomain pointers and pdiff/ddiff length
+ deltas carry over from earlier iterations, causing an out-of-bounds
+ write during cookie rewriting.
+ .
+ Per RFC 6265 sections 5.3 4) and 5.3 7) only the last path= and
+ domain= attributes are meaningful, so reset newpath/pdiff and
+ newdomain/ddiff each time a new attribute is seen.
+Origin: upstream, https://github.com/apache/httpd/commit/403269396d24404e2576a9b20f96cd0b10574048
+Author: Eric Covener <covener@apache.org>
+Last-Update: 2026-06-10
+---
+--- a/modules/proxy/proxy_util.c
++++ b/modules/proxy/proxy_util.c
+@@ -1036,6 +1036,12 @@ PROXY_DECLARE(const char *) ap_proxy_cookie_reverse_map(request_rec *r,
+             poffs = pathp - tmpstr_orig;
+             l1 = strlen(pathp);
+             pathe = str + poffs + l1;
++            /*
++             * RFC 6265 § 5.3 7): Only the last path= should be meaningful
++             * so reset anything previously found.
++             */
++            newpath = NULL;
++            pdiff = 0;
+             if (conf->interpolate_env == 1) {
+                 ent = (struct proxy_alias *)rconf->cookie_paths->elts;
+             }
+@@ -1056,6 +1062,12 @@ PROXY_DECLARE(const char *) ap_proxy_cookie_reverse_map(request_rec *r,
+             doffs = domainp - tmpstr_orig;
+             l1 = strlen(domainp);
+             domaine = str + doffs + l1;
++            /*
++             * RFC 6265 § 5.3 4): Only the last domain= should be meaningful
++             * so reset anything previously found.
++             */
++            newdomain = NULL;
++            ddiff = 0;
+             if (conf->interpolate_env == 1) {
+                 ent = (struct proxy_alias *)rconf->cookie_domains->elts;
+             }
+Description: CVE-2026-44186 - mod_proxy_ftp: fix infinite loop on Retry-After
+ The Retry-After parser in mod_proxy_ftp scans for a digit preceded by
+ whitespace inside the FTP server response. When no such digit is found,
+ the body of the while loop never advances secs_str, causing the worker
+ thread to spin forever (denial of service). This patch wraps the loop
+ body in braces and adds the missing secs_str++ increment so the loop
+ terminates when the response contains no qualifying digit.
+Origin: upstream, https://github.com/apache/httpd/commit/414de374a06549b2c6710cbcff81c3821379f75c
+Author: Eric Covener <covener@apache.org>
+Last-Update: 2026-06-10
+---
+--- a/modules/proxy/mod_proxy_ftp.c
++++ b/modules/proxy/mod_proxy_ftp.c
+@@ -1204,10 +1204,12 @@ static int proxy_ftp_handler(request_rec *r, proxy_worker *worker,
+         time_t secs;
+
+         /* Look for a number, preceded by whitespace */
+-        while (*secs_str)
++        while (*secs_str) {
+             if ((secs_str==ftpmessage || apr_isspace(secs_str[-1])) &&
+                 apr_isdigit(secs_str[0]))
+                 break;
++            secs_str++;
++        }
+         if (*secs_str != '\0') {
+             secs = atol(secs_str);
+             apr_table_addn(r->headers_out, "Retry-After",
