@@ -1,0 +1,1010 @@
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/ProducerBatch.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/ProducerBatch.java
+@@ -72,6 +72,9 @@
+     private final AtomicInteger attempts = new AtomicInteger(0);
+     private final boolean isSplitBatch;
+     private final AtomicReference<FinalState> finalState = new AtomicReference<>(null);
++    private boolean bufferDeallocated = false;
++    // Tracks if the batch has been sent to the NetworkClient
++    private boolean inflight = false;
+ 
+     int recordCount;
+     int maxRecordSize;
+@@ -555,6 +558,22 @@
+         return reopened;
+     }
+ 
++    public boolean isBufferDeallocated() {
++        return bufferDeallocated;
++    }
++
++    public void markBufferDeallocated() {
++        bufferDeallocated = true;
++    }
++
++    public boolean isInflight() {
++        return inflight;
++    }
++
++    public void setInflight(boolean inflight) {
++        this.inflight = inflight;
++    }
++
+     // VisibleForTesting
+     OptionalInt currentLeaderEpoch() {
+         return currentLeaderEpoch;
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/RecordAccumulator.java
+@@ -1045,14 +1045,39 @@
+     }
+ 
+     /**
+-     * Deallocate the record batch
++     * Complete and deallocate the record batch
++     */
++    public void completeAndDeallocateBatch(ProducerBatch batch) {
++        completeBatch(batch);
++        deallocate(batch);
++    }
++
++    /**
++     * Only perform deallocation (and not removal from the incomplete set)
+      */
+     public void deallocate(ProducerBatch batch) {
+-        incomplete.remove(batch);
+         // Only deallocate the batch if it is not a split batch because split batch are allocated outside the
+         // buffer pool.
+-        if (!batch.isSplitBatch())
+-            free.deallocate(batch.buffer(), batch.initialCapacity());
++        if (!batch.isSplitBatch()) {
++            if (batch.isBufferDeallocated()) {
++                log.warn("Skipping deallocating a batch that has already been deallocated. Batch is {}, created time is {}", batch, batch.createdMs);
++            } else {
++                batch.markBufferDeallocated();
++                if (batch.isInflight()) {
++                    // Create a fresh ByteBuffer to give to BufferPool to reuse since we can't safely call deallocate with the ProduceBatch's buffer
++                    free.deallocate(ByteBuffer.allocate(batch.initialCapacity()));
++                    throw new IllegalStateException("Attempting to deallocate a batch that is inflight. Batch is " + batch);
++                }
++                free.deallocate(batch.buffer(), batch.initialCapacity());
++            }
++        }
++    }
++
++    /**
++     * Remove from the incomplete list but do not free memory yet
++     */
++    public void completeBatch(ProducerBatch batch) {
++        incomplete.remove(batch);
+     }
+ 
+     /**
+@@ -1140,7 +1165,14 @@
+                 dq.remove(batch);
+             }
+             batch.abort(reason);
+-            deallocate(batch);
++            if (batch.isInflight()) {
++                // KAFKA-19012: if the batch has been sent it might still be in use by the network client so we cannot allow it to be reused yet.
++                // We skip deallocating it now. When the request in network client completes with a response, either Sender.completeBatch() or
++                // Sender.failBatch() will be called with deallocateBatch=true. The buffer associated with the batch will be deallocated then.
++                completeBatch(batch);
++            } else {
++                completeAndDeallocateBatch(batch);
++            }
+         }
+     }
+ 
+@@ -1164,7 +1196,7 @@
+             }
+             if (aborted) {
+                 batch.abort(reason);
+-                deallocate(batch);
++                completeAndDeallocateBatch(batch);
+             }
+         }
+     }
+--- a/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
++++ b/clients/src/main/java/org/apache/kafka/clients/producer/internals/Sender.java
+@@ -178,7 +178,12 @@
+ 
+     private void maybeRemoveAndDeallocateBatch(ProducerBatch batch) {
+         maybeRemoveFromInflightBatches(batch);
+-        this.accumulator.deallocate(batch);
++        this.accumulator.completeAndDeallocateBatch(batch);
++    }
++
++    private void maybeRemoveAndDeallocateBatchLater(ProducerBatch batch) {
++        maybeRemoveFromInflightBatches(batch);
++        this.accumulator.completeBatch(batch);
+     }
+ 
+     /**
+@@ -362,6 +367,23 @@
+         return false;
+     }
+ 
++    private void failExpiredBatches(List<ProducerBatch> expiredBatches, long now, boolean deallocateBuffer) {
++        // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
++        // for expired batches. see the documentation of @TransactionState.resetIdempotentProducerId to understand why
++        // we need to reset the producer id here.
++        if (!expiredBatches.isEmpty())
++            log.trace("Expired {} batches in accumulator", expiredBatches.size());
++        for (ProducerBatch expiredBatch : expiredBatches) {
++            String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
++                + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation";
++            failBatch(expiredBatch, new TimeoutException(errorMessage), false, deallocateBuffer);
++            if (transactionManager != null && expiredBatch.inRetry()) {
++                // This ensures that no new batches are drained until the current in flight batches are fully resolved.
++                transactionManager.markSequenceUnresolved(expiredBatch);
++            }
++        }
++    }
++
+     private long sendProducerData(long now) {
+         MetadataSnapshot metadataSnapshot = metadata.fetchMetadataSnapshot();
+         // get the list of partitions with data ready to send
+@@ -413,22 +436,10 @@
+         accumulator.resetNextBatchExpiryTime();
+         List<ProducerBatch> expiredInflightBatches = getExpiredInflightBatches(now);
+         List<ProducerBatch> expiredBatches = this.accumulator.expiredBatches(now);
+-        expiredBatches.addAll(expiredInflightBatches);
+ 
+-        // Reset the producer id if an expired batch has previously been sent to the broker. Also update the metrics
+-        // for expired batches. see the documentation of @TransactionState.resetIdempotentProducerId to understand why
+-        // we need to reset the producer id here.
+-        if (!expiredBatches.isEmpty())
+-            log.trace("Expired {} batches in accumulator", expiredBatches.size());
+-        for (ProducerBatch expiredBatch : expiredBatches) {
+-            String errorMessage = "Expiring " + expiredBatch.recordCount + " record(s) for " + expiredBatch.topicPartition
+-                + ":" + (now - expiredBatch.createdMs) + " ms has passed since batch creation";
+-            failBatch(expiredBatch, new TimeoutException(errorMessage), false);
+-            if (transactionManager != null && expiredBatch.inRetry()) {
+-                // This ensures that no new batches are drained until the current in flight batches are fully resolved.
+-                transactionManager.markSequenceUnresolved(expiredBatch);
+-            }
+-        }
++        failExpiredBatches(expiredBatches, now, true);
++        failExpiredBatches(expiredInflightBatches, now, false);
++
+         sensors.updateProduceRequestMetrics(batches);
+ 
+         // If we have any nodes that are ready to send + have sendable data, poll with 0 timeout so this can immediately
+@@ -537,6 +556,7 @@
+     private void maybeAbortBatches(RuntimeException exception) {
+         if (accumulator.hasIncomplete()) {
+             log.error("Aborting producer batches due to fatal error", exception);
+             accumulator.abortBatches(exception);
++            inFlightBatches.clear();
+         }
+     }
+@@ -664,5 +684,6 @@
+     private void completeBatch(ProducerBatch batch, ProduceResponse.PartitionResponse response, long correlationId,
+                                long now, Map<TopicPartition, Metadata.LeaderIdAndEpoch> partitionsWithUpdatedLeaderInfo) {
++        batch.setInflight(false);
+         Errors error = response.error;
+ 
+         if (error == Errors.MESSAGE_TOO_LARGE && batch.recordCount > 1 && !batch.isDone() &&
+@@ -703,7 +724,7 @@
+                 // tell the user the result of their request. We only adjust sequence numbers if the batch didn't exhaust
+                 // its retries -- if it did, we don't know whether the sequence number was accepted or not, and
+                 // thus it is not safe to reassign the sequence.
+-                failBatch(batch, response, batch.attempts() < this.retries);
++                failBatch(batch, response, batch.attempts() < this.retries, true);
+             }
+             if (error.exception() instanceof InvalidMetadataException) {
+                 if (error.exception() instanceof UnknownTopicOrPartitionException) {
+@@ -748,12 +769,16 @@
+ 
+         if (batch.complete(response.baseOffset, response.logAppendTime)) {
+             maybeRemoveAndDeallocateBatch(batch);
++        } else {
++            // Always safe to call deallocate because the batch keeps track of whether or not it was deallocated yet
++            this.accumulator.deallocate(batch);
+         }
+     }
+ 
+     private void failBatch(ProducerBatch batch,
+                            ProduceResponse.PartitionResponse response,
+-                           boolean adjustSequenceNumbers) {
++                           boolean adjustSequenceNumbers,
++                           boolean deallocateBatch) {
+         final RuntimeException topLevelException;
+         if (response.error == Errors.TOPIC_AUTHORIZATION_FAILED)
+             topLevelException = new TopicAuthorizationException(Collections.singleton(batch.topicPartition.topic()));
+@@ -770,6 +795,6 @@
+ 
+         if (response.recordErrors == null || response.recordErrors.isEmpty()) {
+-            failBatch(batch, topLevelException, adjustSequenceNumbers);
++            failBatch(batch, topLevelException, adjustSequenceNumbers, deallocateBatch);
+         } else {
+             Map<Integer, RuntimeException> recordErrorMap = new HashMap<>(response.recordErrors.size());
+             for (ProduceResponse.RecordError recordError : response.recordErrors) {
+@@ -809,23 +834,25 @@
+                 }
+             };
+ 
+-            failBatch(batch, topLevelException, recordExceptions, adjustSequenceNumbers);
++            failBatch(batch, topLevelException, recordExceptions, adjustSequenceNumbers, deallocateBatch);
+         }
+     }
+ 
+     private void failBatch(
+         ProducerBatch batch,
+         RuntimeException topLevelException,
+-        boolean adjustSequenceNumbers
++        boolean adjustSequenceNumbers,
++        boolean deallocateBatch
+     ) {
+-        failBatch(batch, topLevelException, batchIndex -> topLevelException, adjustSequenceNumbers);
++        failBatch(batch, topLevelException, batchIndex -> topLevelException, adjustSequenceNumbers, deallocateBatch);
+     }
+ 
+     private void failBatch(
+         ProducerBatch batch,
+         RuntimeException topLevelException,
+         Function<Integer, RuntimeException> recordExceptions,
+-        boolean adjustSequenceNumbers
++        boolean adjustSequenceNumbers,
++        boolean deallocateBatch
+     ) {
+         this.sensors.recordErrors(batch.topicPartition.topic(), batch.recordCount);
+ 
+@@ -839,7 +866,20 @@
+                     log.debug("Encountered error when transaction manager was handling a failed batch", e);
+                 }
+             }
+-            maybeRemoveAndDeallocateBatch(batch);
++            if (deallocateBatch) {
++                maybeRemoveAndDeallocateBatch(batch);
++            } else {
++                // Fix for KAFKA-19012
++                // The pooled ByteBuffer associated with this batch might still be in use by the network client so we
++                // cannot allow it to be reused yet. We skip deallocating it now. When the request in the network client
++                // completes with a response, either completeBatch() or failBatch() will be called with deallocateBatch=true.
++                // The buffer associated with the batch will be deallocated then.
++                maybeRemoveAndDeallocateBatchLater(batch);
++            }
++        } else {
++            if (deallocateBatch) {
++                this.accumulator.deallocate(batch);
++            }
+         }
+     }
+ 
+@@ -899,7 +939,8 @@
+             tpData.partitionData().add(new ProduceRequestData.PartitionProduceData()
+                     .setIndex(tp.partition())
+                     .setRecords(records));
+             recordsByPartition.put(tp, batch);
++            batch.setInflight(true);
+         }
+ 
+         String transactionalId = null;
+--- a/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java
++++ b/clients/src/test/java/org/apache/kafka/clients/producer/internals/RecordAccumulatorTest.java
+@@ -402,7 +402,7 @@
+                 for (ProducerBatch batch : batches) {
+                     for (Record record : batch.records().records())
+                         read++;
+-                    accum.deallocate(batch);
++                    accum.completeAndDeallocateBatch(batch);
+                 }
+             }
+         }
+@@ -666,7 +666,7 @@
+ 
+         for (List<ProducerBatch> batches: results.values())
+             for (ProducerBatch batch: batches)
+-                accum.deallocate(batch);
++                accum.completeAndDeallocateBatch(batch);
+ 
+         // should be complete with no unsent records.
+         accum.awaitFlushCompletion();
+@@ -1631,6 +1631,6 @@
+         ProducerBatch batch = batches.values().iterator().next().get(0);
+         int numSplitBatches = accum.splitAndReenqueue(batch);
+-        accum.deallocate(batch);
++        accum.completeAndDeallocateBatch(batch);
+ 
+         return numSplitBatches;
+     }
+@@ -1655,7 +1655,7 @@
+                     } else {
+                         batch.complete(0L, 0L);
+                     }
+-                    accum.deallocate(batch);
++                    accum.completeAndDeallocateBatch(batch);
+                 }
+             }
+         } while (batchDrained);
+--- a/clients/src/test/java/org/apache/kafka/clients/producer/internals/SenderTest.java
++++ b/clients/src/test/java/org/apache/kafka/clients/producer/internals/SenderTest.java
+@@ -124,4 +124,5 @@
+ import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertNotSame;
+ import static org.junit.jupiter.api.Assertions.assertNull;
+ import static org.junit.jupiter.api.Assertions.assertSame;
+ import static org.junit.jupiter.api.Assertions.assertThrows;
+@@ -2243,7 +2244,10 @@
+     public void testCancelInFlightRequestAfterFatalError() throws Exception {
+         final long producerId = 343434L;
+         TransactionManager transactionManager = createTransactionManager();
+-        setupWithTransactionState(transactionManager);
++        long totalSize = 1024 * 1024;
++        String metricGrpName = "producer-custom-metrics";
++        MatchingBufferPool pool = new MatchingBufferPool(totalSize, batchSize, metrics, time, metricGrpName);
++        setupWithTransactionState(transactionManager, false, pool);
+ 
+         prepareAndReceiveInitProducerId(producerId, Errors.NONE);
+         assertTrue(transactionManager.hasProducerId());
+@@ -2255,6 +2259,8 @@
+         Future<RecordMetadata> future2 = appendToAccumulator(tp1);
+         sender.runOnce();
+ 
++        assertFalse(pool.allMatch());
++
+         client.respond(
+             body -> body instanceof ProduceRequest && RequestTestUtils.hasIdempotentRecords((ProduceRequest) body),
+             produceResponse(tp0, -1, Errors.CLUSTER_AUTHORIZATION_FAILED, 0));
+@@ -2265,12 +2271,14 @@
+ 
+         sender.runOnce();
+         assertFutureFailure(future2, ClusterAuthorizationException.class);
++        assertFalse(pool.allMatch(), "Batch should not be deallocated before the response is received");
+ 
+         // Should be fine if the second response eventually returns
+         client.respond(
+             body -> body instanceof ProduceRequest && RequestTestUtils.hasIdempotentRecords((ProduceRequest) body),
+             produceResponse(tp1, 0, Errors.NONE, 0));
+         sender.runOnce();
++        assertTrue(pool.allMatch(), "The batch should have been de-allocated");
+     }
+ 
+     @Test
+@@ -2486,12 +2494,15 @@
+             assertEquals(ApiKeys.PRODUCE, client.requests().peek().requestBuilder().apiKey());
+             Node node = new Node(Integer.parseInt(id), "localhost", 0);
+             assertEquals(1, client.inFlightRequestCount());
++            ProducerBatch inflightBatch = sender.inFlightBatches(tp).get(0);
++            assertTrue(inflightBatch.isInflight(), "Batch should be marked inflight after being sent");
+             assertTrue(client.isReady(node, time.milliseconds()), "Client ready status should be true");
+ 
+             Map<TopicPartition, ProduceResponse.PartitionResponse> responseMap = new HashMap<>();
+             responseMap.put(tp, new ProduceResponse.PartitionResponse(Errors.MESSAGE_TOO_LARGE));
+             client.respond(new ProduceResponse(responseMap));
+             sender.runOnce(); // split and reenqueue
++            assertFalse(inflightBatch.isInflight(), "Batch should be marked as not inflight after being split and re-enqueued");
+             assertEquals(2, txnManager.sequenceNumber(tp), "The next sequence should be 2");
+             // The compression ratio should have been improved once.
+             assertEquals(CompressionType.GZIP.rate - CompressionRatioEstimator.COMPRESSION_RATIO_IMPROVING_STEP,
+@@ -2549,14 +2560,16 @@
+         sender.runOnce();  // send request
+         assertEquals(1, client.inFlightRequestCount());
+         assertEquals(1, sender.inFlightBatches(tp0).size());
++        assertFalse(sender.inFlightBatches(tp0).get(0).isBufferDeallocated(), "Buffer not deallocated yet");
++        ProducerBatch inflightBatch = sender.inFlightBatches(tp0).get(0);
+ 
+         time.sleep(REQUEST_TIMEOUT);
+         assertFalse(pool.allMatch());
+ 
+-        sender.runOnce();  // expire the batch
++        sender.runOnce();  // times out the request
+         assertTrue(request1.isDone());
++        assertTrue(inflightBatch.isBufferDeallocated(), "Buffer should be deallocated after request timeout");
+         assertTrue(pool.allMatch(), "The batch should have been de-allocated");
+-        assertTrue(pool.allMatch());
+ 
+         sender.runOnce();
+         assertTrue(pool.allMatch(), "The batch should have been de-allocated");
+@@ -3523,6 +3536,38 @@
+         }
+     }
+ 
++    @Test
++    public void testNoBufferReuseWhenBatchExpires() throws Exception {
++        long totalSize = 1024 * 1024;
++        try (Metrics m = new Metrics()) {
++            BufferPool pool = new BufferPool(totalSize, batchSize, m, time, "producer-internal-metrics");
++
++            // Allocate and store a poolable buffer, then return it to the pool so the Sender can pick it up
++            ByteBuffer buffer = pool.allocate(batchSize, 0);
++            pool.deallocate(buffer);
++
++            setupWithTransactionState(null, false, pool);
++            appendToAccumulator(tp0, 0L, "key", "value");
++            sender.runOnce();  // connect
++            sender.runOnce();  // send produce request
++
++            assertEquals(1, client.inFlightRequestCount());
++            assertEquals(1, sender.inFlightBatches(tp0).size());
++
++            ProducerBatch batch = sender.inFlightBatches(tp0).get(0);
++            // Validate the backing array of the buffer is the same as the pooled one from the start
++            assertSame(buffer.array(), batch.records().buffer().array(), "Sender should have allocated the same buffer we created");
++
++            time.sleep(DELIVERY_TIMEOUT_MS + 100);
++            sender.runOnce();
++
++            ByteBuffer newBuffer = pool.allocate(batchSize, 0);
++
++            // TEST buffer should not be reused
++            assertNotSame(buffer.array(), newBuffer.array(), "Buffer should not be reused");
++        }
++    }
++
+ 
+     private void verifyErrorMessage(ProduceResponse response, String expectedMessage) throws Exception {
+         Future<RecordMetadata> future = appendToAccumulator(tp0, 0L, "key", "value");
+
+--- a/clients/src/main/java/org/apache/kafka/common/requests/AbstractRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/AbstractRequest.java
+@@ -136,7 +136,7 @@
+     }
+
+     @Override
+-    public final String toString() {
++    public String toString() {
+         return toString(true);
+     }
+
+--- a/clients/src/main/java/org/apache/kafka/common/requests/AlterConfigsRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/AlterConfigsRequest.java
+@@ -88,6 +88,11 @@
+         public AlterConfigsRequest build(short version) {
+             return new AlterConfigsRequest(data, version);
+         }
++
++        @Override
++        public String toString() {
++            return maskData(data);
++        }
+     }
+
+     private final AlterConfigsRequestData data;
+@@ -134,5 +139,21 @@
+
+     public static AlterConfigsRequest parse(ByteBuffer buffer, short version) {
+         return new AlterConfigsRequest(new AlterConfigsRequestData(new ByteBufferAccessor(buffer), version), version);
++    }
++
++    // It is not safe to print all config values
++    private static String maskData(AlterConfigsRequestData data) {
++        AlterConfigsRequestData tempData = data.duplicate();
++        tempData.resources().forEach(resource -> {
++            resource.configs().forEach(config -> {
++                config.setValue("REDACTED");
++            });
++        });
++        return tempData.toString();
++    }
++
++    @Override
++    public String toString() {
++        return maskData(data);
+     }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/AlterUserScramCredentialsRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/AlterUserScramCredentialsRequest.java
+@@ -44,7 +44,7 @@
+
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
+
+@@ -81,5 +81,20 @@
+                                 .setErrorMessage(errorMessage))
+                         .collect(Collectors.toList());
+         return new AlterUserScramCredentialsResponse(new AlterUserScramCredentialsResponseData().setResults(results));
++    }
++
++    private static String maskData(AlterUserScramCredentialsRequestData data) {
++        AlterUserScramCredentialsRequestData tempData = data.duplicate();
++        tempData.upsertions().forEach(upsertion -> {
++            upsertion.setSalt(new byte[0]);
++            upsertion.setSaltedPassword(new byte[0]);
++        });
++        return tempData.toString();
++    }
++
++    // Do not print salt or saltedPassword
++    @Override
++    public String toString() {
++        return maskData(data);
+     }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/CreateDelegationTokenResponse.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/CreateDelegationTokenResponse.java
+@@ -103,4 +103,13 @@
+     public boolean shouldClientThrottle(short version) {
+         return version >= 1;
+     }
++
++    // Do not print tokenId and Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        CreateDelegationTokenResponseData tempData = data.duplicate();
++        tempData.setTokenId("REDACTED");
++        tempData.setHmac(new byte[0]);
++        return tempData.toString();
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/DescribeDelegationTokenResponse.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/DescribeDelegationTokenResponse.java
+@@ -128,4 +128,15 @@
+     public boolean shouldClientThrottle(short version) {
+         return version >= 1;
+     }
++
++    // Do not print tokenId and Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        DescribeDelegationTokenResponseData tempData = data.duplicate();
++        tempData.tokens().forEach(token -> {
++            token.setTokenId("REDACTED");
++            token.setHmac(new byte[0]);
++        });
++        return tempData.toString();
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/ExpireDelegationTokenRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/ExpireDelegationTokenRequest.java
+@@ -74,7 +74,19 @@
+
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
++
++    private static String maskData(ExpireDelegationTokenRequestData data) {
++        ExpireDelegationTokenRequestData tempData = data.duplicate();
++        tempData.setHmac(new byte[0]);
++        return tempData.toString();
++    }
++
++    // Do not print Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        return maskData(data);
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/IncrementalAlterConfigsRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/IncrementalAlterConfigsRequest.java
+@@ -73,7 +73,7 @@
+
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
+
+@@ -106,5 +106,21 @@
+                     .setErrorMessage(apiError.message()));
+         }
+         return new IncrementalAlterConfigsResponse(response);
++    }
++
++    // It is not safe to print all config values
++    private static String maskData(IncrementalAlterConfigsRequestData data) {
++        IncrementalAlterConfigsRequestData tempData = data.duplicate();
++        tempData.resources().forEach(resource -> {
++            resource.configs().forEach(config -> {
++                config.setValue("REDACTED");
++            });
++        });
++        return tempData.toString();
++    }
++
++    @Override
++    public String toString() {
++        return maskData(data);
+     }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/RenewDelegationTokenRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/RenewDelegationTokenRequest.java
+@@ -66,7 +66,19 @@
+
+         @Override
+         public String toString() {
+-            return data.toString();
++            return maskData(data);
+         }
+     }
++
++    private static String maskData(RenewDelegationTokenRequestData data) {
++        RenewDelegationTokenRequestData tempData = data.duplicate();
++        tempData.setHmac(new byte[0]);
++        return tempData.toString();
++    }
++
++    // Do not print Hmac, overwrite a temp copy of the data with empty content
++    @Override
++    public String toString() {
++        return maskData(data);
++    }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateRequest.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateRequest.java
+@@ -78,4 +78,12 @@
+     public static SaslAuthenticateRequest parse(ByteBuffer buffer, short version) {
+         return new SaslAuthenticateRequest(new SaslAuthenticateRequestData(new ByteBufferAccessor(buffer), version),
+             version);
++    }
++
++    // Do not print authBytes, overwrite a temp copy of the data with empty bytes
++    @Override
++    public String toString() {
++        SaslAuthenticateRequestData tempData = data.duplicate();
++        tempData.setAuthBytes(new byte[0]);
++        return tempData.toString();
+     }
+ }
+--- a/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateResponse.java
++++ b/clients/src/main/java/org/apache/kafka/common/requests/SaslAuthenticateResponse.java
+@@ -80,4 +80,12 @@
+     public static SaslAuthenticateResponse parse(ByteBuffer buffer, short version) {
+         return new SaslAuthenticateResponse(new SaslAuthenticateResponseData(new ByteBufferAccessor(buffer), version));
+     }
++
++    // Do not print authBytes, overwrite a temp copy of the data with empty bytes
++    @Override
++    public String toString() {
++        SaslAuthenticateResponseData tempData = data.duplicate();
++        tempData.setAuthBytes(new byte[0]);
++        return tempData.toString();
++    }
+ }
+
+diff --git a/clients/src/main/java/org/apache/kafka/common/config/internals/BrokerSecurityConfigs.java b/clients/src/main/java/org/apache/kafka/common/config/internals/BrokerSecurityConfigs.java
+index 767fa9a..ca3105c 100644
+--- a/clients/src/main/java/org/apache/kafka/common/config/internals/BrokerSecurityConfigs.java
++++ b/clients/src/main/java/org/apache/kafka/common/config/internals/BrokerSecurityConfigs.java
+@@ -115,4 +115,7 @@ public class BrokerSecurityConfigs {
+     public final static String SASL_MECHANISM_INTER_BROKER_PROTOCOL_CONFIG = "sasl.mechanism.inter.broker.protocol";
+     public final static String SASL_MECHANISM_INTER_BROKER_PROTOCOL_DOC = "SASL mechanism used for inter-broker communication. Default is GSSAPI.";
+ 
++    // The allowlist of the SASL OAUTHBEARER endpoints
++    public static final String ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG = "org.apache.kafka.sasl.oauthbearer.allowed.urls";
++
+ }
+diff --git a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactory.java b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactory.java
+index ac22473..1a9a286 100644
+--- a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactory.java
++++ b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactory.java
+@@ -53,6 +53,7 @@ public class AccessTokenRetrieverFactory  {
+         String saslMechanism,
+         Map<String, Object> jaasConfig) {
+         ConfigurationUtils cu = new ConfigurationUtils(configs, saslMechanism);
++        cu.throwIfURLIsNotAllowed(SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL);
+         URL tokenEndpointUrl = cu.validateUrl(SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL);
+ 
+         if (tokenEndpointUrl.getProtocol().toLowerCase(Locale.ROOT).equals("file")) {
+diff --git a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtils.java b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtils.java
+index 99bc206..71b58d3 100644
+--- a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtils.java
++++ b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtils.java
+@@ -22,11 +22,16 @@ import java.net.MalformedURLException;
+ import java.net.URISyntaxException;
+ import java.net.URL;
+ import java.nio.file.Path;
++import java.util.Arrays;
+ import java.util.Locale;
+ import java.util.Map;
++import java.util.Set;
++import java.util.stream.Collectors;
+ import org.apache.kafka.common.config.ConfigException;
+ import org.apache.kafka.common.network.ListenerName;
+ 
++import static org.apache.kafka.common.config.internals.BrokerSecurityConfigs.ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG;
++
+ /**
+  * <code>ConfigurationUtils</code> is a utility class to perform basic configuration-related
+  * logic and is separated out here for easier, more direct testing.
+@@ -218,4 +223,22 @@ public class ConfigurationUtils {
+         return (T) configs.get(name);
+     }
+ 
++    // visible for testing
++    void throwIfURLIsNotAllowed(String urlConfig) {
++        String allowedUrlsProp = System.getProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++        if (allowedUrlsProp == null) {
++            // by default, we accept all URLs
++            return;
++        }
++        Set<String> allowedUrlsList = Arrays.stream(allowedUrlsProp.split(","))
++                .map(String::trim)
++                .collect(Collectors.toSet());
++
++        String value = get(urlConfig);
++        if (!allowedUrlsList.contains(value)) {
++            throw new IllegalArgumentException(value + " is not allowed. Update system property '"
++                    + ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG + "' to allow " + value);
++        }
++    }
++
+ }
+diff --git a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactory.java b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactory.java
+index 3eb8dd6..de0bf4b 100644
+--- a/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactory.java
++++ b/clients/src/main/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactory.java
+@@ -55,6 +55,7 @@ public class VerificationKeyResolverFactory {
+         String saslMechanism,
+         Map<String, Object> jaasConfig) {
+         ConfigurationUtils cu = new ConfigurationUtils(configs, saslMechanism);
++        cu.throwIfURLIsNotAllowed(SASL_OAUTHBEARER_JWKS_ENDPOINT_URL);
+         URL jwksEndpointUrl = cu.validateUrl(SASL_OAUTHBEARER_JWKS_ENDPOINT_URL);
+ 
+         if (jwksEndpointUrl.getProtocol().toLowerCase(Locale.ROOT).equals("file")) {
+diff --git a/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactoryTest.java b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactoryTest.java
+index 741b4d2..bfe2d38 100644
+--- a/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactoryTest.java
++++ b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/AccessTokenRetrieverFactoryTest.java
+@@ -18,16 +18,23 @@
+ package org.apache.kafka.common.security.oauthbearer.internals.secured;
+ 
+ import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL;
++import static org.apache.kafka.common.config.internals.BrokerSecurityConfigs.ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG;
+ import static org.junit.jupiter.api.Assertions.assertEquals;
+ 
+ import java.io.File;
+ import java.util.Collections;
+ import java.util.Map;
+ import org.apache.kafka.common.config.ConfigException;
++import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.Test;
+ 
+ public class AccessTokenRetrieverFactoryTest extends OAuthBearerTest {
+ 
++    @AfterEach
++    public void tearDown() throws Exception {
++        System.clearProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++    }
++
+     @Test
+     public void testConfigureRefreshingFileAccessTokenRetriever() throws Exception {
+         String expected = "{}";
+@@ -62,4 +69,15 @@ public class AccessTokenRetrieverFactoryTest extends OAuthBearerTest {
+         assertThrowsWithMessage(ConfigException.class, () -> AccessTokenRetrieverFactory.create(configs, jaasConfig), "that doesn't exist");
+     }
+ 
++    @Test
++    public void testSaslOauthbearerTokenEndpointUrlIsNotAllowed() throws Exception {
++        // Should fail because the file is not in the allowed list
++        File tmpDir = createTempDir("not_allowed");
++        File accessTokenFile = new File(tmpDir, "not_allowed.json");
++        System.setProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG, "nothing");
++        Map<String, ?> configs = getSaslConfigs(SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL, accessTokenFile.toURI().toString());
++        assertThrowsWithMessage(IllegalArgumentException.class, () -> AccessTokenRetrieverFactory.create(configs, Collections.emptyMap()),
++                ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++    }
++
+ }
+diff --git a/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtilsTest.java b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtilsTest.java
+index b1ed7c1..8963f53 100644
+--- a/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtilsTest.java
++++ b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/ConfigurationUtilsTest.java
+@@ -20,14 +20,25 @@ package org.apache.kafka.common.security.oauthbearer.internals.secured;
+ import java.io.File;
+ import java.io.IOException;
+ import java.util.Collections;
++import java.util.HashMap;
+ import java.util.Map;
+ import org.apache.kafka.common.config.ConfigException;
+ import org.apache.kafka.test.TestUtils;
++import org.junit.jupiter.api.AfterEach;
+ import org.junit.jupiter.api.Test;
+ 
++import static org.apache.kafka.common.config.internals.BrokerSecurityConfigs.ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG;
++import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
++
+ public class ConfigurationUtilsTest extends OAuthBearerTest {
+ 
+-    private final static String URL_CONFIG_NAME = "url";
++    private static final String URL_CONFIG_NAME = "url";
++    private static final String FILE_CONFIG_NAME = "file";
++
++    @AfterEach
++    public void tearDown() throws Exception {
++        System.clearProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++    }
+ 
+     @Test
+     public void testUrl() {
+@@ -127,6 +138,31 @@ public class ConfigurationUtilsTest extends OAuthBearerTest {
+         assertThrowsWithMessage(ConfigException.class, () -> testFile("    "), "must not contain only whitespace");
+     }
+ 
++    @Test
++    public void testAllowedSaslOauthbearerUrlSystemProperty() {
++        String url = "http://www.example.com";
++        String fileUrl = "file:///etc/passwd";
++        Map<String, Object> configs = new HashMap<>();
++        configs.put(URL_CONFIG_NAME, url);
++        configs.put(FILE_CONFIG_NAME, fileUrl);
++        ConfigurationUtils cu = new ConfigurationUtils(configs);
++
++        // By default, all URLs are allowed
++        assertDoesNotThrow(() -> cu.throwIfURLIsNotAllowed(URL_CONFIG_NAME));
++        assertDoesNotThrow(() -> cu.throwIfURLIsNotAllowed(FILE_CONFIG_NAME));
++
++        // add one url into allowed list
++        System.setProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG, url);
++        assertDoesNotThrow(() -> cu.throwIfURLIsNotAllowed(URL_CONFIG_NAME));
++        assertThrowsWithMessage(IllegalArgumentException.class, () -> cu.throwIfURLIsNotAllowed(FILE_CONFIG_NAME),
++                ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++
++        // add all urls into allowed list
++        System.setProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG, url + "," + fileUrl);
++        assertDoesNotThrow(() -> cu.throwIfURLIsNotAllowed(URL_CONFIG_NAME));
++        assertDoesNotThrow(() -> cu.throwIfURLIsNotAllowed(FILE_CONFIG_NAME));
++    }
++
+     protected void testFile(String value) {
+         Map<String, Object> configs = Collections.singletonMap(URL_CONFIG_NAME, value);
+         ConfigurationUtils cu = new ConfigurationUtils(configs);
+diff --git a/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactoryTest.java b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactoryTest.java
+new file mode 100644
+index 0000000..0c4abd3
+--- /dev/null
++++ b/clients/src/test/java/org/apache/kafka/common/security/oauthbearer/internals/secured/VerificationKeyResolverFactoryTest.java
+@@ -0,0 +1,80 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one or more
++ * contributor license agreements. See the NOTICE file distributed with
++ * this work for additional information regarding copyright ownership.
++ * The ASF licenses this file to You under the Apache License, Version 2.0
++ * (the "License"); you may not use this file except in compliance with
++ * the License. You may obtain a copy of the License at
++ *
++ *    http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.kafka.common.security.oauthbearer.internals.secured;
++
++import org.apache.kafka.common.config.ConfigException;
++
++import org.junit.jupiter.api.AfterEach;
++import org.junit.jupiter.api.Test;
++
++import java.io.File;
++import java.util.Collections;
++import java.util.Map;
++
++import static org.apache.kafka.common.config.SaslConfigs.SASL_OAUTHBEARER_JWKS_ENDPOINT_URL;
++import static org.apache.kafka.common.config.internals.BrokerSecurityConfigs.ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG;
++
++public class VerificationKeyResolverFactoryTest extends OAuthBearerTest {
++
++    @AfterEach
++    public void tearDown() throws Exception {
++        System.clearProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++    }
++
++    @Test
++    public void testConfigureRefreshingFileVerificationKeyResolver() throws Exception {
++        File tmpDir = createTempDir("access-token");
++        File verificationKeyFile = createTempFile(tmpDir, "access-token-", ".json", "{}");
++
++        Map<String, ?> configs = Collections.singletonMap(SASL_OAUTHBEARER_JWKS_ENDPOINT_URL, verificationKeyFile.toURI().toString());
++        Map<String, Object> jaasConfig = Collections.emptyMap();
++
++        // verify it won't throw exception
++        try (CloseableVerificationKeyResolver verificationKeyResolver = VerificationKeyResolverFactory.create(configs, jaasConfig)) { }
++    }
++
++    @Test
++    public void testConfigureRefreshingFileVerificationKeyResolverWithInvalidDirectory() {
++        // Should fail because the parent path doesn't exist.
++        String file = new File("/tmp/this-directory-does-not-exist/foo.json").toURI().toString();
++        Map<String, ?> configs = getSaslConfigs(SASL_OAUTHBEARER_JWKS_ENDPOINT_URL, file);
++        Map<String, Object> jaasConfig = Collections.emptyMap();
++        assertThrowsWithMessage(ConfigException.class, () -> VerificationKeyResolverFactory.create(configs, jaasConfig), "that doesn't exist");
++    }
++
++    @Test
++    public void testConfigureRefreshingFileVerificationKeyResolverWithInvalidFile() throws Exception {
++        // Should fail because while the parent path exists, the file itself doesn't.
++        File tmpDir = createTempDir("this-directory-does-exist");
++        File verificationKeyFile = new File(tmpDir, "this-file-does-not-exist.json");
++        Map<String, ?> configs = getSaslConfigs(SASL_OAUTHBEARER_JWKS_ENDPOINT_URL, verificationKeyFile.toURI().toString());
++        Map<String, Object> jaasConfig = Collections.emptyMap();
++        assertThrowsWithMessage(ConfigException.class, () -> VerificationKeyResolverFactory.create(configs, jaasConfig), "that doesn't exist");
++    }
++
++    @Test
++    public void testSaslOauthbearerTokenEndpointUrlIsNotAllowed() throws Exception {
++        // Should fail because the file is not in the allowed list
++        File tmpDir = createTempDir("not_allowed");
++        File verificationKeyFile = new File(tmpDir, "not_allowed.json");
++        System.setProperty(ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG, "nothing");
++        Map<String, ?> configs = getSaslConfigs(SASL_OAUTHBEARER_JWKS_ENDPOINT_URL, verificationKeyFile.toURI().toString());
++        assertThrowsWithMessage(IllegalArgumentException.class, () -> VerificationKeyResolverFactory.create(configs, Collections.emptyMap()),
++                ALLOWED_SASL_OAUTHBEARER_URLS_CONFIG);
++    }
++}
+
+--- a/clients/src/main/java/org/apache/kafka/common/security/JaasUtils.java
++++ b/clients/src/main/java/org/apache/kafka/common/security/JaasUtils.java
+@@ -26,7 +26,8 @@ public final class JaasUtils {
+     private static final Logger LOG = LoggerFactory.getLogger(JaasUtils.class);
+     public static final String JAVA_LOGIN_CONFIG_PARAM = "java.security.auth.login.config";
+     public static final String DISALLOWED_LOGIN_MODULES_CONFIG = "org.apache.kafka.disallowed.login.modules";
+-    public static final String DISALLOWED_LOGIN_MODULES_DEFAULT = "com.sun.security.auth.module.JndiLoginModule";
++    public static final String DISALLOWED_LOGIN_MODULES_DEFAULT =
++            "com.sun.security.auth.module.JndiLoginModule,com.sun.security.auth.module.LdapLoginModule";
+     public static final String SERVICE_NAME = "serviceName";
+
+     public static final String ZK_SASL_CLIENT = "zookeeper.sasl.client";
+--- a/clients/src/test/java/org/apache/kafka/common/security/JaasContextTest.java
++++ b/clients/src/test/java/org/apache/kafka/common/security/JaasContextTest.java
+@@ -188,6 +188,10 @@ public class JaasContextTest {
+         String jaasConfigProp1 = "com.sun.security.auth.module.JndiLoginModule required;";
+         assertThrows(IllegalArgumentException.class, () -> configurationEntry(JaasContext.Type.CLIENT, jaasConfigProp1));
+
++        //test LdapLoginModule is not allowed by default
++        String jaasConfigProp2 = "com.sun.security.auth.module.LdapLoginModule required;";
++        assertThrows(IllegalArgumentException.class, () -> configurationEntry(JaasContext.Type.CLIENT, jaasConfigProp2));
++
+         //test ListenerName Override
+         writeConfiguration(Arrays.asList(
+                 "KafkaServer { test.LoginModuleDefault required; };",
+@@ -196,11 +200,19 @@ public class JaasContextTest {
+         assertThrows(IllegalArgumentException.class, () -> JaasContext.loadServerContext(new ListenerName("plaintext"),
+                 "SOME-MECHANISM", Collections.emptyMap()));
+
++        //test ListenerName Override
++        writeConfiguration(Arrays.asList(
++                "KafkaServer { test.LoginModuleDefault required; };",
++                "plaintext.KafkaServer { com.sun.security.auth.module.LdapLoginModule requisite; };"
++        ));
++        assertThrows(IllegalArgumentException.class, () -> JaasContext.loadServerContext(new ListenerName("plaintext"),
++                "SOME-MECHANISM", Collections.emptyMap()));
++
+         //test org.apache.kafka.disallowed.login.modules system property with multiple modules
+         System.setProperty(DISALLOWED_LOGIN_MODULES_CONFIG, " com.ibm.security.auth.module.LdapLoginModule , com.ibm.security.auth.module.Krb5LoginModule ");
+
+-        String jaasConfigProp2 = "com.ibm.security.auth.module.LdapLoginModule required;";
+-        assertThrows(IllegalArgumentException.class, () ->  configurationEntry(JaasContext.Type.CLIENT, jaasConfigProp2));
++        String jaasConfigProp3 = "com.ibm.security.auth.module.LdapLoginModule required;";
++        assertThrows(IllegalArgumentException.class, () ->  configurationEntry(JaasContext.Type.CLIENT, jaasConfigProp3));
+
+         //test ListenerName Override
+         writeConfiguration(Arrays.asList(
+@@ -215,6 +227,7 @@ public class JaasContextTest {
+         System.setProperty(DISALLOWED_LOGIN_MODULES_CONFIG, "");
+
+         checkConfiguration("com.sun.security.auth.module.JndiLoginModule", LoginModuleControlFlag.REQUIRED, new HashMap<>());
++        checkConfiguration("com.sun.security.auth.module.LdapLoginModule", LoginModuleControlFlag.REQUIRED, new HashMap<>());
+
+         //test ListenerName Override
+         writeConfiguration(Arrays.asList(
+@@ -226,6 +239,17 @@ public class JaasContextTest {
+         assertEquals(1, context.configurationEntries().size());
+         checkEntry(context.configurationEntries().get(0), "com.sun.security.auth.module.JndiLoginModule",
+                 LoginModuleControlFlag.REQUISITE, Collections.emptyMap());
++
++        //test ListenerName Override
++        writeConfiguration(Arrays.asList(
++                "KafkaServer { com.sun.security.auth.module.LdapLoginModule required; };",
++                "plaintext.KafkaServer { com.sun.security.auth.module.LdapLoginModule requisite; };"
++        ));
++        context = JaasContext.loadServerContext(new ListenerName("plaintext"),
++                "SOME-MECHANISM", Collections.emptyMap());
++        assertEquals(1, context.configurationEntries().size());
++        checkEntry(context.configurationEntries().get(0), "com.sun.security.auth.module.LdapLoginModule",
++                LoginModuleControlFlag.REQUISITE, Collections.emptyMap());
+     }
+
+     @Test
