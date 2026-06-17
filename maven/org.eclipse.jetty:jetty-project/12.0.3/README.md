@@ -5,12 +5,14 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-22201
+- CVE-2024-6763
+- CVE-2024-8184
+- CVE-2025-11143
 - CVE-2025-1948
 - CVE-2025-5115
 - CVE-2026-1605
 - CVE-2026-2332
 - CVE-2026-5795
-- CVE-2025-11143
 
 ## How to Apply:
 1. Clone or download the source code for org.eclipse.jetty:jetty-project
