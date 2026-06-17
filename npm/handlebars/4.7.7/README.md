@@ -4,11 +4,13 @@ This patch is based on handlebars version 4.7.7, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-33916
 - CVE-2026-33937
 - CVE-2026-33938
 - CVE-2026-33939
 - CVE-2026-33940
 - CVE-2026-33941
+- GHSA-7rx3-28cr-v5wh
 
 ## How to Apply:
 1. Clone or download the source code for handlebars
