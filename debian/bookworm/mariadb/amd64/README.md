@@ -1,14 +1,14 @@
-# mariadb : 1:10.11.11-0+deb12u1.root.io.2
+# mariadb : 1:10.11.14-0+deb12u2.root.io.5
 
-This patch is based on mariadb version 1:10.11.11-0+deb12u1.root.io.2, which is available at:
-https://sources.debian.org/src/mariadb/1:10.11.11-0+deb12u1/
+This patch is based on mariadb version 1:10.11.14-0+deb12u2.root.io.5, which is available at:
+https://sources.debian.org/src/mariadb/1:10.11.14-0+deb12u2/
 
 ## Affected CVEs:
-- CVE-2023-52969
-- CVE-2025-30722
-- CVE-2025-30693
-- CVE-2023-52971
-- CVE-2023-52970
+- CVE-2025-13699
+- CVE-2026-21968
+- CVE-2026-48163
+- CVE-2026-48165
+- CVE-2026-44168
 
 ## How to Apply:
 1. Obtain the source package: `apt source mariadb`
