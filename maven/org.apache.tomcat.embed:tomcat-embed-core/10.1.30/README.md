@@ -20,6 +20,7 @@ unknown
 - CVE-2026-24734
 - CVE-2026-25854
 - CVE-2026-34483
+- CVE-2026-34487
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.tomcat.embed:tomcat-embed-core
