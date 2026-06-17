@@ -1,0 +1,278 @@
+--- a/x-pack/plugin/security/src/internalClusterTest/java/org/elasticsearch/xpack/security/profile/ProfileIntegTests.java
++++ b/x-pack/plugin/security/src/internalClusterTest/java/org/elasticsearch/xpack/security/profile/ProfileIntegTests.java
+@@ -8,6 +8,7 @@
+ package org.elasticsearch.xpack.security.profile;
+
+ import org.apache.lucene.search.TotalHits;
++import org.elasticsearch.ElasticsearchException;
+ import org.elasticsearch.ResourceNotFoundException;
+ import org.elasticsearch.action.admin.indices.get.GetIndexAction;
+ import org.elasticsearch.action.admin.indices.get.GetIndexRequest;
+@@ -119,6 +120,7 @@ public class ProfileIntegTests extends AbstractProfileIntegTestCase {
+         final Settings.Builder builder = Settings.builder().put(super.nodeSettings(nodeOrdinal, otherSettings));
+         // This setting tests that the setting is registered
+         builder.put("xpack.security.authc.domains.my_domain.realms", "file");
++        builder.put("xpack.security.profile.max_size", "1kb");
+         // enable anonymous
+         builder.putList(AnonymousUser.ROLES_SETTING.getKey(), ANONYMOUS_ROLE);
+         return builder.build();
+@@ -338,6 +340,37 @@ public class ProfileIntegTests extends AbstractProfileIntegTestCase {
+         );
+     }
+
++    public void testUpdateProfileDataHitStorageQuota() {
++        Profile profile1 = doActivateProfile(RAC_USER_NAME, TEST_PASSWORD_SECURE_STRING);
++
++        char[] buf = new char[512]; // half of the 1,024 quota
++        Arrays.fill(buf, 'a');
++        String largeValue = new String(buf);
++
++        var repeatable = new UpdateProfileDataRequest(
++            profile1.uid(),
++            Map.of(),
++            Map.of("app1", Map.of("key1", largeValue)),
++            -1,
++            -1,
++            WriteRequest.RefreshPolicy.WAIT_UNTIL
++        );
++
++        client().execute(UpdateProfileDataAction.INSTANCE, repeatable).actionGet(); // occupy half of the quota
++        client().execute(UpdateProfileDataAction.INSTANCE, repeatable).actionGet(); // in-place change, still half quota
++
++        var overflow = new UpdateProfileDataRequest(
++            profile1.uid(),
++            Map.of(),
++            Map.of("app1", Map.of("key2", largeValue)),
++            -1,
++            -1,
++            WriteRequest.RefreshPolicy.WAIT_UNTIL
++        );
++
++        assertThrows(ElasticsearchException.class, () -> client().execute(UpdateProfileDataAction.INSTANCE, overflow).actionGet());
++    }
++
+     public void testSuggestProfilesWithName() {
+         final ProfileService profileService = getInstanceFromRandomNode(ProfileService.class);
+
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/Security.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/Security.java
+@@ -1605,6 +1605,7 @@ public class Security extends Plugin
+         settingsList.add(TokenService.TOKEN_EXPIRATION);
+         settingsList.add(TokenService.DELETE_INTERVAL);
+         settingsList.add(TokenService.DELETE_TIMEOUT);
++        settingsList.add(ProfileService.MAX_SIZE_SETTING);
+         settingsList.addAll(SSLConfigurationSettings.getProfileSettings());
+         settingsList.add(ApiKeyService.STORED_HASH_ALGO_SETTING);
+         settingsList.add(ApiKeyService.DELETE_TIMEOUT);
+--- a/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/profile/ProfileService.java
++++ b/x-pack/plugin/security/src/main/java/org/elasticsearch/xpack/security/profile/ProfileService.java
+@@ -39,7 +39,10 @@ import org.elasticsearch.common.BackoffPolicy;
+ import org.elasticsearch.common.Strings;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.lucene.Lucene;
++import org.elasticsearch.common.settings.Setting;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.unit.ByteSizeUnit;
++import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.unit.Fuzziness;
+ import org.elasticsearch.common.xcontent.XContentHelper;
+ import org.elasticsearch.core.TimeValue;
+@@ -107,6 +110,15 @@ import static org.elasticsearch.xpack.security.support.SecurityIndexManager.Avai
+ import static org.elasticsearch.xpack.security.support.SecuritySystemIndices.SECURITY_PROFILE_ALIAS;
+
+ public class ProfileService {
++
++    public static final Setting<ByteSizeValue> MAX_SIZE_SETTING = Setting.byteSizeSetting(
++        "xpack.security.profile.max_size",
++        ByteSizeValue.of(10, ByteSizeUnit.MB), // default: 10 MB
++        ByteSizeValue.ZERO, // minimum: 0 bytes
++        ByteSizeValue.ofBytes(Integer.MAX_VALUE),
++        Setting.Property.NodeScope
++    );
++
+     private static final Logger logger = LogManager.getLogger(ProfileService.class);
+     private static final String DOC_ID_PREFIX = "profile_";
+     private static final BackoffPolicy DEFAULT_BACKOFF = BackoffPolicy.exponentialBackoff();
+@@ -119,6 +131,7 @@ public class ProfileService {
+     private final SecurityIndexManager profileIndex;
+     private final Function<String, DomainConfig> domainConfigLookup;
+     private final Function<RealmConfig.RealmIdentifier, Authentication.RealmRef> realmRefLookup;
++    private final ByteSizeValue maxProfileSize;
+
+     public ProfileService(Settings settings, Clock clock, Client client, SecurityIndexManager profileIndex, Realms realms) {
+         this.settings = settings;
+@@ -127,6 +140,7 @@ public class ProfileService {
+         this.profileIndex = profileIndex;
+         this.domainConfigLookup = realms::getDomainConfig;
+         this.realmRefLookup = realms::getRealmRef;
++        this.maxProfileSize = MAX_SIZE_SETTING.get(settings);
+     }
+
+     public void getProfiles(List<String> uids, Set<String> dataKeys, ActionListener<ResultsAndErrors<Profile>> listener) {
+@@ -241,10 +255,59 @@ public class ProfileService {
+             return;
+         }
+
+-        doUpdate(
+-            buildUpdateRequest(request.getUid(), builder, request.getRefreshPolicy(), request.getIfPrimaryTerm(), request.getIfSeqNo()),
+-            listener.map(updateResponse -> AcknowledgedResponse.TRUE)
+-        );
++        getVersionedDocument(request.getUid(), ActionListener.wrap(doc -> {
++            validateProfileSize(doc, request, maxProfileSize);
++
++            doUpdate(
++                buildUpdateRequest(request.getUid(), builder, request.getRefreshPolicy(), request.getIfPrimaryTerm(), request.getIfSeqNo()),
++                listener.map(updateResponse -> AcknowledgedResponse.TRUE)
++            );
++        }, listener::onFailure));
++    }
++
++    static void validateProfileSize(VersionedDocument doc, UpdateProfileDataRequest request, ByteSizeValue limit) {
++        if (doc == null) {
++            return;
++        }
++        Map<String, Object> labels = combineMaps(doc.doc.labels(), request.getLabels());
++        Map<String, Object> data = combineMaps(mapFromBytesReference(doc.doc.applicationData()), request.getData());
++        ByteSizeValue actualSize = ByteSizeValue.ofBytes(serializationSize(labels) + serializationSize(data));
++        if (actualSize.compareTo(limit) > 0) {
++            throw new ElasticsearchStatusException(
++                Strings.format(
++                    "cannot update profile [%s] because the combined profile size of [%s] exceeds the maximum of [%s]",
++                    request.getUid(),
++                    actualSize,
++                    limit
++                ),
++                RestStatus.BAD_REQUEST
++            );
++        }
++    }
++
++    static Map<String, Object> combineMaps(Map<String, Object> src, Map<String, Object> update) {
++        Map<String, Object> result = new HashMap<>(); // ensure mutable outer source map for update below
++        if (src != null) {
++            result.putAll(src);
++        }
++        XContentHelper.update(result, update, false);
++        return result;
++    }
++
++    static Map<String, Object> mapFromBytesReference(BytesReference bytesRef) {
++        if (bytesRef == null || bytesRef.length() == 0) {
++            return Map.of();
++        }
++        return XContentHelper.convertToMap(bytesRef, false, XContentType.JSON).v2();
++    }
++
++    static int serializationSize(Map<String, Object> map) {
++        try (XContentBuilder builder = XContentFactory.jsonBuilder()) {
++            builder.value(map);
++            return BytesReference.bytes(builder).length();
++        } catch (IOException e) {
++            throw new ElasticsearchException("Error occurred computing serialization size", e); // I/O error should never happen here
++        }
+     }
+
+     public void suggestProfile(SuggestProfilesRequest request, TaskId parentTaskId, ActionListener<SuggestProfilesResponse> listener) {
+--- a/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/profile/ProfileServiceTests.java
++++ b/x-pack/plugin/security/src/test/java/org/elasticsearch/xpack/security/profile/ProfileServiceTests.java
+@@ -31,6 +31,7 @@ import org.elasticsearch.action.search.ShardSearchFailure;
+ import org.elasticsearch.action.search.TransportMultiSearchAction;
+ import org.elasticsearch.action.search.TransportSearchAction;
+ import org.elasticsearch.action.support.PlainActionFuture;
++import org.elasticsearch.action.support.WriteRequest;
+ import org.elasticsearch.action.update.TransportUpdateAction;
+ import org.elasticsearch.action.update.UpdateRequest;
+ import org.elasticsearch.action.update.UpdateRequestBuilder;
+@@ -41,6 +42,7 @@ import org.elasticsearch.common.bytes.BytesArray;
+ import org.elasticsearch.common.bytes.BytesReference;
+ import org.elasticsearch.common.hash.MessageDigests;
+ import org.elasticsearch.common.settings.Settings;
++import org.elasticsearch.common.unit.ByteSizeValue;
+ import org.elasticsearch.common.unit.Fuzziness;
+ import org.elasticsearch.common.util.concurrent.EsExecutors;
+ import org.elasticsearch.common.util.set.Sets;
+@@ -72,6 +74,7 @@ import org.elasticsearch.xpack.core.security.action.profile.Profile;
+ import org.elasticsearch.xpack.core.security.action.profile.SuggestProfilesRequest;
+ import org.elasticsearch.xpack.core.security.action.profile.SuggestProfilesRequestTests;
+ import org.elasticsearch.xpack.core.security.action.profile.SuggestProfilesResponse;
++import org.elasticsearch.xpack.core.security.action.profile.UpdateProfileDataRequest;
+ import org.elasticsearch.xpack.core.security.authc.Authentication;
+ import org.elasticsearch.xpack.core.security.authc.AuthenticationTestHelper;
+ import org.elasticsearch.xpack.core.security.authc.AuthenticationTests;
+@@ -90,7 +93,10 @@ import org.junit.After;
+ import org.junit.Before;
+ import org.mockito.Mockito;
+
++import java.io.ByteArrayInputStream;
+ import java.io.IOException;
++import java.nio.ByteBuffer;
++import java.nio.charset.StandardCharsets;
+ import java.time.Clock;
+ import java.time.Instant;
+ import java.util.ArrayList;
+@@ -1324,6 +1330,54 @@ public class ProfileServiceTests extends ESTestCase {
+         assertThat(e.getMessage(), containsString("test unavailable"));
+     }
+
++    public void testSerializationSize() {
++        assertThat(ProfileService.serializationSize(Map.of()), is(2));
++        assertThat(ProfileService.serializationSize(Map.of("foo", "bar")), is(13));
++        assertThrows(
++            IllegalArgumentException.class,
++            () -> ProfileService.serializationSize(Map.of("bad", new ByteArrayInputStream(new byte[0])))
++        );
++    }
++
++    public void testMapFromBytesReference() {
++        assertThat(ProfileService.mapFromBytesReference(null), is(Map.of()));
++        assertThat(ProfileService.mapFromBytesReference(BytesReference.fromByteBuffer(ByteBuffer.allocate(0))), is(Map.of()));
++        assertThat(ProfileService.mapFromBytesReference(newBytesReference("{}")), is(Map.of()));
++        assertThat(ProfileService.mapFromBytesReference(newBytesReference("{\"foo\":\"bar\"}")), is(Map.of("foo", "bar")));
++    }
++
++    public void testCombineMaps() {
++        assertThat(ProfileService.combineMaps(null, Map.of("a", 1)), is(Map.of("a", 1)));
++        assertThat(
++            ProfileService.combineMaps(new HashMap<>(Map.of("a", 1, "b", 2)), Map.of("b", 3, "c", 4)),
++            is(Map.of("a", 1, "b", 3, "c", 4))
++        );
++        assertThat(
++            ProfileService.combineMaps(new HashMap<>(Map.of("a", new HashMap<>(Map.of("b", "c")))), Map.of("a", Map.of("d", "e"))),
++            is(Map.of("a", Map.of("b", "c", "d", "e")))
++        );
++    }
++
++    public void testValidateProfileSize() {
++        var pd = new ProfileDocument("uid", true, 0L, null, Map.of(), newBytesReference("{}"));
++        var vd = new ProfileService.VersionedDocument(pd, 1L, 1L);
++        var up = new UpdateProfileDataRequest(
++            "uid",
++            Map.of("key", "value"),
++            Map.of("key", "value"),
++            1L,
++            1L,
++            WriteRequest.RefreshPolicy.NONE
++        );
++        assertThrows(ElasticsearchException.class, () -> ProfileService.validateProfileSize(vd, up, ByteSizeValue.ZERO));
++        ProfileService.validateProfileSize(vd, up, ByteSizeValue.ofBytes(100));
++        ProfileService.validateProfileSize(null, up, ByteSizeValue.ZERO);
++    }
++
++    private static BytesReference newBytesReference(String str) {
++        return BytesReference.fromByteBuffer(ByteBuffer.wrap(str.getBytes(StandardCharsets.UTF_8)));
++    }
++
+     record SampleDocumentParameter(String uid, String username, List<String> roles, long lastSynchronized) {}
+
+     private void mockMultiGetRequest(List<SampleDocumentParameter> sampleDocumentParameters) {
+
+--- a/x-pack/libs/es-opensaml-security-api/build.gradle
++++ b/x-pack/libs/es-opensaml-security-api/build.gradle
+@@ -31,4 +31,6 @@ tasks.named("shadowJar").configure {
+     attributes 'Automatic-Module-Name': 'org.opensaml.security'
+   }
+   exclude 'META-INF/services/org.opensaml.security.crypto.ec.NamedCurve'
++  // Root.io: merged net.jpountz.* duplicates module org.lz4.java (split package on compile).
++  exclude 'net/jpountz/**'
+ }
+ 
