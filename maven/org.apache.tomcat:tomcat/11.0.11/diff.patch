@@ -1,0 +1,246 @@
+--- a/java/org/apache/catalina/connector/LocalStrings.properties
++++ b/java/org/apache/catalina/connector/LocalStrings.properties
+@@ -95,6 +95,7 @@
+ request.fragmentInDispatchPath=The fragment in dispatch path [{0}] has been removed
+ request.illegalWrap=The request wrapper must wrap the request obtained from getRequest()
+ request.notAsync=It is illegal to call this method if the current request is not in asynchronous mode (i.e. isAsyncStarted() returns false)
++request.partCleanup.failed=Unable to delete temporary file for uploaded part after multi-part processing failed
+ request.session.failed=Failed to load session [{0}] due to [{1}]
+
+ requestFacade.nullRequest=The request object has been recycled and is no longer associated with this facade
+--- a/java/org/apache/catalina/connector/Request.java
++++ b/java/org/apache/catalina/connector/Request.java
+@@ -2572,8 +2572,10 @@ public class Request implements HttpServletRequest {
+         upload.setFileCountMax(partLimit);
+
+         parts = new ArrayList<>();
++        List<FileItem> items = null;
++        boolean success = false;
+         try {
+-            List<FileItem> items = upload.parseRequest(new ServletRequestContext(this));
++            items = upload.parseRequest(new ServletRequestContext(this));
+             int maxPostSize = getConnector().getMaxPostSize();
+             long postSize = 0;
+             Charset charset = getCharset();
+@@ -2609,6 +2611,7 @@ public class Request implements HttpServletRequest {
+                 }
+                 parts.add(part);
+             }
++            success = true;
+         } catch (InvalidContentTypeException e) {
+             partsParseException = new ServletException(e);
+         } catch (SizeException | FileCountLimitExceededException e) {
+@@ -2619,6 +2622,24 @@ public class Request implements HttpServletRequest {
+         } catch (IllegalStateException e) {
+             checkSwallowInput();
+             partsParseException = e;
++        } finally {
++            /*
++             * GC will delete any temporary copies of uploaded files left in the work directory but if we know that the
++             * upload has failed then explicitly clean up now.
++             */
++            if (!success) {
++                parts.clear();
++                if (items != null) {
++                    for (FileItem item : items) {
++                        try {
++                            item.delete();
++                        } catch (Throwable t) {
++                            ExceptionUtils.handleThrowable(t);
++                            log.warn(sm.getString("request.partCleanup.failed"), t);
++                        }
++                    }
++                }
++            }
+         }
+     }
+
+--- a/java/org/apache/tomcat/util/net/SocketWrapperBase.java
++++ b/java/org/apache/tomcat/util/net/SocketWrapperBase.java
+@@ -85,6 +85,8 @@
+     protected int remotePort = -1;
+     protected volatile ServletConnection servletConnection = null;
+
++    protected String sniHostName = null;
++
+     /**
+      * Used to record the first IOException that occurs during non-blocking read/writes that can't be usefully
+      * propagated up the stack since there is no user code or appropriate container code in the stack to handle it.
+@@ -208,6 +210,20 @@
+         this.negotiatedProtocol = negotiatedProtocol;
+     }
+
++    /**
++     * @return the sniHostName
++     */
++    public String getSniHostName() {
++        return this.sniHostName;
++    }
++
++    /**
++     * @param sniHostName the SNI host name to set
++     */
++    public void setSniHostName(String sniHostName) {
++        this.sniHostName = sniHostName;
++    }
++
+     /**
+      * Set the timeout for reading. Values of zero or less will be changed to -1.
+      *
+--- a/java/org/apache/tomcat/util/net/SecureNioChannel.java
++++ b/java/org/apache/tomcat/util/net/SecureNioChannel.java
+@@ -275,6 +275,7 @@
+         switch (extractor.getResult()) {
+             case COMPLETE:
+                 hostName = extractor.getSNIValue();
++                socketWrapper.setSniHostName(hostName);
+                 clientRequestedApplicationProtocols = extractor.getClientRequestedApplicationProtocols();
+                 //$FALL-THROUGH$ to set the client requested ciphers
+             case NOT_PRESENT:
+--- a/java/org/apache/tomcat/util/net/AbstractEndpoint.java
++++ b/java/org/apache/tomcat/util/net/AbstractEndpoint.java
+@@ -257,6 +257,17 @@
+     }
+
+
++    private boolean strictSni = true;
++
++    public boolean getStrictSni() {
++        return strictSni;
++    }
++
++    public void setStrictSni(boolean strictSni) {
++        this.strictSni = strictSni;
++    }
++
++
+     private String defaultSSLHostConfigName = SSLHostConfig.DEFAULT_SSL_HOST_NAME;
+
+     /**
+@@ -668,6 +679,22 @@
+     }
+
+
++    /**
++     * Check if two host names share the same SSLHostConfig.
++     *
++     * @param sniHostName the host name from SNI, null if SNI is not in use
++     * @param protocolHostName the host name from the protocol
++     * @return true if SNI is not checked, if the SNI host name matches the protocol host name,
++     *    if both host names use the same SSLHostConfig configuration, if there is no SNI and the
++     *    protocol host name uses the default SSLHostConfig configuration, and false otherwise
++     */
++    public boolean checkSni(String sniHostName, String protocolHostName) {
++        return (!strictSni || !isSSLEnabled()
++                || (sniHostName != null && sniHostName.equalsIgnoreCase(protocolHostName))
++                || getSSLHostConfig(sniHostName) == getSSLHostConfig(protocolHostName));
++    }
++
++
+     /**
+      * Has the user requested that send file be used where possible?
+      */
+--- a/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
++++ b/java/org/apache/coyote/http11/AbstractHttp11Protocol.java
+@@ -759,6 +759,10 @@
+     }
+
+
++    public boolean checkSni(String sniHostName, String protocolHostName) {
++        return getEndpoint().checkSni(sniHostName, protocolHostName);
++    }
++
+     // ------------------------------------------------------------- Common code
+
+     @Override
+--- a/java/org/apache/coyote/http11/Http11Processor.java
++++ b/java/org/apache/coyote/http11/Http11Processor.java
+@@ -774,6 +774,11 @@
+         // Validate host name and extract port if present
+         parseHost(hostValueMB);
+
++        // Match host name with SNI if required
++        if (!protocol.checkSni(socketWrapper.getSniHostName(), request.serverName().toString())) {
++            badRequest("http11processor.request.sni");
++        }
++
+         if (!getErrorState().isIoAllowed()) {
+             getAdapter().log(request, response, 0);
+         }
+--- a/java/org/apache/coyote/http11/LocalStrings.properties
++++ b/java/org/apache/coyote/http11/LocalStrings.properties
+@@ -41,5 +41,6 @@
+ http11processor.request.prepare=Error preparing request
+ http11processor.request.process=Error processing request
++http11processor.request.sni=The host header does not match the SNI host
+ http11processor.request.unsupportedEncoding=Error preparing request, unsupported transfer encoding [{0}]
+ http11processor.request.unsupportedVersion=Error preparing request, unsupported HTTP version [{0}]
+ http11processor.response.finish=Error finishing response
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -1859,6 +1859,10 @@
+         }
+     }
+
++    String getSniHostName() {
++        return socketWrapper.getSniHostName();
++    }
++
+     protected class PingManager {
+
+         protected boolean initiateDisabled = false;
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -107,4 +107,5 @@
+ stream.host.inconsistent=Connection [{0}], Stream [{1}], The header host header [{2}] is inconsistent with previously provided values for host [{3}] and/or port [{4}]
++stream.host.sni=Connection [{0}], Stream [{1}], The host header [{2}] does not match the SNI host [{3}]
+ stream.inputBuffer.copy=Copying [{0}] bytes from inBuffer to outBuffer
+ stream.inputBuffer.dispatch=Data added to inBuffer when read interest is registered. Triggering a read dispatch
+ stream.inputBuffer.empty=The Stream input buffer is empty. Waiting for more data
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -504,6 +504,11 @@
+         } else {
+             coyoteRequest.serverName().setString(value);
+         }
++        // Match host name with SNI if required
++        if (!handler.getProtocol().getHttp11Protocol().checkSni(handler.getSniHostName(), coyoteRequest.serverName().getString())) {
++            throw new HpackException(sm.getString("stream.host.sni", getConnectionId(), getIdAsString(), value,
++                    handler.getSniHostName()));
++        }
+     }
+
+
+
+--- a/java/org/apache/tomcat/util/openssl/openssl_h.java
++++ b/java/org/apache/tomcat/util/openssl/openssl_h.java
+@@ -196,6 +196,16 @@
+         return X509_V_OK;
+     }
+
++    private static final int X509_V_ERR_UNABLE_TO_GET_CRL = (int) 3L;
++
++    /**
++     * {@snippet lang = c : * #define X509_V_ERR_UNABLE_TO_GET_CRL 3
++     * }
++     */
++    public static int X509_V_ERR_UNABLE_TO_GET_CRL() {
++        return X509_V_ERR_UNABLE_TO_GET_CRL;
++    }
++
+     private static final int X509_V_ERR_CRL_HAS_EXPIRED = (int) 12L;
+
+     /**
+--- a/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
++++ b/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
+@@ -1340,7 +1340,9 @@
+                             OCSP_resp_get0(basicResponse, OCSP_resp_find(basicResponse, certId, -1));
+                     return OCSP_single_get0_status(singleResponse, MemorySegment.NULL, MemorySegment.NULL,
+                             MemorySegment.NULL, MemorySegment.NULL);
+-                }
++                } else {
++                    X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
++                }
+             }
+         } catch (Exception e) {
+             log.warn(sm.getString("engine.ocspRequestError", url.toString()), e);
