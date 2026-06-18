@@ -1,0 +1,416 @@
+--- a/server/workflow/workflow_server.go
++++ b/server/workflow/workflow_server.go
+@@ -710,22 +710,34 @@ func (s *workflowServer) getWorkflow(ctx context.Context, wfClient versioned.Int
+ 		log.Debugf("Resolved alias %s to workflow %s.\n", latestAlias, latest.Name)
+ 		return latest, nil
+ 	}
+-	var err error
++
+ 	wf, origErr := wfClient.ArgoprojV1alpha1().Workflows(namespace).Get(ctx, name, options)
++	// fallback to retrieve from archived workflows
+ 	if wf == nil || origErr != nil {
+-		wf, err = s.wfArchive.GetWorkflow("", namespace, name)
++		allowed, err := auth.CanI(ctx, "get", workflow.WorkflowPlural, namespace, name)
+ 		if err != nil {
+-			log.Errorf("failed to get live workflow: %v; failed to get archived workflow: %v", origErr, err)
+-			// We only return the original error to preserve the original status code.
+-			return nil, sutils.ToStatusError(origErr, codes.Internal)
++			return nil, getWorkflowOrigErr(origErr, err)
+ 		}
+-		if wf == nil {
+-			return nil, status.Error(codes.NotFound, "not found")
++		if !allowed {
++			err = status.Error(codes.PermissionDenied, "permission denied")
++			return nil, getWorkflowOrigErr(origErr, err)
++		}
++
++		wf, err = s.wfArchive.GetWorkflow("", namespace, name)
++		if wf == nil || err != nil {
++			return nil, getWorkflowOrigErr(origErr, err)
+ 		}
+ 	}
+ 	return wf, nil
+ }
+
++// getWorkflowOrigErr only returns the original error to preserve the original status code
++// it logs out the new error
++func getWorkflowOrigErr(origErr error, err error) error {
++	log.Errorf("failed to get live workflow: %v; failed to get archived workflow: %v", origErr, err)
++	return sutils.ToStatusError(origErr, codes.Internal)
++}
++
+ func (s *workflowServer) validateWorkflow(wf *wfv1.Workflow) error {
+ 	return sutils.ToStatusError(s.instanceIDService.Validate(wf), codes.InvalidArgument)
+ }
+
+--- a/workflow/executor/executor.go
++++ b/workflow/executor/executor.go
+@@ -942,11 +942,18 @@ func untar(tarPath string, destPath string) error {
+ 				continue
+ 			}
+ 			target := filepath.Join(dest, filepath.Clean(header.Name))
++			if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) {
++				return fmt.Errorf("illegal file path: %s", header.Name)
++			}
+ 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil && os.IsExist(err) {
+ 				return err
+ 			}
+ 			switch header.Typeflag {
+ 			case tar.TypeSymlink:
++				linkTarget := filepath.Join(filepath.Dir(target), header.Linkname)
++				if !strings.HasPrefix(filepath.Clean(linkTarget), filepath.Clean(dest)+string(os.PathSeparator)) {
++					return fmt.Errorf("illegal symlink target: %s -> %s", header.Name, header.Linkname)
++				}
+ 				err := os.Symlink(header.Linkname, target)
+ 				if err != nil {
+ 					return err
+--- /dev/null
++++ b/workflow/executor/os-specific/signal_linux.go
+@@ -0,0 +1,61 @@
++package os_specific
++
++import (
++	"os"
++	"syscall"
++	"time"
++
++	"github.com/argoproj/argo-workflows/v3/util/errors"
++)
++
++var (
++	Term = syscall.SIGTERM
++)
++
++func CanIgnoreSignal(s os.Signal) bool {
++	return s == syscall.SIGCHLD || s == syscall.SIGURG
++}
++
++func Kill(pid int, s syscall.Signal) error {
++	pgid, err := syscall.Getpgid(pid)
++	if err == nil {
++		return syscall.Kill(-pgid, s)
++	}
++	return syscall.Kill(pid, s)
++}
++
++func Setpgid(a *syscall.SysProcAttr) {
++	a.Setpgid = true
++}
++
++func Wait(process *os.Process) error {
++	// We must copy the behaviour of Kubernetes in how we handle sub-processes.
++	// Kubernetes only waits on PID 1, not on any sub-process that process might fork.
++	// The only way for those forked processes to run in the background is to background the
++	// sub-process by calling Process.Release.
++	// Background processes always become zombies when they exit.
++	// Because the sub-process is now running in the background it will become a zombie,
++	// so we must wait for it.
++	// Because we run the process in the background, we cannot Process.Wait for it to get the exit code.
++	// Instead, we can reap it to get the exit code
++	pid := process.Pid
++	if err := process.Release(); err != nil {
++		return err
++	}
++
++	for {
++		var s syscall.WaitStatus
++		wpid, err := syscall.Wait4(-1, &s, syscall.WNOHANG, nil)
++		if err != nil {
++			return err
++		}
++		if wpid == pid {
++			if s.Exited() {
++				return errors.NewExitErr(s.ExitStatus())
++			} else if s.Signaled() {
++				return errors.NewExitErr(128 + int(s.Signal()))
++			}
++		}
++		time.Sleep(time.Second)
++	}
++}
+
+--- a/workflow/executor/executor.go
++++ b/workflow/executor/executor.go
+@@ -945,15 +945,20 @@ func untar(tarPath string, destPath string) error {
+ 			if !strings.HasPrefix(target, filepath.Clean(dest)+string(os.PathSeparator)) {
+ 				return fmt.Errorf("illegal file path: %s", header.Name)
+ 			}
+-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil && os.IsExist(err) {
+-				return err
+-			}
+ 			switch header.Typeflag {
+ 			case tar.TypeSymlink:
+-				linkTarget := filepath.Join(filepath.Dir(target), header.Linkname)
++				// Validate symlink target before creating it
++				linkTarget := header.Linkname
++				if !filepath.IsAbs(linkTarget) {
++					linkTarget = filepath.Join(filepath.Dir(target), header.Linkname)
++				}
+ 				if !strings.HasPrefix(filepath.Clean(linkTarget), filepath.Clean(dest)+string(os.PathSeparator)) {
+ 					return fmt.Errorf("illegal symlink target: %s -> %s", header.Name, header.Linkname)
+ 				}
++				// Create parent directory if needed
++				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
++					return err
++				}
+ 				err := os.Symlink(header.Linkname, target)
+ 				if err != nil {
+ 					return err
+@@ -963,6 +968,32 @@ func untar(tarPath string, destPath string) error {
+ 					return err
+ 				}
+ 			case tar.TypeReg:
++				// Before writing the file, check if the parent directory resolves outside dest
++				parentDir := filepath.Dir(target)
++				// Resolve the destination directory
++				resolvedDest, err := filepath.EvalSymlinks(dest)
++				if err != nil {
++					return err
++				}
++				// Check if parent exists and if so, verify it doesn't resolve outside dest
++				if _, err := os.Lstat(parentDir); err == nil {
++					// Parent exists, resolve it to check for symlink traversal
++					resolvedParent, err := filepath.EvalSymlinks(parentDir)
++					if err != nil {
++						return err
++					}
++					// Check if resolved parent is outside dest
++					if !strings.HasPrefix(resolvedParent+string(os.PathSeparator), resolvedDest+string(os.PathSeparator)) && resolvedParent != resolvedDest {
++						return fmt.Errorf("illegal file path after symlink resolution: %s resolves outside destination", header.Name)
++					}
++				} else if !os.IsNotExist(err) {
++					return err
++				} else {
++					// Parent doesn't exist, create it
++					if err := os.MkdirAll(parentDir, 0o755); err != nil {
++						return err
++					}
++				}
+ 				f, err := os.OpenFile(target, os.O_CREATE|os.O_RDWR, os.FileMode(header.Mode))
+ 				if err != nil {
+ 					return err
+
+--- a/server/clusterworkflowtemplate/cluster_workflow_template_server.go
++++ b/server/clusterworkflowtemplate/cluster_workflow_template_server.go
+@@ -6,6 +6,7 @@
+ 	"sort"
+
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+ 	clusterwftmplpkg "github.com/argoproj/argo-workflows/v3/pkg/apiclient/clusterworkflowtemplate"
+@@ -49,6 +50,13 @@
+ }
+
+ func (cwts *ClusterWorkflowTemplateServer) GetClusterWorkflowTemplate(ctx context.Context, req *clusterwftmplpkg.ClusterWorkflowTemplateGetRequest) (*v1alpha1.ClusterWorkflowTemplate, error) {
++	allowed, err := auth.CanI(ctx, "get", "clusterworkflowtemplates", "", req.Name)
++	if err != nil {
++		return nil, serverutils.ToStatusError(err, codes.Internal)
++	}
++	if !allowed {
++		return nil, status.Error(codes.PermissionDenied, "permission denied")
++	}
+ 	wfTmpl, err := cwts.getTemplateAndValidate(ctx, req.Name)
+ 	if err != nil {
+ 		return nil, serverutils.ToStatusError(err, codes.Internal)
+--- a/server/workflowtemplate/workflow_template_server.go
++++ b/server/workflowtemplate/workflow_template_server.go
+@@ -9,6 +9,7 @@
+ 	"strings"
+
+ 	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/status"
+ 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+ 	workflowtemplatepkg "github.com/argoproj/argo-workflows/v3/pkg/apiclient/workflowtemplate"
+@@ -51,6 +52,13 @@
+ }
+
+ func (wts *WorkflowTemplateServer) GetWorkflowTemplate(ctx context.Context, req *workflowtemplatepkg.WorkflowTemplateGetRequest) (*v1alpha1.WorkflowTemplate, error) {
++	allowed, err := auth.CanI(ctx, "get", "workflowtemplates", req.Namespace, req.Name)
++	if err != nil {
++		return nil, sutils.ToStatusError(err, codes.Internal)
++	}
++	if !allowed {
++		return nil, status.Error(codes.PermissionDenied, "permission denied")
++	}
+ 	wfTmpl, err := wts.getTemplateAndValidate(ctx, req.Namespace, req.Name)
+ 	if err != nil {
+ 		return nil, sutils.ToStatusError(err, codes.Internal)
+
+--- a/workflow/controller/operator.go
++++ b/workflow/controller/operator.go
+@@ -3909,6 +3909,14 @@
+ 
+ func (woc *wfOperationCtx) setExecWorkflow(ctx context.Context) error {
+ 	if woc.wf.Spec.WorkflowTemplateRef != nil { // not-woc-misuse
++		// When workflow restrictions require template referencing (Strict/Secure mode),
++		// reject workflows that include a podSpecPatch as it could override security
++		// settings defined in the WorkflowTemplate.
++		if woc.controller.Config.WorkflowRestrictions.MustUseReference() && woc.wf.Spec.HasPodSpecPatch() { // not-woc-misuse: intentionally checking the user-submitted spec
++			err := fmt.Errorf("podSpecPatch is not permitted when using workflowTemplateRef with templateReferencing restriction")
++			woc.markWorkflowError(ctx, err)
++			return err
++		}
+ 		err := woc.setStoredWfSpec(ctx)
+ 		if err != nil {
+ 			woc.markWorkflowError(ctx, err)
+
+--- a/server/auth/webhook/interceptor.go
++++ b/server/auth/webhook/interceptor.go
+@@ -66,9 +66,17 @@ func addWebhookAuthorization(r *http.Request, kube kubernetes.Interface) error {
+ 	if err != nil {
+ 		return fmt.Errorf("failed to get webhook clients: %w", err)
+ 	}
+-	// we need to read the request body to check the signature, but we still need it for the GRPC request,
+-	// so read it all now, and then reinstate when we are done
+-	buf, _ := io.ReadAll(r.Body)
++	// we need to read the request body to check the signature, but we still need it for the GRPC request,
++	// so read it all now, and then reinstate when we are done.
++	// Limit to 2MB to prevent denial-of-service via oversized webhook payloads.
++	const maxWebhookSize = 2 * 1024 * 1024 // 2MB
++	buf, err2 := io.ReadAll(io.LimitReader(r.Body, maxWebhookSize+1))
++	if err2 != nil {
++		return fmt.Errorf("failed to read webhook request body: %w", err2)
++	}
++	if len(buf) > maxWebhookSize {
++		return fmt.Errorf("webhook request body exceeds maximum size of 2MB")
++	}
+ 	defer func() { r.Body = io.NopCloser(bytes.NewBuffer(buf)) }()
+ 	serviceAccountInterface := kube.CoreV1().ServiceAccounts(namespace)
+ 	for serviceAccountName, data := range webhookClients.Data {
+
+--- a/workflow/controller/operator.go
++++ b/workflow/controller/operator.go
+@@ -3917,6 +3917,15 @@ func (woc *wfOperationCtx) setExecWorkflow(ctx context.Context) error {
+ 			woc.markWorkflowError(ctx, err)
+ 			return err
+ 		}
++		// When workflow restrictions require template referencing (Strict/Secure mode),
++		// reject workflows that set any non-allowed fields, as they could override
++		// security settings defined in the WorkflowTemplate.
++		if woc.controller.Config.WorkflowRestrictions.MustUseReference() { // not-woc-misuse: intentionally checking the user-submitted spec
++			if err := wfutil.ValidateUserOverrides(&woc.wf.Spec); err != nil { // not-woc-misuse
++				woc.markWorkflowError(ctx, err)
++				return err
++			}
++		}
+ 		err := woc.setStoredWfSpec(ctx)
+ 		if err != nil {
+ 			woc.markWorkflowError(ctx, err)
+@@ -4029,8 +4038,14 @@ func (woc *wfOperationCtx) setStoredWfSpec(ctx context.Context) error {
+ 	}
+ 	// Update the Entrypoint, ShutdownStrategy and Suspend
+ 	if woc.needsStoredWfSpecUpdate() {
++		// In reference mode, sanitize the user spec before merging so that
++		// only allow-listed fields participate in the strategic merge patch.
++		userSpec := &woc.wf.Spec // not-woc-misuse
++		if woc.controller.Config.WorkflowRestrictions.MustUseReference() {
++			userSpec = wfutil.SanitizeUserWorkflowSpec(&woc.wf.Spec) // not-woc-misuse
++		}
+ 		// Join workflow, workflow template, and workflow default metadata to workflow spec.
+-		mergedWf, err := wfutil.JoinWorkflowSpec(&woc.wf.Spec, workflowTemplateSpec, &wfDefault.Spec) // not-woc-misuse
++		mergedWf, err := wfutil.JoinWorkflowSpec(userSpec, workflowTemplateSpec, &wfDefault.Spec)
+ 		if err != nil {
+ 			return err
+ 		}
+@@ -4041,7 +4056,11 @@ func (woc *wfOperationCtx) setStoredWfSpec(ctx context.Context) error {
+ 		if err != nil {
+ 			return err
+ 		}
+-		mergedWf, err := wfutil.JoinWorkflowSpec(&woc.wf.Spec, wftHolder.GetWorkflowSpec(), &wfDefault.Spec) // not-woc-misuse
++		userSpec := &woc.wf.Spec // not-woc-misuse
++		if woc.controller.Config.WorkflowRestrictions.MustUseReference() {
++			userSpec = wfutil.SanitizeUserWorkflowSpec(&woc.wf.Spec) // not-woc-misuse
++		}
++		mergedWf, err := wfutil.JoinWorkflowSpec(userSpec, wftHolder.GetWorkflowSpec(), &wfDefault.Spec)
+ 		if err != nil {
+ 			return err
+ 		}
+--- a/workflow/util/merge.go
++++ b/workflow/util/merge.go
+@@ -2,6 +2,9 @@ package util
+ 
+ import (
+ 	"encoding/json"
++	"fmt"
++	"reflect"
++	"sort"
+ 
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/util/strategicpatch"
+@@ -9,6 +12,73 @@ import (
+ 	wfv1 "github.com/argoproj/argo-workflows/v3/pkg/apis/workflow/v1alpha1"
+ )
+ 
++// allowedUserOverrideFields lists WorkflowSpec fields that users may set when
++// submitting a workflow via workflowTemplateRef under Strict/Secure mode.
++// Any field NOT in this set is blocked by default, ensuring new fields added
++// to WorkflowSpec are denied until explicitly reviewed.
++var allowedUserOverrideFields = map[string]bool{
++	"Arguments":             true,
++	"Entrypoint":            true,
++	"Shutdown":              true,
++	"Suspend":               true,
++	"ActiveDeadlineSeconds": true,
++	"Priority":              true,
++	"TTLStrategy":           true,
++	"PodGC":                 true,
++	"VolumeClaimGC":         true,
++	"ArchiveLogs":           true,
++	"WorkflowMetadata":      true,
++	"WorkflowTemplateRef":   true,
++	"Metrics":               true,
++	"ArtifactGC":            true,
++}
++
++// ValidateUserOverrides checks that a user-submitted WorkflowSpec only sets
++// fields from the allow-list. Returns an error listing all violations.
++func ValidateUserOverrides(userSpec *wfv1.WorkflowSpec) error {
++	if userSpec == nil {
++		return nil
++	}
++	v := reflect.ValueOf(userSpec).Elem()
++	t := v.Type()
++	zero := reflect.New(t).Elem()
++
++	var violations []string
++	for i := 0; i < t.NumField(); i++ {
++		fieldName := t.Field(i).Name
++		if allowedUserOverrideFields[fieldName] {
++			continue
++		}
++		if !reflect.DeepEqual(v.Field(i).Interface(), zero.Field(i).Interface()) {
++			violations = append(violations, fieldName)
++		}
++	}
++	if len(violations) > 0 {
++		sort.Strings(violations)
++		return fmt.Errorf("fields %v are not permitted when using workflowTemplateRef with templateReferencing restriction", violations)
++	}
++	return nil
++}
++
++// SanitizeUserWorkflowSpec returns a copy of userSpec with only allow-listed
++// fields preserved. This provides defense-in-depth after validation.
++func SanitizeUserWorkflowSpec(userSpec *wfv1.WorkflowSpec) *wfv1.WorkflowSpec {
++	if userSpec == nil {
++		return nil
++	}
++	sanitized := &wfv1.WorkflowSpec{}
++	src := reflect.ValueOf(userSpec).Elem()
++	dst := reflect.ValueOf(sanitized).Elem()
++	t := src.Type()
++
++	for i := 0; i < t.NumField(); i++ {
++		if allowedUserOverrideFields[t.Field(i).Name] {
++			dst.Field(i).Set(src.Field(i))
++		}
++	}
++	return sanitized
++}
++
+ // MergeTo will merge one workflow (the "patch" workflow) into another (the "target" workflow.
+ // If the target workflow defines a field, this take precedence over the patch.
+ func MergeTo(patch, target *wfv1.Workflow) error {
