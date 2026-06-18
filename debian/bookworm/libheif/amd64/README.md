@@ -1,6 +1,6 @@
-# libheif : 1.15.1-1+deb12u1.root.io.9
+# libheif : 1.15.1-1+deb12u1.root.io.10
 
-This patch is based on libheif version 1.15.1-1+deb12u1.root.io.9, which is available at:
+This patch is based on libheif version 1.15.1-1+deb12u1.root.io.10, which is available at:
 https://sources.debian.org/src/libheif/1.15.1-1+deb12u1/
 
 ## Affected CVEs:
@@ -10,6 +10,9 @@ https://sources.debian.org/src/libheif/1.15.1-1+deb12u1/
 - CVE-2026-32741
 - CVE-2026-32740
 - CVE-2026-41071
+- CVE-2026-32739
+- CVE-2026-32738
+- CVE-2026-32814
 
 ## How to Apply:
 1. Obtain the source package: `apt source libheif`
