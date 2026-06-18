@@ -4,6 +4,14 @@ This patch is based on n8n version 2.19.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-49444
+- CVE-2026-54301
+- CVE-2026-54302
+- CVE-2026-54309
+- CVE-2026-54304
+- CVE-2026-54307
+- CVE-2026-54312
+- CVE-2026-54305
 - GHSA-3875-8gcx-7v46
 
 ## How to Apply:
