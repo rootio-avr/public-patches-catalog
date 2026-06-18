@@ -1,0 +1,1797 @@
+diff --git a/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/HTTP2Session.java b/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/HTTP2Session.java
+index 5f622fa..07281e2 100644
+--- a/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/HTTP2Session.java
++++ b/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/HTTP2Session.java
+@@ -464,9 +464,14 @@ public abstract class HTTP2Session extends ContainerLifeCycle implements Session
+                     if (LOG.isDebugEnabled())
+                         LOG.debug("Updating {} max header list size to {} for {}", local ? "decoder" : "encoder", value, this);
+                     if (local)
++                    {
+                         parser.getHpackDecoder().setMaxHeaderListSize(value);
++                    }
+                     else
+-                        generator.getHpackEncoder().setMaxHeaderListSize(value);
++                    {
++                        HpackEncoder hpackEncoder = generator.getHpackEncoder();
++                        hpackEncoder.setMaxHeaderListSize(Math.min(value, hpackEncoder.getMaxHeaderListSize()));
++                    }
+                 }
+                 case SettingsFrame.ENABLE_CONNECT_PROTOCOL ->
+                 {
+diff --git a/jetty-core/jetty-http2/jetty-http2-hpack/src/main/java/org/eclipse/jetty/http2/hpack/HpackEncoder.java b/jetty-core/jetty-http2/jetty-http2-hpack/src/main/java/org/eclipse/jetty/http2/hpack/HpackEncoder.java
+index bcbac88..d58182c 100644
+--- a/jetty-core/jetty-http2/jetty-http2-hpack/src/main/java/org/eclipse/jetty/http2/hpack/HpackEncoder.java
++++ b/jetty-core/jetty-http2/jetty-http2-hpack/src/main/java/org/eclipse/jetty/http2/hpack/HpackEncoder.java
+@@ -156,7 +156,7 @@ public class HpackEncoder
+ 
+     public void setMaxHeaderListSize(int maxHeaderListSize)
+     {
+-        _maxHeaderListSize = maxHeaderListSize;
++        _maxHeaderListSize = maxHeaderListSize > 0 ? maxHeaderListSize : HpackContext.DEFAULT_MAX_HEADER_LIST_SIZE;
+     }
+ 
+     public HpackContext getHpackContext()
+diff --git a/jetty-core/jetty-http2/jetty-http2-tests/src/test/java/org/eclipse/jetty/http2/tests/SettingsTest.java b/jetty-core/jetty-http2/jetty-http2-tests/src/test/java/org/eclipse/jetty/http2/tests/SettingsTest.java
+index f7224ec..578a64d 100644
+--- a/jetty-core/jetty-http2/jetty-http2-tests/src/test/java/org/eclipse/jetty/http2/tests/SettingsTest.java
++++ b/jetty-core/jetty-http2/jetty-http2-tests/src/test/java/org/eclipse/jetty/http2/tests/SettingsTest.java
+@@ -446,6 +446,42 @@ public class SettingsTest extends AbstractTest
+         assertTrue(goAwayLatch.await(5, TimeUnit.SECONDS));
+     }
+ 
++    @Test
++    public void testMaxHeaderListSizeCappedByClient() throws Exception
++    {
++        int maxHeadersSize = 2 * 1024;
++        CountDownLatch goAwayLatch = new CountDownLatch(1);
++        start(new ServerSessionListener()
++        {
++            @Override
++            public Map<Integer, Integer> onPreface(Session session)
++            {
++                return Map.of(SettingsFrame.MAX_HEADER_LIST_SIZE, maxHeadersSize);
++            }
++
++            @Override
++            public void onGoAway(Session session, GoAwayFrame frame)
++            {
++                goAwayLatch.countDown();
++            }
++        });
++        http2Client.setMaxRequestHeadersSize(maxHeadersSize / 2);
++
++        Session clientSession = newClientSession(new Session.Listener() {});
++        HttpFields requestHeaders = HttpFields.build()
++            .put("X-Large", "x".repeat(maxHeadersSize - 256)); // 256 bytes to account for the other headers
++        MetaData.Request request = newRequest("GET", requestHeaders);
++        HeadersFrame frame = new HeadersFrame(request, null, true);
++
++        Throwable failure = assertThrows(ExecutionException.class,
++            () -> clientSession.newStream(frame, new Stream.Listener() {}).get(5, TimeUnit.SECONDS))
++            .getCause();
++        // The HPACK context is compromised trying to encode the large header.
++        assertThat(failure, Matchers.instanceOf(HpackException.SessionException.class));
++
++        assertTrue(goAwayLatch.await(5, TimeUnit.SECONDS));
++    }
++
+     @Test
+     public void testMaxHeaderListSizeExceededByServer() throws Exception
+     {
+
+--- a/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/HTTP2Session.java
++++ b/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/HTTP2Session.java
+@@ -543,8 +543,17 @@ public abstract class HTTP2Session extends ContainerLifeCycle implements Session
+             }
+             else
+             {
+-                if (!isStreamClosed(streamId))
++                if (isStreamClosed(streamId))
++                {
++                    // SPEC: this case must not be treated as an error.
++                    // However, we want to rate control it.
++                    if (!rateControlOnEvent(frame))
++                        onConnectionFailure(ErrorCode.ENHANCE_YOUR_CALM_ERROR.code, "invalid_window_update_frame_rate");
++                }
++                else
++                {
+                     onConnectionFailure(ErrorCode.PROTOCOL_ERROR.code, "unexpected_window_update_frame");
++                }
+             }
+         }
+         else
+@@ -721,14 +730,26 @@ public abstract class HTTP2Session extends ContainerLifeCycle implements Session
+ 
+     void reset(HTTP2Stream stream, ResetFrame frame, Callback callback)
+     {
+-        control(stream, Callback.from(() ->
++        if (rateControlOnEvent(frame))
+         {
+-            if (stream != null)
++            control(stream, Callback.from(() ->
+             {
+-                stream.close();
+-                removeStream(stream);
+-            }
+-        }, callback), frame);
++                if (stream != null)
++                {
++                    stream.close();
++                    removeStream(stream);
++                }
++            }, callback), frame);
++        }
++        else
++        {
++            onConnectionFailure(ErrorCode.ENHANCE_YOUR_CALM_ERROR.code, "invalid_rst_stream_frame_rate");
++        }
++    }
++
++    private boolean rateControlOnEvent(Object event)
++    {
++        return getParser().rateControlOnEvent(event);
+     }
+ 
+     /**
+--- a/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/BodyParser.java
++++ b/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/BodyParser.java
+@@ -226,7 +226,7 @@ public abstract class BodyParser
+     protected boolean streamFailure(int streamId, int error, String reason)
+     {
+         notifyStreamFailure(streamId, error, reason);
+-        return false;
++        return true;
+     }
+ 
+     private void notifyStreamFailure(int streamId, int error, String reason)
+@@ -243,6 +243,6 @@ public abstract class BodyParser
+ 
+     protected boolean rateControlOnEvent(Object o)
+     {
+-        return headerParser.getRateControl().onEvent(o);
++        return headerParser.rateControlOnEvent(o);
+     }
+ }
+--- a/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/HeaderParser.java
++++ b/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/HeaderParser.java
+@@ -45,6 +45,11 @@ public class HeaderParser
+         return rateControl;
+     }
+ 
++    boolean rateControlOnEvent(Object event)
++    {
++        return getRateControl().onEvent(event);
++    }
++
+     protected void reset()
+     {
+         state = State.LENGTH;
+--- a/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/Parser.java
++++ b/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/Parser.java
+@@ -90,6 +90,11 @@ public class Parser
+         bodyParsers[FrameType.CONTINUATION.getType()] = new ContinuationBodyParser(headerParser, listener, headerBlockParser, headerBlockFragments);
+     }
+ 
++    public boolean rateControlOnEvent(Object event)
++    {
++        return headerParser.rateControlOnEvent(event);
++    }
++
+     protected Listener getListener()
+     {
+         return listener;
+--- a/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/WindowUpdateBodyParser.java
++++ b/jetty-core/jetty-http2/jetty-http2-common/src/main/java/org/eclipse/jetty/http2/parser/WindowUpdateBodyParser.java
+@@ -89,15 +89,16 @@ public class WindowUpdateBodyParser extends BodyParser
+     private boolean onWindowUpdate(ByteBuffer buffer, int windowDelta)
+     {
+         int streamId = getStreamId();
++        WindowUpdateFrame frame = new WindowUpdateFrame(streamId, windowDelta);
++        reset();
+         if (windowDelta == 0)
+         {
+             if (streamId == 0)
+                 return connectionFailure(buffer, ErrorCode.PROTOCOL_ERROR.code, "invalid_window_update_frame");
+-            else
++            if (rateControlOnEvent(frame))
+                 return streamFailure(streamId, ErrorCode.PROTOCOL_ERROR.code, "invalid_window_update_frame");
++            return connectionFailure(buffer, ErrorCode.ENHANCE_YOUR_CALM_ERROR.code, "invalid_window_update_frame_rate");
+         }
+-        WindowUpdateFrame frame = new WindowUpdateFrame(streamId, windowDelta);
+-        reset();
+         notifyWindowUpdate(frame);
+         return true;
+     }
+--- a/jetty-core/jetty-http2/jetty-http2-common/src/test/java/org/eclipse/jetty/http2/frames/FrameFloodTest.java
++++ b/jetty-core/jetty-http2/jetty-http2-common/src/test/java/org/eclipse/jetty/http2/frames/FrameFloodTest.java
+@@ -15,10 +15,11 @@ package org.eclipse.jetty.http2.frames;
+ 
+ import java.nio.ByteBuffer;
+ import java.time.Duration;
+-import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ 
+ import org.eclipse.jetty.http.HttpVersion;
+ import org.eclipse.jetty.http.MetaData;
++import org.eclipse.jetty.http2.ErrorCode;
+ import org.eclipse.jetty.http2.Flags;
+ import org.eclipse.jetty.http2.WindowRateControl;
+ import org.eclipse.jetty.http2.hpack.HpackEncoder;
+@@ -29,6 +30,7 @@ import org.junit.jupiter.api.Test;
+ 
+ import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.hamcrest.Matchers.lessThan;
++import static org.junit.jupiter.api.Assertions.assertEquals;
+ 
+ public class FrameFloodTest
+ {
+@@ -144,6 +146,13 @@ public class FrameFloodTest
+         testFrameFlood(null, frameFrom(payload.length, FrameType.RST_STREAM.getType(), 0, 13, payload));
+     }
+ 
++    @Test
++    public void testWindowUpdateFrameFlood()
++    {
++        byte[] payload = {0, 0, 0, 0};
++        testFrameFlood(null, frameFrom(payload.length, FrameType.WINDOW_UPDATE.getType(), 0, 13, payload));
++    }
++
+     @Test
+     public void testUnknownFrameFlood()
+     {
+@@ -153,14 +162,14 @@ public class FrameFloodTest
+ 
+     private void testFrameFlood(byte[] preamble, byte[] bytes)
+     {
+-        AtomicBoolean failed = new AtomicBoolean();
++        AtomicInteger failed = new AtomicInteger();
+         Parser parser = new Parser(bufferPool, 8192, new WindowRateControl(8, Duration.ofSeconds(1)));
+         parser.init(new Parser.Listener()
+         {
+             @Override
+             public void onConnectionFailure(int error, String reason)
+             {
+-                failed.set(true);
++                failed.set(error);
+             }
+         });
+ 
+@@ -174,7 +183,7 @@ public class FrameFloodTest
+         }
+ 
+         int count = 0;
+-        while (!failed.get())
++        while (failed.get() == 0)
+         {
+             ByteBuffer buffer = ByteBuffer.wrap(bytes);
+             while (buffer.hasRemaining())
+@@ -183,5 +192,7 @@ public class FrameFloodTest
+             }
+             assertThat("too many frames allowed", ++count, lessThan(1024));
+         }
++
++        assertEquals(ErrorCode.ENHANCE_YOUR_CALM_ERROR.code, failed.get());
+     }
+ }
+--- a/jetty-core/jetty-http2/jetty-http2-server/src/main/config/etc/jetty-http2.xml
++++ b/jetty-core/jetty-http2/jetty-http2-server/src/main/config/etc/jetty-http2.xml
+@@ -12,7 +12,7 @@
+         <Set name="maxSettingsKeys"><Property name="jetty.http2.maxSettingsKeys" default="64"/></Set>
+         <Set name="rateControlFactory">
+           <New class="org.eclipse.jetty.http2.WindowRateControl$Factory">
+-            <Arg type="int"><Property name="jetty.http2.rateControl.maxEventsPerSecond" default="50"/></Arg>
++            <Arg type="int"><Property name="jetty.http2.rateControl.maxEventsPerSecond" default="128"/></Arg>
+           </New>
+         </Set>
+       </New>
+--- a/jetty-core/jetty-http2/jetty-http2-server/src/main/config/etc/jetty-http2c.xml
++++ b/jetty-core/jetty-http2/jetty-http2-server/src/main/config/etc/jetty-http2c.xml
+@@ -12,7 +12,7 @@
+         <Set name="maxSettingsKeys" property="jetty.http2c.maxSettingsKeys"/>
+         <Set name="rateControlFactory">
+           <New class="org.eclipse.jetty.http2.WindowRateControl$Factory">
+-            <Arg type="int"><Property name="jetty.http2c.rateControl.maxEventsPerSecond" default="50"/></Arg>
++            <Arg type="int"><Property name="jetty.http2c.rateControl.maxEventsPerSecond" default="128"/></Arg>
+           </New>
+         </Set>
+       </New>
+--- a/jetty-core/jetty-http2/jetty-http2-server/src/main/config/modules/http2.mod
++++ b/jetty-core/jetty-http2/jetty-http2-server/src/main/config/modules/http2.mod
+@@ -35,5 +35,5 @@ etc/jetty-http2.xml
+ 
+ ## Specifies the maximum number of bad frames and pings per second,
+ ## after which a session is closed to avoid denial of service attacks.
+-# jetty.http2.rateControl.maxEventsPerSecond=50
++# jetty.http2.rateControl.maxEventsPerSecond=128
+ # end::documentation[]
+--- a/jetty-core/jetty-http2/jetty-http2-server/src/main/config/modules/http2c.mod
++++ b/jetty-core/jetty-http2/jetty-http2-server/src/main/config/modules/http2c.mod
+@@ -33,5 +33,5 @@ etc/jetty-http2c.xml
+ 
+ ## Specifies the maximum number of bad frames and pings per second,
+ ## after which a session is closed to avoid denial of service attacks.
+-# jetty.http2c.rateControl.maxEventsPerSecond=50
++# jetty.http2c.rateControl.maxEventsPerSecond=128
+ # end::documentation[]
+--- a/jetty-core/jetty-http2/jetty-http2-tests/src/test/java/org/eclipse/jetty/http2/tests/SmallThreadPoolLoadTest.java
++++ b/jetty-core/jetty-http2/jetty-http2-tests/src/test/java/org/eclipse/jetty/http2/tests/SmallThreadPoolLoadTest.java
+@@ -24,6 +24,7 @@ import java.util.stream.IntStream;
+ import org.eclipse.jetty.http.HttpFields;
+ import org.eclipse.jetty.http.HttpMethod;
+ import org.eclipse.jetty.http.MetaData;
++import org.eclipse.jetty.http2.RateControl;
+ import org.eclipse.jetty.http2.api.Session;
+ import org.eclipse.jetty.http2.api.Stream;
+ import org.eclipse.jetty.http2.frames.DataFrame;
+@@ -69,6 +70,8 @@ public class SmallThreadPoolLoadTest extends AbstractTest
+     public void testConcurrentWithSmallServerThreadPool() throws Exception
+     {
+         start(new LoadHandler());
++        AbstractHTTP2ServerConnectionFactory h2 = connector.getConnectionFactory(AbstractHTTP2ServerConnectionFactory.class);
++        h2.setRateControlFactory(new RateControl.Factory() {});
+ 
+         // Only one connection to the server.
+         Session session = newClientSession(new Session.Listener() {});
+--- /dev/null
++++ b/jetty-core/jetty-http2/jetty-http2-tests/src/test/java/org/eclipse/jetty/http2/tests/TriggeredResetTest.java
+@@ -0,0 +1,171 @@
++//
++// ========================================================================
++// Copyright (c) 1995 Mort Bay Consulting Pty Ltd and others.
++//
++// This program and the accompanying materials are made available under the
++// terms of the Eclipse Public License v. 2.0 which is available at
++// https://www.eclipse.org/legal/epl-2.0, or the Apache License, Version 2.0
++// which is available at https://www.apache.org/licenses/LICENSE-2.0.
++//
++// SPDX-License-Identifier: EPL-2.0 OR Apache-2.0
++// ========================================================================
++//
++
++package org.eclipse.jetty.http2.tests;
++
++import java.nio.ByteBuffer;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.eclipse.jetty.http.HttpFields;
++import org.eclipse.jetty.http.HttpStatus;
++import org.eclipse.jetty.http.HttpVersion;
++import org.eclipse.jetty.http.MetaData;
++import org.eclipse.jetty.http2.ErrorCode;
++import org.eclipse.jetty.http2.HTTP2Session;
++import org.eclipse.jetty.http2.WindowRateControl;
++import org.eclipse.jetty.http2.api.Session;
++import org.eclipse.jetty.http2.api.Stream;
++import org.eclipse.jetty.http2.api.server.ServerSessionListener;
++import org.eclipse.jetty.http2.frames.GoAwayFrame;
++import org.eclipse.jetty.http2.frames.HeadersFrame;
++import org.eclipse.jetty.http2.frames.SettingsFrame;
++import org.eclipse.jetty.http2.server.AbstractHTTP2ServerConnectionFactory;
++import org.eclipse.jetty.util.Callback;
++import org.junit.jupiter.api.Test;
++
++import static org.awaitility.Awaitility.await;
++import static org.hamcrest.MatcherAssert.assertThat;
++import static org.hamcrest.Matchers.equalTo;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++public class TriggeredResetTest extends AbstractTest
++{
++    @Test
++    public void testClosedDataFrameTriggersReset() throws Exception
++    {
++        CountDownLatch settingsLatch = new CountDownLatch(2);
++        start(new ServerSessionListener()
++        {
++            @Override
++            public void onSettings(Session session, SettingsFrame frame)
++            {
++                settingsLatch.countDown();
++            }
++
++            @Override
++            public Stream.Listener onNewStream(Stream stream, HeadersFrame frame)
++            {
++                MetaData.Response response = new MetaData.Response(HttpStatus.OK_200, null, HttpVersion.HTTP_2, HttpFields.EMPTY);
++                stream.headers(new HeadersFrame(stream.getId(), response, null, true));
++                return null;
++            }
++        });
++        AbstractHTTP2ServerConnectionFactory h2 = connector.getBean(AbstractHTTP2ServerConnectionFactory.class);
++        int maxEventRate = 5;
++        h2.setRateControlFactory(new WindowRateControl.Factory(maxEventRate));
++
++        AtomicInteger errorRef = new AtomicInteger();
++        Session session = newClientSession(new Session.Listener()
++        {
++            @Override
++            public void onSettings(Session session, SettingsFrame frame)
++            {
++                settingsLatch.countDown();
++            }
++
++            @Override
++            public void onGoAway(Session session, GoAwayFrame frame)
++            {
++                errorRef.set(frame.getError());
++            }
++        });
++
++        assertTrue(settingsLatch.await(5, TimeUnit.SECONDS));
++
++        CountDownLatch responseLatch = new CountDownLatch(1);
++        Stream stream = session.newStream(new HeadersFrame(newRequest("GET", HttpFields.EMPTY), null, true), new Stream.Listener()
++            {
++                @Override
++                public void onHeaders(Stream stream, HeadersFrame frame)
++                {
++                    responseLatch.countDown();
++                }
++            })
++            .get(5, TimeUnit.SECONDS);
++
++        assertThat(stream.getId(), equalTo(1));
++        assertTrue(responseLatch.await(5, TimeUnit.SECONDS));
++
++        // Send many DATA frames for that stream to trigger a reset from the server.
++        // DATA format in bytes: LEN(3) TYPE(1) FLAGS(1) STREAM_ID(4)
++        // Empty DATA frame with END_STREAM=true for STREAM_ID=1.
++        byte[] dataFrameBytes = {0, 0, 0, 0, 1, 0, 0, 0, 1};
++        int dataFrameCount = 2 * maxEventRate;
++        ByteBuffer byteBuffer = ByteBuffer.allocate(dataFrameBytes.length * dataFrameCount);
++        for (int i = 0; i < dataFrameCount; ++i)
++        {
++            byteBuffer.put(dataFrameBytes);
++        }
++        byteBuffer.flip();
++        ((HTTP2Session)session).getEndPoint().write(Callback.NOOP, byteBuffer);
++
++        await().atMost(5, TimeUnit.SECONDS).until(errorRef::get, equalTo(ErrorCode.ENHANCE_YOUR_CALM_ERROR.code));
++    }
++
++    @Test
++    public void testWindowUpdateExceededTriggersReset() throws Exception
++    {
++        CountDownLatch settingsLatch = new CountDownLatch(2);
++        start(new ServerSessionListener()
++        {
++            @Override
++            public void onSettings(Session session, SettingsFrame frame)
++            {
++                settingsLatch.countDown();
++            }
++        });
++        AbstractHTTP2ServerConnectionFactory h2 = connector.getBean(AbstractHTTP2ServerConnectionFactory.class);
++        int maxEventRate = 5;
++        h2.setRateControlFactory(new WindowRateControl.Factory(maxEventRate));
++
++        AtomicInteger errorRef = new AtomicInteger();
++        Session session = newClientSession(new Session.Listener()
++        {
++            @Override
++            public void onSettings(Session session, SettingsFrame frame)
++            {
++                settingsLatch.countDown();
++            }
++
++            @Override
++            public void onGoAway(Session session, GoAwayFrame frame)
++            {
++                errorRef.set(frame.getError());
++            }
++        });
++
++        assertTrue(settingsLatch.await(5, TimeUnit.SECONDS));
++
++        // The request is not responded, so the stream remains alive.
++        Stream stream = session.newStream(new HeadersFrame(newRequest("GET", HttpFields.EMPTY), null, true), new Stream.Listener() {})
++            .get(5, TimeUnit.SECONDS);
++
++        assertThat(stream.getId(), equalTo(1));
++
++        // Now send WINDOW_UPDATE frames to overflow 2^31-1.
++        // WINDOW_UPDATE format in bytes: LEN(3) TYPE(1) FLAGS(1) STREAM_ID(4) WINDOW(4)
++        byte[] dataFrameBytes = {0, 0, 4, 8, 0, 0, 0, 0, 1, -1, -1, -1, -1};
++        int dataFrameCount = 2 * maxEventRate;
++        ByteBuffer byteBuffer = ByteBuffer.allocate(dataFrameBytes.length * dataFrameCount);
++        for (int i = 0; i < dataFrameCount; ++i)
++        {
++            byteBuffer.put(dataFrameBytes);
++        }
++        byteBuffer.flip();
++        ((HTTP2Session)session).getEndPoint().write(Callback.NOOP, byteBuffer);
++
++        await().atMost(5, TimeUnit.SECONDS).until(errorRef::get, equalTo(ErrorCode.ENHANCE_YOUR_CALM_ERROR.code));
++    }
++}
+
+--- a/jetty-core/jetty-server/src/main/java/org/eclipse/jetty/server/handler/gzip/GzipHandler.java
++++ b/jetty-core/jetty-server/src/main/java/org/eclipse/jetty/server/handler/gzip/GzipHandler.java
+@@ -590,7 +590,9 @@ public class GzipHandler extends Handler.Wrapper implements GzipFactory
+         if (inflatable && tryInflate || etagMatches)
+         {
+             // Wrap the request to update the fields and do any inflation
+-            request = new GzipRequest(request, inflatable && tryInflate ? getInflateBufferSize() : -1);
++            GzipRequest gzipRequest = new GzipRequest(request, _inflaterPool, inflatable && tryInflate ? getInflateBufferSize() : -1);
++            request = gzipRequest;
++            callback = Callback.from(callback, gzipRequest::destroy);
+         }
+ 
+         if (tryDeflate && _vary != null)
+@@ -611,9 +613,10 @@ public class GzipHandler extends Handler.Wrapper implements GzipFactory
+         if (next.handle(request, response, callback))
+             return true;
+ 
+-        // If the request was not accepted, destroy any gzipRequest wrapper
++        // If the request was not handled, destroy GzipRequest.
+         if (request instanceof GzipRequest gzipRequest)
+             gzipRequest.destroy();
++
+         return false;
+     }
+ 
+--- a/jetty-core/jetty-server/src/main/java/org/eclipse/jetty/server/handler/gzip/GzipRequest.java
++++ b/jetty-core/jetty-server/src/main/java/org/eclipse/jetty/server/handler/gzip/GzipRequest.java
+@@ -34,14 +34,11 @@ public class GzipRequest extends Request.Wrapper
+ {
+     private static final HttpField X_CE_GZIP = new PreEncodedHttpField("X-Content-Encoding", "gzip");
+ 
+-    // TODO: use InflaterPool from somewhere.
+-    private static final InflaterPool __inflaterPool = new InflaterPool(-1, true);
+-
+     private final HttpFields _fields;
+     private Decoder _decoder;
+     private GzipTransformer _gzipTransformer;
+ 
+-    public GzipRequest(Request request, int inflateBufferSize)
++    public GzipRequest(Request request, InflaterPool inflaterPool, int inflateBufferSize)
+     {
+         super(request);
+         _fields = updateRequestFields(request, inflateBufferSize > 0);
+@@ -49,7 +46,7 @@ public class GzipRequest extends Request.Wrapper
+         if (inflateBufferSize > 0)
+         {
+             Components components = getComponents();
+-            _decoder = new Decoder(__inflaterPool, components.getByteBufferPool(), inflateBufferSize);
++            _decoder = new Decoder(inflaterPool, components.getByteBufferPool(), inflateBufferSize);
+             _gzipTransformer = new GzipTransformer(getWrapped(), _decoder);
+         }
+     }
+--- a/jetty-core/jetty-server/src/main/java/org/eclipse/jetty/server/handler/gzip/GzipResponseAndCallback.java
++++ b/jetty-core/jetty-server/src/main/java/org/eclipse/jetty/server/handler/gzip/GzipResponseAndCallback.java
+@@ -87,34 +87,18 @@ public class GzipResponseAndCallback extends Response.Wrapper implements Callbac
+     @Override
+     public void succeeded()
+     {
+-        try
+-        {
+-            // We need to write nothing here to intercept the committing of the
+-            // response and possibly change headers in case write is never called.
+-            if (_last)
+-                _callback.succeeded();
+-            else
+-                write(true, null, _callback);
+-        }
+-        finally
+-        {
+-            if (getRequest() instanceof GzipRequest gzipRequest)
+-                gzipRequest.destroy();
+-        }
++        // We need to write nothing here to intercept the committing of the
++        // response and possibly change headers in case write is never called.
++        if (_last)
++            _callback.succeeded();
++        else
++            write(true, null, _callback);
+     }
+ 
+     @Override
+     public void failed(Throwable x)
+     {
+-        try
+-        {
+-            _callback.failed(x);
+-        }
+-        finally
+-        {
+-            if (getRequest() instanceof GzipRequest gzipRequest)
+-                gzipRequest.destroy();
+-        }
++        _callback.failed(x);
+     }
+ 
+     @Override
+--- a/jetty-core/jetty-server/src/test/java/org/eclipse/jetty/server/handler/gzip/GzipHandlerTest.java
++++ b/jetty-core/jetty-server/src/test/java/org/eclipse/jetty/server/handler/gzip/GzipHandlerTest.java
+@@ -35,6 +35,7 @@ import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.stream.Collectors;
+ import java.util.stream.Stream;
++import java.util.zip.Deflater;
+ import java.util.zip.GZIPInputStream;
+ import java.util.zip.GZIPOutputStream;
+ import java.util.zip.Inflater;
+@@ -71,8 +72,12 @@ import org.eclipse.jetty.util.BufferUtil;
+ import org.eclipse.jetty.util.Callback;
+ import org.eclipse.jetty.util.Fields;
+ import org.eclipse.jetty.util.IO;
++import org.eclipse.jetty.util.Pool;
+ import org.eclipse.jetty.util.StringUtil;
+ import org.eclipse.jetty.util.component.LifeCycle;
++import org.eclipse.jetty.util.compression.CompressionPool;
++import org.eclipse.jetty.util.compression.DeflaterPool;
++import org.eclipse.jetty.util.compression.InflaterPool;
+ import org.hamcrest.MatcherAssert;
+ import org.hamcrest.Matchers;
+ import org.junit.jupiter.api.AfterEach;
+@@ -86,6 +91,7 @@ import org.junit.jupiter.params.provider.MethodSource;
+ import org.junit.jupiter.params.provider.ValueSource;
+ 
+ import static java.nio.charset.StandardCharsets.UTF_8;
++import static org.awaitility.Awaitility.await;
+ import static org.hamcrest.MatcherAssert.assertThat;
+ import static org.hamcrest.Matchers.both;
+ import static org.hamcrest.Matchers.contains;
+@@ -944,6 +950,10 @@ public class GzipHandlerTest
+ 
+         assertThat(response.getStatus(), is(200));
+         assertThat(response.getContent(), is(data));
++
++        InflaterPool inflaterPool = _gzipHandler.getBean(InflaterPool.class);
++        Pool<CompressionPool<Inflater>.Entry> pool = inflaterPool.getPool();
++        await().atMost(5, TimeUnit.SECONDS).until(pool::getInUseCount, is(0));
+     }
+ 
+     @Test
+@@ -1307,6 +1317,10 @@ public class GzipHandlerTest
+         {
+             assertEquals(CONTENT, new String(Arrays.copyOfRange(bytes, i * CONTENT_BYTES.length, (i + 1) * CONTENT_BYTES.length), StandardCharsets.UTF_8), "chunk " + i);
+         }
++
++        DeflaterPool deflaterPool = _gzipHandler.getBean(DeflaterPool.class);
++        Pool<CompressionPool<Deflater>.Entry> pool = deflaterPool.getPool();
++        await().atMost(5, TimeUnit.SECONDS).until(pool::getInUseCount, is(0));
+     }
+ 
+     /**
+
+diff --git a/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpParser.java b/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpParser.java
+index 717966ec..5a599d08 100644
+--- a/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpParser.java
++++ b/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpParser.java
+@@ -21,6 +21,7 @@ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Locale;
+ import java.util.Map;
++import java.util.Objects;
+ 
+ import org.eclipse.jetty.http.HttpTokens.EndOfContent;
+ import org.eclipse.jetty.util.BufferUtil;
+@@ -94,7 +95,6 @@ public class HttpParser
+ {
+     private static final Logger LOG = LoggerFactory.getLogger(HttpParser.class);
+     public static final int INITIAL_URI_LENGTH = 256;
+-    private static final int MAX_CHUNK_LENGTH = Integer.MAX_VALUE / 16 - 16;
+     private static final String UNMATCHED_VALUE = "\u0000";
+ 
+     /**
+@@ -199,16 +199,6 @@ public class HttpParser
+         return l;
+     }
+ 
+-    // States
+-    public enum FieldState
+-    {
+-        FIELD,
+-        IN_NAME,
+-        VALUE,
+-        IN_VALUE,
+-        WS_AFTER_NAME,
+-    }
+-
+     // States
+     public enum State
+     {
+@@ -227,8 +217,8 @@ public class HttpParser
+         EOF_CONTENT,
+         CHUNKED_CONTENT,
+         CHUNK_SIZE,
+-        CHUNK_PARAMS,
+         CHUNK,
++        CHUNK_END,
+         CONTENT_END,
+         TRAILER,
+         END,
+@@ -236,6 +226,28 @@ public class HttpParser
+         CLOSED  // The associated stream/endpoint is at EOF
+     }
+ 
++    public enum FieldState
++    {
++        FIELD,
++        IN_NAME,
++        VALUE,
++        IN_VALUE,
++        WS_AFTER_NAME,
++    }
++
++    public enum ChunkSizeState
++    {
++        SIZE,
++        EXT_BWS,
++        EXT_NAME_BWS_BEFORE,
++        EXT_NAME,
++        EXT_NAME_BWS_AFTER,
++        EXT_VALUE_BWS_BEFORE,
++        EXT_VALUE_OPEN_QUOTE,
++        EXT_VALUE,
++        EXT_VALUE_CLOSE_QUOTE,
++    }
++
+     private static final EnumSet<State> __idleStates = EnumSet.of(State.START, State.END, State.CLOSE, State.CLOSED);
+     private static final EnumSet<State> __completeStates = EnumSet.of(State.END, State.CLOSE, State.CLOSED);
+     private static final EnumSet<State> __terminatedStates = EnumSet.of(State.CLOSE, State.CLOSED);
+@@ -249,6 +261,7 @@ public class HttpParser
+     private final HttpCompliance _complianceMode;
+     private final Utf8StringBuilder _uri = new Utf8StringBuilder(INITIAL_URI_LENGTH);
+     private final FieldCache _fieldCache = new FieldCache();
++    private final StringBuilder _string = new StringBuilder();
+     private HttpField _field;
+     private HttpHeader _header;
+     private long _beginNanoTime;
+@@ -264,18 +277,20 @@ public class HttpParser
+     private HttpMethod _method;
+     private String _methodString;
+     private HttpVersion _version;
+-    private EndOfContent _endOfContent;
++    private EndOfContent _endOfContent = EndOfContent.UNKNOWN_CONTENT;
+     private boolean _hasContentLength;
+     private boolean _hasTransferEncoding;
+     private long _contentLength = -1;
+     private long _contentPosition;
+-    private int _chunkLength;
+-    private int _chunkPosition;
++    private int _chunkSizeDigits;
++    private long _chunkLength;
++    private long _chunkOffset;
+     private boolean _headResponse;
+     private boolean _cr;
+     private ByteBuffer _contentChunk;
+     private int _length;
+-    private final StringBuilder _string = new StringBuilder();
++    private ChunkSizeState _chunkSizeState = ChunkSizeState.SIZE;
++    private boolean _chunkQuotedEscape = false;
+ 
+     private static HttpCompliance compliance()
+     {
+@@ -480,6 +495,7 @@ public class HttpParser
+     private HttpTokens.Token next(ByteBuffer buffer)
+     {
+         byte ch = buffer.get();
++        addAndCheckHeadersSize(1);
+         HttpTokens.Token t = HttpTokens.getToken(ch);
+ 
+         switch (t.getType())
+@@ -497,10 +513,8 @@ public class HttpParser
+ 
+                 if (buffer.hasRemaining())
+                 {
+-                    // Don't count the CRs and LFs of the chunked encoding.
+-                    if (_maxHeaderBytes > 0 && (_state == State.HEADER || _state == State.TRAILER))
+-                        _headerBytes++;
+                     ch = buffer.get();
++                    addAndCheckHeadersSize(1);
+                     t = HttpTokens.TOKENS[0xff & ch];
+                     return switch (t.getType())
+                     {
+@@ -531,6 +545,26 @@ public class HttpParser
+         return t;
+     }
+ 
++    private void addAndCheckHeadersSize(int delta)
++    {
++        if (_maxHeaderBytes <= 0)
++            return;
++        if (_state.ordinal() <= State.HEADER.ordinal() ||
++            (_state == State.CHUNK_SIZE && _chunkSizeState != ChunkSizeState.SIZE) ||
++            _state == State.TRAILER)
++        {
++            _headerBytes += delta;
++            if (_headerBytes > _maxHeaderBytes)
++            {
++                if (_state == State.URI)
++                    throw new HttpException.RuntimeException(HttpStatus.URI_TOO_LONG_414);
++                if (_requestParser)
++                    throw new HttpException.RuntimeException(HttpStatus.REQUEST_HEADER_FIELDS_TOO_LARGE_431);
++                throw new HttpException.RuntimeException(_responseStatus, "Response Header Bytes Too Large");
++            }
++        }
++    }
++
+     private boolean quickStartRequestLine(ByteBuffer buffer)
+     {
+         int position = buffer.position();
+@@ -545,7 +579,9 @@ public class HttpParser
+                 long v = buffer.getLong(position + Long.BYTES);
+                 if (v == TP_SLASH_1_1_CRLF_AS_LONG)
+                 {
+-                    buffer.position(position + 2 * Long.BYTES);
++                    int delta = 2 * Long.BYTES;
++                    buffer.position(position + delta);
++                    addAndCheckHeadersSize(delta);
+                     _methodString = HttpMethod.GET.asString();
+                     _version = HttpVersion.HTTP_1_1;
+                     _fieldCache.prepare();
+@@ -555,7 +591,9 @@ public class HttpParser
+                 }
+                 if (v == TP_SLASH_1_0_CRLF_AS_LONG)
+                 {
+-                    buffer.position(position + 2 * Long.BYTES);
++                    int delta = 2 * Long.BYTES;
++                    buffer.position(position + delta);
++                    addAndCheckHeadersSize(delta);
+                     _methodString = HttpMethod.GET.asString();
+                     _version = HttpVersion.HTTP_1_0;
+                     _fieldCache.prepare();
+@@ -581,8 +619,9 @@ public class HttpParser
+             _methodString = _method.asString();
+             // The lookAheadGet method above checks for the trailing space,
+             // so it is safe to move the position 1 more than the method length.
+-            position = position + _methodString.length() + 1;
+-            buffer.position(position);
++            int delta = _methodString.length() + 1;
++            buffer.position(position + delta);
++            addAndCheckHeadersSize(delta);
+             setState(State.SPACE1);
+             return true;
+         }
+@@ -613,6 +652,7 @@ public class HttpParser
+                     buffer.getLong(position) == SPACE_200_OK_CR_AS_LONG)
+                 {
+                     buffer.position(position + 9);
++                    addAndCheckHeadersSize(9);
+                     _responseStatus = HttpStatus.OK_200;
+                     _fieldCache.prepare();
+                     setState(State.HEADER);
+@@ -623,6 +663,7 @@ public class HttpParser
+                 if (buffer.get(position) == ' ')
+                 {
+                     buffer.position(position + 1);
++                    addAndCheckHeadersSize(1);
+                     setState(State.SPACE1);
+                     return true;
+                 }
+@@ -671,16 +712,6 @@ public class HttpParser
+                 {
+                 }
+             }
+-
+-            // count this white space as a header byte to avoid DOS
+-            if (_maxHeaderBytes > 0 && ++_headerBytes > _maxHeaderBytes)
+-            {
+-                LOG.warn("padding is too large >{}", _maxHeaderBytes);
+-                if (_requestParser)
+-                    throw new BadMessageException(HttpStatus.BAD_REQUEST_400);
+-                else
+-                    throw new HttpException.RuntimeException(_responseStatus, "Bad Response");
+-            }
+         }
+     }
+ 
+@@ -733,28 +764,6 @@ public class HttpParser
+             if (t == null)
+                 break;
+ 
+-            if (_maxHeaderBytes > 0 && ++_headerBytes > _maxHeaderBytes)
+-            {
+-                if (_state == State.URI)
+-                {
+-                    LOG.warn("URI is too large >{}", _maxHeaderBytes);
+-                    throw new BadMessageException(HttpStatus.URI_TOO_LONG_414);
+-                }
+-                else
+-                {
+-                    if (_requestParser)
+-                    {
+-                        LOG.warn("request is too large >{}", _maxHeaderBytes);
+-                        throw new BadMessageException(HttpStatus.REQUEST_HEADER_FIELDS_TOO_LARGE_431);
+-                    }
+-                    else
+-                    {
+-                        LOG.warn("response is too large >{}", _maxHeaderBytes);
+-                        throw new HttpException.RuntimeException(_responseStatus, "Response Header Bytes Too Large");
+-                    }
+-                }
+-            }
+-
+             switch (_state)
+             {
+                 case METHOD:
+@@ -847,8 +856,10 @@ public class HttpParser
+                                 // quick scan for space or EoBuffer
+                                 if (buffer.hasArray())
+                                 {
++                                    // look ahead for the space after the URI
+                                     byte[] array = buffer.array();
+-                                    int p = buffer.arrayOffset() + buffer.position();
++                                    int position = buffer.position();
++                                    int p = buffer.arrayOffset() + position;
+                                     int l = buffer.arrayOffset() + buffer.limit();
+                                     int i = p;
+                                     while (i < l && array[i] > HttpTokens.SPACE)
+@@ -857,18 +868,15 @@ public class HttpParser
+                                     }
+ 
+                                     int len = i - p;
+-                                    _headerBytes += len;
+-
+-                                    if (_maxHeaderBytes > 0 && ++_headerBytes > _maxHeaderBytes)
+-                                    {
+-                                        LOG.warn("URI is too large >{}", _maxHeaderBytes);
+-                                        throw new BadMessageException(HttpStatus.URI_TOO_LONG_414);
+-                                    }
++                                    buffer.position(position + len);
++                                    addAndCheckHeadersSize(len);
+                                     _uri.append(array, p - 1, len + 1);
+-                                    buffer.position(i - buffer.arrayOffset());
+                                 }
+                                 else
++                                {
++                                    // Copy URI byte by byte
+                                     _uri.append(t.getByte());
++                                }
+                             }
+                             break;
+ 
+@@ -927,6 +935,7 @@ public class HttpParser
+                                 if (version != null)
+                                 {
+                                     buffer.position(endOfVersion + 2);
++                                    addAndCheckHeadersSize(endOfVersion + 2 - position);
+                                     _version = version;
+                                     _string.setLength(0);
+                                     checkVersion();
+@@ -1239,7 +1248,7 @@ public class HttpParser
+ 
+     private long convertContentLength(String valueString)
+     {
+-        if (valueString == null || valueString.length() == 0)
++        if (valueString == null || valueString.isEmpty())
+             throw new BadMessageException("Invalid Content-Length Value", new NumberFormatException());
+ 
+         long value = 0;
+@@ -1269,17 +1278,6 @@ public class HttpParser
+             if (t == null)
+                 break;
+ 
+-            if (_maxHeaderBytes > 0 && ++_headerBytes > _maxHeaderBytes)
+-            {
+-                boolean header = _state == State.HEADER;
+-                if (debugEnabled)
+-                    LOG.debug("{} is too large {}>{}", header ? "Header" : "Trailer", _headerBytes, _maxHeaderBytes);
+-                if (_requestParser)
+-                    throw new BadMessageException(header ? HttpStatus.REQUEST_HEADER_FIELDS_TOO_LARGE_431 : HttpStatus.PAYLOAD_TOO_LARGE_413);
+-                // There is no equivalent of 431 for response headers.
+-                throw new HttpException.RuntimeException(_responseStatus, "Response Header Fields Too Large");
+-            }
+-
+             switch (_fieldState)
+             {
+                 case FIELD:
+@@ -1398,7 +1396,7 @@ public class HttpParser
+                                     String n = cachedField.getName();
+                                     String v = cachedField.getValue();
+ 
+-                                    if (v != UNMATCHED_VALUE)
++                                    if (!Objects.equals(v, UNMATCHED_VALUE))
+                                     {
+                                         if (CASE_SENSITIVE_FIELD_NAME.isAllowedBy(_complianceMode))
+                                         {
+@@ -1426,15 +1424,18 @@ public class HttpParser
+                                     _header = cachedField.getHeader();
+                                     _headerString = n;
+ 
+-                                    int posAfterName = buffer.position() + n.length() + 1;
++                                    int position = buffer.position();
++                                    int delta = n.length() + 1;
++                                    int posAfterName = position + delta;
+ 
+-                                    if (v == UNMATCHED_VALUE || (posAfterName + v.length()) >= buffer.limit())
++                                    if (Objects.equals(v, UNMATCHED_VALUE) || (posAfterName + v.length()) >= buffer.limit())
+                                     {
+                                         // Header only
+                                         setState(FieldState.VALUE);
+                                         _string.setLength(0);
+                                         _length = 0;
+                                         buffer.position(posAfterName);
++                                        addAndCheckHeadersSize(delta);
+                                         break;
+                                     }
+ 
+@@ -1446,6 +1447,7 @@ public class HttpParser
+                                         _field = cachedField;
+                                         _valueString = v;
+                                         buffer.position(posAfterValue + 1);
++                                        addAndCheckHeadersSize(posAfterValue + 1 - position);
+                                         if (peek == LINE_FEED)
+                                         {
+                                             setState(FieldState.FIELD);
+@@ -1458,6 +1460,7 @@ public class HttpParser
+                                     setState(FieldState.IN_VALUE);
+                                     setString(v);
+                                     buffer.position(posAfterValue);
++                                    addAndCheckHeadersSize(posAfterValue - position);
+                                     break;
+                                 }
+                             }
+@@ -1704,6 +1707,7 @@ public class HttpParser
+                     if (b != CARRIAGE_RETURN && b != LINE_FEED)
+                         break;
+                     buffer.get();
++                    addAndCheckHeadersSize(1);
+                     ++whiteSpace;
+                 }
+                 if (debugEnabled && whiteSpace > 0)
+@@ -1747,7 +1751,6 @@ public class HttpParser
+                     case CONTENT:
+                     case CHUNKED_CONTENT:
+                     case CHUNK_SIZE:
+-                    case CHUNK_PARAMS:
+                     case CHUNK:
+                         setState(State.CLOSED);
+                         _handler.earlyEOF();
+@@ -1873,6 +1876,8 @@ public class HttpParser
+                     HttpTokens.Token t = next(buffer);
+                     if (t == null)
+                         break;
++
++                    _chunkOffset = 0;
+                     switch (t.getType())
+                     {
+                         case LF:
+@@ -1880,7 +1885,6 @@ public class HttpParser
+ 
+                         case DIGIT:
+                             _chunkLength = t.getHexDigit();
+-                            _chunkPosition = 0;
+                             setState(State.CHUNK_SIZE);
+                             break;
+ 
+@@ -1888,7 +1892,6 @@ public class HttpParser
+                             if (t.isHexDigit())
+                             {
+                                 _chunkLength = t.getHexDigit();
+-                                _chunkPosition = 0;
+                                 setState(State.CHUNK_SIZE);
+                                 break;
+                             }
+@@ -1902,90 +1905,45 @@ public class HttpParser
+ 
+                 case CHUNK_SIZE:
+                 {
+-                    HttpTokens.Token t = next(buffer);
+-                    if (t == null)
+-                        break;
+-
+-                    switch (t.getType())
+-                    {
+-                        case LF:
+-                            if (_chunkLength == 0)
+-                            {
+-                                setState(State.TRAILER);
+-                                if (_handler.contentComplete())
+-                                    return true;
+-                            }
+-                            else
+-                                setState(State.CHUNK);
+-                            break;
+-
+-                        default:
+-                            if (t.isHexDigit())
+-                            {
+-                                if (_chunkLength > MAX_CHUNK_LENGTH)
+-                                    throw new BadMessageException(HttpStatus.PAYLOAD_TOO_LARGE_413);
+-                                _chunkLength = _chunkLength * 16 + t.getHexDigit();
+-                            }
+-                            else if (t.getChar() == ';')
+-                            {
+-                                setState(State.CHUNK_PARAMS);
+-                            }
+-                            else
+-                            {
+-                                throw new IllegalCharacterException(_state, t, buffer);
+-                            }
+-                    }
+-                    break;
+-                }
+-
+-                case CHUNK_PARAMS:
+-                {
+-                    HttpTokens.Token t = next(buffer);
+-                    if (t == null)
+-                        break;
+-
+-                    switch (t.getType())
+-                    {
+-                        case LF:
+-                            if (_chunkLength == 0)
+-                            {
+-                                setState(State.TRAILER);
+-                                if (_handler.contentComplete())
+-                                    return true;
+-                            }
+-                            else
+-                                setState(State.CHUNK);
+-                            break;
+-                        default:
+-                            break; // TODO review
+-                    }
++                    if (parseChunkSize(buffer))
++                        return true;
+                     break;
+                 }
+ 
+                 case CHUNK:
+                 {
+-                    int chunk = _chunkLength - _chunkPosition;
+-                    if (chunk == 0)
++                    long chunkLength = _chunkLength - _chunkOffset;
++                    if (chunkLength == 0)
+                     {
+-                        setState(State.CHUNKED_CONTENT);
++                        setState(State.CHUNK_END);
+                     }
+                     else
+                     {
+-                        _contentChunk = buffer.asReadOnlyBuffer();
+-
+-                        if (remaining > chunk)
+-                            _contentChunk.limit(_contentChunk.position() + chunk);
+-                        chunk = _contentChunk.remaining();
++                        int length = (int)Math.min(remaining, chunkLength);
++                        _contentChunk = buffer.slice(buffer.position(), length);
+ 
+-                        _contentPosition += chunk;
+-                        _chunkPosition += chunk;
+-                        buffer.position(buffer.position() + chunk);
++                        _contentPosition += length;
++                        _chunkOffset += length;
++                        buffer.position(buffer.position() + length);
+                         if (_handler.content(_contentChunk))
+                             return true;
+                     }
+                     break;
+                 }
+ 
++                case CHUNK_END:
++                {
++                    HttpTokens.Token t = next(buffer);
++                    if (t == null)
++                        break;
++
++                    // We must be exactly on a line-terminator after consuming the chunk.
++                    if (t.getType() != HttpTokens.Type.LF)
++                        throw new IllegalCharacterException(_state, t, buffer);
++                    setState(State.CHUNKED_CONTENT);
++                    break;
++                }
++
+                 case CONTENT_END:
+                 {
+                     setState(_endOfContent == EndOfContent.EOF_CONTENT ? State.CLOSED : State.END);
+@@ -2001,6 +1959,212 @@ public class HttpParser
+         return false;
+     }
+ 
++    private boolean parseChunkSize(ByteBuffer buffer)
++    {
++        while (_state == State.CHUNK_SIZE && buffer.hasRemaining())
++        {
++            HttpTokens.Token t = next(buffer);
++            if (t == null)
++                break;
++
++            switch (_chunkSizeState)
++            {
++                case SIZE ->
++                {
++                    if (t.getType() == HttpTokens.Type.LF)
++                    {
++                        if (chunkSizeEnd(t))
++                            return true;
++                    }
++                    else if (t.isHexDigit())
++                    {
++                        // Allow at most 16 digits (8 bytes).
++                        if (++_chunkSizeDigits == 16)
++                            throw new HttpException.RuntimeException(HttpStatus.BAD_REQUEST_400);
++                        _chunkLength = _chunkLength * 16 + t.getHexDigit();
++                        // Check for overflow.
++                        if (_chunkLength < 0)
++                            throw new HttpException.RuntimeException(HttpStatus.BAD_REQUEST_400);
++                    }
++                    else if (isBWS(t))
++                        setChunkSizeState(ChunkSizeState.EXT_BWS);
++                    else if (t.getChar() == ';')
++                        setChunkSizeState(ChunkSizeState.EXT_NAME_BWS_BEFORE);
++                    else
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_BWS ->
++                {
++                    if (t.getChar() == ';')
++                        setChunkSizeState(ChunkSizeState.EXT_NAME_BWS_BEFORE);
++                    else if (!isBWS(t))
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_NAME_BWS_BEFORE ->
++                {
++                    if (isTchar(t))
++                        setChunkSizeState(ChunkSizeState.EXT_NAME);
++                    else if (!isBWS(t))
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_NAME ->
++                {
++                    if (t.getType() == HttpTokens.Type.LF)
++                    {
++                        if (chunkSizeEnd(t))
++                            return true;
++                    }
++                    else if (t.getChar() == ';')
++                        setChunkSizeState(ChunkSizeState.EXT_NAME_BWS_BEFORE);
++                    else if (isBWS(t))
++                        setChunkSizeState(ChunkSizeState.EXT_NAME_BWS_AFTER);
++                    else if (t.getChar() == '=')
++                        setChunkSizeState(ChunkSizeState.EXT_VALUE_BWS_BEFORE);
++                    else if (!isTchar(t))
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_NAME_BWS_AFTER ->
++                {
++                    if (t.getChar() == ';')
++                        setChunkSizeState(ChunkSizeState.EXT_NAME_BWS_BEFORE);
++                    else if (t.getChar() == '=')
++                        setChunkSizeState(ChunkSizeState.EXT_VALUE_BWS_BEFORE);
++                    else if (!isBWS(t))
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_VALUE_BWS_BEFORE ->
++                {
++                    if (t.getChar() == '"')
++                        setChunkSizeState(ChunkSizeState.EXT_VALUE_OPEN_QUOTE);
++                    else if (isTchar(t))
++                        setChunkSizeState(ChunkSizeState.EXT_VALUE);
++                    else if (!isBWS(t))
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_VALUE_OPEN_QUOTE ->
++                {
++                    if (_chunkQuotedEscape)
++                    {
++                        if (!isQuotedPair(t))
++                            throw new IllegalCharacterException(_state, t, buffer);
++                        _chunkQuotedEscape = false;
++                    }
++                    else if (t.getChar() == '\\')
++                        _chunkQuotedEscape = true;
++                    else if (t.getChar() == '"')
++                        setChunkSizeState(ChunkSizeState.EXT_VALUE_CLOSE_QUOTE);
++                    else if (!isQdText(t))
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_VALUE ->
++                {
++                    if (t.getType() == HttpTokens.Type.LF)
++                    {
++                        if (chunkSizeEnd(t))
++                            return true;
++                    }
++                    else if (isBWS(t))
++                        setChunkSizeState(ChunkSizeState.EXT_BWS);
++                    else if (t.getChar() == ';')
++                        setChunkSizeState(ChunkSizeState.EXT_NAME_BWS_BEFORE);
++                    else if (!isTchar(t))
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++                case EXT_VALUE_CLOSE_QUOTE ->
++                {
++                    if (t.getType() == HttpTokens.Type.LF)
++                    {
++                        if (chunkSizeEnd(t))
++                            return true;
++                    }
++                    else if (isBWS(t))
++                        setChunkSizeState(ChunkSizeState.EXT_BWS);
++                    else if (t.getChar() == ';')
++                        setChunkSizeState(ChunkSizeState.EXT_NAME_BWS_BEFORE);
++                    else
++                        throw new IllegalCharacterException(_state, t, buffer);
++                }
++            }
++        }
++        return false;
++    }
++
++    private boolean chunkSizeEnd(HttpTokens.Token t)
++    {
++        setChunkSizeState(ChunkSizeState.SIZE);
++        _chunkSizeDigits = 0;
++        if (_chunkLength == 0)
++        {
++            setState(State.TRAILER);
++            return _handler.contentComplete();
++        }
++        else
++        {
++            setState(State.CHUNK);
++            return false;
++        }
++    }
++
++    /**
++     * Bad white space is defined in RFC-9110[5.6.3].
++     *
++     * @param t the token
++     * @return whether the token is a bad white space
++     */
++    private boolean isBWS(HttpTokens.Token t)
++    {
++        return t.getType() == HttpTokens.Type.SPACE || t.getType() == HttpTokens.Type.HTAB;
++    }
++
++    /**
++     * Token and token characters are defined in RFC-9110[5.6.2].
++     *
++     * @param t the token
++     * @return whether the token is a token character
++     */
++    private boolean isTchar(HttpTokens.Token t)
++    {
++        return switch (t.getType())
++        {
++            case TCHAR, DIGIT, ALPHA -> true;
++            default -> false;
++        };
++    }
++
++    /**
++     * Text inside quotes (qdtext) is defined in RFC-9110[5.6.4].
++     *
++     * @param t the token
++     * @return whether the token is quoted text
++     */
++    private boolean isQdText(HttpTokens.Token t)
++    {
++        return switch (t.getType())
++        {
++            case HTAB, SPACE, OTEXT -> true;
++            default ->
++            {
++                char c = t.getChar();
++                yield c == 0x21 || (c >= 0x23 && c <= 0x5B) || (c >= 0x5D && c <= 0x7E);
++            }
++        };
++    }
++
++    /**
++     * Escaped text inside quotes (quoted-pair) is defined in RFC-9110[5.6.4].
++     *
++     * @param t the token
++     * @return whether the token is a quoted pair
++     */
++    private boolean isQuotedPair(HttpTokens.Token t)
++    {
++        return switch (t.getType())
++        {
++            case HTAB, SPACE, COLON, TCHAR, VCHAR, DIGIT, ALPHA, OTEXT -> true;
++            default -> false;
++        };
++    }
++
+     public boolean isAtEOF()
+     {
+         return _eof;
+@@ -2035,17 +2199,36 @@ public class HttpParser
+         if (_state == State.CLOSE || _state == State.CLOSED)
+             return;
+ 
+-        setState(State.START);
++        _uri.reset();
++        _string.setLength(0);
++        _field = null;
++        _header = null;
++        _beginNanoTime = 0;
++        _headerString = null;
++        _valueString = null;
++        _responseStatus = 0;
++        _headerBytes = 0;
++        _parsedHost = null;
++        _headerComplete = false;
++        _state = State.START;
++        _fieldState = FieldState.FIELD;
++        _eof = false;
++        _method = null;
++        _methodString = null;
++        _version = null;
+         _endOfContent = EndOfContent.UNKNOWN_CONTENT;
+-        _contentLength = -1;
+         _hasContentLength = false;
+         _hasTransferEncoding = false;
++        _contentLength = -1;
+         _contentPosition = 0;
+-        _responseStatus = 0;
++        _chunkLength = 0;
++        _chunkOffset = 0;
++        _headResponse = false;
++        _cr = false;
+         _contentChunk = null;
+-        _headerBytes = 0;
+-        _parsedHost = null;
+-        _headerComplete = false;
++        _length = 0;
++        _chunkSizeState = ChunkSizeState.SIZE;
++        _chunkQuotedEscape = false;
+     }
+ 
+     public void servletUpgrade()
+@@ -2095,6 +2278,13 @@ public class HttpParser
+         _fieldState = state;
+     }
+ 
++    private void setChunkSizeState(ChunkSizeState state)
++    {
++        if (debugEnabled)
++            LOG.debug("{}:{} --> {}", _state, _chunkSizeState, state);
++        _chunkSizeState = state;
++    }
++
+     public Index<HttpField> getFieldCache()
+     {
+         _fieldCache.prepare();
+diff --git a/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpTokens.java b/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpTokens.java
+index bef67b52..c548d37c 100644
+--- a/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpTokens.java
++++ b/jetty-core/jetty-http/src/main/java/org/eclipse/jetty/http/HttpTokens.java
+@@ -43,8 +43,8 @@ public class HttpTokens
+         COLON,   // Colon character
+         DIGIT,   // Digit
+         ALPHA,   // Alpha
+-        TCHAR,   // token characters excluding COLON,DIGIT,ALPHA, which is equivalent to VCHAR excluding delimiters
+-        VCHAR,   // Visible characters excluding COLON,DIGIT,ALPHA
++        TCHAR,   // token characters excluding DIGIT and ALPHA
++        VCHAR,   // Visible characters excluding COLON, DIGIT and ALPHA
+         OTEXT    // Obsolete text
+     }
+ 
+
+
+--- a/jetty-ee10/jetty-ee10-jaspi/src/main/java/org/eclipse/jetty/ee10/security/jaspi/JaspiAuthenticator.java
++++ b/jetty-ee10/jetty-ee10-jaspi/src/main/java/org/eclipse/jetty/ee10/security/jaspi/JaspiAuthenticator.java
+@@ -154,10 +154,13 @@
+     @Override
+     public AuthenticationState validateRequest(Request request, Response response, Callback callback) throws ServerAuthException
+     {
+-        JaspiMessageInfo info = new JaspiMessageInfo(request, response, callback);
+-        request.setAttribute("org.eclipse.jetty.ee10.security.jaspi.info", info);
+-
+-        return validateRequest(info);
++        boolean isDeferred = AuthenticationState.getAuthenticationState(request) instanceof AuthenticationState.Deferred;
++        boolean isAuthenticationRequest = isDeferred && !AuthenticationState.Deferred.isDeferred(response);
++        boolean isMandatory = !isDeferred || isAuthenticationRequest;
++        JaspiMessageInfo messageInfo = new JaspiMessageInfo(request, response, callback);
++        messageInfo.setMandatory(isMandatory);
++        messageInfo.setAuthenticationRequest(isAuthenticationRequest);
++        return validateRequest(messageInfo);
+     }
+ 
+     public AuthenticationState validateRequest(JaspiMessageInfo messageInfo) throws ServerAuthException
+@@ -171,8 +174,21 @@
+             String authContextId = authConfig.getAuthContextID(messageInfo);
+             ServerAuthContext authContext = authConfig.getAuthContext(authContextId, _serviceSubject, _authProperties);
+             Subject clientSubject = new Subject();
++            AuthStatus authStatus;
++            CallerPrincipalCallback principalCallback;
++            GroupPrincipalCallback groupPrincipalCallback;
+ 
+-            AuthStatus authStatus = authContext.validateRequest(messageInfo, clientSubject, _serviceSubject);
++            try
++            {
++                _callbackHandler.clear();
++                authStatus = authContext.validateRequest(messageInfo, clientSubject, _serviceSubject);
++                principalCallback = _callbackHandler.getThreadCallerPrincipalCallback();
++                groupPrincipalCallback = _callbackHandler.getThreadGroupPrincipalCallback();
++            }
++            finally
++            {
++                _callbackHandler.clear();
++            }
+ 
+             if (authStatus == AuthStatus.SEND_CONTINUE)
+                 return AuthenticationState.CHALLENGE;
+@@ -183,13 +199,12 @@
+             {
+                 Set<UserIdentity> ids = clientSubject.getPrivateCredentials(UserIdentity.class);
+                 UserIdentity userIdentity;
+-                if (ids.size() > 0)
++                if (!ids.isEmpty())
+                 {
+                     userIdentity = ids.iterator().next();
+                 }
+                 else
+                 {
+-                    CallerPrincipalCallback principalCallback = _callbackHandler.getThreadCallerPrincipalCallback();
+                     if (principalCallback == null)
+                     {
+                         return null;
+@@ -214,7 +229,6 @@
+                             principal = new UserPrincipal(principalName, null);
+                         }
+                     }
+-                    GroupPrincipalCallback groupPrincipalCallback = _callbackHandler.getThreadGroupPrincipalCallback();
+                     String[] groups = groupPrincipalCallback == null ? null : groupPrincipalCallback.getGroups();
+                     userIdentity = _identityService.newUserIdentity(clientSubject, principal, groups);
+                 }
+@@ -224,7 +238,10 @@
+                 if (cached != null)
+                     return cached;
+ 
+-                return new UserAuthenticationSucceeded(getAuthenticationType(), userIdentity);
++                String authType = messageInfo.getAuthenticationType();
++                if (authType == null)
++                    authType = getAuthenticationType();
++                return new UserAuthenticationSucceeded(authType, userIdentity);
+             }
+             if (authStatus == AuthStatus.SEND_SUCCESS)
+             {
+@@ -274,7 +291,7 @@
+         {
+             throw new ServerAuthException(e);
+         }
+-    }   
++    }
+ 
+     private static class JaspiAuthenticatorConfiguration extends Configuration.Wrapper
+     {
+
+--- a/jetty-ee10/jetty-ee10-jaspi/src/main/java/org/eclipse/jetty/ee10/security/jaspi/JaspiMessageInfo.java
++++ b/jetty-ee10/jetty-ee10-jaspi/src/main/java/org/eclipse/jetty/ee10/security/jaspi/JaspiMessageInfo.java
+@@ -13,10 +13,8 @@
+ 
+ package org.eclipse.jetty.ee10.security.jaspi;
+ 
+-import java.util.Collection;
+ import java.util.HashMap;
+ import java.util.Map;
+-import java.util.Set;
+ 
+ import jakarta.security.auth.message.MessageInfo;
+ import jakarta.servlet.ServletRequest;
+@@ -32,28 +30,28 @@
+  */
+ public class JaspiMessageInfo implements MessageInfo
+ {
++    public static final String AUTH_REQUEST_KEY = "jakarta.servlet.http.isAuthenticationRequest";
+     public static final String AUTHENTICATION_TYPE_KEY = "jakarta.servlet.http.authType";
++    public static final String MANDATORY_KEY = "jakarta.security.auth.message.MessagePolicy.isMandatory";
+     private final Callback _callback;
+     private Request _request;
+     private Response _response;
+-    private final MIMap _map;
++    private final Map<String, Object> _map = new HashMap<>();
+ 
+     public JaspiMessageInfo(Request request, Response response, Callback callback)
+     {
+         _request = request;
+         _response = response;
+         _callback = callback;
+-        //JASPI 3.8.1
+-        _map = new MIMap();
+     }
+-    
++
+     public Callback getCallback()
+     {
+         return _callback;
+     }
+ 
+     @Override
+-    public Map getMap()
++    public Map<String, Object> getMap()
+     {
+         return _map;
+     }
+@@ -62,12 +60,33 @@
+     {
+         return _request;
+     }
+-    
++
+     public Response getBaseResponse()
+     {
+         return _response;
+     }
+-    
++
++    public String getAuthenticationType()
++    {
++        return (String)_map.get(AUTHENTICATION_TYPE_KEY);
++    }
++
++    public void setMandatory(boolean isMandatory)
++    {
++        if (isMandatory)
++            _map.put(JaspiMessageInfo.MANDATORY_KEY, "true");
++        else
++            _map.remove(JaspiMessageInfo.MANDATORY_KEY);
++    }
++
++    public void setAuthenticationRequest(boolean isAuthenticationRequest)
++    {
++        if (isAuthenticationRequest)
++            _map.put(JaspiMessageInfo.AUTH_REQUEST_KEY, "true");
++        else
++            _map.remove(JaspiMessageInfo.AUTH_REQUEST_KEY);
++    }
++
+     @Override
+     public Object getRequestMessage()
+     {
+@@ -98,141 +117,5 @@
+         if (!(response instanceof ServletResponse))
+             throw new IllegalStateException("Not a ServletResponse");
+         _response = ServletContextResponse.getServletContextResponse((ServletResponse)response);
+-    }
+-
+-    //TODO this has bugs in the view implementations.  Changing them will not affect the hardcoded values.
+-    private static class MIMap implements Map
+-    {
+-        private String authenticationType;
+-        private Map delegate;
+-
+-        private MIMap()
+-        {
+-        }
+-
+-        @Override
+-        public int size()
+-        {
+-            return delegate.size();
+-        }
+-
+-        @Override
+-        public boolean isEmpty()
+-        {
+-            return delegate == null || delegate.isEmpty();
+-        }
+-
+-        @Override
+-        public boolean containsKey(Object key)
+-        {
+-            if (AUTHENTICATION_TYPE_KEY.equals(key))
+-                return authenticationType != null;
+-            return delegate != null && delegate.containsKey(key);
+-        }
+-
+-        @Override
+-        public boolean containsValue(Object value)
+-        {
+-            if (authenticationType == value || (authenticationType != null && authenticationType.equals(value)))
+-                return true;
+-            return delegate != null && delegate.containsValue(value);
+-        }
+-
+-        @Override
+-        public Object get(Object key)
+-        {
+-            if (AUTHENTICATION_TYPE_KEY.equals(key))
+-                return authenticationType;
+-            if (delegate == null)
+-                return null;
+-            return delegate.get(key);
+-        }
+-
+-        @Override
+-        public Object put(Object key, Object value)
+-        {
+-            if (AUTHENTICATION_TYPE_KEY.equals(key))
+-            {
+-                String authenticationType = this.authenticationType;
+-                this.authenticationType = (String)value;
+-                if (delegate != null)
+-                    delegate.put(AUTHENTICATION_TYPE_KEY, value);
+-                return authenticationType;
+-            }
+-
+-            return getDelegate(true).put(key, value);
+-        }
+-
+-        @Override
+-        public Object remove(Object key)
+-        {
+-            if (AUTHENTICATION_TYPE_KEY.equals(key))
+-            {
+-                String authenticationType = this.authenticationType;
+-                this.authenticationType = null;
+-                if (delegate != null)
+-                    delegate.remove(AUTHENTICATION_TYPE_KEY);
+-                return authenticationType;
+-            }
+-            if (delegate == null)
+-                return null;
+-            return delegate.remove(key);
+-        }
+-
+-        @Override
+-        public void putAll(Map map)
+-        {
+-            if (map != null)
+-            {
+-                for (Object o : map.entrySet())
+-                {
+-                    Map.Entry entry = (Entry)o;
+-                    put(entry.getKey(), entry.getValue());
+-                }
+-            }
+-        }
+-
+-        @Override
+-        public void clear()
+-        {
+-            authenticationType = null;
+-            delegate = null;
+-        }
+-
+-        @Override
+-        public Set keySet()
+-        {
+-            return getDelegate(true).keySet();
+-        }
+-
+-        @Override
+-        public Collection values()
+-        {
+-            return getDelegate(true).values();
+-        }
+-
+-        @Override
+-        public Set entrySet()
+-        {
+-            return getDelegate(true).entrySet();
+-        }
+-
+-        private Map getDelegate(boolean create)
+-        {
+-            if (!create || delegate != null)
+-                return delegate;
+-            if (create)
+-            {
+-                delegate = new HashMap();
+-                if (authenticationType != null)
+-                    delegate.put(AUTHENTICATION_TYPE_KEY, authenticationType);
+-            }
+-            return delegate;
+-        }
+-
+-        String getAuthenticationType()
+-        {
+-            return authenticationType;
+-        }
+     }
+ }
+
+--- a/jetty-ee10/jetty-ee10-jaspi/src/main/java/org/eclipse/jetty/ee10/security/jaspi/ServletCallbackHandler.java
++++ b/jetty-ee10/jetty-ee10-jaspi/src/main/java/org/eclipse/jetty/ee10/security/jaspi/ServletCallbackHandler.java
+@@ -129,4 +129,10 @@
+         _groupPrincipals.set(null);
+         return groupPrincipalCallback;
+     }
++
++    public void clear()
++    {
++        _callerPrincipals.remove();
++        _groupPrincipals.remove();
++    }
+ }
