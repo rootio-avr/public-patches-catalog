@@ -1,7 +1,7 @@
-# perl : 5.32.1-4+deb11u5.root.io.2
+# perl : 5.32.1-4+deb11u3.root.io.3
 
-This patch is based on perl version 5.32.1-4+deb11u5.root.io.2, which is available at:
-https://sources.debian.org/src/perl/5.32.1-4+deb11u5/
+This patch is based on perl version 5.32.1-4+deb11u3.root.io.3, which is available at:
+https://sources.debian.org/src/perl/5.32.1-4+deb11u3/
 
 ## Affected CVEs:
 - CVE-2025-40909
@@ -10,6 +10,7 @@ https://sources.debian.org/src/perl/5.32.1-4+deb11u5/
 - CVE-2026-9538
 - CVE-2026-48962
 - CVE-2026-42497
+- CVE-2026-48959
 
 ## How to Apply:
 1. Obtain the source package: `apt source perl`
