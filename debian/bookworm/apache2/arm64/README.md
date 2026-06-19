@@ -1,17 +1,19 @@
-# apache2 : 2.4.62-1~deb12u2.root.io.7
+# apache2 : 2.4.67-1~deb12u3.root.io.11
 
-This patch is based on apache2 version 2.4.62-1~deb12u2.root.io.7, which is available at:
-https://sources.debian.org/src/apache2/2.4.62-1~deb12u2/
+This patch is based on apache2 version 2.4.67-1~deb12u3.root.io.11, which is available at:
+https://sources.debian.org/src/apache2/2.4.67-1~deb12u3/
 
 ## Affected CVEs:
-- CVE-2024-43204
-- CVE-2024-42516
-- CVE-2024-47252
 - CVE-2007-0086
-- CVE-2025-23048
-- CVE-2025-49630
-- CVE-2025-53020
-- CVE-2025-49812
+- CVE-2026-29167
+- CVE-2026-34355
+- CVE-2026-34356
+- CVE-2026-42535
+- CVE-2026-42536
+- CVE-2026-44185
+- CVE-2026-44186
+- CVE-2026-44631
+- CVE-2026-48913
 
 ## How to Apply:
 1. Obtain the source package: `apt source apache2`
