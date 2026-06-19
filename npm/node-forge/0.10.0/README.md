@@ -4,9 +4,12 @@ This patch is based on node-forge version 0.10.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2022-0122
 - CVE-2022-24771
 - CVE-2022-24772
+- CVE-2022-24773
 - CVE-2025-12816
+- CVE-2025-66030
 - CVE-2025-66031
 - CVE-2026-33891
 - CVE-2026-33894
