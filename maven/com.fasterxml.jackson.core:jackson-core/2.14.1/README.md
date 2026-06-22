@@ -4,6 +4,7 @@ This patch is based on com.fasterxml.jackson.core:jackson-core version 2.14.1, w
 unknown
 
 ## Affected CVEs:
+- CVE-2025-52999
 - GHSA-72hv-8253-57qq
 
 ## How to Apply:
