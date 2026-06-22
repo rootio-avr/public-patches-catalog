@@ -5,6 +5,9 @@ unknown
 
 ## Affected CVEs:
 - CVE-2022-42003
+- CVE-2022-42004
+- CVE-2020-36518
+- CVE-2021-46877
 
 ## How to Apply:
 1. Clone or download the source code for com.fasterxml.jackson.core:jackson-databind
