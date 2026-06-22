@@ -4,6 +4,7 @@ This patch is based on nodemailer version 7.0.11, which is available at:
 unknown
 
 ## Affected CVEs:
+- GHSA-p6gq-j5cr-w38f
 - GHSA-vvjj-xcjg-gr5g
 
 ## How to Apply:
