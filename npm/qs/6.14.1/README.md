@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-2391
+- CVE-2026-8723
 
 ## How to Apply:
 1. Clone or download the source code for qs
