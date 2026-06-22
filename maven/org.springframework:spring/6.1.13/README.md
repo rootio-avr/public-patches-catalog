@@ -5,7 +5,14 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-38819
+- CVE-2025-41234
+- CVE-2025-41242
 - CVE-2025-41249
+- CVE-2025-41254
+- CVE-2026-22737
+- CVE-2026-22740
+- CVE-2026-22741
+- CVE-2026-22745
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework:spring
