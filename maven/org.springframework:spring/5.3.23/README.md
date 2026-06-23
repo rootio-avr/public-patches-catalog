@@ -4,12 +4,20 @@ This patch is based on org.springframework:spring version 5.3.23, which is avail
 unknown
 
 ## Affected CVEs:
-- CVE-2016-1000027
 - CVE-2023-20860
 - CVE-2024-22259
 - CVE-2024-22262
 - CVE-2024-38816
 - CVE-2024-38819
+- CVE-2016-1000027
+- CVE-2024-38809
+- CVE-2024-38820
+- CVE-2024-22243
+- CVE-2025-41242
+- CVE-2026-22741
+- CVE-2026-22745
+- CVE-2026-22737
+- CVE-2024-38828
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework:spring
