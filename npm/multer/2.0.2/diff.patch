@@ -98,3 +98,353 @@
        } else {
          cb(null, errors)
        }
+
+--- a/lib/make-middleware.js
++++ b/lib/make-middleware.js
+@@ -46,6 +46,7 @@ function makeMiddleware (setup) {
+     var errorOccured = false
+     var pendingWrites = new Counter()
+     var uploadedFiles = []
++    var pendingFiles = []
+
+     function done (err) {
+       if (isDone) return
+@@ -72,7 +73,12 @@ function makeMiddleware (setup) {
+           storage._removeFile(req, file, cb)
+         }
+
+-        removeUploadedFiles(uploadedFiles, remove, function (err, storageErrors) {
++        var filesToRemove = uploadedFiles.concat(
++          pendingFiles.filter(function (f) { return f.path })
++        )
++        pendingFiles = []
++
++        removeUploadedFiles(filesToRemove, remove, function (err, storageErrors) {
+           if (err) return done(err)
+
+           uploadError.storageErrors = storageErrors
+@@ -155,7 +161,12 @@ function makeMiddleware (setup) {
+           abortWithCode('LIMIT_FILE_SIZE', fieldname)
+         })
+
++        pendingFiles.push(file)
++
+         storage._handleFile(req, file, function (err, info) {
++          var idx = pendingFiles.indexOf(file)
++          if (idx !== -1) pendingFiles.splice(idx, 1)
++
+           if (aborting) {
+             appender.removePlaceholder(placeholder)
+             uploadedFiles.push(extend(file, info))
+--- a/storage/disk.js
++++ b/storage/disk.js
+@@ -35,8 +35,13 @@ DiskStorage.prototype._handleFile = function _handleFile (req, file, cb) {
+       if (err) return cb(err)
+
+       var finalPath = path.join(destination, filename)
++
++      if (file.stream.destroyed) return
++
+       var outStream = fs.createWriteStream(finalPath)
+
++      file.path = finalPath
++
+       file.stream.pipe(outStream)
+       outStream.on('error', cb)
+       outStream.on('finish', function () {
+--- /dev/null
++++ b/test/orphan-file-cleanup.js
+@@ -0,0 +1,165 @@
++/* eslint-env mocha */
++
++var assert = require('assert')
++var fs = require('fs')
++var http = require('http')
++
++var express = require('express')
++var multer = require('../')
++var rimraf = require('rimraf')
++var temp = require('fs-temp')
++
++// @see https://github.com/expressjs/multer/security/advisories/GHSA-3p4h-7m6x-2hcm
++describe('orphan file cleanup on abort/malformed requests', function () {
++  var uploadDir, server, port
++
++  beforeEach(function (done) {
++    temp.mkdir(function (err, dir) {
++      if (err) return done(err)
++
++      uploadDir = dir
++      var upload = multer({ dest: dir })
++      var app = express()
++
++      app.post('/upload', upload.single('file'), function (req, res) {
++        res.json({ success: true })
++      })
++
++      app.post('/upload-multi', upload.array('file', 2), function (req, res) {
++        res.json({ success: true })
++      })
++
++      app.use(function (err, req, res, next) {
++        res.status(400).json({ error: err.message || err.code })
++      })
++
++      server = app.listen(0, function () {
++        port = server.address().port
++        done()
++      })
++    })
++  })
++
++  afterEach(function (done) {
++    server.close(function () {
++      rimraf(uploadDir, done)
++    })
++  })
++
++  it('should not leave orphan files when client aborts mid-upload', function (done) {
++    this.timeout(5000)
++
++    var boundary = 'AbortBound' + Date.now()
++    var preamble =
++      '--' + boundary + '\r\n' +
++      'Content-Disposition: form-data; name="file"; filename="test.bin"\r\n' +
++      'Content-Type: application/octet-stream\r\n\r\n'
++    var chunk = Buffer.alloc(64 * 1024, 0x5a)
++
++    var req = http.request({
++      hostname: 'localhost',
++      port: port,
++      path: '/upload',
++      method: 'POST',
++      headers: {
++        'Content-Type': 'multipart/form-data; boundary=' + boundary,
++        'Content-Length': Buffer.byteLength(preamble) + (chunk.length * 10)
++      }
++    })
++
++    req.on('error', function () {})
++    req.write(preamble)
++    req.write(chunk)
++
++    setTimeout(function () {
++      req.destroy()
++
++      setTimeout(function () {
++        var files = fs.readdirSync(uploadDir)
++        assert.strictEqual(files.length, 0, 'orphan files after client abort: ' + files.join(', '))
++        done()
++      }, 500)
++    }, 50)
++  })
++
++  it('should not leave orphan files on truncated multipart', function (done) {
++    this.timeout(5000)
++
++    var boundary = 'TruncBound' + Date.now()
++    var body =
++      '--' + boundary + '\r\n' +
++      'Content-Disposition: form-data; name="file"; filename="test.bin"\r\n' +
++      'Content-Type: application/octet-stream\r\n\r\n' +
++      'ORPHAN FILE DATA'
++
++    var req = http.request({
++      hostname: 'localhost',
++      port: port,
++      path: '/upload',
++      method: 'POST',
++      headers: {
++        'Content-Type': 'multipart/form-data; boundary=' + boundary,
++        'Content-Length': Buffer.byteLength(body)
++      }
++    }, function (res) {
++      res.resume()
++      res.on('end', function () {
++        setTimeout(function () {
++          var files = fs.readdirSync(uploadDir)
++          assert.strictEqual(files.length, 0, 'orphan files after truncated multipart: ' + files.join(', '))
++          done()
++        }, 500)
++      })
++    })
++
++    req.on('error', function () {})
++    req.write(body)
++    req.end()
++  })
++
++  it('should not leave orphan files when a later file aborts after an earlier one completed', function (done) {
++    this.timeout(5000)
++
++    var boundary = 'CompletedBound' + Date.now()
++
++    var partA =
++      '--' + boundary + '\r\n' +
++      'Content-Disposition: form-data; name="file"; filename="done.bin"\r\n' +
++      'Content-Type: application/octet-stream\r\n\r\n' +
++      'COMPLETED FILE CONTENT\r\n'
++
++    var partBStart =
++      '--' + boundary + '\r\n' +
++      'Content-Disposition: form-data; name="file"; filename="aborted.bin"\r\n' +
++      'Content-Type: application/octet-stream\r\n\r\n'
++
++    var chunkB = Buffer.alloc(64 * 1024, 0x5a)
++
++    var req = http.request({
++      hostname: 'localhost',
++      port: port,
++      path: '/upload-multi',
++      method: 'POST',
++      headers: {
++        'Content-Type': 'multipart/form-data; boundary=' + boundary,
++        'Content-Length': Buffer.byteLength(partA) + Buffer.byteLength(partBStart) + (chunkB.length * 10)
++      }
++    })
++
++    req.on('error', function () {})
++
++    req.write(partA)
++    req.write(partBStart)
++    req.write(chunkB)
++
++    setTimeout(function () {
++      req.destroy()
++
++      setTimeout(function () {
++        var files = fs.readdirSync(uploadDir)
++        assert.strictEqual(files.length, 0, 'orphan files after late abort: ' + files.join(', '))
++        done()
++      }, 200)
++    }, 200)
++  })
++})
+
+Description: Fix CVE-2026-5079 - DoS via deeply nested field names
+ Multer is vulnerable to a denial of service via deeply nested field names
+ in multipart/form-data input. An attacker can craft field names with many
+ nesting levels (e.g. "a[0][0][0]...") to force append-field to perform
+ expensive recursion, exhausting CPU/memory.
+ .
+ This patch adds a new "fieldNestingDepth" limit option. When set, multer
+ rejects field names whose bracket-nesting depth exceeds the configured
+ limit with a new LIMIT_FIELD_NESTING error code. When unset, behavior is
+ unchanged (unlimited nesting) for backward compatibility.
+ .
+ Only the security-relevant subset of upstream commit
+ a192b5278f240967f5eb13dd1e9a413b4e1b6533 is applied; unrelated refactors
+ (abortWithError lifecycle, defParamCharset, extend->spread, README) are
+ omitted.
+Origin: upstream, https://github.com/expressjs/multer/commit/a192b5278f240967f5eb13dd1e9a413b4e1b6533
+Bug: https://github.com/expressjs/multer/security/advisories/GHSA-72gw-mp4g-v24j
+Forwarded: not-needed
+Last-Update: 2026-06-19
+
+--- a/lib/make-middleware.js
++++ b/lib/make-middleware.js
+@@ -94,10 +94,14 @@
+       // Work around bug in Busboy (https://github.com/mscdex/busboy/issues/6)
+       if (limits && Object.prototype.hasOwnProperty.call(limits, 'fieldNameSize')) {
+         if (fieldname.length > limits.fieldNameSize) return abortWithCode('LIMIT_FIELD_KEY')
+       }
+ 
++      if (limits && Object.prototype.hasOwnProperty.call(limits, 'fieldNestingDepth')) {
++        if (fieldname.split('[').length - 1 > limits.fieldNestingDepth) return abortWithCode('LIMIT_FIELD_NESTING', fieldname)
++      }
++
+       appendField(req.body, fieldname, value)
+     })
+ 
+     // handle files
+     busboy.on('file', function (fieldname, fileStream, { filename, encoding, mimeType }) {
+--- a/lib/multer-error.js
++++ b/lib/multer-error.js
+@@ -8,7 +8,8 @@
+   LIMIT_FIELD_VALUE: 'Field value too long',
+   LIMIT_FIELD_COUNT: 'Too many fields',
+   LIMIT_UNEXPECTED_FILE: 'Unexpected field',
+-  MISSING_FIELD_NAME: 'Field name missing'
++  MISSING_FIELD_NAME: 'Field name missing',
++  LIMIT_FIELD_NESTING: 'Field name nesting too deep'
+ }
+ 
+ function MulterError (code, field) {
+--- /dev/null
++++ b/test/nesting-depth.js
+@@ -0,0 +1,75 @@
++/* eslint-env mocha */
++
++var assert = require('assert')
++
++var util = require('./_util')
++var multer = require('../')
++var FormData = require('form-data')
++
++describe('Field name nesting depth', function () {
++  // @see https://github.com/expressjs/multer/security/advisories/GHSA-72gw-mp4g-v24j
++
++  it('should reject field names exceeding fieldNestingDepth (array brackets)', function (done) {
++    var parser = multer({ limits: { fieldNestingDepth: 10 } }).none()
++    var form = new FormData()
++
++    form.append('a' + '[0]'.repeat(11), 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ok(err, 'should have returned an error')
++      assert.strictEqual(err.code, 'LIMIT_FIELD_NESTING')
++      done()
++    })
++  })
++
++  it('should reject field names exceeding fieldNestingDepth (object brackets)', function (done) {
++    var parser = multer({ limits: { fieldNestingDepth: 10 } }).none()
++    var form = new FormData()
++
++    form.append('a' + '[key]'.repeat(11), 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ok(err, 'should have returned an error')
++      assert.strictEqual(err.code, 'LIMIT_FIELD_NESTING')
++      done()
++    })
++  })
++
++  it('should allow field names at exactly the nesting depth limit', function (done) {
++    var parser = multer({ limits: { fieldNestingDepth: 3 } }).none()
++    var form = new FormData()
++
++    form.append('a[0][1][2]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      assert.strictEqual(req.body.a[0][1][2], 'value')
++      done()
++    })
++  })
++
++  it('should allow unlimited nesting by default', function (done) {
++    var parser = multer().none()
++    var form = new FormData()
++
++    form.append('a' + '[0]'.repeat(100), 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      done()
++    })
++  })
++
++  it('should allow flat field names with fieldNestingDepth set', function (done) {
++    var parser = multer({ limits: { fieldNestingDepth: 1 } }).none()
++    var form = new FormData()
++
++    form.append('simple', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      assert.strictEqual(req.body.simple, 'value')
++      done()
++    })
++  })
++})
