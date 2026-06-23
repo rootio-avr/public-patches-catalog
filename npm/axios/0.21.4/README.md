@@ -4,11 +4,15 @@ This patch is based on axios version 0.21.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2023-45857
 - CVE-2025-62718
 - CVE-2026-25639
 - CVE-2026-42033
+- CVE-2026-42035
+- CVE-2026-42036
 - CVE-2026-42038
 - CVE-2026-42039
+- CVE-2026-42041
 - CVE-2026-42043
 - CVE-2026-44486
 - CVE-2026-44487
