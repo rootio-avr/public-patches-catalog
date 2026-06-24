@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2022-0144
+- GHSA-64g7-mvw6-v9qj
 
 ## How to Apply:
 1. Clone or download the source code for shelljs
