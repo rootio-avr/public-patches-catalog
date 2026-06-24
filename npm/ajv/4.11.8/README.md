@@ -4,6 +4,7 @@ This patch is based on ajv version 4.11.8, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2020-15366
 - CVE-2025-69873
 
 ## How to Apply:
