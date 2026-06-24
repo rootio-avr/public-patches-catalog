@@ -4,6 +4,7 @@ This patch is based on org.eclipse.jetty:jetty-project version 12.0.13, which is
 unknown
 
 ## Affected CVEs:
+- CVE-2025-11143
 - CVE-2025-1948
 - CVE-2025-5115
 - CVE-2026-1605
