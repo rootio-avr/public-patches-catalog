@@ -7,6 +7,8 @@ unknown
 - CVE-2024-56128
 - CVE-2025-27817
 - CVE-2025-27818
+- CVE-2026-33558
+- CVE-2026-35554
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.kafka:kafka
