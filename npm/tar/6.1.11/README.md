@@ -4,6 +4,7 @@ This patch is based on tar version 6.1.11, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2024-28863
 - CVE-2026-23745
 - CVE-2026-23950
 - CVE-2026-24842
