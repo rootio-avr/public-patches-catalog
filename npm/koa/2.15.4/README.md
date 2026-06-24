@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-27959
+- CVE-2025-8129
+- CVE-2025-32379
 
 ## How to Apply:
 1. Clone or download the source code for koa
