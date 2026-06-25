@@ -8,6 +8,7 @@ https://sources.debian.org/src/sqlite3/3.34.1-3+deb11u1/
 - CVE-2025-29088
 - CVE-2022-35737
 - CVE-2026-11822
+- CVE-2026-11824
 
 ## How to Apply:
 1. Obtain the source package: `apt source sqlite3`
