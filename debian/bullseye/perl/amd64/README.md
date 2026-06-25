@@ -1,7 +1,7 @@
-# perl : 5.32.1-4+deb11u3.root.io.3
+# perl : 5.32.1-4+deb11u5.root.io.4
 
-This patch is based on perl version 5.32.1-4+deb11u3.root.io.3, which is available at:
-https://sources.debian.org/src/perl/5.32.1-4+deb11u3/
+This patch is based on perl version 5.32.1-4+deb11u5.root.io.4, which is available at:
+https://sources.debian.org/src/perl/5.32.1-4+deb11u5/
 
 ## Affected CVEs:
 - CVE-2025-40909
