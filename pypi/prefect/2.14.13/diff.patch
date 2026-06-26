@@ -1,0 +1,555 @@
+--- a/src/prefect/client/base.py
++++ b/src/prefect/client/base.py
+@@ -1,9 +1,10 @@
+ import copy
+ import sys
+ import threading
++import uuid
+ from collections import defaultdict
+ from contextlib import asynccontextmanager
+-from functools import partial
++from datetime import datetime, timezone
+ from typing import (
+     Any,
+     AsyncGenerator,
+@@ -11,6 +12,7 @@ from typing import (
+     Callable,
+     Dict,
+     MutableMapping,
++    Optional,
+     Protocol,
+     Set,
+     Tuple,
+@@ -21,10 +23,11 @@ from typing import (
+ import anyio
+ import httpx
+ from asgi_lifespan import LifespanManager
+-from httpx import HTTPStatusError, Response
++from httpx import HTTPStatusError, Request, Response
+ from starlette import status
+ from typing_extensions import Self
+
++from prefect.client.schemas.objects import CsrfToken
+ from prefect.exceptions import PrefectHTTPStatusError
+ from prefect.logging import get_logger
+ from prefect.settings import (
+@@ -188,9 +191,20 @@ class PrefectHttpxClient(httpx.AsyncClient):
+     [Configuring Cloudflare Rate Limiting](https://support.cloudflare.com/hc/en-us/articles/115001635128-Configuring-Rate-Limiting-from-UI)
+     """
+
++    def __init__(self, *args, enable_csrf_support: bool = False, **kwargs):
++        self.enable_csrf_support: bool = enable_csrf_support
++        self.csrf_token: Optional[str] = None
++        self.csrf_token_expiration: Optional[datetime] = None
++        self.csrf_client_id: uuid.UUID = uuid.uuid4()
++
++        super().__init__(*args, **kwargs)
++
+     async def _send_with_retry(
+         self,
+-        request: Callable,
++        request: Request,
++        send: Callable[[Request], Awaitable[Response]],
++        send_args: Tuple,
++        send_kwargs: Dict,
+         retry_codes: Set[int] = set(),
+         retry_exceptions: Tuple[Exception, ...] = tuple(),
+     ):
+@@ -207,21 +221,34 @@ class PrefectHttpxClient(httpx.AsyncClient):
+         try_count = 0
+         response = None
+
++        is_change_request = request.method.lower() in {"post", "put", "patch", "delete"}
++
++        if self.enable_csrf_support and is_change_request:
++            await self._add_csrf_headers(request=request)
++
+         while try_count <= PREFECT_CLIENT_MAX_RETRIES.value():
+             try_count += 1
+             retry_seconds = None
+             exc_info = None
+
+             try:
+-                response = await request()
++                response = await send(request, *send_args, **send_kwargs)
+             except retry_exceptions:  # type: ignore
+                 if try_count > PREFECT_CLIENT_MAX_RETRIES.value():
+                     raise
+                 # Otherwise, we will ignore this error but capture the info for logging
+                 exc_info = sys.exc_info()
+             else:
+-                # We got a response; return immediately if it is not retryable
+-                if response.status_code not in retry_codes:
++                # We got a response; check if it's a CSRF error, otherwise
++                # return immediately if it is not retryable
++                if (
++                    response.status_code == status.HTTP_403_FORBIDDEN
++                    and "Invalid CSRF token" in response.text
++                ):
++                    # We got a CSRF error, clear the token and try again
++                    self.csrf_token = None
++                    await self._add_csrf_headers(request)
++                elif response.status_code not in retry_codes:
+                     return response
+
+                 if "Retry-After" in response.headers:
+@@ -268,19 +295,24 @@ class PrefectHttpxClient(httpx.AsyncClient):
+         # We ran out of retries, return the failed response
+         return response
+
+-    async def send(self, *args, **kwargs) -> Response:
++    async def send(self, request: Request, *args, **kwargs) -> Response:
+         """
+         Send a request with automatic retry behavior for the following status codes:
+
++        - 403 Forbidden, if the request failed due to CSRF protection
++        - 408 Request Timeout
+         - 429 CloudFlare-style rate limiting
+         - 502 Bad Gateway
+         - 503 Service unavailable
++        - Any additional status codes provided in `PREFECT_CLIENT_RETRY_EXTRA_CODES`
+         """
+
+-        api_request = partial(super().send, *args, **kwargs)
+-
++        super_send = super().send
+         response = await self._send_with_retry(
+-            request=api_request,
++            request=request,
++            send=super_send,
++            send_args=args,
++            send_kwargs=kwargs,
+             retry_codes={
+                 status.HTTP_429_TOO_MANY_REQUESTS,
+                 status.HTTP_503_SERVICE_UNAVAILABLE,
+@@ -312,3 +344,34 @@ class PrefectHttpxClient(httpx.AsyncClient):
+         response.raise_for_status()
+
+         return response
++
++    async def _add_csrf_headers(self, request: Request):
++        now = datetime.now(timezone.utc)
++
++        if not self.enable_csrf_support:
++            return
++
++        if not self.csrf_token or (
++            self.csrf_token_expiration and now > self.csrf_token_expiration
++        ):
++            token_request = self.build_request(
++                "GET", f"/csrf-token?client={self.csrf_client_id}"
++            )
++
++            try:
++                token_response = await self.send(token_request)
++            except PrefectHTTPStatusError as exc:
++                if exc.response.status_code == status.HTTP_404_NOT_FOUND:
++                    # The token endpoint is not available, likely an older
++                    # server version; disable CSRF support
++                    self.enable_csrf_support = False
++                    return
++
++                raise
++
++            token: CsrfToken = CsrfToken.parse_obj(token_response.json())
++            self.csrf_token = token.token
++            self.csrf_token_expiration = token.expiration
++
++        request.headers["Prefect-Csrf-Token"] = self.csrf_token
++        request.headers["Prefect-Csrf-Client"] = str(self.csrf_client_id)
+--- a/src/prefect/client/cloud.py
++++ b/src/prefect/client/cloud.py
+@@ -72,7 +72,7 @@ class CloudClient:
+         httpx_settings.setdefault("base_url", host)
+         if not PREFECT_UNIT_TEST_MODE.value():
+             httpx_settings.setdefault("follow_redirects", True)
+-        self._client = PrefectHttpxClient(**httpx_settings)
++        self._client = PrefectHttpxClient(**httpx_settings, enable_csrf_support=False)
+
+     async def api_healthcheck(self):
+         """
+--- a/src/prefect/client/orchestration.py
++++ b/src/prefect/client/orchestration.py
+@@ -119,6 +119,7 @@ from prefect.settings import (
+     PREFECT_API_REQUEST_TIMEOUT,
+     PREFECT_API_TLS_INSECURE_SKIP_VERIFY,
+     PREFECT_API_URL,
++    PREFECT_CLIENT_CSRF_SUPPORT_ENABLED,
+     PREFECT_CLOUD_API_URL,
+     PREFECT_UNIT_TEST_MODE,
+ )
+@@ -296,9 +297,17 @@ class PrefectClient:
+                 pool=PREFECT_API_REQUEST_TIMEOUT.value(),
+             ),
+         )
+-
+         if not PREFECT_UNIT_TEST_MODE:
+             httpx_settings.setdefault("follow_redirects", True)
+-        self._client = PrefectHttpxClient(**httpx_settings)
++
++        enable_csrf_support = (
++            self.server_type != ServerType.CLOUD
++            and PREFECT_CLIENT_CSRF_SUPPORT_ENABLED.value()
++        )
++
++        self._client = PrefectHttpxClient(
++            **httpx_settings, enable_csrf_support=enable_csrf_support
++        )
++
+         self._loop = None
+
+         # See https://www.python-httpx.org/advanced/#custom-transports
+--- a/src/prefect/client/schemas/objects.py
++++ b/src/prefect/client/schemas/objects.py
+@@ -1549,3 +1549,16 @@ class FlowRunInput(ObjectBaseModel):
+     def validate_name_characters(cls, v):
+         raise_on_name_alphanumeric_dashes_only(v)
+         return v
++
++
++class CsrfToken(ObjectBaseModel):
++    token: str = Field(
++        default=...,
++        description="The CSRF token",
++    )
++    client: str = Field(
++        default=..., description="The client id associated with the CSRF token"
++    )
++    expiration: DateTimeTZ = Field(
++        default=..., description="The expiration time of the CSRF token"
++    )
+--- a/src/prefect/settings.py
++++ b/src/prefect/settings.py
+@@ -647,6 +647,21 @@ A comma-separated list of extra HTTP status codes to retry on. Defaults to an em
+ may result in unexpected behavior.
+ """
+
++PREFECT_CLIENT_CSRF_SUPPORT_ENABLED = Setting(bool, default=True)
++"""
++Determines if CSRF token handling is active in the Prefect client for API
++requests.
++
++When enabled (`True`), the client automatically manages CSRF tokens by
++retrieving, storing, and including them in applicable state-changing requests
++(POST, PUT, PATCH, DELETE) to the API.
++
++Disabling this setting (`False`) means the client will not handle CSRF tokens,
++which might be suitable for environments where CSRF protection is disabled.
++
++Defaults to `True`, ensuring CSRF protection is enabled by default.
++"""
++
+ PREFECT_CLOUD_API_URL = Setting(
+     str,
+     default="https://api.prefect.cloud/api",
+--- a/tests/test_deployments.py
++++ b/tests/test_deployments.py
+@@ -791,6 +791,7 @@ class TestRunDeployment:
+                 ),
+             ]
+
++            router.get("/csrf-token", params={"client": mock.ANY}).pass_through()
+             router.get(f"/deployments/name/{d.flow_name}/{d.name}").pass_through()
+             router.post(f"/deployments/{deployment_id}/create_flow_run").pass_through()
+             flow_polls = router.get(re.compile("/flow_runs/.*")).mock(
+@@ -838,6 +839,7 @@ class TestRunDeployment:
+                 ),
+             ]
+
++            router.get("/csrf-token", params={"client": mock.ANY}).pass_through()
+             router.get(f"/deployments/name/{d.flow_name}/{d.name}").pass_through()
+             router.post(f"/deployments/{deployment_id}/create_flow_run").pass_through()
+             flow_polls = router.get(re.compile("/flow_runs/.*")).mock(
+@@ -918,6 +920,7 @@ class TestRunDeployment:
+         with respx.mock(
+             base_url=PREFECT_API_URL.value(), assert_all_mocked=True
+         ) as router:
++            router.get("/csrf-token", params={"client": mock.ANY}).pass_through()
+             router.get(f"/deployments/name/{d.flow_name}/{d.name}").pass_through()
+             router.post(f"/deployments/{deployment_id}/create_flow_run").pass_through()
+             flow_polls = router.request(
+@@ -951,6 +954,7 @@ class TestRunDeployment:
+             assert_all_mocked=True,
+             assert_all_called=False,
+         ) as router:
++            router.get("/csrf-token", params={"client": mock.ANY}).pass_through()
+             router.get(f"/deployments/name/{d.flow_name}/{d.name}").pass_through()
+             router.post(f"/deployments/{deployment_id}/create_flow_run").pass_through()
+             flow_polls = router.request(
+@@ -995,6 +999,7 @@ class TestRunDeployment:
+             assert_all_mocked=True,
+             assert_all_called=False,
+         ) as router:
++            router.get("/csrf-token", params={"client": mock.ANY}).pass_through()
+             router.get(f"/deployments/name/{d.flow_name}/{d.name}").pass_through()
+             router.post(f"/deployments/{deployment_id}/create_flow_run").pass_through()
+             flow_polls = router.request(
+
+--- a/src/prefect/server/api/server.py
++++ b/src/prefect/server/api/server.py
+@@ -547,9 +547,15 @@
+     # middleware
+     app.add_middleware(
+         CORSMiddleware,
+-        allow_origins=["*"],
+-        allow_methods=["*"],
+-        allow_headers=["*"],
++        allow_origins=prefect.settings.PREFECT_SERVER_CORS_ALLOWED_ORIGINS.value().split(
++            ","
++        ),
++        allow_methods=prefect.settings.PREFECT_SERVER_CORS_ALLOWED_METHODS.value().split(
++            ","
++        ),
++        allow_headers=prefect.settings.PREFECT_SERVER_CORS_ALLOWED_HEADERS.value().split(
++            ","
++        ),
+     )
+
+     # Limit the number of concurrent requests when using a SQLite database to reduce
+--- a/src/prefect/settings.py
++++ b/src/prefect/settings.py
+@@ -1446,6 +1446,36 @@
+ Can be either an organization/username or a registry URL with an organization/username.
+ """
+
++PREFECT_SERVER_CORS_ALLOWED_ORIGINS = Setting(
++    str,
++    default="*",
++)
++"""
++A comma-separated list of origins that are authorized to make cross-origin requests to the API.
++
++By default, this is set to `*`, which allows requests from all origins.
++"""
++
++PREFECT_SERVER_CORS_ALLOWED_METHODS = Setting(
++    str,
++    default="*",
++)
++"""
++A comma-separated list of methods that are authorized to make cross-origin requests to the API.
++
++By default, this is set to `*`, which allows requests with all methods.
++"""
++
++PREFECT_SERVER_CORS_ALLOWED_HEADERS = Setting(
++    str,
++    default="*",
++)
++"""
++A comma-separated list of headers that are authorized to make cross-origin requests to the API.
++
++By default, this is set to `*`, which allows requests with all headers.
++"""
++
+ # Deprecated settings ------------------------------------------------------------------
+
+
+
+From 5a97f25f36ed58980223761562fcfb76e4ceed5d Mon Sep 17 00:00:00 2001
+From: subeesh7558 <subeesh.t@focaloid.com>
+Date: Fri, 26 Jun 2026 14:28:09 +0530
+Subject: [PATCH 1/2] 1
+
+---
+ ROOT-SECURITY-RELEASE.md | 93 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 93 insertions(+)
+ create mode 100644 ROOT-SECURITY-RELEASE.md
+
+diff --git a/ROOT-SECURITY-RELEASE.md b/ROOT-SECURITY-RELEASE.md
+new file mode 100644
+index 0000000000..e9ee2ac3ce
+--- /dev/null
++++ b/ROOT-SECURITY-RELEASE.md
+@@ -0,0 +1,93 @@
++# False Positive Report: CVE-2026-7722
++
++## Summary
++
++CVE-2026-7722 does **not** affect PrefectHQ/prefect version **2.14.13**. This is a confirmed false positive. The vulnerable code path was introduced nearly a year after version 2.14.13 was released.
++
++---
++
++## CVE Details
++
++| Field | Value |
++|-------|-------|
++| CVE ID | CVE-2026-7722 |
++| Severity | High |
++| CWE | CWE-287 (Improper Authentication) |
++| Component | Health Check API (`/api/health`) |
++| Affected File | `src/prefect/server/api/server.py` |
++| Reported Affected Versions | PrefectHQ/prefect up to 3.6.21 |
++| Fixed Version | 3.6.22 |
++| Fix Commit | `e21617125335025b4b27e7d6f0ca028e8e8f3b79` |
++
++---
++
++## Vulnerability Description
++
++The vulnerability exists in the `token_validation` HTTP middleware inside `create_api_app()` in `src/prefect/server/api/server.py`. The middleware was introduced as part of the `PREFECT_SERVER_API_AUTH_STRING` Basic Auth feature.
++
++The vulnerable code used Python's `str.endswith()` to exempt health check paths from authentication:
++
++```python
++# VULNERABLE code (never present in 2.14.x)
++if (
++    request.url.path.endswith(("health", "ready"))
++    and request.method.upper() == "GET"
++):
++    return await call_next(request)
++```
++
++This had two weaknesses:
++1. **Suffix matching bypass** — any path ending in `health` or `ready` (e.g., `/api/variables/name/system-health`) bypassed authentication.
++2. **Host header spoofing** — a crafted `Host` header could manipulate `request.url.path`, making the check evaluate against an attacker-controlled path.
++
++The fix (commit `e21617125335025b4b27e7d6f0ca028e8e8f3b79`) replaced suffix matching with exact path matching using `scope["path"]`:
++
++```python
++# FIXED code
++health_check_paths = {health_check_path, "/ready"}
++scope = request.scope
++app_path = scope["path"].removeprefix(scope.get("root_path", ""))
++if app_path in health_check_paths and request.method.upper() == "GET":
++    return await call_next(request)
++```
++
++---
++
++## Why This Is a False Positive for Version 2.14.13
++
++### Timeline
++
++| Event | Date | Commit |
++|-------|------|--------|
++| Version 2.14.13 released | 2024-01-04 | `9df5ba721c` |
++| `PREFECT_SERVER_API_AUTH_STRING` feature introduced | 2024-12-16 | `9af5624920` |
++| CVE-2026-7722 fix released (v3.6.22) | 2026 | `e21617125` |
++
++Version 2.14.13 was released on **January 4, 2024**. The `PREFECT_SERVER_API_AUTH_STRING` Basic Auth feature — which contains the vulnerable `token_validation` middleware — was not introduced until **December 16, 2024** (commit `9af56249209abb8d3b0201a4c2957949926b8508`), nearly **12 months later**.
++
++### Proof: Vulnerable Code Does Not Exist in 2.14.13
++
++The following git command confirms that `src/prefect/server/api/server.py` in the `2.14.13` tag contains no reference to `AUTH_STRING`, `auth_string`, or `token_validation`:
++
++```bash
++git show 2.14.13:src/prefect/server/api/server.py | grep -n "AUTH_STRING\|auth_string\|token_validation"
++# (no output)
++```
++
++The `PREFECT_SERVER_API_AUTH_STRING` setting and the accompanying middleware simply do not exist in the 2.14.x codebase. There is no authentication middleware to bypass, and therefore no attack surface for this vulnerability.
++
++### Why the Scanner Flagged It
++
++Automated vulnerability scanners typically match CVEs against package name and version range. CVE-2026-7722 is associated with the `prefect` PyPI package, and scanners may flag all versions without verifying whether the specific vulnerable feature was present in a given release. The CVE advisory itself states the affected range as "up to 3.6.21", which refers exclusively to the 3.x series.
++
++---
++
++## Conclusion
++
++| | |
++|--|--|
++| **Is 2.14.13 vulnerable?** | No |
++| **Does the vulnerable code exist in 2.14.13?** | No |
++| **Recommended action** | Mark as false positive; no patch or upgrade required for 2.14.13 |
++
++The `PREFECT_SERVER_API_AUTH_STRING` feature and the `token_validation` middleware were introduced exclusively in the 3.x line. Version 2.14.13 is not susceptible to CVE-2026-7722.
+-- 
+2.43.0
+
+
+diff --git a/ROOT-SECURITY-RELEASE.md b/ROOT-SECURITY-RELEASE.md
+index e9ee2ac3ce..cbe5565bf5 100644
+--- a/ROOT-SECURITY-RELEASE.md
++++ b/ROOT-SECURITY-RELEASE.md
+@@ -91,3 +91,89 @@ Automated vulnerability scanners typically match CVEs against package name and v
+ | **Recommended action** | Mark as false positive; no patch or upgrade required for 2.14.13 |
+ 
+ The `PREFECT_SERVER_API_AUTH_STRING` feature and the `token_validation` middleware were introduced exclusively in the 3.x line. Version 2.14.13 is not susceptible to CVE-2026-7722.
++
++# False Positive Report: CVE-2026-7723
++
++## Summary
++
++CVE-2026-7723 does **not** affect PrefectHQ/prefect version **2.14.13**. This is a confirmed false positive. The vulnerable component (`/api/events/in` WebSocket endpoint) did not exist in the 2.14.x release line at all.
++
++---
++
++## CVE Details
++
++| Field | Value |
++|-------|-------|
++| CVE ID | CVE-2026-7723 |
++| Severity | High (CVSS 7.3) |
++| CWE | CWE-306 (Missing Authentication for Critical Functionality) |
++| Component | WebSocket Endpoint (`/api/events/in`) |
++| Affected File | `src/prefect/server/api/events.py` |
++| Reported Affected Versions | PrefectHQ/prefect 3.6.0 through 3.6.13 |
++| Fixed Version | 3.6.14 |
++| Fix Commit | `f8afecadf88ea5f73694dafa3a365b9d8fae1ad6` |
++
++---
++
++## Vulnerability Description
++
++The vulnerability exists in the `/api/events/in` WebSocket endpoint defined in `src/prefect/server/api/events.py`. Before the fix, this endpoint accepted WebSocket connections without any authentication check, even when `PREFECT_SERVER_API_AUTH_STRING` was configured.
++
++```python
++# VULNERABLE code (never present in 2.14.x)
++@router.websocket("/in")
++async def events_in(websocket: WebSocket):
++    await websocket.accept()  # no auth check
++    ...
++```
++
++The fix (commit `f8afecadf88ea5f73694dafa3a365b9d8fae1ad6`) replaced the bare `websocket.accept()` call with an authenticated handshake via `accept_prefect_socket()` in `src/prefect/server/utilities/subscriptions.py`. The updated function checks for the `prefect` WebSocket subprotocol and validates the auth token before accepting the connection:
++
++```python
++# FIXED code
++@router.websocket("/in")
++async def events_in(websocket: WebSocket):
++    websocket = await subscriptions.accept_prefect_socket(websocket)
++    if not websocket:
++        return  # rejected — invalid or missing auth
++    ...
++```
++
++---
++
++## Why This Is a False Positive for Version 2.14.13
++
++### Timeline
++
++| Event | Date | Commit |
++|-------|------|--------|
++| Version 2.14.13 released | 2024-01-04 | `9df5ba721c` |
++| `/api/events/in` WebSocket endpoint introduced (3.x line) | 3.x era | — |
++| Auth added to `/api/events/in` (CVE fix, v3.6.14) | 2026-01-26 | `f8afecadf8` |
++
++### Proof: The Vulnerable File Does Not Exist in 2.14.13
++
++The following git command confirms that `src/prefect/server/api/events.py` does not exist in the `2.14.13` tag:
++
++```bash
++git show 2.14.13:src/prefect/server/api/events.py
++# fatal: path 'src/prefect/server/api/events.py' exists on disk, but not in '2.14.13'
++```
++
++The `/api/events/in` WebSocket endpoint was introduced as part of the events system overhaul in the 3.x series. In version 2.14.13, the file `src/prefect/server/api/events.py` does not exist at all. There is no WebSocket events endpoint to be unauthenticated, and therefore no attack surface for this vulnerability.
++
++### Why the Scanner Flagged It
++
++Automated scanners match CVEs against package name and version ranges. CVE-2026-7723 is attributed to the `prefect` PyPI package, causing scanners to flag all versions without verifying whether the specific endpoint existed in a given release. The CVE advisory itself explicitly states the affected range as **3.6.0 through 3.6.13**, which refers exclusively to the 3.x series.
++
++---
++
++## Conclusion
++
++| | |
++|--|--|
++| **Is 2.14.13 vulnerable?** | No |
++| **Does the vulnerable endpoint exist in 2.14.13?** | No — `src/prefect/server/api/events.py` is absent from the 2.14.x codebase entirely |
++| **Recommended action** | Mark as false positive; no patch or upgrade required for 2.14.13 |
++
++The `/api/events/in` WebSocket endpoint was introduced exclusively in the 3.x line. Version 2.14.13 is not susceptible to CVE-2026-7723.
