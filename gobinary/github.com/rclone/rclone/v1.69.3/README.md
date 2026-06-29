@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-41179
 - CVE-2026-41176
+- CVE-2026-49980
 
 ## How to Apply:
 1. Clone or download the source code for github.com/rclone/rclone

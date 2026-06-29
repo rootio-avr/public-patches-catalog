@@ -1,7 +1,7 @@
 --- a/fs/operations/rc.go
 +++ b/fs/operations/rc.go
 @@ -431,9 +431,10 @@
-
+ 
  func init() {
  	rc.Add(rc.Call{
 -		Path:  "operations/fsinfo",
@@ -12,7 +12,7 @@
 +		Fn:           rcFsInfo,
 +		Title:        "Return information about the remote",
  		Help: `This takes the following parameters:
-
+ 
  - fs - a remote name string e.g. "drive:"
 
 --- a/fs/rc/config.go
@@ -54,3 +54,217 @@
  		writeError(path, in, w, fmt.Errorf("authentication must be set up on the rc server to use %q or the --rc-no-auth flag must be in use", path), http.StatusForbidden)
  		return
  	}
+
+--- a/docs/content/rc.md
++++ b/docs/content/rc.md
+@@ -77,6 +77,13 @@ so you can browse to http://127.0.0.1:5572/ or http://127.0.0.1:5572/*
+ to see a listing of the remotes.  Objects may be requested from
+ remotes using this syntax http://127.0.0.1:5572/[remote:path]/path/to/object
+ 
++Unless the rc server has authentication configured (`--rc-user`/`--rc-pass`
++or `--rc-htpasswd`) or the `--rc-no-auth` flag is set, only remotes already
++present in the config file may be served this way. Inline remotes (e.g.
++`[:webdav,url=...:]`), connection string parameters and bare local paths are
++rejected, since instantiating them from an unauthenticated request could run
++commands or read arbitrary local files.
++
+ Default Off.
+ 
+ ### --rc-serve-no-modtime
+--- a/fs/rc/rcserver/rcserver.go
++++ b/fs/rc/rcserver/rcserver.go
+@@ -5,6 +5,7 @@ import (
+ 	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
++	"errors"
+ 	"flag"
+ 	"fmt"
+ 	"mime"
+@@ -20,6 +21,7 @@ import (
+ 	"github.com/rclone/rclone/fs"
+ 	"github.com/rclone/rclone/fs/cache"
+ 	"github.com/rclone/rclone/fs/config"
++	"github.com/rclone/rclone/fs/fspath"
+ 	"github.com/rclone/rclone/fs/list"
+ 	"github.com/rclone/rclone/fs/rc"
+ 	"github.com/rclone/rclone/fs/rc/jobs"
+@@ -304,7 +306,55 @@ func (s *Server) serveRoot(w http.ResponseWriter, r *http.Request) {
+ 	directory.Serve(w, r)
+ }
+ 
++// checkServeRemote returns an error if fsName must not be instantiated on the
++// file-serving (--rc-serve) path given the current authentication state.
++//
++// Instantiating a backend from request-supplied configuration can execute
++// commands during initialisation (e.g. webdav bearer_token_command, sftp ssh),
++// read arbitrary local files, or mutate process-wide config via global.*
++// options. See GHSA-qw24-gh76-8rvv.
++//
++// authenticated must be true if the request has been authenticated (HTTP auth
++// is configured on the server) or --rc-no-auth was passed to explicitly opt in
++// to running without authentication.
++func checkServeRemote(fsName string, authenticated bool) error {
++	parsed, err := fspath.Parse(fsName)
++	if err != nil {
++		return fmt.Errorf("invalid remote %q: %w", fsName, err)
++	}
++
++	// global.* connection string options mutate process-wide rclone config. Never honour these
++	// from a request-derived remote, even when the request is authenticated
++	for k := range parsed.Config {
++		if strings.HasPrefix(k, "global.") {
++			return fmt.Errorf("setting %q on a served remote is not allowed", k)
++		}
++	}
++
++	if authenticated {
++		return nil
++	}
++
++	// On an unauthenticated server only allow access to pre-configured named remotes. Reject
++	// inline backend definitions, connection string option overrides and bare local paths
++	switch {
++	case parsed.Name == "":
++		return errors.New("serving local paths requires authentication to be set up on the rc server or the --rc-no-auth flag")
++	case strings.HasPrefix(parsed.Name, ":"):
++		return errors.New("serving inline remotes requires authentication to be set up on the rc server or the --rc-no-auth flag")
++	case len(parsed.Config) > 0:
++		return errors.New("serving remotes with connection string parameters requires authentication to be set up on the rc server or the --rc-no-auth flag")
++	}
++	return nil
++}
++
+ func (s *Server) serveRemote(w http.ResponseWriter, r *http.Request, path string, fsName string) {
++	// Check we are allowed to instantiate this remote
++	authenticated := s.opt.NoAuth || s.server.UsingAuth()
++	if err := checkServeRemote(fsName, authenticated); err != nil {
++		writeError(path, nil, w, err, http.StatusForbidden)
++		return
++	}
+ 	f, err := cache.Get(s.ctx, fsName)
+ 	if err != nil {
+ 		writeError(path, nil, w, fmt.Errorf("failed to make Fs: %w", err), http.StatusInternalServerError)
+--- a/fs/rc/rcserver/rcserver_test.go
++++ b/fs/rc/rcserver/rcserver_test.go
+@@ -368,6 +368,112 @@ func TestRemoteServing(t *testing.T) {
+ 	opt := newTestOpt()
+ 	opt.Serve = true
+ 	opt.Files = testFs
++	opt.NoAuth = true
++	testServer(t, tests, &opt)
++}
++
++// checkServeRemote must reject request-derived backend instantiation on the
++// unauthenticated file-serving path, and global.* config mutation.
++func TestCheckServeRemote(t *testing.T) {
++	for _, test := range []struct {
++		name          string
++		fsName        string
++		authenticated bool
++		wantErr       string // substring of expected error, "" means no error
++	}{
++		// Plain named remotes are always allowed
++		{name: "named remote unauth", fsName: "remote:path", wantErr: ""},
++		{name: "named remote auth", fsName: "remote:path", authenticated: true, wantErr: ""},
++		// Inline backend definitions can run commands (webdav bearer_token_command, sftp ssh)
++		{name: "inline webdav unauth", fsName: ":webdav,url=http://localhost,bearer_token_command=id:", wantErr: "inline remotes"},
++		{name: "inline sftp unauth", fsName: ":sftp,ssh=id:", wantErr: "inline remotes"},
++		{name: "inline local unauth", fsName: ":local:/etc", wantErr: "inline remotes"},
++		{name: "inline allowed when authed", fsName: ":local:/etc", authenticated: true, wantErr: ""},
++		// Bare local paths allow arbitrary local file access
++		{name: "bare path unauth", fsName: "/etc/passwd", wantErr: "local paths"},
++		{name: "bare path allowed when authed", fsName: "/etc/passwd", authenticated: true, wantErr: ""},
++		// Connection string overrides can set command-executing options
++		{name: "connection string unauth", fsName: "remote,vendor=other:path", wantErr: "connection string"},
++		{name: "connection string allowed when authed", fsName: "remote,vendor=other:path", authenticated: true, wantErr: ""},
++		// global.* mutates process-wide config and is never allowed
++		{name: "global config unauth", fsName: "remote,global.http_proxy=x:path", wantErr: "global.http_proxy"},
++		{name: "global config blocked even when authed", fsName: "remote,global.http_proxy=x:path", authenticated: true, wantErr: "global.http_proxy"},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			err := checkServeRemote(test.fsName, test.authenticated)
++			if test.wantErr == "" {
++				assert.NoError(t, err)
++			} else {
++				require.Error(t, err)
++				assert.Contains(t, err.Error(), test.wantErr)
++			}
++		})
++	}
++}
++
++// On an unauthenticated server the serve path must not instantiate
++// attacker-supplied inline remotes or local paths, but must still allow
++// configured named remotes.
++func TestServeRemoteUnauthenticated(t *testing.T) {
++	forbidden := regexp.MustCompile(`"status": 403`)
++	tests := []testRun{{
++		// An inline remote could run a command during initialisation
++		Name:     "inline-remote-rejected",
++		URL:      "[:local:" + testFs + "]/file.txt",
++		Status:   http.StatusForbidden,
++		Contains: forbidden,
++	}, {
++		Name:     "bare-local-path-rejected",
++		URL:      remoteURL + "file.txt",
++		Status:   http.StatusForbidden,
++		Contains: forbidden,
++	}, {
++		// A configured (here non-existent) named remote is allowed through to
++		// the backend, which then reports it isn't in the config file
++		Name:     "named-remote-allowed-through",
++		URL:      "[notfoundremote:]/",
++		Status:   http.StatusInternalServerError,
++		Contains: regexp.MustCompile(`didn't find section in config file`),
++	}}
++	opt := newTestOpt()
++	opt.Serve = true
++	testServer(t, tests, &opt)
++}
++
++// With authentication configured the serve path may instantiate inline remotes
++// (the request is authenticated) but must still refuse to mutate process-wide
++// config via global.* options.
++func TestServeRemoteWithAuth(t *testing.T) {
++	const user, pass = "user", "pass"
++	tests := []testRun{{
++		// Authenticated requests can serve bare local paths again
++		Name:     "bare-local-path-served-when-authenticated",
++		URL:      remoteURL + "file.txt",
++		User:     user,
++		Pass:     pass,
++		Status:   http.StatusOK,
++		Expected: "this is file1.txt
++",
++	}, {
++		// global.* is blocked even for an authenticated request
++		Name:     "global-config-blocked-when-authenticated",
++		URL:      "[notfoundremote,global.http_proxy=x:]/",
++		User:     user,
++		Pass:     pass,
++		Status:   http.StatusForbidden,
++		Contains: regexp.MustCompile(`global\.http_proxy`),
++	}, {
++		// A request without credentials is rejected before reaching the handler
++		Name:     "unauthenticated-request-rejected",
++		URL:      remoteURL + "file.txt",
++		Status:   http.StatusUnauthorized,
++		Contains: regexp.MustCompile(``),
++	}}
++	opt := newTestOpt()
++	opt.Serve = true
++	opt.Files = testFs
++	opt.Auth.BasicUser = user
++	opt.Auth.BasicPass = pass
+ 	testServer(t, tests, &opt)
+ }
+ 
+@@ -784,6 +890,7 @@ func TestServeModTime(t *testing.T) {
+ 	opt := newTestOpt()
+ 	opt.Serve = true
+ 	opt.Template.Path = "testdata/golden/testmodtime.html"
++	opt.NoAuth = true
+ 
+ 	tests := []testRun{{
+ 		Name:     "modtime",
