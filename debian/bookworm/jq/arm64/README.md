@@ -1,10 +1,13 @@
-# jq : 1.6-2.1+deb12u1.root.io.6
+# jq : 1.6-2.1+deb12u1.root.io.7
 
-This patch is based on jq version 1.6-2.1+deb12u1.root.io.6, which is available at:
+This patch is based on jq version 1.6-2.1+deb12u1.root.io.7, which is available at:
 https://sources.debian.org/src/jq/1.6-2.1+deb12u1/
 
 ## Affected CVEs:
 - CVE-2024-23337
+- CVE-2026-40164
+- CVE-2026-49839
+- CVE-2026-39979
 
 ## How to Apply:
 1. Obtain the source package: `apt source jq`
