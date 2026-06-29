@@ -1,0 +1,533 @@
+--- a/src/errors.ts
++++ b/src/errors.ts
+@@ -4,3 +4,23 @@
+   ERR_CONTEXT_MATCHER_INVALID_ARRAY = '[HPM] Invalid pathFilter. Plain paths (e.g. "/api") can not be mixed with globs (e.g. "/api/**"). Expecting something like: ["/api", "/ajax"] or ["/api/**", "!**.html"].',
+   ERR_PATH_REWRITER_CONFIG = '[HPM] Invalid pathRewrite config. Expecting object with pathRewrite config or a rewrite function',
+ }
++
++export class HttpProxyMiddlewareError extends Error {
++  code: string;
++
++  constructor(message: string, code: string) {
++    super(message);
++
++    // add custom `code` property
++    // so this can be used in src/plugins/default/error-response-plugin.ts to determine the status code to return
++    this.code = code;
++
++    // set the correct name for the error class
++    this.name = this.constructor.name;
++
++    // maintain proper stack trace (V8 environments)
++    if (Error.captureStackTrace) {
++      Error.captureStackTrace(this, this.constructor);
++    }
++  }
++}
+--- /dev/null
++++ b/src/handlers/fix-request-body-utils/stringify-form-data.ts
+@@ -0,0 +1,65 @@
++import { HttpProxyMiddlewareError } from '../../errors';
++
++const CR_OR_LF = /[\r\n]/;
++const ERROR_CODE_PREFIX = 'HPM_ERR_INVALID_MULTIPART';
++
++/**
++ * stringify FormData data
++ * @param contentType
++ * @param data
++ * @returns
++ */
++export function stringifyFormData(contentType: string, data: object): string {
++  const boundary = getMultipartBoundary(contentType);
++  let str = '';
++
++  for (const [key, value] of Object.entries(data)) {
++    const normalizedKey = String(key);
++    const normalizedValue = String(value);
++
++    // Reject potentially dangerous sequences to prevent multipart header/body injection.
++    validateMultipartField(normalizedKey, normalizedValue, boundary);
++
++    str += `--${boundary}\r\nContent-Disposition: form-data; name="${escapeMultipartFieldName(normalizedKey)}"\r\n\r\n${normalizedValue}\r\n`;
++  }
++
++  return str;
++}
++
++function getMultipartBoundary(contentType: string): string {
++  const boundaryMatch = /(?:^|;)\s*boundary=(?:"([^"]+)"|([^;]+))/i.exec(contentType);
++
++  // Keep backward-compatible behavior when boundary is omitted: fall back to legacy extraction.
++  const boundary = (boundaryMatch?.[1] ?? boundaryMatch?.[2] ?? contentType).trim();
++
++  if (!boundary || CR_OR_LF.test(boundary)) {
++    throw new HttpProxyMiddlewareError(
++      '[HPM] invalid multipart boundary detected.',
++      `${ERROR_CODE_PREFIX}_BOUNDARY`,
++    );
++  }
++
++  return boundary;
++}
++
++function validateMultipartField(fieldName: string, fieldValue: string, boundary: string): void {
++  const boundaryDelimiter = `--${boundary}`;
++
++  if (CR_OR_LF.test(fieldName)) {
++    throw new HttpProxyMiddlewareError(
++      `[HPM] invalid multipart field name "${fieldName}" detected.`,
++      `${ERROR_CODE_PREFIX}_FIELD_NAME`,
++    );
++  }
++
++  if (CR_OR_LF.test(fieldValue) || fieldValue.includes(boundaryDelimiter)) {
++    throw new HttpProxyMiddlewareError(
++      `[HPM] invalid multipart field value for "${fieldName}" detected.`,
++      `${ERROR_CODE_PREFIX}_FIELD_VALUE`,
++    );
++  }
++}
++
++function escapeMultipartFieldName(fieldName: string): string {
++  return fieldName.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
++}
+--- a/src/handlers/fix-request-body.ts
++++ b/src/handlers/fix-request-body.ts
+@@ -1,6 +1,8 @@
+ import type * as http from 'http';
+ import * as querystring from 'querystring';
+ 
++import { stringifyFormData } from './fix-request-body-utils/stringify-form-data';
++
+ export type BodyParserLikeRequest = http.IncomingMessage & { body?: any };
+ 
+ /**
+@@ -32,28 +34,23 @@
+     proxyReq.write(bodyData);
+   };
+ 
+-  // Use if-elseif to prevent multiple writeBody/setHeader calls:
+-  // Error: "Cannot set headers after they are sent to the client"
+-  if (contentType.includes('application/json') || contentType.includes('+json')) {
+-    writeBody(JSON.stringify(requestBody));
+-  } else if (contentType.includes('application/x-www-form-urlencoded')) {
+-    writeBody(querystring.stringify(requestBody));
+-  } else if (contentType.includes('multipart/form-data')) {
+-    writeBody(handlerFormDataBodyData(contentType, requestBody));
++  try {
++    // Use if-elseif to prevent multiple writeBody/setHeader calls:
++    // Error: "Cannot set headers after they are sent to the client"
++    if (contentType.includes('application/json') || contentType.includes('+json')) {
++      writeBody(JSON.stringify(requestBody));
++    } else if (contentType.includes('application/x-www-form-urlencoded')) {
++      writeBody(querystring.stringify(requestBody));
++    } else if (contentType.includes('multipart/form-data')) {
++      writeBody(stringifyFormData(contentType, requestBody));
++    }
++  } catch (error) {
++    // proxyReq listeners run outside the middleware try/catch path; re-throwing here can bubble as
++    // an unhandled exception in consumers, so destroy() is used to fail closed through proxy error handling.
++    proxyReq.destroy(toError(error));
+   }
+ }
+ 
+-/**
+- * format FormData data
+- * @param contentType
+- * @param data
+- * @returns
+- */
+-function handlerFormDataBodyData(contentType: string, data: any) {
+-  const boundary = contentType.replace(/^.*boundary=(.*)$/, '$1');
+-  let str = '';
+-  for (const [key, value] of Object.entries(data)) {
+-    str += `--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`;
+-  }
+-  return str;
++function toError(error: unknown): Error {
++  return error instanceof Error ? error : new Error(String(error));
+ }
+--- a/src/status-code.ts
++++ b/src/status-code.ts
+@@ -3,18 +3,24 @@
+ 
+   if (/HPE_INVALID/.test(errorCode)) {
+     statusCode = 502;
+-  } else {
+-    switch (errorCode) {
+-      case 'ECONNRESET':
+-      case 'ENOTFOUND':
+-      case 'ECONNREFUSED':
+-      case 'ETIMEDOUT':
+-        statusCode = 504;
+-        break;
+-      default:
+-        statusCode = 500;
+-        break;
+-    }
++    return statusCode;
++  }
++
++  if (/HPM_ERR_INVALID_MULTIPART_/.test(errorCode)) {
++    statusCode = 400;
++    return statusCode;
++  }
++
++  switch (errorCode) {
++    case 'ECONNRESET':
++    case 'ENOTFOUND':
++    case 'ECONNREFUSED':
++    case 'ETIMEDOUT':
++      statusCode = 504;
++      break;
++    default:
++      statusCode = 500;
++      break;
+   }
+ 
+   return statusCode;
+--- a/test/e2e/http-proxy-middleware.spec.ts
++++ b/test/e2e/http-proxy-middleware.spec.ts
+@@ -129,6 +129,50 @@
+       });
+     });
+ 
++    it('should reject CRLF multipart injection when fixRequestBody serializes multipart', async () => {
++      const targetSpy = jest.fn();
++
++      agent = request(
++        createApp(
++          bodyParser.urlencoded({ extended: false }),
++          (req, res, next) => {
++            if (req.body?.role === 'admin') {
++              res.status(403).send('gateway: role=admin forbidden');
++              return;
++            }
++            next();
++          },
++          createProxyMiddleware({
++            target: `http://localhost:${mockTargetServer.port}`,
++            pathFilter: '/api',
++            on: {
++              proxyReq: (proxyReq, req) => {
++                proxyReq.setHeader('Content-Type', 'multipart/form-data; boundary=BB');
++                fixRequestBody(proxyReq, req);
++              },
++            },
++          }),
++        ),
++      );
++
++      await mockTargetServer.forPost('/api').thenCallback(async () => {
++        targetSpy();
++        return { status: 200 };
++      });
++
++      const injectedValue =
++        'alice\r\n--BB\r\nContent-Disposition: form-data; name="role"\r\n\r\nadmin\r\n--BB--';
++
++      const response = await agent
++        .post('/api')
++        .set('Content-Type', 'application/x-www-form-urlencoded')
++        .send(`user=${encodeURIComponent(injectedValue)}`)
++        .expect(400);
++
++      expect(response.text).toContain('Error occurred while trying to proxy');
++      expect(targetSpy).toHaveBeenCalledTimes(0);
++    });
++
+     describe('custom pathFilter matcher/filter', () => {
+       it('should have response body: "HELLO WEB"', async () => {
+         const filter = (path, req) => {
+--- /dev/null
++++ b/test/unit/fix-request-body-utils/stringify-form-data.spec.ts
+@@ -0,0 +1,184 @@
++import { HttpProxyMiddlewareError } from '../../../src/errors';
++import { stringifyFormData } from '../../../src/handlers/fix-request-body-utils/stringify-form-data';
++
++describe('stringifyFormData', () => {
++  describe('boundary parsing', () => {
++    it('should serialize using quoted boundary', () => {
++      const result = stringifyFormData('multipart/form-data; boundary="BB"', { user: 'alice' });
++
++      expect(result).toBe('--BB\r\nContent-Disposition: form-data; name="user"\r\n\r\nalice\r\n');
++    });
++
++    it('should serialize using unquoted boundary', () => {
++      const result = stringifyFormData('multipart/form-data; boundary=BB', { user: 'alice' });
++
++      expect(result).toBe('--BB\r\nContent-Disposition: form-data; name="user"\r\n\r\nalice\r\n');
++    });
++
++    it('should serialize using case-insensitive boundary parameter', () => {
++      const result = stringifyFormData('multipart/form-data; BOUNDARY=BB', { user: 'alice' });
++
++      expect(result).toBe('--BB\r\nContent-Disposition: form-data; name="user"\r\n\r\nalice\r\n');
++    });
++
++    it('should lock legacy fallback when boundary parameter is missing', () => {
++      const contentType = 'multipart/form-data; charset=utf-8';
++
++      const result = stringifyFormData(contentType, { user: 'alice' });
++
++      expect(result).toBe(
++        '--multipart/form-data; charset=utf-8\r\nContent-Disposition: form-data; name="user"\r\n\r\nalice\r\n',
++      );
++    });
++  });
++
++  describe('field serialization', () => {
++    it('should escape field names and coerce values with String()', () => {
++      // Input key includes a backslash + quote sequence: field\"name
++      // Output escapes backslash first, then quote in Content-Disposition name.
++      const result = stringifyFormData('multipart/form-data; boundary=BB', {
++        'field\\"name': 42,
++      });
++
++      expect(result).toBe(
++        '--BB\r\nContent-Disposition: form-data; name="field\\\\\\"name"\r\n\r\n42\r\n',
++      );
++    });
++
++    it('should coerce null and undefined values with String()', () => {
++      const result = stringifyFormData('multipart/form-data; boundary=BB', {
++        nullValue: null,
++        undefinedValue: undefined,
++      });
++
++      expect(result).toContain('name="nullValue"\r\n\r\nnull\r\n');
++      expect(result).toContain('name="undefinedValue"\r\n\r\nundefined\r\n');
++    });
++
++    it('should serialize multiple fields in insertion order', () => {
++      const result = stringifyFormData('multipart/form-data; boundary=BB', {
++        first: '1',
++        second: true,
++      });
++
++      expect(result).toBe(
++        '--BB\r\nContent-Disposition: form-data; name="first"\r\n\r\n1\r\n' +
++          '--BB\r\nContent-Disposition: form-data; name="second"\r\n\r\ntrue\r\n',
++      );
++    });
++  });
++
++  describe('security validation', () => {
++    // RFC 9112 obsolete line folding guidance: reject CR/LF in multipart boundary and fields.
++    it('should reject unsafe multipart boundary containing CRLF', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary="BB\r\nX-Injection: 1"', {
++          user: 'alice',
++        }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart boundary detected.',
++          'HPM_ERR_INVALID_MULTIPART_BOUNDARY',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart boundary containing CR only', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary="BB\rX"', { user: 'alice' }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart boundary detected.',
++          'HPM_ERR_INVALID_MULTIPART_BOUNDARY',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart boundary containing LF only', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary="BB\nX"', { user: 'alice' }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart boundary detected.',
++          'HPM_ERR_INVALID_MULTIPART_BOUNDARY',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart boundary when empty after trimming', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary=   ', { user: 'alice' }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart boundary detected.',
++          'HPM_ERR_INVALID_MULTIPART_BOUNDARY',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart field names containing LF', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary=BB', {
++          'bad\nname': 'alice',
++        }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart field name "bad\nname" detected.',
++          'HPM_ERR_INVALID_MULTIPART_FIELD_NAME',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart field names containing CR', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary=BB', {
++          'bad\rname': 'alice',
++        }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart field name "bad\rname" detected.',
++          'HPM_ERR_INVALID_MULTIPART_FIELD_NAME',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart field values containing CRLF', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary=BB', {
++          user: 'alice\r\nadmin',
++        }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart field value for "user" detected.',
++          'HPM_ERR_INVALID_MULTIPART_FIELD_VALUE',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart field values containing CR', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary=BB', {
++          user: 'alice\radmin',
++        }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart field value for "user" detected.',
++          'HPM_ERR_INVALID_MULTIPART_FIELD_VALUE',
++        ),
++      );
++    });
++
++    it('should reject unsafe multipart field values containing boundary delimiter', () => {
++      expect(() =>
++        stringifyFormData('multipart/form-data; boundary=BB', {
++          user: 'prefix --BB suffix',
++        }),
++      ).toThrow(
++        new HttpProxyMiddlewareError(
++          '[HPM] invalid multipart field value for "user" detected.',
++          'HPM_ERR_INVALID_MULTIPART_FIELD_VALUE',
++        ),
++      );
++    });
++  });
++});
+--- a/test/unit/fix-request-body.spec.ts
++++ b/test/unit/fix-request-body.spec.ts
+@@ -6,6 +6,8 @@
+ const fakeProxyRequest = (): ClientRequest => {
+   const proxyRequest = new ClientRequest('http://some-host');
+   proxyRequest.emit = jest.fn();
++  proxyRequest.write = jest.fn();
++  proxyRequest.destroy = jest.fn();
+ 
+   return proxyRequest;
+ };
+@@ -118,6 +120,92 @@
+ 
+     expect(proxyRequest.setHeader).toHaveBeenCalledWith('Content-Length', expectedBody.length);
+     expect(proxyRequest.write).toHaveBeenCalledWith(expectedBody);
++  });
++
++  it('should reject multipart field values containing CRLF', () => {
++    const proxyRequest = fakeProxyRequest();
++    proxyRequest.setHeader('content-type', 'multipart/form-data; boundary=BB');
++
++    fixRequestBody(
++      proxyRequest,
++      createRequestWithBody({
++        user: 'alice\r\n--BB\r\nContent-Disposition: form-data; name="role"\r\n\r\nadmin',
++      }),
++    );
++
++    expect(proxyRequest.write).toHaveBeenCalledTimes(0);
++    expect(proxyRequest.destroy).toHaveBeenCalledTimes(1);
++  });
++
++  it('should reject multipart field values containing LF only', () => {
++    const proxyRequest = fakeProxyRequest();
++    proxyRequest.setHeader('content-type', 'multipart/form-data; boundary=BB');
++
++    fixRequestBody(
++      proxyRequest,
++      createRequestWithBody({
++        user: 'alice\nadmin',
++      }),
++    );
++
++    expect(proxyRequest.write).toHaveBeenCalledTimes(0);
++    expect(proxyRequest.destroy).toHaveBeenCalledTimes(1);
++  });
++
++  it('should reject multipart field values containing CR only', () => {
++    const proxyRequest = fakeProxyRequest();
++    proxyRequest.setHeader('content-type', 'multipart/form-data; boundary=BB');
++
++    fixRequestBody(
++      proxyRequest,
++      createRequestWithBody({
++        user: 'alice\radmin',
++      }),
++    );
++
++    expect(proxyRequest.write).toHaveBeenCalledTimes(0);
++    expect(proxyRequest.destroy).toHaveBeenCalledTimes(1);
++  });
++
++  it('should reject multipart field names containing LF', () => {
++    const proxyRequest = fakeProxyRequest();
++    proxyRequest.setHeader('content-type', 'multipart/form-data; boundary=BB');
++
++    fixRequestBody(
++      proxyRequest,
++      createRequestWithBody({
++        'bad\nname': 'alice',
++      }),
++    );
++
++    expect(proxyRequest.write).toHaveBeenCalledTimes(0);
++    expect(proxyRequest.destroy).toHaveBeenCalledTimes(1);
++  });
++
++  it('should reject multipart field values containing the active boundary delimiter', () => {
++    const proxyRequest = fakeProxyRequest();
++    proxyRequest.setHeader('content-type', 'multipart/form-data; boundary=BB');
++
++    fixRequestBody(
++      proxyRequest,
++      createRequestWithBody({
++        user: '--BB',
++      }),
++    );
++
++    expect(proxyRequest.write).toHaveBeenCalledTimes(0);
++    expect(proxyRequest.destroy).toHaveBeenCalledTimes(1);
++  });
++
++  it('should escape quotes in multipart field names', () => {
++    const proxyRequest = fakeProxyRequest();
++    proxyRequest.setHeader('content-type', 'multipart/form-data; boundary=BB');
++
++    fixRequestBody(proxyRequest, createRequestWithBody({ 'field"name': 'value' }));
++
++    expect(proxyRequest.write).toHaveBeenCalledWith(
++      '--BB\r\nContent-Disposition: form-data; name="field\\"name"\r\n\r\nvalue\r\n',
++    );
+   });
+ 
+   it('should write when body is not empty and Content-Type ends with +json', () => {
