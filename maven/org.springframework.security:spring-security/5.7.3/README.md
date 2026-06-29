@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2022-31692
 - CVE-2024-22257
+- CVE-2024-38827
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework.security:spring-security
