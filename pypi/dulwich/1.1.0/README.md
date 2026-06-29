@@ -4,6 +4,7 @@ This patch is based on dulwich version 1.1.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-42305
 - CVE-2026-42563
 
 ## How to Apply:
