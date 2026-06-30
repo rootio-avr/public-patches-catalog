@@ -6,6 +6,13 @@ unknown
 ## Affected CVEs:
 - CVE-2025-22872
 - CVE-2025-22870
+- CVE-2026-25680
+- CVE-2026-33814
+- CVE-2026-42506
+- CVE-2026-25681
+- CVE-2026-42502
+- CVE-2026-27136
+- CVE-2026-39821
 
 ## How to Apply:
 1. Clone or download the source code for golang.org/x/net
