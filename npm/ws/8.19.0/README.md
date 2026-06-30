@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-45736
+- CVE-2026-48779
 
 ## How to Apply:
 1. Clone or download the source code for ws
