@@ -1,3 +1,92 @@
+--- a/ssh/agent/client.go
++++ b/ssh/agent/client.go
+@@ -430,8 +430,9 @@ func (c *client) List() ([]*Key, error) {
+ 		return keys, nil
+ 	case *failureAgentMsg:
+ 		return nil, errors.New("agent: failed to list keys")
++	default:
++		return nil, fmt.Errorf("agent: failed to list keys, unexpected message type %T", msg)
+ 	}
+-	panic("unreachable")
+ }
+ 
+ // Sign has the agent sign the data using a protocol 2 key as defined
+@@ -462,8 +463,9 @@ func (c *client) SignWithFlags(key ssh.PublicKey, data []byte, flags SignatureFl
+ 		return &sig, nil
+ 	case *failureAgentMsg:
+ 		return nil, errors.New("agent: failed to sign challenge")
++	default:
++		return nil, fmt.Errorf("agent: failed to sign challenge, unexpected message type %T", msg)
+ 	}
+-	panic("unreachable")
+ }
+ 
+ // unmarshal parses an agent message in packet, returning the parsed
+--- a/ssh/agent/client_test.go
++++ b/ssh/agent/client_test.go
+@@ -7,6 +7,7 @@ package agent
+ import (
+ 	"bytes"
+ 	"crypto/rand"
++	"encoding/binary"
+ 	"errors"
+ 	"io"
+ 	"net"
+@@ -347,6 +348,53 @@ func TestServerResponseTooLarge(t *testing.T) {
+ 	}
+ }
+ 
++func TestInvalidResponses(t *testing.T) {
++	a, b, err := netPipe()
++	if err != nil {
++		t.Fatalf("netPipe: %v", err)
++	}
++	done := make(chan struct{})
++	defer func() { <-done }()
++
++	defer a.Close()
++	defer b.Close()
++
++	agent := NewClient(a)
++	go func() {
++		defer close(done)
++
++		resp := []byte{agentSuccess}
++		msg := make([]byte, 4+len(resp))
++		binary.BigEndian.PutUint32(msg[:4], uint32(len(resp)))
++		copy(msg[4:], resp)
++
++		if _, err := b.Write(msg); err != nil {
++			t.Errorf("unexpected error sending agent reply: %v", err)
++			b.Close()
++			return
++		}
++
++		if _, err := b.Write(msg); err != nil {
++			t.Errorf("unexpected error sending agent reply: %v", err)
++			b.Close()
++		}
++	}()
++	_, err = agent.List()
++	if err == nil {
++		t.Fatal("error expected")
++	}
++	if !strings.Contains(err.Error(), "failed to list keys, unexpected message type") {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	_, err = agent.Sign(testPublicKeys["rsa"], []byte("message"))
++	if err == nil {
++		t.Fatal("error expected")
++	}
++	if !strings.Contains(err.Error(), "failed to sign challenge, unexpected message type") {
++		t.Fatalf("unexpected error: %v", err)
++	}
++}
++
+ func TestAuth(t *testing.T) {
+ 	agent, _, cleanup := startOpenSSHAgent(t)
+ 	defer cleanup()
+
 --- a/ssh/agent/server.go
 +++ b/ssh/agent/server.go
 @@ -203,6 +203,9 @@ func parseConstraints(constraints []byte) (lifetimeSecs uint32, confirmBeforeUse
@@ -98,3 +187,2282 @@
  func TestBuildMIC(t *testing.T) {
  	sessionID := []byte{134, 180, 134, 194, 62, 145, 171, 82, 119, 149, 254, 196, 125, 173, 177, 145, 187, 85, 53,
  		183, 44, 150, 219, 129, 166, 195, 19, 33, 209, 246, 175, 121}
+
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -530,7 +530,17 @@ func (ch *channel) Reject(reason RejectionReason, message string) error {
+ 		Language: "en",
+ 	}
+ 	ch.decided = true
+-	return ch.sendMessage(reject)
++	err := ch.sendMessage(reject)
++
++	// Remove the channel from the mux to prevent memory leaks.
++	// Do not call ch.close() here: no goroutine holds a reference to a
++	// rejected channel's internal channels (msg, incomingRequests), so
++	// removing it from chanList is sufficient for GC. Calling close()
++	// would race with the mux loop goroutine (handlePacket or dropAll),
++	// causing a panic from closing an already-closed channel.
++	ch.mux.chanList.remove(ch.localId)
++
++	return err
+ }
+ 
+ func (ch *channel) Read(data []byte) (int, error) {
+--- a/ssh/mux_test.go
++++ b/ssh/mux_test.go
+@@ -825,6 +825,50 @@ func TestMuxChannelWindowDeferredUpdates(t *testing.T) {
+ 	}
+ }
+ 
++func TestMuxChannelRejectRemovesFromMux(t *testing.T) {
++	serverMux, clientMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	var wg sync.WaitGroup
++	t.Cleanup(wg.Wait)
++	wg.Add(1)
++
++	go func() {
++		defer wg.Done()
++
++		// The server waits for the channel creation request
++		newCh, ok := <-serverMux.incomingChannels
++		if !ok {
++			t.Error("failed to accept channel")
++			return
++		}
++		ch := newCh.(*channel)
++
++		if serverMux.chanList.getChan(ch.localId) == nil {
++			t.Errorf("channel %d is not in the chanList before Reject", ch.localId)
++		}
++
++		if err := ch.Reject(Prohibited, "rejecting this channel"); err != nil {
++			t.Errorf("Reject failed: %v", err)
++		}
++
++		if serverMux.chanList.getChan(ch.localId) != nil {
++			t.Errorf("channel %d is still in the chanList after Reject", ch.localId)
++		}
++	}()
++
++	_, _, err := clientMux.OpenChannel("test_leak", nil)
++
++	if err == nil {
++		t.Fatal("expected an error (channel rejected), but got nil")
++	}
++
++	if _, ok := err.(*OpenChannelError); !ok {
++		t.Errorf("expected *OpenChannelError, got: %T", err)
++	}
++}
++
+ // Don't ship code with debug=true.
+ func TestDebug(t *testing.T) {
+ 	if debugMux {
+
+--- a/ssh/server.go
++++ b/ssh/server.go
+@@ -223,8 +223,10 @@ func (c *pubKeyCache) add(candidate cachedPubKey) {
+ type ServerConn struct {
+ 	Conn
+
+-	// If the succeeding authentication callback returned a
+-	// non-nil Permissions pointer, it is stored here.
++	// If the succeeding authentication callback returned a non-nil Permissions
++	// pointer, it is stored here. These are the permissions from the final,
++	// successful authentication method. Permissions returned by callbacks that
++	// return PartialSuccessError are not preserved and must be nil.
+ 	Permissions *Permissions
+ }
+
+@@ -802,6 +804,13 @@ userAuthLoop:
+ 		var failureMsg userAuthFailureMsg
+
+ 		if partialSuccess, ok := authErr.(*PartialSuccessError); ok {
++			// Permissions are not preserved between authentication steps. To
++			// avoid confusion about the final state of the connection, we
++			// disallow returning non-nil Permissions combined with
++			// PartialSuccessError.
++			if perms != nil {
++				return nil, errors.New("ssh: permissions must be nil when returning PartialSuccessError")
++			}
+ 			// After a partial success error we don't allow changing the user
+ 			// name and execute the NoClientAuthCallback.
+ 			partialSuccessReturned = true
+
+Description: Fix CVE-2026-39829 - DoS via pathological RSA/DSA SSH public keys
+ Combines two upstream fixes for golang.org/x/crypto/ssh:
+ 1. Reject RSA keys with moduli larger than 8192 bits (parseRSA).
+ 2. Enforce strict limits on DSA key parameters: Q must be exactly
+    160 bits (FIPS 186-2), and G/Y must be in range (parseDSA,
+    checkDSAParams).
+ Both fixes prevent an unauthenticated attacker from causing
+ excessive CPU consumption during SSH public-key signature
+ verification.
+Origin: upstream, https://github.com/golang/crypto/commit/890731877d85f71cfdc9554e7a27fec4684fc4c4
+Origin: upstream, https://github.com/golang/crypto/commit/9c2cd33e8d96a96133fd6ff732510ebba539c2bd
+Author: Nicola Murino <nicola.murino@gmail.com>
+Last-Update: 2026-06-23
+
+--- a/ssh/keys.go
++++ b/ssh/keys.go
+@@ -449,6 +449,12 @@ func parseRSA(in []byte) (out PublicKey, rest []byte, err error) {
+ 		return nil, nil, err
+ 	}
+
++	// 8192 bits is also the maximum RSA key size accepted by crypto/tls for
++	// signature verification:
++	// https://github.com/golang/go/blob/69801b25/src/crypto/tls/handshake_client.go#L1096
++	if w.N.BitLen() > 8192 {
++		return nil, nil, errors.New("ssh: rsa modulus too large")
++	}
+ 	if w.E.BitLen() > 24 {
+ 		return nil, nil, errors.New("ssh: exponent too large")
+ 	}
+@@ -551,6 +557,24 @@ func checkDSAParams(param *dsa.Parameters) error {
+ 		return fmt.Errorf("ssh: unsupported DSA key size %d", l)
+ 	}
+
++	// FIPS 186-2 specifies that Q must be exactly 160 bits. We must enforce
++	// this to prevent DoS attacks where an attacker sends a huge Q which makes
++	// verification slow.
++	if l := param.Q.BitLen(); l != 160 {
++		return fmt.Errorf("ssh: unsupported DSA sub-prime size %d", l)
++	}
++
++	// The generator G is an element of the group, so it must be strictly less
++	// than the modulus P.
++	if param.G.Cmp(param.P) >= 0 {
++		return errors.New("ssh: DSA generator larger than modulus")
++	}
++
++	// G must be positive.
++	if param.G.Sign() <= 0 {
++		return errors.New("ssh: DSA generator must be positive")
++	}
++
+ 	return nil
+ }
+
+@@ -573,6 +597,14 @@ func parseDSA(in []byte) (out PublicKey, rest []byte, err error) {
+ 		return nil, nil, err
+ 	}
+
++	// The public value Y must be a non-zero element of the group, i.e.
++	// strictly between 0 and P. crypto/dsa.Verify does not range-check Y,
++	// so we reject out-of-range values here to prevent a maliciously
++	// oversized Y from slowing verification.
++	if w.Y.Sign() <= 0 || w.Y.Cmp(w.P) >= 0 {
++		return nil, nil, errors.New("ssh: DSA public value Y out of range")
++	}
++
+ 	key := &dsaPublicKey{
+ 		Parameters: param,
+ 		Y:          w.Y,
+--- a/ssh/keys_test.go
++++ b/ssh/keys_test.go
+@@ -19,6 +19,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"math/big"
+ 	"reflect"
+ 	"strings"
+ 	"testing"
+@@ -205,6 +206,20 @@ func TestParseRSAPrivateKey(t *testing.T) {
+ 	}
+ }
+
++func TestParseRSAModulusTooLarge(t *testing.T) {
++	rsa16384 := "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAIAQC0vyqtnpzMZ8Th6gv1t3+7dDVd2X+7MwjqKe08/wrKZaIuCAHX7jglC8FdHfiOcPhLHAreSJLZGXiSzCTUExbp9Zdt7tHluKMQxZCnbk02V89ggc4KpptQqfcmjMNgrEPF4PGJBe3eSYu9m7A1ptm0buWxaKtA17O1c2q2CVNYmuajSUAfi8+AZcdyRAX8eqga3u77DEj4O+CCuNA908NYv9Pc7SbaCwCgX3FXh7MvlaYcruTk529psNk1SK6uwBNak3CLRrXUBo5yTO7cCO0gmlvd8SwtY5mPaDLLCJa+Ed2t9OCt8HCPrdkH3aiQBTP3k/Iofy3NRv+/1lenJP1qWB2rnyagoj+osrLc6m8PRd7GBje7KdO6nyY1D+q1MvX4zV1qNQfD+38N6PixVX1MGKw72sD+oLCDjHKS24BHfnfaE7f8n+Alp2mxnSz9tYqsN3JXrbbwblzH8YFOz9MMKkTY5lQNQFoKdTHoPVXBqcMlGQGgC/kkH9TH110MDE3L+Z0i9kG53QLcHNVC0cJzo6X77PQF1WoS33Ssf1s21kUB6fe/5G2L2Tuy635ingtnQMUazwJMli+y/3U7QqqcuJzITbLw/zozRzbqFRE4HHOyGkJSptraH4/3cjmYro8JL20A7EUDiXxmn+z+eoxaBWaEP2Rs5LH0ocrwYmBmSUIrPy4e5ESlRRVuv+prNUB1pYGnFZUI9HRRFxRFg+SxXZZp4mq8jzroRLZFAqKY1/eDgsCGoV1HG3QW1t0jGNkv8BL/Zpz7Hhmt0lRr7rVN+PJaTQx8NNUJZ/l7nMXp/+7aTbkyI8PiNyemko0+joDrkBWdcK0vi8Du6k3oQRBUsJ0aM0iPxMWQq/oYyHqpf6revycYTUdOGeckGWXuXLNRIZQ/PsKuw/teqDaBkkMKaQH2oXWMsacL6WDu5VYUQidOtaTgHX8AKVHF/vobTQfw7HgPKlyRN41dAX+YIjRABYoqU7M2MYPuoPYbqzTz7iLZyFP8FCJ3dRQBTWSeer/s+Ih6Ev1EsznVmAw9SKb5q8QCSYk5mMugUTDVETOQo10CGAF6094/PcJRXgag/uWs4k+13c+/HaeNzrHQyqzWnf9bFFHIvs7Wqov9k+nWv/TwSGplkyBk4bHfhEZNbl+b6T8sZXsv8mTT+INzKT4DCVZ5a/G+NQ6Xo26Aa6Se5DOdzdXOLZ7yIhOi+olip8AOXIIFLb7Vee1+q7Ri6ScUJEKxdEvec5EceXEtWs0U4AnuHgiH0ewJSX9yUp8T4ImCzu00JhTMOH2nXU3PJuGgZgrDifNWXGpFruIBjHWRKpESpy+9HPGoNoxSO/hzSfuM5LKvwX+I96cMK5OC+fKsBh59cMpU4YnqFNh59ZP/kaMDxAXgrVku5s9oB3Rgc7t1rfm6dqycBiwn4QnYJpk7M+gzAbrF/nty8y84ajNdhINXgMgvv3JLC5YTqznBPm3koHSOEF8f4xtCZtzjNN6jNjX8gEvxoRpC9Z+X15c8XBSFyDMBoi0FMDor619XJKgTxNiOYmeH/DLhKEb8MIaug8IFu34FKbG81IsWD+zwA1A5xqXEVlgsfEOcML+Oe2rulkpwQBWnsmY+f/Z80004Mytreo/ME2TDuPJPOi15D0j0CbwG7xzE8qrn0EomBE9mrwH3uuH7df3lzx1HiLAmh2s4MO5R64AoWeAPQW9lWZPzp+2dNgk+0qWpoEsMN+r91yWxUZHgeoC+GJKs13LItH32sGInyUrquMYQjEh44fAEFrMREcS4A7l+875GUmWC6i2MSLyvtAzuPS2IV0t9GU0ooH8cfG5JUeDnsJcVanJTR+XuXPetM+cDyGFTGri3lsCndE9maLgs9iDHtJxzKUBUUakaIPLsXtZD51cS4jhSbbHuzgC21BRtnBhCE2phVYbz4Tj0t90wBmemBaP2eVwv9p4s/JJAHEELvV7k+Gro4FozOoC2WBdqdTPDFB00la08O6ADBdjd2el2pRA7HCTG6v3qwA6RQJfm4UHOXaFYhhiNngxHB4VHZMvpd+YMEqNmtYOb4lzWwI13iHU0Rh0Sj4IaY9EwEy/KjR5dc2DjWGj11SFFCP1uG24fccF+LhtdMNDItI1mBxfaeRelYlsCZwtbbVLnuVQ5izuTzXa48x7CBaHnD3i09BZCuQITLX4d7KkD6CLWWTHrc5onLFJKxRF/p5AEFoqtN3vP9CsLXSYNKxFV5UbxAY5TnAoLFCCo0WbgvtAV77jWSbru9Oq/7ORN9smog4zNuYBZE1uXjxM2xszDduOym7+CxwpJMc7XPknt2XwiANaf2QANMMMH6lmnjTH1RVR7oH4+ts4xVcsdiO/QOlMp+Th9/KIMYyUevR18vHbs+88uxzIG28/58xLZTs6rZc71g9mGw9Q21ugL2sfTc7e0VDMnAmdg+92s2RXQMvkmx+oRc+IsFqgOZzjYcTmnJxZaXsoIsydDVcTalgmhK6/dD0grPLaGgaeXMEw2hN8p8seAHrGRW8+6WBD63NBYaAG0/zwuGOCHUo/BeG9bz39Hsz9Yvs5KvJiLhmM5K+8RlnxIY329REqdFZVyuXyy0NpDueFQelnd0j47Quc7GJGX3QycJiKpLolMtDnpnjgYOvdfycM+JEMZGwpLsBBE8R6vJ3RVczT6DdMtpVQ4l7kOzsPSYlp4qAv5fiqUboyv5eP7G7MOD/qSUwBnMS1p9Vm4Wr8B9w=="
++	_, _, _, _, err := ParseAuthorizedKey([]byte(rsa16384))
++
++	if err == nil {
++		t.Fatal("ParseAuthorizedKey accepted a 16384-bit modulus; expected it to be rejected")
++	}
++
++	expectedError := "rsa modulus too large"
++	if !strings.Contains(err.Error(), expectedError) {
++		t.Errorf("unexpected error message: got %q, want substring %q", err.Error(), expectedError)
++	}
++}
++
+ func TestParseECPrivateKey(t *testing.T) {
+ 	key := testPrivateKeys["ecdsa"]
+
+@@ -330,6 +345,72 @@ func TestMarshalParsePublicKey(t *testing.T) {
+ 	}
+ }
+
++func TestParseDSAHugeQ(t *testing.T) {
++	P := new(big.Int).Lsh(big.NewInt(1), 1023)
++	Q := new(big.Int).Lsh(big.NewInt(1), 20000) // very large
++	// G and Y: Dummy values, just needs to be < P to pass that specific check
++	G := big.NewInt(2)
++	Y := big.NewInt(5)
++
++	rawKey := struct {
++		P, Q, G, Y *big.Int
++	}{
++		P: P,
++		Q: Q,
++		G: G,
++		Y: Y,
++	}
++
++	inputBytes := Marshal(&rawKey)
++
++	_, _, err := parseDSA(inputBytes)
++	if err == nil {
++		t.Fatal("parseDSA accepted a DSA key with large Q")
++	}
++
++	expectedError := "ssh: unsupported DSA sub-prime size"
++	if !strings.Contains(err.Error(), expectedError) {
++		t.Errorf("unexpected error message: got %q, want substring %q", err.Error(), expectedError)
++	}
++}
++
++func TestParseDSAYOutOfRange(t *testing.T) {
++	// Valid 1024/160 parameters (values don't need to be a real DSA group,
++	// they only need to pass the checkDSAParams bit-length checks and the
++	// G < P / G > 0 checks).
++	P := new(big.Int).Lsh(big.NewInt(1), 1023)
++	P.SetBit(P, 0, 1) // make P odd so it can pass as a prime candidate shape
++	Q := new(big.Int).Lsh(big.NewInt(1), 159)
++	Q.SetBit(Q, 0, 1)
++	G := big.NewInt(2)
++
++	for _, tc := range []struct {
++		name string
++		Y    *big.Int
++	}{
++		{"Y_zero", big.NewInt(0)},
++		{"Y_negative", big.NewInt(-1)},
++		{"Y_equals_P", new(big.Int).Set(P)},
++		{"Y_greater_than_P", new(big.Int).Add(P, big.NewInt(1))},
++		{"Y_much_greater_than_P", new(big.Int).Lsh(big.NewInt(1), 20000)},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			rawKey := struct {
++				P, Q, G, Y *big.Int
++			}{P: P, Q: Q, G: G, Y: tc.Y}
++
++			_, _, err := parseDSA(Marshal(&rawKey))
++			if err == nil {
++				t.Fatalf("parseDSA accepted a DSA key with Y=%s (P=%s)", tc.Y, P)
++			}
++			expectedError := "DSA public value Y out of range"
++			if !strings.Contains(err.Error(), expectedError) {
++				t.Errorf("unexpected error message: got %q, want substring %q", err.Error(), expectedError)
++			}
++		})
++	}
++}
++
+ func TestMarshalPrivateKey(t *testing.T) {
+ 	tests := []struct {
+ 		name string
+
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -11,6 +11,7 @@ import (
+ 	"io"
+ 	"log"
+ 	"sync"
++	"sync/atomic"
+ )
+ 
+ const (
+@@ -177,6 +178,12 @@ type channel struct {
+ 	// with WantReply=true outstanding.  This lock is held by a
+ 	// goroutine that has such an outgoing request pending.
+ 	sentRequestMu sync.Mutex
++	// sentRequestPending is set to true while a SendRequest call with
++	// WantReply=true is in flight. handlePacket uses it as a gate: responses
++	// arriving while no request is pending are dropped to prevent a
++	// misbehaving peer from stalling the mux read loop by filling ch.msg
++	// with unsolicited channelRequestSuccess/Failure messages.
++	sentRequestPending atomic.Bool
+ 
+ 	incomingRequests chan *Request
+ 
+@@ -460,6 +467,18 @@ func (ch *channel) handlePacket(packet []byte) error {
+ 		}
+ 
+ 		ch.incomingRequests <- &req
++	case *channelRequestSuccessMsg, *channelRequestFailureMsg:
++		// Drop responses that arrive when no SendRequest is waiting, to
++		// prevent a malicious peer from filling ch.msg and stalling the
++		// mux read loop. The non-blocking send additionally protects the
++		// loop if a well-behaved caller is slow to read.
++		if !ch.sentRequestPending.Load() {
++			return nil
++		}
++		select {
++		case ch.msg <- msg:
++		default:
++		}
+ 	default:
+ 		ch.msg <- msg
+ 	}
+@@ -586,6 +605,24 @@ func (ch *channel) SendRequest(name string, wantReply bool, payload []byte) (boo
+ 	if wantReply {
+ 		ch.sentRequestMu.Lock()
+ 		defer ch.sentRequestMu.Unlock()
++
++		// Open the gate so that responses arriving while this request is in
++		// flight are allowed to reach ch.msg. Responses arriving while no
++		// request is pending are dropped by handlePacket.
++		ch.sentRequestPending.Store(true)
++		defer ch.sentRequestPending.Store(false)
++
++		// Drain any spurious responses that may have been buffered. This
++		// prevents a previously buffered unexpected response from being
++		// consumed instead of the actual response for this request.
++	drain:
++		for {
++			select {
++			case <-ch.msg:
++			default:
++				break drain
++			}
++		}
+ 	}
+ 
+ 	msg := channelRequestMsg{
+--- a/ssh/mux.go
++++ b/ssh/mux.go
+@@ -91,9 +91,10 @@ type mux struct {
+ 
+ 	incomingChannels chan NewChannel
+ 
+-	globalSentMu     sync.Mutex
+-	globalResponses  chan interface{}
+-	incomingRequests chan *Request
++	globalSentMu      sync.Mutex
++	globalSentPending atomic.Bool
++	globalResponses   chan interface{}
++	incomingRequests  chan *Request
+ 
+ 	errCond *sync.Cond
+ 	err     error
+@@ -141,6 +142,24 @@ func (m *mux) SendRequest(name string, wantReply bool, payload []byte) (bool, []
+ 	if wantReply {
+ 		m.globalSentMu.Lock()
+ 		defer m.globalSentMu.Unlock()
++
++		// Open the gate so that responses arriving while this request is in
++		// flight are allowed to reach globalResponses. Any response arriving
++		// while no request is pending is dropped by handleGlobalPacket.
++		m.globalSentPending.Store(true)
++		defer m.globalSentPending.Store(false)
++
++		// Drain any spurious responses that may have been buffered. This prevents
++		// a previously buffered unexpected response from being consumed instead
++		// of the actual response for this request.
++	drain:
++		for {
++			select {
++			case <-m.globalResponses:
++			default:
++				break drain
++			}
++		}
+ 	}
+ 
+ 	if err := m.sendMessage(globalRequestMsg{
+@@ -267,7 +286,16 @@ func (m *mux) handleGlobalPacket(packet []byte) error {
+ 			mux:       m,
+ 		}
+ 	case *globalRequestSuccessMsg, *globalRequestFailureMsg:
+-		m.globalResponses <- msg
++		// Drop responses that arrive when no SendRequest is waiting, to
++		// prevent a malicious peer from staging responses for a future
++		// caller.
++		if !m.globalSentPending.Load() {
++			return nil
++		}
++		select {
++		case m.globalResponses <- msg:
++		default:
++		}
+ 	default:
+ 		panic(fmt.Sprintf("not a global message %#v", msg))
+ 	}
+--- a/ssh/mux_test.go
++++ b/ssh/mux_test.go
+@@ -837,3 +837,488 @@ func TestDebug(t *testing.T) {
+ 		t.Error("transport debug switched on")
+ 	}
+ }
++
++func TestMuxUnexpectedGlobalResponsesDiscarded(t *testing.T) {
++	clientPipe, serverPipe := memPipe()
++	client := newMux(clientPipe)
++	defer serverPipe.Close()
++	defer client.Close()
++
++	done := make(chan error, 1)
++	go func() {
++		// Send multiple unexpected global responses, this should not block the
++		// globalResponses channel.
++		for i := range 5 {
++			err := serverPipe.writePacket(Marshal(globalRequestSuccessMsg{
++				Data: []byte{byte(i)},
++			}))
++			if err != nil {
++				done <- fmt.Errorf("send success msg %d: %w", i, err)
++				return
++			}
++		}
++		for i := range 5 {
++			err := serverPipe.writePacket(Marshal(globalRequestFailureMsg{
++				Data: []byte{byte(i)},
++			}))
++			if err != nil {
++				done <- fmt.Errorf("send failure msg %d: %w", i, err)
++				return
++			}
++		}
++
++		// Now send a global request and wait for the response. This
++		// verifies the mux is still processing packets.
++		err := serverPipe.writePacket(Marshal(globalRequestMsg{
++			Type:      "keepalive@golang.org",
++			WantReply: true,
++			Data:      nil,
++		}))
++		if err != nil {
++			done <- fmt.Errorf("send global request: %w", err)
++			return
++		}
++
++		packet, err := serverPipe.readPacket()
++		if err != nil {
++			done <- fmt.Errorf("read packet: %w", err)
++			return
++		}
++		decoded, err := decode(packet)
++		if err != nil {
++			done <- fmt.Errorf("decode: %w", err)
++			return
++		}
++		switch decoded.(type) {
++		case *globalRequestSuccessMsg, *globalRequestFailureMsg:
++			// Expected response
++		default:
++			done <- fmt.Errorf("unexpected packet type: %T", decoded)
++			return
++		}
++		done <- nil
++	}()
++
++	// Handle the incoming request from the server and reply
++	req, ok := <-client.incomingRequests
++	if !ok {
++		t.Fatal("incomingRequests channel closed unexpectedly")
++	}
++	if req.Type != "keepalive@golang.org" {
++		t.Fatalf("unexpected request type: %s", req.Type)
++	}
++	if err := req.Reply(true, nil); err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestMuxConcurrentGlobalRequests(t *testing.T) {
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	const numRequests = 50
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for r := range serverMux.incomingRequests {
++			if r.WantReply {
++				replyData := append([]byte("reply:"), r.Payload...)
++				r.Reply(true, replyData)
++			}
++		}
++	}()
++
++	var clientWg sync.WaitGroup
++	clientWg.Add(numRequests)
++
++	errCh := make(chan error, numRequests)
++
++	for i := range numRequests {
++		go func(id int) {
++			defer clientWg.Done()
++
++			payloadStr := fmt.Sprintf("req-%d", id)
++			payload := []byte(payloadStr)
++
++			// This call blocks until the globalSentMu is acquired.
++			// The mutex ensures that even with many concurrent attempts,
++			// the "drain" and "send" logic happens atomically per request.
++			ok, data, err := clientMux.SendRequest("echo", true, payload)
++			if err != nil {
++				errCh <- fmt.Errorf("req %d error: %v", id, err)
++				return
++			}
++			if !ok {
++				errCh <- fmt.Errorf("req %d failed (want success)", id)
++				return
++			}
++
++			expected := "reply:" + payloadStr
++			if string(data) != expected {
++				errCh <- fmt.Errorf("req %d mismatch: got %q, want %q", id, string(data), expected)
++			}
++		}(i)
++	}
++
++	clientWg.Wait()
++	close(errCh)
++
++	for err := range errCh {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	clientMux.Close()
++	<-serverDone
++}
++
++func TestMuxGlobalResponseDroppedWhenIdle(t *testing.T) {
++	clientPipe, serverPipe := memPipe()
++	clientMux := newMux(clientPipe)
++	defer serverPipe.Close()
++	defer clientMux.Close()
++
++	errCh := make(chan error, 1)
++	go func() {
++		// Send a spurious response while no SendRequest is pending.
++		if err := serverPipe.writePacket(Marshal(globalRequestSuccessMsg{
++			Data: []byte("spurious"),
++		})); err != nil {
++			errCh <- fmt.Errorf("send spurious: %w", err)
++			return
++		}
++		// Follow with a global request; once the client observes this on
++		// incomingRequests, the mux loop has necessarily processed (and
++		// dropped) the prior spurious response.
++		if err := serverPipe.writePacket(Marshal(globalRequestMsg{
++			Type:      "sync@example.com",
++			WantReply: false,
++		})); err != nil {
++			errCh <- fmt.Errorf("send sync request: %w", err)
++			return
++		}
++		errCh <- nil
++	}()
++
++	if err := <-errCh; err != nil {
++		t.Fatal(err)
++	}
++
++	req, ok := <-clientMux.incomingRequests
++	if !ok {
++		t.Fatal("incomingRequests closed unexpectedly")
++	}
++	if req.Type != "sync@example.com" {
++		t.Fatalf("unexpected sync request type %q", req.Type)
++	}
++
++	// The spurious response preceded the sync request, so by now the mux
++	// loop has processed it. The pending-gate must have caused it to be
++	// dropped rather than buffered.
++	if n := len(clientMux.globalResponses); n != 0 {
++		t.Fatalf("globalResponses buffer should be empty after idle drop, has %d entries", n)
++	}
++}
++
++func TestMuxStaleResponseDrained(t *testing.T) {
++	// Simulate a stale response sitting in globalResponses (e.g. a response
++	// that slipped in through the pending-gate on a prior SendRequest that
++	// exited without consuming it). The drain step in the next SendRequest
++	// must discard it so the caller receives the correct reply.
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	clientMux.globalResponses <- &globalRequestSuccessMsg{Data: []byte("stale")}
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range serverMux.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, append([]byte("reply:"), req.Payload...))
++			}
++		}
++	}()
++
++	ok, data, err := clientMux.SendRequest("test", true, []byte("hello"))
++	if err != nil {
++		t.Fatalf("request failed: %v", err)
++	}
++	if !ok {
++		t.Fatal("expected success response")
++	}
++	if string(data) != "reply:hello" {
++		t.Fatalf("got %q, want %q (drain did not remove stale response)", data, "reply:hello")
++	}
++
++	clientMux.Close()
++	<-serverDone
++}
++
++func TestMuxGlobalResponseAcceptedWhilePending(t *testing.T) {
++	// Positive control: when a SendRequest is actually pending, the
++	// response must be delivered (the gate is open).
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range serverMux.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, []byte("pong"))
++			}
++		}
++	}()
++
++	ok, data, err := clientMux.SendRequest("ping", true, nil)
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	if !ok || string(data) != "pong" {
++		t.Fatalf("unexpected response: ok=%v data=%q", ok, data)
++	}
++
++	clientMux.Close()
++	<-serverDone
++}
++
++func TestChannelUnexpectedResponsesDiscarded(t *testing.T) {
++	// A malicious peer that spams channelRequestSuccess/Failure messages
++	// for an open, idle channel must not be able to stall the mux read
++	// loop by filling ch.msg. After the flood, the channel must still be
++	// usable: a subsequent legitimate SendRequest receives its reply.
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	serverRes := make(chan *channel, 1)
++	go func() {
++		newCh, ok := <-serverMux.incomingChannels
++		if !ok {
++			close(serverRes)
++			return
++		}
++		c, _, err := newCh.Accept()
++		if err != nil {
++			close(serverRes)
++			return
++		}
++		serverRes <- c.(*channel)
++	}()
++
++	clientCh, err := clientMux.openChannel("chan", nil)
++	if err != nil {
++		t.Fatalf("openChannel: %v", err)
++	}
++	serverCh := <-serverRes
++	if serverCh == nil {
++		t.Fatal("server did not accept channel")
++	}
++
++	// Spam many unsolicited success/failure responses. More than chanSize
++	// to ensure ch.msg would overflow without the pending-gate.
++	const spam = chanSize * 4
++	done := make(chan error, 1)
++	go func() {
++		for i := range spam {
++			if err := serverCh.ackRequest(i%2 == 0); err != nil {
++				done <- fmt.Errorf("ackRequest %d: %w", i, err)
++				return
++			}
++		}
++		// Echo any legitimate request back.
++		for req := range serverCh.incomingRequests {
++			if req.WantReply {
++				if err := req.Reply(true, append([]byte("reply:"), req.Payload...)); err != nil {
++					done <- fmt.Errorf("reply: %w", err)
++					return
++				}
++			}
++		}
++		done <- nil
++	}()
++
++	// If the flood had wedged the mux loop, this SendRequest would never
++	// receive a reply.
++	ok, err := clientCh.SendRequest("ping", true, []byte("hello"))
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	if !ok {
++		t.Fatal("expected success reply")
++	}
++
++	// Clean up so the server goroutine can exit.
++	clientCh.Close()
++	serverCh.Close()
++	if err := <-done; err != nil {
++		if !errors.Is(err, io.EOF) {
++			t.Fatal(err)
++		}
++	}
++}
++
++func TestChannelConcurrentRequests(t *testing.T) {
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range writer.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, append([]byte("reply:"), req.Payload...))
++			}
++		}
++	}()
++
++	const numRequests = 50
++	var wg sync.WaitGroup
++	wg.Add(numRequests)
++	errCh := make(chan error, numRequests)
++
++	for i := 0; i < numRequests; i++ {
++		go func(id int) {
++			defer wg.Done()
++			payload := []byte(fmt.Sprintf("req-%d", id))
++			ok, err := reader.SendRequest("echo", true, payload)
++			if err != nil {
++				errCh <- fmt.Errorf("req %d: %v", id, err)
++				return
++			}
++			if !ok {
++				errCh <- fmt.Errorf("req %d: expected success", id)
++			}
++		}(i)
++	}
++
++	wg.Wait()
++	close(errCh)
++
++	for err := range errCh {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	reader.Close()
++	writer.Close()
++	<-serverDone
++}
++
++func TestChannelResponseDroppedWhenIdle(t *testing.T) {
++	// A spurious response arriving while no SendRequest is pending must
++	// be dropped rather than buffered in ch.msg.
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	// Server sends an unsolicited reply, then a request so we can
++	// synchronise: once the client observes the request, the mux loop has
++	// necessarily processed (and dropped) the prior spurious reply.
++	errCh := make(chan error, 1)
++	go func() {
++		if err := writer.ackRequest(true); err != nil {
++			errCh <- err
++			return
++		}
++		if _, err := writer.SendRequest("sync", false, nil); err != nil {
++			errCh <- err
++			return
++		}
++		errCh <- nil
++	}()
++
++	req := <-reader.incomingRequests
++	if req.Type != "sync" {
++		t.Fatalf("unexpected request type %q", req.Type)
++	}
++
++	if n := len(reader.msg); n != 0 {
++		t.Fatalf("ch.msg should be empty after idle drop, has %d entries", n)
++	}
++
++	if err := <-errCh; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestChannelStaleResponseDrained(t *testing.T) {
++	// Simulate a stale response sitting in ch.msg (e.g. a response that
++	// slipped through the pending-gate on a prior SendRequest that exited
++	// without consuming it). The drain step in the next SendRequest must
++	// discard it so the caller receives the correct reply.
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	reader.msg <- &channelRequestSuccessMsg{PeersID: reader.remoteId}
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range writer.incomingRequests {
++			if req.WantReply {
++				req.Reply(false, append([]byte("nack:"), req.Payload...))
++			}
++		}
++	}()
++
++	ok, err := reader.SendRequest("test", true, []byte("hello"))
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	// If the stale success had been consumed, ok would be true.
++	if ok {
++		t.Fatal("got stale success response; drain did not remove it")
++	}
++
++	reader.Close()
++	writer.Close()
++	<-serverDone
++}
++
++func TestChannelResponseAcceptedWhilePending(t *testing.T) {
++	// Positive control: when a SendRequest is actually pending, the
++	// response must be delivered (the gate is open).
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range writer.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, nil)
++			}
++		}
++	}()
++
++	ok, err := reader.SendRequest("ping", true, nil)
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	if !ok {
++		t.Fatal("expected success")
++	}
++
++	reader.Close()
++	writer.Close()
++	<-serverDone
++}
+
+--- a/ssh/certs.go
++++ b/ssh/certs.go
+@@ -444,7 +444,17 @@ func (c *CertChecker) CheckCert(principal string, cert *Certificate) error {
+ 	if before := int64(cert.ValidBefore); cert.ValidBefore != uint64(CertTimeInfinity) && (unixNow >= before || before < 0) {
+ 		return fmt.Errorf("ssh: cert has expired")
+ 	}
+-	if err := cert.SignatureKey.Verify(cert.bytesForSigning(), cert.Signature); err != nil {
++	// Match OpenSSH: the SK user-presence flag is never enforced on a
++	// certificate's CA signature. OpenSSH calls sshkey_verify with
++	// detailsp==NULL in sshkey.c:cert_parse, so the UP/UV flags are
++	// not even extracted. The UP bit on a CA signature reflects the
++	// CA operator's presence at signing time, which has no bearing on
++	// whether the user being authenticated is present now; enforcing
++	// it here would only break interop with certificates issued by
++	// non-interactive SK CAs. skKeyWithoutUP is a no-op for non-SK
++	// keys (the common case).
++	caKey := skKeyWithoutUP(cert.SignatureKey)
++	if err := caKey.Verify(cert.bytesForSigning(), cert.Signature); err != nil {
+ 		return fmt.Errorf("ssh: certificate signature does not verify")
+ 	}
+ 
+--- a/ssh/certs_test.go
++++ b/ssh/certs_test.go
+@@ -9,8 +9,10 @@ import (
+ 	"crypto/ecdsa"
+ 	"crypto/elliptic"
+ 	"crypto/rand"
++	"crypto/sha256"
+ 	"fmt"
+ 	"io"
++	"math/big"
+ 	"net"
+ 	"reflect"
+ 	"testing"
+@@ -128,6 +130,103 @@ func TestValidateCert(t *testing.T) {
+ 	}
+ }
+ 
++// signSKCert builds an SK-ECDSA signature over cert.bytesForSigning()
++// using caKey as the simulated hardware token. The SK signing flags
++// byte (UP bit and others) is caller-controlled so tests can exercise
++// the user-presence enforcement paths. caApp is the SK application
++// string (typically "ssh:").
++func signSKCert(t *testing.T, cert *Certificate, caKey *ecdsa.PrivateKey, caApp string, flags byte) {
++	t.Helper()
++	cert.SignatureKey = &skECDSAPublicKey{
++		application: caApp,
++		PublicKey:   caKey.PublicKey,
++	}
++	cert.Nonce = make([]byte, 32)
++	if _, err := rand.Read(cert.Nonce); err != nil {
++		t.Fatal(err)
++	}
++
++	h := sha256.New()
++	h.Write([]byte(caApp))
++	appDigest := h.Sum(nil)
++	h.Reset()
++	h.Write(cert.bytesForSigning())
++	dataDigest := h.Sum(nil)
++
++	var counter uint32 = 1
++	blob := struct {
++		ApplicationDigest []byte `ssh:"rest"`
++		Flags             byte
++		Counter           uint32
++		MessageDigest     []byte `ssh:"rest"`
++	}{appDigest, flags, counter, dataDigest}
++	h.Reset()
++	h.Write(Marshal(blob))
++	digest := h.Sum(nil)
++
++	r, s, err := ecdsa.Sign(rand.Reader, caKey, digest)
++	if err != nil {
++		t.Fatal(err)
++	}
++	cert.Signature = &Signature{
++		Format: KeyAlgoSKECDSA256,
++		Blob:   Marshal(struct{ R, S *big.Int }{r, s}),
++		Rest: Marshal(struct {
++			Flags   byte
++			Counter uint32
++		}{flags, counter}),
++	}
++}
++
++// TestCheckCertSKAuthorityNoUPRequired pins the OpenSSH-parity
++// behavior of CertChecker.CheckCert for SK CA signatures: a
++// certificate signed by an SK CA that produced a UP=0 signature is
++// accepted, because the UP bit on a CA signature has no bearing on
++// the current user authentication (see sshkey.c:cert_parse, which
++// passes detailsp==NULL to sshkey_verify). Without this, certs issued
++// by non-interactive SK CAs would fail to verify.
++func TestCheckCertSKAuthorityNoUPRequired(t *testing.T) {
++	caKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	userKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	userPub, err := NewPublicKey(&userKey.PublicKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	mkCert := func(flags byte) *Certificate {
++		c := &Certificate{
++			CertType:        UserCert,
++			Key:             userPub,
++			ValidBefore:     CertTimeInfinity,
++			ValidPrincipals: []string{"user"},
++		}
++		signSKCert(t, c, caKey, "ssh:", flags)
++		return c
++	}
++
++	checker := CertChecker{
++		IsUserAuthority: func(k PublicKey) bool {
++			caSK := &skECDSAPublicKey{application: "ssh:", PublicKey: caKey.PublicKey}
++			return bytes.Equal(k.Marshal(), caSK.Marshal())
++		},
++	}
++
++	// Both UP=0 and UP=1 CA signatures verify: UP is not enforced
++	// here, matching OpenSSH.
++	if err := checker.CheckCert("user", mkCert(0)); err != nil {
++		t.Errorf("UP=0 CA signature must verify (OpenSSH parity): %v", err)
++	}
++	if err := checker.CheckCert("user", mkCert(flagUserPresence)); err != nil {
++		t.Errorf("UP=1 CA signature must verify: %v", err)
++	}
++}
++
+ func TestValidateCertTime(t *testing.T) {
+ 	cert := Certificate{
+ 		ValidPrincipals: []string{"user"},
+--- a/ssh/keys.go
++++ b/ssh/keys.go
+@@ -901,11 +901,25 @@ type skFields struct {
+ 	Counter uint32
+ }
+ 
++// flagUserPresence is the "user present" bit (UP) in the SK signature
++// flags, matching the FIDO CTAP2 authenticatorData UP flag. See
++// openssh/PROTOCOL.u2f.
++const flagUserPresence = 0x01
++
++// errSKMissingUserPresence is returned by SK key Verify methods when
++// the signature does not assert user presence and the key was not
++// marked as no-touch-required.
++var errSKMissingUserPresence = errors.New("ssh: signature missing required user presence flag")
++
+ type skECDSAPublicKey struct {
+ 	// application is a URL-like string, typically "ssh:" for SSH.
+ 	// see openssh/PROTOCOL.u2f for details.
+ 	application string
+ 	ecdsa.PublicKey
++	// noTouchRequired, when true, disables the default user-presence
++	// check in Verify. It is set by skKeyWithoutUP on a clone of the
++	// key, never on an instance shared across authentication attempts.
++	noTouchRequired bool
+ }
+ 
+ func (k *skECDSAPublicKey) Type() string {
+@@ -991,6 +1005,10 @@ func (k *skECDSAPublicKey) Verify(data []byte, sig *Signature) error {
+ 		return err
+ 	}
+ 
++	if skf.Flags&flagUserPresence == 0 && !k.noTouchRequired {
++		return errSKMissingUserPresence
++	}
++
+ 	blob := struct {
+ 		ApplicationDigest []byte `ssh:"rest"`
+ 		Flags             byte
+@@ -1024,6 +1042,10 @@ type skEd25519PublicKey struct {
+ 	// see openssh/PROTOCOL.u2f for details.
+ 	application string
+ 	ed25519.PublicKey
++	// noTouchRequired, when true, disables the default user-presence
++	// check in Verify. It is set by skKeyWithoutUP on a clone of the
++	// key, never on an instance shared across authentication attempts.
++	noTouchRequired bool
+ }
+ 
+ func (k *skEd25519PublicKey) Type() string {
+@@ -1098,6 +1120,10 @@ func (k *skEd25519PublicKey) Verify(data []byte, sig *Signature) error {
+ 		return err
+ 	}
+ 
++	if skf.Flags&flagUserPresence == 0 && !k.noTouchRequired {
++		return errSKMissingUserPresence
++	}
++
+ 	blob := struct {
+ 		ApplicationDigest []byte `ssh:"rest"`
+ 		Flags             byte
+--- a/ssh/keys_test.go
++++ b/ssh/keys_test.go
+@@ -12,6 +12,7 @@ import (
+ 	"crypto/elliptic"
+ 	"crypto/rand"
+ 	"crypto/rsa"
++	"crypto/sha256"
+ 	"crypto/x509"
+ 	"encoding/base64"
+ 	"encoding/hex"
+@@ -841,6 +842,296 @@ func TestSKKeys(t *testing.T) {
+ 	}
+ }
+ 
++// skTestHarness builds SK-formatted signatures over a fixed payload
++// using a caller-supplied signing function, letting tests vary the UP
++// flag byte without duplicating the wire-format scaffolding.
++type skTestHarness struct {
++	format      string
++	application string
++	data        []byte
++	// sign takes the SHA-256 digest of the marshalled SK blob and
++	// returns the value to embed in Signature.Blob. For ECDSA keys the
++	// helper feeds the digest to ecdsa.Sign; for ed25519 the helper
++	// feeds the raw marshalled blob to ed25519.Sign.
++	signDigest func(digest []byte) []byte
++	signBlob   func(blob []byte) []byte
++}
++
++func (h skTestHarness) sign(t *testing.T, flags byte) *Signature {
++	t.Helper()
++	hsh := sha256.New()
++	hsh.Write([]byte(h.application))
++	appDigest := hsh.Sum(nil)
++
++	hsh.Reset()
++	hsh.Write(h.data)
++	dataDigest := hsh.Sum(nil)
++
++	var counter uint32 = 1
++	blob := struct {
++		ApplicationDigest []byte `ssh:"rest"`
++		Flags             byte
++		Counter           uint32
++		MessageDigest     []byte `ssh:"rest"`
++	}{appDigest, flags, counter, dataDigest}
++	marshalled := Marshal(blob)
++
++	var sigBlob []byte
++	if h.signDigest != nil {
++		hsh.Reset()
++		hsh.Write(marshalled)
++		sigBlob = h.signDigest(hsh.Sum(nil))
++	} else {
++		sigBlob = h.signBlob(marshalled)
++	}
++
++	return &Signature{
++		Format: h.format,
++		Blob:   sigBlob,
++		Rest: Marshal(struct {
++			Flags   byte
++			Counter uint32
++		}{flags, counter}),
++	}
++}
++
++func TestSKUserPresence(t *testing.T) {
++	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	h := skTestHarness{
++		format:      "sk-ecdsa-sha2-nistp256@openssh.com",
++		application: "ssh:",
++		data:        []byte("test data"),
++		signDigest: func(digest []byte) []byte {
++			r, s, err := ecdsa.Sign(rand.Reader, ecKey, digest)
++			if err != nil {
++				t.Fatal(err)
++			}
++			return Marshal(struct{ R, S *big.Int }{r, s})
++		},
++	}
++
++	pk := &skECDSAPublicKey{
++		application: h.application,
++		PublicKey:   ecKey.PublicKey,
++	}
++
++	// Valid signature with UP=1 should pass.
++	if err := pk.Verify(h.data, h.sign(t, flagUserPresence)); err != nil {
++		t.Errorf("Verify failed with UP=1: %v", err)
++	}
++
++	// Valid signature with UP=0 should fail with the user-presence sentinel.
++	sigNoUP := h.sign(t, 0)
++	if err := pk.Verify(h.data, sigNoUP); !errors.Is(err, errSKMissingUserPresence) {
++		t.Errorf("expected errSKMissingUserPresence, got: %v", err)
++	}
++
++	// UV set but UP clear must still fail: we only waive UP, never UV-only.
++	if err := pk.Verify(h.data, h.sign(t, 0x04)); !errors.Is(err, errSKMissingUserPresence) {
++		t.Errorf("UV-only (flags=0x04): expected errSKMissingUserPresence, got: %v", err)
++	}
++
++	// With noTouchRequired, UP=0 passes; UP=1+UV=1 also passes.
++	pk.noTouchRequired = true
++	if err := pk.Verify(h.data, sigNoUP); err != nil {
++		t.Errorf("Verify with noTouchRequired failed: %v", err)
++	}
++	if err := pk.Verify(h.data, h.sign(t, flagUserPresence|0x04)); err != nil {
++		t.Errorf("Verify UP|UV with noTouchRequired failed: %v", err)
++	}
++}
++
++func TestSKKeyWithoutUP(t *testing.T) {
++	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	edPub, _, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	skEC := &skECDSAPublicKey{PublicKey: ecKey.PublicKey}
++	skED := &skEd25519PublicKey{PublicKey: edPub}
++	certEC := &Certificate{Key: &skECDSAPublicKey{PublicKey: ecKey.PublicKey}}
++	certED := &Certificate{Key: &skEd25519PublicKey{PublicKey: edPub}}
++	rsaKey, err := rsa.GenerateKey(rand.Reader, 2048)
++	if err != nil {
++		t.Fatal(err)
++	}
++	rsaPub, err := NewPublicKey(&rsaKey.PublicKey)
++	if err != nil {
++		t.Fatal(err)
++	}
++	certRSA := &Certificate{Key: rsaPub}
++
++	// SK raw keys: return a clone with the flag set, original untouched.
++	gotEC := skKeyWithoutUP(skEC)
++	if gotEC == skEC {
++		t.Error("skECDSAPublicKey: expected a clone, got the original pointer")
++	}
++	if !gotEC.(*skECDSAPublicKey).noTouchRequired {
++		t.Error("skECDSAPublicKey clone: noTouchRequired not set")
++	}
++	if skEC.noTouchRequired {
++		t.Error("skECDSAPublicKey: original mutated")
++	}
++
++	gotED := skKeyWithoutUP(skED)
++	if gotED == skED {
++		t.Error("skEd25519PublicKey: expected a clone, got the original pointer")
++	}
++	if !gotED.(*skEd25519PublicKey).noTouchRequired {
++		t.Error("skEd25519PublicKey clone: noTouchRequired not set")
++	}
++	if skED.noTouchRequired {
++		t.Error("skEd25519PublicKey: original mutated")
++	}
++
++	// Certificate wrapping SK: return a clone of the cert with a cloned
++	// SK key inside. Neither the original cert nor the original inner
++	// key must be mutated.
++	originalInnerEC := certEC.Key
++	gotCertEC := skKeyWithoutUP(certEC)
++	if gotCertEC == certEC {
++		t.Error("*Certificate(SK ecdsa): expected a clone, got the original pointer")
++	}
++	if got := gotCertEC.(*Certificate).Key.(*skECDSAPublicKey); !got.noTouchRequired {
++		t.Error("*Certificate(SK ecdsa): inner clone missing noTouchRequired")
++	}
++	if certEC.Key != originalInnerEC {
++		t.Error("*Certificate(SK ecdsa): original cert's Key pointer mutated")
++	}
++	if originalInnerEC.(*skECDSAPublicKey).noTouchRequired {
++		t.Error("*Certificate(SK ecdsa): original inner key mutated")
++	}
++
++	gotCertED := skKeyWithoutUP(certED)
++	if gotCertED == certED {
++		t.Error("*Certificate(SK ed25519): expected a clone, got the original pointer")
++	}
++	if got := gotCertED.(*Certificate).Key.(*skEd25519PublicKey); !got.noTouchRequired {
++		t.Error("*Certificate(SK ed25519): inner clone missing noTouchRequired")
++	}
++
++	// Non-SK key inside a cert: return original unchanged (nothing to clone).
++	if got := skKeyWithoutUP(certRSA); got != certRSA {
++		t.Error("*Certificate(RSA): expected the original pointer back")
++	}
++
++	// Plain non-SK key: return original unchanged.
++	if got := skKeyWithoutUP(rsaPub); got != rsaPub {
++		t.Error("rsaPublicKey: expected the original pointer back")
++	}
++
++	// Pathological: *Certificate whose Key is itself a *Certificate.
++	// The SSH cert format forbids this and parseCert rejects it, but
++	// a Go caller can still construct such a value. skKeyWithoutUP
++	// must not recurse into it (or panic); it returns the input
++	// unchanged. This also defends against a hypothetical cycle built
++	// from hand-constructed Certificate pointers.
++	nestedCert := &Certificate{Key: &Certificate{Key: skEC}}
++	if got := skKeyWithoutUP(nestedCert); got != nestedCert {
++		t.Error("*Certificate wrapping *Certificate: expected the original pointer back")
++	}
++	selfCycle := &Certificate{}
++	selfCycle.Key = selfCycle
++	if got := skKeyWithoutUP(selfCycle); got != selfCycle {
++		t.Error("self-referential *Certificate: expected the original pointer back")
++	}
++}
++
++func TestNoTouchAllowed(t *testing.T) {
++	ecKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sk := &skECDSAPublicKey{PublicKey: ecKey.PublicKey}
++	certNoExt := &Certificate{Key: sk}
++	certOptOut := &Certificate{
++		Key:         sk,
++		Permissions: Permissions{Extensions: map[string]string{"no-touch-required": ""}},
++	}
++	// Non-empty value: OpenSSH writes "" but any value must be accepted
++	// because the check is presence-only.
++	certOptOutNonEmpty := &Certificate{
++		Key:         sk,
++		Permissions: Permissions{Extensions: map[string]string{"no-touch-required": "yes"}},
++	}
++	// no-touch-required belongs in Extensions, never CriticalOptions.
++	// Putting it in CriticalOptions must NOT be treated as opt-out.
++	certCritOnly := &Certificate{
++		Key:         sk,
++		Permissions: Permissions{CriticalOptions: map[string]string{"no-touch-required": ""}},
++	}
++
++	permsEmpty := &Permissions{}
++	permsOptOut := &Permissions{Extensions: map[string]string{"no-touch-required": ""}}
++	permsCritOnly := &Permissions{CriticalOptions: map[string]string{"no-touch-required": ""}}
++
++	cases := []struct {
++		name  string
++		pub   PublicKey
++		perms *Permissions
++		want  bool
++	}{
++		{"nil perms, no cert", sk, nil, false},
++		{"empty perms, no cert", sk, permsEmpty, false},
++		{"perms opt-out, raw key", sk, permsOptOut, true},
++		{"nil perms, cert opt-out", certOptOut, nil, true},
++		{"nil perms, cert opt-out non-empty value", certOptOutNonEmpty, nil, true},
++		{"nil perms, cert no ext", certNoExt, nil, false},
++		{"perms opt-out, cert no ext", certNoExt, permsOptOut, true},
++		{"empty perms, cert opt-out", certOptOut, permsEmpty, true},
++		// Negative controls: CriticalOptions must not waive UP.
++		{"critical-options only, raw key", sk, permsCritOnly, false},
++		{"critical-options only, cert", certCritOnly, nil, false},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := noTouchAllowed(tc.pub, tc.perms); got != tc.want {
++				t.Errorf("noTouchAllowed = %v, want %v", got, tc.want)
++			}
++		})
++	}
++}
++
++func TestSKUserPresenceEd25519(t *testing.T) {
++	pub, priv, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	h := skTestHarness{
++		format:      "sk-ssh-ed25519@openssh.com",
++		application: "ssh:",
++		data:        []byte("test data"),
++		signBlob: func(blob []byte) []byte {
++			return ed25519.Sign(priv, blob)
++		},
++	}
++
++	pk := &skEd25519PublicKey{
++		application: h.application,
++		PublicKey:   pub,
++	}
++
++	if err := pk.Verify(h.data, h.sign(t, flagUserPresence)); err != nil {
++		t.Errorf("Verify failed with UP=1: %v", err)
++	}
++	sigNoUP := h.sign(t, 0)
++	if err := pk.Verify(h.data, sigNoUP); !errors.Is(err, errSKMissingUserPresence) {
++		t.Errorf("expected errSKMissingUserPresence, got: %v", err)
++	}
++	pk.noTouchRequired = true
++	if err := pk.Verify(h.data, sigNoUP); err != nil {
++		t.Errorf("Verify with noTouchRequired failed: %v", err)
++	}
++}
++
+ func TestNewSignerWithAlgos(t *testing.T) {
+ 	algorithSigner, ok := testSigners["rsa"].(AlgorithmSigner)
+ 	if !ok {
+--- a/ssh/server_test.go
++++ b/ssh/server_test.go
+@@ -6,9 +6,14 @@ package ssh
+ 
+ import (
+ 	"bytes"
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/sha256"
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"math/big"
+ 	"net"
+ 	"reflect"
+ 	"strings"
+@@ -904,3 +909,126 @@ func (*markerConn) RemoteAddr() net.Addr { return nil }
+ func (*markerConn) SetDeadline(t time.Time) error      { return nil }
+ func (*markerConn) SetReadDeadline(t time.Time) error  { return nil }
+ func (*markerConn) SetWriteDeadline(t time.Time) error { return nil }
++
++// skTestSigner is a Signer that produces SK-ECDSA signatures over
++// user-auth data, simulating a FIDO/U2F authenticator. The flags
++// byte (UP and other bits) is caller-controlled so tests can exercise
++// the server's user-presence enforcement and its opt-out paths. This
++// is test-only: the real Signer is hardware-backed.
++type skTestSigner struct {
++	priv        *ecdsa.PrivateKey
++	pub         PublicKey
++	flags       byte
++	application string
++}
++
++func (s *skTestSigner) PublicKey() PublicKey { return s.pub }
++
++func (s *skTestSigner) Sign(r io.Reader, data []byte) (*Signature, error) {
++	h := sha256.New()
++	h.Write([]byte(s.application))
++	appDigest := h.Sum(nil)
++	h.Reset()
++	h.Write(data)
++	dataDigest := h.Sum(nil)
++	var counter uint32 = 1
++	blob := struct {
++		ApplicationDigest []byte `ssh:"rest"`
++		Flags             byte
++		Counter           uint32
++		MessageDigest     []byte `ssh:"rest"`
++	}{appDigest, s.flags, counter, dataDigest}
++	h.Reset()
++	h.Write(Marshal(blob))
++	digest := h.Sum(nil)
++	x, y, err := ecdsa.Sign(r, s.priv, digest)
++	if err != nil {
++		return nil, err
++	}
++	return &Signature{
++		Format: KeyAlgoSKECDSA256,
++		Blob:   Marshal(struct{ R, S *big.Int }{x, y}),
++		Rest: Marshal(struct {
++			Flags   byte
++			Counter uint32
++		}{s.flags, counter}),
++	}, nil
++}
++
++// TestServerAuthSKUserPresence drives the full userAuthLoop with an SK
++// public-key client and verifies the server's wiring of the UP check
++// and its two opt-out paths: the per-key Permissions.Extensions route
++// and (via cert) the cert-level route. It also confirms that non-SK
++// clients are unaffected by the new code path.
++func TestServerAuthSKUserPresence(t *testing.T) {
++	userKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	skPub := &skECDSAPublicKey{application: "ssh:", PublicKey: userKey.PublicKey}
++
++	runAuth := func(t *testing.T, signer Signer, perms *Permissions) error {
++		t.Helper()
++		c1, c2, err := netPipe()
++		if err != nil {
++			t.Fatal(err)
++		}
++		defer c1.Close()
++		defer c2.Close()
++
++		serverConf := &ServerConfig{
++			PublicKeyCallback: func(ConnMetadata, PublicKey) (*Permissions, error) {
++				return perms, nil
++			},
++		}
++		serverConf.AddHostKey(testSigners["ecdsa"])
++
++		serverErr := make(chan error, 1)
++		go func() {
++			_, _, _, err := NewServerConn(c1, serverConf)
++			serverErr <- err
++		}()
++
++		clientConf := &ClientConfig{
++			User:            "user",
++			Auth:            []AuthMethod{PublicKeys(signer)},
++			HostKeyCallback: InsecureIgnoreHostKey(),
++		}
++		_, _, _, clientErr := NewClientConn(c2, "", clientConf)
++		<-serverErr
++		return clientErr
++	}
++
++	optOut := &Permissions{Extensions: map[string]string{noTouchRequiredExtension: ""}}
++
++	t.Run("UP=1, default perms accepts", func(t *testing.T) {
++		s := &skTestSigner{priv: userKey, pub: skPub, flags: flagUserPresence, application: "ssh:"}
++		if err := runAuth(t, s, nil); err != nil {
++			t.Errorf("expected auth to succeed: %v", err)
++		}
++	})
++	t.Run("UP=0, default perms rejects", func(t *testing.T) {
++		s := &skTestSigner{priv: userKey, pub: skPub, flags: 0, application: "ssh:"}
++		if err := runAuth(t, s, nil); err == nil {
++			t.Error("expected auth to fail with UP=0")
++		}
++	})
++	t.Run("UP=0, perms opt-out accepts", func(t *testing.T) {
++		s := &skTestSigner{priv: userKey, pub: skPub, flags: 0, application: "ssh:"}
++		if err := runAuth(t, s, optOut); err != nil {
++			t.Errorf("expected auth to succeed with opt-out: %v", err)
++		}
++	})
++	t.Run("UP=0, perms CriticalOptions does NOT opt out", func(t *testing.T) {
++		s := &skTestSigner{priv: userKey, pub: skPub, flags: 0, application: "ssh:"}
++		critOnly := &Permissions{CriticalOptions: map[string]string{noTouchRequiredExtension: ""}}
++		if err := runAuth(t, s, critOnly); err == nil {
++			t.Error("no-touch-required in CriticalOptions must not waive UP")
++		}
++	})
++	t.Run("non-SK RSA signer unaffected", func(t *testing.T) {
++		if err := runAuth(t, testSigners["rsa"], nil); err != nil {
++			t.Errorf("plain RSA auth must still work: %v", err)
++		}
++	})
++}
+--- a/ssh/server.go
++++ b/ssh/server.go
+@@ -36,11 +36,16 @@ type Permissions struct {
+ 
+-	// Extensions are extra functionality that the server may
+-	// offer on authenticated connections. Lack of support for an
+-	// extension does not preclude authenticating a user. Common
+-	// extensions are "permit-agent-forwarding",
+-	// "permit-X11-forwarding". The Go SSH library currently does
+-	// not act on any extension, and it is up to server
+-	// implementations to honor them. Extensions can be used to
+-	// pass data from the authentication callbacks to the server
+-	// application layer.
++	// Extensions are extra functionality that the server may offer on
++	// authenticated connections. Lack of support for an extension does not
++	// preclude authenticating a user. Common extensions are
++	// "permit-agent-forwarding", "permit-X11-forwarding". In general the Go
++	// SSH library does not act on extensions and it is up to server
++	// implementations to honor them; extensions can also be used to pass data
++	// from the authentication callbacks to the server application layer.
++	//
++	// The one extension acted upon by this library is "no-touch-required",
++	// which applies only to security-key public keys
++	// (sk-ecdsa-sha2-nistp256@openssh.com and sk-ssh-ed25519@openssh.com).
++	// When present, it waives the default requirement that SK signatures
++	// assert user presence (i.e. a physical touch of the authenticator)
++	// during signature verification.
+ 	Extensions map[string]string
+@@ -86,2 +91,75 @@ type ServerPreAuthConn interface {
+ 
++// noTouchRequiredExtension is the extension name used by OpenSSH in
++// authorized_keys options and certificate extensions to mark keys
++// whose signatures do not need to assert user presence (touch). See
++// ssh-keygen(1) and sshd(8).
++const noTouchRequiredExtension = "no-touch-required"
++
++// noTouchAllowed reports whether the user presence requirement on
++// SK signatures should be waived for this authentication attempt. The
++// requirement is waived when the "no-touch-required" extension is
++// present either in the Permissions returned by the auth callback
++// (authorized_keys-level opt-out) or in the certificate's own
++// Extensions (CA-level opt-out), matching OpenSSH behavior. OpenSSH
++// reads the per-key opt-out only from cert Extensions and
++// authorized_keys options (never from CriticalOptions); we follow the
++// same rule.
++func noTouchAllowed(pubKey PublicKey, perms *Permissions) bool {
++	if perms != nil {
++		if _, ok := perms.Extensions[noTouchRequiredExtension]; ok {
++			return true
++		}
++	}
++	if cert, ok := pubKey.(*Certificate); ok {
++		if _, ok := cert.Extensions[noTouchRequiredExtension]; ok {
++			return true
++		}
++	}
++	return false
++}
++
++// skKeyWithoutUP returns a PublicKey equivalent to pubKey but whose
++// Verify accepts SK signatures with the user-presence flag clear. If
++// pubKey is not (and does not wrap) an SK key, pubKey is returned
++// unchanged. The returned value never mutates pubKey: for SK keys a
++// shallow copy is made so that the noTouchRequired flag is set only on
++// the clone.
++//
++// The implementation is iterative rather than recursive. When pubKey
++// is a *Certificate we unwrap exactly one level to look at the inner
++// key. The SSH cert format forbids Certificate.Key from being another
++// Certificate (parseCert rejects it), but nothing stops callers from
++// constructing such a value directly in Go; a recursive descent could
++// otherwise be driven to unbounded depth by a hand-crafted or cyclic
++// Certificate. A malformed input of that shape simply returns
++// unchanged here.
++func skKeyWithoutUP(pubKey PublicKey) PublicKey {
++	cert, isCert := pubKey.(*Certificate)
++	target := pubKey
++	if isCert {
++		target = cert.Key
++	}
++	var cloned PublicKey
++	switch k := target.(type) {
++	case *skECDSAPublicKey:
++		c := *k
++		c.noTouchRequired = true
++		cloned = &c
++	case *skEd25519PublicKey:
++		c := *k
++		c.noTouchRequired = true
++		cloned = &c
++	default:
++		// Not an SK key (or a pathological *Certificate wrapping
++		// another *Certificate): pubKey is already usable for Verify.
++		return pubKey
++	}
++	if !isCert {
++		return cloned
++	}
++	c := *cert
++	c.Key = cloned
++	return &c
++}
++
+ // ServerConfig holds server specific configuration data.
+@@ -741,4 +819,11 @@ userAuthLoop:
+ 				signedData := buildDataSignedForAuth(sessionID, userAuthReq, algo, pubKeyData)
+-
+-				if err := pubKey.Verify(signedData, sig); err != nil {
++				// pubKey is reused below for VerifiedPublicKeyCallback and
++				// must remain the key as presented by the client; derive a
++				// separate value for Verify that carries any applicable
++				// no-touch-required opt-out.
++				pubKeyForVerify := pubKey
++				if noTouchAllowed(pubKey, candidate.perms) {
++					pubKeyForVerify = skKeyWithoutUP(pubKey)
++				}
++				if err := pubKeyForVerify.Verify(signedData, sig); err != nil {
+ 					return nil, err
+
+--- a/ssh/agent/client.go
++++ b/ssh/agent/client.go
+@@ -663,6 +663,13 @@ func (c *client) Add(key AddedKey) error {
+ 		constraints = append(constraints, agentConstrainConfirm)
+ 	}
+ 
++	for _, ext := range key.ConstraintExtensions {
++		constraints = append(constraints, ssh.Marshal(constrainExtensionAgentMsg{
++			ExtensionName:    ext.ExtensionName,
++			ExtensionDetails: ext.ExtensionDetails,
++		})...)
++	}
++
+ 	cert := key.Certificate
+ 	if cert == nil {
+ 		return c.insertKey(key.PrivateKey, key.Comment, constraints)
+--- a/ssh/agent/client_test.go
++++ b/ssh/agent/client_test.go
+@@ -594,3 +594,63 @@ func TestAgentExtensions(t *testing.T) {
+ 		t.Fatal("should have gotten agent extension failure")
+ 	}
+ }
++
++// capturingAgent records the AddedKey observed on the server side of the
++// agent protocol. It forwards to a keyring with constraint fields stripped,
++// so the keyring's own rejection of unsupported constraints does not
++// interfere with what this test is measuring: the client-side wire
++// serialization of ConstraintExtensions.
++type capturingAgent struct {
++	Agent
++	lastAdd AddedKey
++}
++
++func newCapturingAgent() *capturingAgent {
++	return &capturingAgent{Agent: NewKeyring()}
++}
++
++func (a *capturingAgent) Add(key AddedKey) error {
++	a.lastAdd = key
++	stripped := key
++	stripped.ConstraintExtensions = nil
++	stripped.ConfirmBeforeUse = false
++	return a.Agent.Add(stripped)
++}
++
++// TestAddConstraintExtensionsWireFormat verifies that client.Add serializes
++// ConstraintExtensions into the SSH_AGENTC_ADD_IDENTITY payload and the
++// server deserializes them back into the AddedKey delivered to the backend.
++// Regressions in the client marshal loop (missing, swapped fields, wrong
++// framing) would be invisible to a keyring-based rejection test, which
++// signals only "extensions were present", not "the right ones arrived".
++func TestAddConstraintExtensionsWireFormat(t *testing.T) {
++	capturing := newCapturingAgent()
++	client, cleanup := startAgent(t, capturing)
++	defer cleanup()
++
++	constraints := []ConstraintExtension{
++		{ExtensionName: "ext-one@example.com", ExtensionDetails: []byte("details-one")},
++		{ExtensionName: "ext-two@example.com", ExtensionDetails: []byte("\x00\x01\x02\xff")},
++	}
++
++	if err := client.Add(AddedKey{
++		PrivateKey:           testPrivateKeys["rsa"],
++		Comment:              "wire-format-test",
++		ConstraintExtensions: constraints,
++	}); err != nil {
++		t.Fatalf("client.Add: %v", err)
++	}
++
++	got := capturing.lastAdd.ConstraintExtensions
++	if len(got) != len(constraints) {
++		t.Fatalf("server received %d extensions, want %d", len(got), len(constraints))
++	}
++	for i, want := range constraints {
++		if got[i].ExtensionName != want.ExtensionName {
++			t.Errorf("extension[%d] name: got %q, want %q", i, got[i].ExtensionName, want.ExtensionName)
++		}
++		if !bytes.Equal(got[i].ExtensionDetails, want.ExtensionDetails) {
++			t.Errorf("extension[%d] details: got %x, want %x", i, got[i].ExtensionDetails, want.ExtensionDetails)
++		}
++	}
++}
+--- a/ssh/agent/keyring.go
++++ b/ssh/agent/keyring.go
+@@ -143,15 +143,21 @@ func (r *keyring) List() ([]*Key, error) {
+ 	return ids, nil
+ }
+ 
+-// Insert adds a private key to the keyring. If a certificate
+-// is given, that certificate is added as public key. Note that
+-// any constraints given are ignored.
++// Add adds a private key to the keyring. If a certificate is given, that
++// certificate is added as public key.
++//
++// Add returns an error if key contains ConstraintExtensions.
+ func (r *keyring) Add(key AddedKey) error {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+ 	if r.locked {
+ 		return errLocked
+ 	}
++
++	if len(key.ConstraintExtensions) > 0 {
++		return errors.New("agent: constraint extensions are present but not supported")
++	}
++
+ 	signer, err := ssh.NewSignerFromKey(key.PrivateKey)
+ 
+ 	if err != nil {
+--- a/ssh/agent/keyring_test.go
++++ b/ssh/agent/keyring_test.go
+@@ -120,3 +120,27 @@ func TestAddDuplicateKey(t *testing.T) {
+ 		t.Fatal("key with the updated comment not found")
+ 	}
+ }
++
++func TestAddKeyWithConstraints(t *testing.T) {
++	// Verifies the keyring refuses keys carrying constraint extensions it
++	// cannot enforce.
++	agent, cleanup := startKeyringAgent(t)
++	defer cleanup()
++
++	constraints := []ConstraintExtension{
++		{
++			ExtensionName:    "extension1",
++			ExtensionDetails: []byte("details1"),
++		},
++	}
++
++	key := testPrivateKeys["rsa"]
++
++	err := agent.Add(AddedKey{
++		PrivateKey:           key,
++		ConstraintExtensions: constraints,
++	})
++	if err == nil {
++		t.Fatal("adding a key with unsupported constraints succeeded")
++	}
++}
+
+--- a/ssh/agent/keyring.go
++++ b/ssh/agent/keyring.go
+@@ -146,7 +146,7 @@
+ // Add adds a private key to the keyring. If a certificate is given, that
+ // certificate is added as public key.
+ //
+-// Add returns an error if key contains ConstraintExtensions.
++// Add returns an error if key contains ConstraintExtensions or ConfirmBeforeUse.
+ func (r *keyring) Add(key AddedKey) error {
+ 	r.mu.Lock()
+ 	defer r.mu.Unlock()
+@@ -157,6 +157,9 @@
+ 	if len(key.ConstraintExtensions) > 0 {
+ 		return errors.New("agent: constraint extensions are present but not supported")
+ 	}
++	if key.ConfirmBeforeUse {
++		return errors.New("agent: confirm before use constraint is not supported")
++	}
+ 
+ 	signer, err := ssh.NewSignerFromKey(key.PrivateKey)
+ 
+--- a/ssh/agent/keyring_test.go
++++ b/ssh/agent/keyring_test.go
+@@ -144,3 +144,18 @@
+ 		t.Fatal("adding a key with unsupported constraints succeeded")
+ 	}
+ }
++
++func TestAddKeyWithConfirmBeforeUse(t *testing.T) {
++	agent, cleanup := startKeyringAgent(t)
++	defer cleanup()
++
++	key := testPrivateKeys["rsa"]
++
++	err := agent.Add(AddedKey{
++		PrivateKey:       key,
++		ConfirmBeforeUse: true,
++	})
++	if err == nil {
++		t.Fatal("adding a key with confirm before use constraint succeeded")
++	}
++}
+--- a/ssh/test/agent_unix_test.go
++++ b/ssh/test/agent_unix_test.go
+@@ -24,9 +24,8 @@
+ 		t.Fatalf("Error adding key: %s", err)
+ 	}
+ 	if err := keyring.Add(agent.AddedKey{
+-		PrivateKey:       testPrivateKeys["ecdsa"],
+-		ConfirmBeforeUse: true,
+-		LifetimeSecs:     3600,
++		PrivateKey:   testPrivateKeys["ecdsa"],
++		LifetimeSecs: 3600,
+ 	}); err != nil {
+ 		t.Fatalf("Error adding key with constraints: %s", err)
+ 	}
+
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -131,11 +131,17 @@ func (r RejectionReason) String() string {
+ 	return fmt.Sprintf("unknown reason %d", int(r))
+ }
+ 
+-func min(a uint32, b int) uint32 {
+-	if a < uint32(b) {
+-		return a
++// minPayloadSize returns min(limit, length) clamped to a uint32. It is used
++// to compute the size of the next channel data packet from the remaining
++// payload. The comparison is done in int64 because length is an int — on
++// 64-bit systems len(data) can exceed 2^32, and a direct uint32(length)
++// cast would silently truncate to 0 at every multiple of 2^32, causing
++// WriteExtended's loop to spin without making progress.
++func minPayloadSize(limit uint32, length int) uint32 {
++	if int64(length) > int64(limit) {
++		return limit
+ 	}
+-	return uint32(b)
++	return uint32(length)
+ }
+ 
+ type channelDirection uint8
+@@ -251,7 +257,7 @@ func (ch *channel) WriteExtended(data []byte, extendedCode uint32) (n int, err e
+ 	ch.writeMu.Unlock()
+ 
+ 	for len(data) > 0 {
+-		space := min(ch.maxRemotePayload, len(data))
++		space := minPayloadSize(ch.maxRemotePayload, len(data))
+ 		if space, err = ch.remoteWin.reserve(space); err != nil {
+ 			return n, err
+ 		}
+--- /dev/null
++++ b/ssh/channel_test.go
+@@ -0,0 +1,140 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ssh
++
++import (
++	"math/bits"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++func TestMinPayloadSize(t *testing.T) {
++	// 4 GiB (2^32). Declared as a var (not a const) so that int(bigPayload)
++	// is a runtime conversion: a constant conversion would fail to compile
++	// on 32-bit platforms with "constant 4294967296 overflows int". On
++	// 32-bit the value truncates to 0 at runtime, but the is64Bit cases
++	// that reference it are skipped by the runtime check below.
++	var bigPayload int64 = 1 << 32
++
++	tests := []struct {
++		name       string
++		maxPayload uint32
++		dataLen    int
++		want       uint32
++		is64Bit    bool // Flag to run only on 64-bit architectures
++	}{
++		{
++			name:       "Normal Case - Data fits in payload",
++			maxPayload: 32768,
++			dataLen:    1000,
++			want:       1000,
++		},
++		{
++			name:       "Normal Case - Data larger than payload",
++			maxPayload: 32768,
++			dataLen:    50000,
++			want:       32768,
++		},
++		{
++			name:       "Boundary Case - Data zero",
++			maxPayload: 32768,
++			dataLen:    0,
++			want:       0,
++		},
++		{
++			name:       "Overflow Case - Data is exactly 4GB (1<<32)",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload),
++			want:       32768,
++			is64Bit:    true,
++		},
++		{
++			name:       "Overflow Case - Data is 4GB + small amount",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload + 100),
++			want:       32768,
++			is64Bit:    true,
++		},
++	}
++
++	is64Bit := bits.UintSize == 64
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.is64Bit && !is64Bit {
++				t.Skip("Skipping test requiring 64-bit int")
++			}
++			got := minPayloadSize(tt.maxPayload, tt.dataLen)
++			if got != tt.want {
++				t.Errorf("minPayloadSize(%d, %d) = %d; want %d", tt.maxPayload, tt.dataLen, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestWriteExtendedNoInfiniteLoopOnLargeWrite is an end-to-end regression
++// test for the integer-overflow bug in WriteExtended. Before the fix, a
++// write whose len(data) was a multiple of 2^32 caused minPayloadSize to
++// return 0; WriteExtended then spun forever, reserving 0 bytes per
++// iteration and never advancing the data slice.
++//
++// We exercise the real WriteExtended path with a slice whose declared
++// length is exactly 2^32. Allocating 4 GiB is unnecessary: each iteration
++// only reads up to maxRemotePayload bytes from the head of the slice, and
++// the loop blocks in remoteWin.reserve() once the channel window is
++// exhausted — before the slice base advances past the underlying buffer.
++//
++// With the fix, the loop blocks in reserve(); we detect that via
++// waitWriterBlocked(), then close the window to let WriteExtended return.
++// With the bug, the loop never blocks and the test times out.
++//
++//go:nocheckptr
++func TestWriteExtendedNoInfiniteLoopOnLargeWrite(t *testing.T) {
++	if bits.UintSize < 64 {
++		t.Skip("test requires 64-bit int to construct a slice with len >= 2^32")
++	}
++
++	reader, writer, mux := channelPair(t)
++	defer reader.Close()
++	defer writer.Close()
++	defer mux.Close()
++
++	// Sized to hold the full pre-update remote window so that no iteration
++	// reads past the backing buffer before reserve() blocks.
++	backing := make([]byte, channelWindowSize)
++	var bigLen int64 = 1 << 32
++	bigSlice := unsafe.Slice(&backing[0], int(bigLen))
++
++	done := make(chan int, 1)
++	go func() {
++		n, _ := writer.Write(bigSlice)
++		done <- n
++	}()
++
++	blocked := make(chan struct{})
++	go func() {
++		writer.remoteWin.waitWriterBlocked()
++		close(blocked)
++	}()
++
++	select {
++	case <-blocked:
++		// Good — the loop made progress and is now blocked in reserve().
++		// Close the window to let WriteExtended return.
++		writer.remoteWin.close()
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not block in reserve within 2s — minPayloadSize likely returned 0 (integer overflow regression)")
++	}
++
++	select {
++	case n := <-done:
++		if n == 0 {
++			t.Fatalf("WriteExtended returned n=0; expected progress")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not return after closing the window")
++	}
++}
+
+--- a/ssh/certs.go
++++ b/ssh/certs.go
+@@ -342,6 +342,9 @@
+ 	if cert.CertType != HostCert {
+ 		return fmt.Errorf("ssh: certificate presented as a host key has type %d", cert.CertType)
+ 	}
++	if c.IsHostAuthority == nil {
++		return errors.New("ssh: cannot verify certificate, IsHostAuthority not set")
++	}
+ 	if !c.IsHostAuthority(cert.SignatureKey, addr) {
+ 		return fmt.Errorf("ssh: no authorities for hostname: %v", addr)
+ 	}
+@@ -369,6 +372,9 @@
+ 	if cert.CertType != UserCert {
+ 		return nil, fmt.Errorf("ssh: cert has type %d", cert.CertType)
+ 	}
++	if c.IsUserAuthority == nil {
++		return nil, errors.New("ssh: cannot verify certificate, IsUserAuthority not set")
++	}
+ 	if !c.IsUserAuthority(cert.SignatureKey) {
+ 		return nil, fmt.Errorf("ssh: certificate signed by unrecognized authority")
+ 	}
+
+--- a/ssh/knownhosts/knownhosts.go
++++ b/ssh/knownhosts/knownhosts.go
+@@ -160,8 +160,13 @@ func (db *hostKeyDB) IsHostAuthority(remote ssh.PublicKey, address string) bool
+ 
+ // IsRevoked can be used as a callback in ssh.CertChecker
+ func (db *hostKeyDB) IsRevoked(key *ssh.Certificate) bool {
+-	_, ok := db.revoked[string(key.Marshal())]
+-	return ok
++	if _, ok := db.revoked[string(key.Marshal())]; ok {
++		return true
++	}
++	if _, ok := db.revoked[string(key.SignatureKey.Marshal())]; ok {
++		return true
++	}
++	return false
+ }
+ 
+ const markerCert = "@cert-authority"
+--- a/ssh/knownhosts/knownhosts_test.go
++++ b/ssh/knownhosts/knownhosts_test.go
+@@ -6,6 +6,8 @@ package knownhosts
+ 
+ import (
+ 	"bytes"
++	"crypto/ed25519"
++	"crypto/rand"
+ 	"fmt"
+ 	"net"
+ 	"reflect"
+@@ -272,7 +274,45 @@ func TestWildcardMatch(t *testing.T) {
+ 	}
+ }
+ 
+-// TODO(hanwen): test coverage for certificates.
++func TestRevokedCA(t *testing.T) {
++	_, caPriv, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	caSigner, err := ssh.NewSignerFromKey(caPriv)
++	if err != nil {
++		t.Fatal(err)
++	}
++	caKey := caSigner.PublicKey()
++
++	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	hostKey, err := ssh.NewPublicKey(hostPriv.Public())
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	cert := &ssh.Certificate{
++		CertType:        ssh.HostCert,
++		Key:             hostKey,
++		ValidBefore:     ssh.CertTimeInfinity,
++		ValidPrincipals: []string{"server.org"},
++	}
++	if err := cert.SignCert(rand.Reader, caSigner); err != nil {
++		t.Fatal(err)
++	}
++
++	caLine := "ssh-ed25519 " + serialize(caKey)[len("ssh-ed25519 "):]
++	knownHostsData := "@revoked server.org " + caLine + "\n" +
++		"@cert-authority server.org " + caLine + "\n"
++	db := testDB(t, knownHostsData)
++
++	if !db.IsRevoked(cert) {
++		t.Error("IsRevoked returned false for certificate signed by revoked CA")
++	}
++}
+ 
+ const testHostname = "hostname"
+ 
+
+--- a/ssh/server.go
++++ b/ssh/server.go
+@@ -728,6 +728,13 @@
+
+ 				authErr = candidate.result
+ 				perms = candidate.perms
++				if authErr == nil && perms != nil && perms.CriticalOptions != nil {
++					if saco := perms.CriticalOptions[sourceAddressCriticalOption]; saco != "" {
++						if err := checkSourceAddress(s.RemoteAddr(), saco); err != nil {
++							authErr = err
++						}
++					}
++				}
+ 			}
+ 		case "gssapi-with-mic":
+ 			if authConfig.GSSAPIWithMICConfig == nil {
+--- a/ssh/server_test.go
++++ b/ssh/server_test.go
+@@ -66,6 +66,46 @@
+ 		<-done
+ 	}
+ }
++
++// TestPublicKeyCallbackSourceAddress is a backport regression test for
++// CVE-2026-46595. It exercises the post-signature-verification source-address
++// re-check: when PublicKeyCallback returns Permissions whose CriticalOptions
++// contain a "source-address" restriction that does not match the client's
++// remote address, the server must reject the login.
++func TestPublicKeyCallbackSourceAddress(t *testing.T) {
++	c1, c2, err := netPipe()
++	if err != nil {
++		t.Fatalf("netPipe: %v", err)
++	}
++	defer c1.Close()
++	defer c2.Close()
++
++	serverConf := &ServerConfig{
++		PublicKeyCallback: func(conn ConnMetadata, key PublicKey) (*Permissions, error) {
++			return &Permissions{
++				CriticalOptions: map[string]string{
++					sourceAddressCriticalOption: "192.168.99.99",
++				},
++			}, nil
++		},
++	}
++	serverConf.AddHostKey(testSigners["rsa"])
++
++	clientConf := ClientConfig{
++		User: "user",
++		Auth: []AuthMethod{
++			PublicKeys(testSigners["rsa"]),
++		},
++		HostKeyCallback: InsecureIgnoreHostKey(),
++	}
++
++	go NewServerConn(c1, serverConf)
++
++	_, _, _, err = NewClientConn(c2, "", &clientConf)
++	if err == nil {
++		t.Fatal("client login succeeded with mismatching source-address critical option")
++	}
++}
+
+ func TestMaxAuthTriesNoneMethod(t *testing.T) {
+ 	username := "testuser"
+
+--- a/ssh/cipher.go
++++ b/ssh/cipher.go
+@@ -405,7 +405,7 @@ func (c *gcmCipher) readCipherPacket(seqNum uint32, r io.Reader) ([]byte, error)
+ 		return nil, fmt.Errorf("ssh: illegal padding %d", padding)
+ 	}
+ 
+-	if int(padding+1) >= len(plain) {
++	if int(padding)+1 >= len(plain) {
+ 		return nil, fmt.Errorf("ssh: padding %d too large", padding)
+ 	}
+ 	plain = plain[1 : length-uint32(padding)]
+
+--- a/ssh/agent/server.go
++++ b/ssh/agent/server.go
+@@ -267,6 +267,9 @@ func parseEd25519Key(req []byte) (*AddedKey, error) {
+ 	if err := ssh.Unmarshal(req, &k); err != nil {
+ 		return nil, err
+ 	}
++	if len(k.Priv) != ed25519.PrivateKeySize {
++		return nil, fmt.Errorf("agent: bad ED25519 key size: %d", len(k.Priv))
++	}
+ 	priv := ed25519.PrivateKey(k.Priv)
+
+ 	addedKey := &AddedKey{PrivateKey: &priv, Comment: k.Comments}
+@@ -333,6 +336,9 @@ func parseEd25519Cert(req []byte) (*AddedKey, error) {
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if len(k.Priv) != ed25519.PrivateKeySize {
++		return nil, fmt.Errorf("agent: bad ED25519 key size: %d", len(k.Priv))
++	}
+ 	priv := ed25519.PrivateKey(k.Priv)
+ 	cert, ok := pubKey.(*ssh.Certificate)
+ 	if !ok {
+--- a/ssh/agent/server_test.go
++++ b/ssh/agent/server_test.go
+@@ -264,3 +264,35 @@ func TestParseConstraints(t *testing.T) {
+ 		t.Errorf("unexpected error: %v", err)
+ 	}
+ }
++
++func TestParseEd25519KeyShortPanic(t *testing.T) {
++	msg := ssh.Marshal(ed25519KeyMsg{
++		Type: ssh.KeyAlgoED25519,
++		Pub:  []byte{1, 2, 3},
++		Priv: []byte{1, 2, 3, 4, 5},
++	})
++
++	a, b, err := netPipe()
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer a.Close()
++	defer b.Close()
++
++	done := make(chan error, 1)
++	go func() { done <- ServeAgent(NewKeyring(), a) }()
++
++	c := NewClient(b)
++	_, err = c.(*client).call(msg)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	keys, err := c.List()
++	if err != nil {
++		t.Fatalf("agent died: %v", err)
++	}
++	if len(keys) != 0 {
++		t.Error("short ed25519 key was accepted into keyring")
++	}
++}
