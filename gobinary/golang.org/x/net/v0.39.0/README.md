@@ -4,6 +4,7 @@ This patch is based on golang.org/x/net version v0.39.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-25680
 - CVE-2026-25681
 - CVE-2026-27136
 - CVE-2026-33814
