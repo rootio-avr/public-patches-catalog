@@ -638,7 +638,7 @@
 
 --- a/ssh/agent/client.go
 +++ b/ssh/agent/client.go
-@@ -663,6 +663,13 @@ func (c *client) Add(key AddedKey) error {
+@@ -663,6 +663,13 @@
  		constraints = append(constraints, agentConstrainConfirm)
  	}
  
@@ -654,7 +654,7 @@
  		return c.insertKey(key.PrivateKey, key.Comment, constraints)
 --- a/ssh/agent/client_test.go
 +++ b/ssh/agent/client_test.go
-@@ -594,3 +594,63 @@ func TestAgentExtensions(t *testing.T) {
+@@ -594,3 +594,63 @@
  		t.Fatal("should have gotten agent extension failure")
  	}
  }
@@ -720,7 +720,7 @@
 +}
 --- a/ssh/agent/keyring.go
 +++ b/ssh/agent/keyring.go
-@@ -143,15 +143,21 @@ func (r *keyring) List() ([]*Key, error) {
+@@ -143,15 +143,26 @@
  	return ids, nil
  }
  
@@ -730,13 +730,18 @@
 +// Add adds a private key to the keyring. If a certificate is given, that
 +// certificate is added as public key.
 +//
-+// Add returns an error if key contains ConstraintExtensions.
++// Add returns an error if key contains ConstraintExtensions or
++// ConfirmBeforeUse.
  func (r *keyring) Add(key AddedKey) error {
  	r.mu.Lock()
  	defer r.mu.Unlock()
  	if r.locked {
  		return errLocked
  	}
++
++	if key.ConfirmBeforeUse {
++		return errors.New("agent: confirm before use constraint is not supported")
++	}
 +
 +	if len(key.ConstraintExtensions) > 0 {
 +		return errors.New("agent: constraint extensions are present but not supported")
@@ -747,7 +752,7 @@
  	if err != nil {
 --- a/ssh/agent/keyring_test.go
 +++ b/ssh/agent/keyring_test.go
-@@ -120,3 +120,27 @@ func TestAddDuplicateKey(t *testing.T) {
+@@ -120,3 +120,27 @@
  		t.Fatal("key with the updated comment not found")
  	}
  }
@@ -1716,3 +1721,924 @@
  	if !c.IsUserAuthority(cert.SignatureKey) {
  		return nil, fmt.Errorf("ssh: certificate signed by unrecognized authority")
  	}
+
+--- a/ssh/mux.go
++++ b/ssh/mux.go
+@@ -91,9 +91,10 @@
+ 
+ 	incomingChannels chan NewChannel
+ 
+-	globalSentMu     sync.Mutex
+-	globalResponses  chan interface{}
+-	incomingRequests chan *Request
++	globalSentMu      sync.Mutex
++	globalSentPending atomic.Bool
++	globalResponses   chan interface{}
++	incomingRequests  chan *Request
+ 
+ 	errCond *sync.Cond
+ 	err     error
+@@ -141,6 +142,24 @@
+ 	if wantReply {
+ 		m.globalSentMu.Lock()
+ 		defer m.globalSentMu.Unlock()
++
++		// Open the gate so that responses arriving while this request is in
++		// flight are allowed to reach globalResponses. Any response arriving
++		// while no request is pending is dropped by handleGlobalPacket.
++		m.globalSentPending.Store(true)
++		defer m.globalSentPending.Store(false)
++
++		// Drain any spurious responses that may have been buffered. This prevents
++		// a previously buffered unexpected response from being consumed instead
++		// of the actual response for this request.
++	drain:
++		for {
++			select {
++			case <-m.globalResponses:
++			default:
++				break drain
++			}
++		}
+ 	}
+ 
+ 	if err := m.sendMessage(globalRequestMsg{
+@@ -267,7 +286,16 @@
+ 			mux:       m,
+ 		}
+ 	case *globalRequestSuccessMsg, *globalRequestFailureMsg:
+-		m.globalResponses <- msg
++		// Drop responses that arrive when no SendRequest is waiting, to
++		// prevent a malicious peer from staging responses for a future
++		// caller.
++		if !m.globalSentPending.Load() {
++			return nil
++		}
++		select {
++		case m.globalResponses <- msg:
++		default:
++		}
+ 	default:
+ 		panic(fmt.Sprintf("not a global message %#v", msg))
+ 	}
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -11,6 +11,7 @@
+ 	"io"
+ 	"log"
+ 	"sync"
++	"sync/atomic"
+ )
+ 
+ const (
+@@ -177,6 +178,12 @@
+ 	// with WantReply=true outstanding.  This lock is held by a
+ 	// goroutine that has such an outgoing request pending.
+ 	sentRequestMu sync.Mutex
++	// sentRequestPending is set to true while a SendRequest call with
++	// WantReply=true is in flight. handlePacket uses it as a gate: responses
++	// arriving while no request is pending are dropped to prevent a
++	// misbehaving peer from stalling the mux read loop by filling ch.msg
++	// with unsolicited channelRequestSuccess/Failure messages.
++	sentRequestPending atomic.Bool
+ 
+ 	incomingRequests chan *Request
+ 
+@@ -460,6 +467,18 @@
+ 		}
+ 
+ 		ch.incomingRequests <- &req
++	case *channelRequestSuccessMsg, *channelRequestFailureMsg:
++		// Drop responses that arrive when no SendRequest is waiting, to
++		// prevent a malicious peer from filling ch.msg and stalling the
++		// mux read loop. The non-blocking send additionally protects the
++		// loop if a well-behaved caller is slow to read.
++		if !ch.sentRequestPending.Load() {
++			return nil
++		}
++		select {
++		case ch.msg <- msg:
++		default:
++		}
+ 	default:
+ 		ch.msg <- msg
+ 	}
+@@ -586,6 +605,24 @@
+ 	if wantReply {
+ 		ch.sentRequestMu.Lock()
+ 		defer ch.sentRequestMu.Unlock()
++
++		// Open the gate so that responses arriving while this request is in
++		// flight are allowed to reach ch.msg. Responses arriving while no
++		// request is pending are dropped by handlePacket.
++		ch.sentRequestPending.Store(true)
++		defer ch.sentRequestPending.Store(false)
++
++		// Drain any spurious responses that may have been buffered. This
++		// prevents a previously buffered unexpected response from being
++		// consumed instead of the actual response for this request.
++	drain:
++		for {
++			select {
++			case <-ch.msg:
++			default:
++				break drain
++			}
++		}
+ 	}
+ 
+ 	msg := channelRequestMsg{
+--- a/ssh/mux_test.go
++++ b/ssh/mux_test.go
+@@ -837,3 +837,488 @@
+ 		t.Error("transport debug switched on")
+ 	}
+ }
++
++func TestMuxUnexpectedGlobalResponsesDiscarded(t *testing.T) {
++	clientPipe, serverPipe := memPipe()
++	client := newMux(clientPipe)
++	defer serverPipe.Close()
++	defer client.Close()
++
++	done := make(chan error, 1)
++	go func() {
++		// Send multiple unexpected global responses, this should not block the
++		// globalResponses channel.
++		for i := range 5 {
++			err := serverPipe.writePacket(Marshal(globalRequestSuccessMsg{
++				Data: []byte{byte(i)},
++			}))
++			if err != nil {
++				done <- fmt.Errorf("send success msg %d: %w", i, err)
++				return
++			}
++		}
++		for i := range 5 {
++			err := serverPipe.writePacket(Marshal(globalRequestFailureMsg{
++				Data: []byte{byte(i)},
++			}))
++			if err != nil {
++				done <- fmt.Errorf("send failure msg %d: %w", i, err)
++				return
++			}
++		}
++
++		// Now send a global request and wait for the response. This
++		// verifies the mux is still processing packets.
++		err := serverPipe.writePacket(Marshal(globalRequestMsg{
++			Type:      "keepalive@golang.org",
++			WantReply: true,
++			Data:      nil,
++		}))
++		if err != nil {
++			done <- fmt.Errorf("send global request: %w", err)
++			return
++		}
++
++		packet, err := serverPipe.readPacket()
++		if err != nil {
++			done <- fmt.Errorf("read packet: %w", err)
++			return
++		}
++		decoded, err := decode(packet)
++		if err != nil {
++			done <- fmt.Errorf("decode: %w", err)
++			return
++		}
++		switch decoded.(type) {
++		case *globalRequestSuccessMsg, *globalRequestFailureMsg:
++			// Expected response
++		default:
++			done <- fmt.Errorf("unexpected packet type: %T", decoded)
++			return
++		}
++		done <- nil
++	}()
++
++	// Handle the incoming request from the server and reply
++	req, ok := <-client.incomingRequests
++	if !ok {
++		t.Fatal("incomingRequests channel closed unexpectedly")
++	}
++	if req.Type != "keepalive@golang.org" {
++		t.Fatalf("unexpected request type: %s", req.Type)
++	}
++	if err := req.Reply(true, nil); err != nil {
++		t.Fatalf("Reply: %v", err)
++	}
++
++	if err := <-done; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestMuxConcurrentGlobalRequests(t *testing.T) {
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	const numRequests = 50
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for r := range serverMux.incomingRequests {
++			if r.WantReply {
++				replyData := append([]byte("reply:"), r.Payload...)
++				r.Reply(true, replyData)
++			}
++		}
++	}()
++
++	var clientWg sync.WaitGroup
++	clientWg.Add(numRequests)
++
++	errCh := make(chan error, numRequests)
++
++	for i := range numRequests {
++		go func(id int) {
++			defer clientWg.Done()
++
++			payloadStr := fmt.Sprintf("req-%d", id)
++			payload := []byte(payloadStr)
++
++			// This call blocks until the globalSentMu is acquired.
++			// The mutex ensures that even with many concurrent attempts,
++			// the "drain" and "send" logic happens atomically per request.
++			ok, data, err := clientMux.SendRequest("echo", true, payload)
++			if err != nil {
++				errCh <- fmt.Errorf("req %d error: %v", id, err)
++				return
++			}
++			if !ok {
++				errCh <- fmt.Errorf("req %d failed (want success)", id)
++				return
++			}
++
++			expected := "reply:" + payloadStr
++			if string(data) != expected {
++				errCh <- fmt.Errorf("req %d mismatch: got %q, want %q", id, string(data), expected)
++			}
++		}(i)
++	}
++
++	clientWg.Wait()
++	close(errCh)
++
++	for err := range errCh {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	clientMux.Close()
++	<-serverDone
++}
++
++func TestMuxGlobalResponseDroppedWhenIdle(t *testing.T) {
++	clientPipe, serverPipe := memPipe()
++	clientMux := newMux(clientPipe)
++	defer serverPipe.Close()
++	defer clientMux.Close()
++
++	errCh := make(chan error, 1)
++	go func() {
++		// Send a spurious response while no SendRequest is pending.
++		if err := serverPipe.writePacket(Marshal(globalRequestSuccessMsg{
++			Data: []byte("spurious"),
++		})); err != nil {
++			errCh <- fmt.Errorf("send spurious: %w", err)
++			return
++		}
++		// Follow with a global request; once the client observes this on
++		// incomingRequests, the mux loop has necessarily processed (and
++		// dropped) the prior spurious response.
++		if err := serverPipe.writePacket(Marshal(globalRequestMsg{
++			Type:      "sync@example.com",
++			WantReply: false,
++		})); err != nil {
++			errCh <- fmt.Errorf("send sync request: %w", err)
++			return
++		}
++		errCh <- nil
++	}()
++
++	if err := <-errCh; err != nil {
++		t.Fatal(err)
++	}
++
++	req, ok := <-clientMux.incomingRequests
++	if !ok {
++		t.Fatal("incomingRequests closed unexpectedly")
++	}
++	if req.Type != "sync@example.com" {
++		t.Fatalf("unexpected sync request type %q", req.Type)
++	}
++
++	// The spurious response preceded the sync request, so by now the mux
++	// loop has processed it. The pending-gate must have caused it to be
++	// dropped rather than buffered.
++	if n := len(clientMux.globalResponses); n != 0 {
++		t.Fatalf("globalResponses buffer should be empty after idle drop, has %d entries", n)
++	}
++}
++
++func TestMuxStaleResponseDrained(t *testing.T) {
++	// Simulate a stale response sitting in globalResponses (e.g. a response
++	// that slipped in through the pending-gate on a prior SendRequest that
++	// exited without consuming it). The drain step in the next SendRequest
++	// must discard it so the caller receives the correct reply.
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	clientMux.globalResponses <- &globalRequestSuccessMsg{Data: []byte("stale")}
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range serverMux.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, append([]byte("reply:"), req.Payload...))
++			}
++		}
++	}()
++
++	ok, data, err := clientMux.SendRequest("test", true, []byte("hello"))
++	if err != nil {
++		t.Fatalf("request failed: %v", err)
++	}
++	if !ok {
++		t.Fatal("expected success response")
++	}
++	if string(data) != "reply:hello" {
++		t.Fatalf("got %q, want %q (drain did not remove stale response)", data, "reply:hello")
++	}
++
++	clientMux.Close()
++	<-serverDone
++}
++
++func TestMuxGlobalResponseAcceptedWhilePending(t *testing.T) {
++	// Positive control: when a SendRequest is actually pending, the
++	// response must be delivered (the gate is open).
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range serverMux.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, []byte("pong"))
++			}
++		}
++	}()
++
++	ok, data, err := clientMux.SendRequest("ping", true, nil)
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	if !ok || string(data) != "pong" {
++		t.Fatalf("unexpected response: ok=%v data=%q", ok, data)
++	}
++
++	clientMux.Close()
++	<-serverDone
++}
++
++func TestChannelUnexpectedResponsesDiscarded(t *testing.T) {
++	// A malicious peer that spams channelRequestSuccess/Failure messages
++	// for an open, idle channel must not be able to stall the mux read
++	// loop by filling ch.msg. After the flood, the channel must still be
++	// usable: a subsequent legitimate SendRequest receives its reply.
++	clientMux, serverMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	serverRes := make(chan *channel, 1)
++	go func() {
++		newCh, ok := <-serverMux.incomingChannels
++		if !ok {
++			close(serverRes)
++			return
++		}
++		c, _, err := newCh.Accept()
++		if err != nil {
++			close(serverRes)
++			return
++		}
++		serverRes <- c.(*channel)
++	}()
++
++	clientCh, err := clientMux.openChannel("chan", nil)
++	if err != nil {
++		t.Fatalf("openChannel: %v", err)
++	}
++	serverCh := <-serverRes
++	if serverCh == nil {
++		t.Fatal("server did not accept channel")
++	}
++
++	// Spam many unsolicited success/failure responses. More than chanSize
++	// to ensure ch.msg would overflow without the pending-gate.
++	const spam = chanSize * 4
++	done := make(chan error, 1)
++	go func() {
++		for i := range spam {
++			if err := serverCh.ackRequest(i%2 == 0); err != nil {
++				done <- fmt.Errorf("ackRequest %d: %w", i, err)
++				return
++			}
++		}
++		// Echo any legitimate request back.
++		for req := range serverCh.incomingRequests {
++			if req.WantReply {
++				if err := req.Reply(true, append([]byte("reply:"), req.Payload...)); err != nil {
++					done <- fmt.Errorf("reply: %w", err)
++					return
++				}
++			}
++		}
++		done <- nil
++	}()
++
++	// If the flood had wedged the mux loop, this SendRequest would never
++	// receive a reply.
++	ok, err := clientCh.SendRequest("ping", true, []byte("hello"))
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	if !ok {
++		t.Fatal("expected success reply")
++	}
++
++	// Clean up so the server goroutine can exit.
++	clientCh.Close()
++	serverCh.Close()
++	if err := <-done; err != nil {
++		if !errors.Is(err, io.EOF) {
++			t.Fatal(err)
++		}
++	}
++}
++
++func TestChannelConcurrentRequests(t *testing.T) {
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range writer.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, append([]byte("reply:"), req.Payload...))
++			}
++		}
++	}()
++
++	const numRequests = 50
++	var wg sync.WaitGroup
++	wg.Add(numRequests)
++	errCh := make(chan error, numRequests)
++
++	for i := 0; i < numRequests; i++ {
++		go func(id int) {
++			defer wg.Done()
++			payload := []byte(fmt.Sprintf("req-%d", id))
++			ok, err := reader.SendRequest("echo", true, payload)
++			if err != nil {
++				errCh <- fmt.Errorf("req %d: %v", id, err)
++				return
++			}
++			if !ok {
++				errCh <- fmt.Errorf("req %d: expected success", id)
++			}
++		}(i)
++	}
++
++	wg.Wait()
++	close(errCh)
++
++	for err := range errCh {
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	reader.Close()
++	writer.Close()
++	<-serverDone
++}
++
++func TestChannelResponseDroppedWhenIdle(t *testing.T) {
++	// A spurious response arriving while no SendRequest is pending must
++	// be dropped rather than buffered in ch.msg.
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	// Server sends an unsolicited reply, then a request so we can
++	// synchronise: once the client observes the request, the mux loop has
++	// necessarily processed (and dropped) the prior spurious reply.
++	errCh := make(chan error, 1)
++	go func() {
++		if err := writer.ackRequest(true); err != nil {
++			errCh <- err
++			return
++		}
++		if _, err := writer.SendRequest("sync", false, nil); err != nil {
++			errCh <- err
++			return
++		}
++		errCh <- nil
++	}()
++
++	req := <-reader.incomingRequests
++	if req.Type != "sync" {
++		t.Fatalf("unexpected request type %q", req.Type)
++	}
++
++	if n := len(reader.msg); n != 0 {
++		t.Fatalf("ch.msg should be empty after idle drop, has %d entries", n)
++	}
++
++	if err := <-errCh; err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestChannelStaleResponseDrained(t *testing.T) {
++	// Simulate a stale response sitting in ch.msg (e.g. a response that
++	// slipped through the pending-gate on a prior SendRequest that exited
++	// without consuming it). The drain step in the next SendRequest must
++	// discard it so the caller receives the correct reply.
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	reader.msg <- &channelRequestSuccessMsg{PeersID: reader.remoteId}
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range writer.incomingRequests {
++			if req.WantReply {
++				req.Reply(false, append([]byte("nack:"), req.Payload...))
++			}
++		}
++	}()
++
++	ok, err := reader.SendRequest("test", true, []byte("hello"))
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	// If the stale success had been consumed, ok would be true.
++	if ok {
++		t.Fatal("got stale success response; drain did not remove it")
++	}
++
++	reader.Close()
++	writer.Close()
++	<-serverDone
++}
++
++func TestChannelResponseAcceptedWhilePending(t *testing.T) {
++	// Positive control: when a SendRequest is actually pending, the
++	// response must be delivered (the gate is open).
++	writer, reader, mux := channelPair(t)
++	defer writer.Close()
++	defer reader.Close()
++	defer mux.Close()
++
++	serverDone := make(chan struct{})
++	go func() {
++		defer close(serverDone)
++		for req := range writer.incomingRequests {
++			if req.WantReply {
++				req.Reply(true, nil)
++			}
++		}
++	}()
++
++	ok, err := reader.SendRequest("ping", true, nil)
++	if err != nil {
++		t.Fatalf("SendRequest: %v", err)
++	}
++	if !ok {
++		t.Fatal("expected success")
++	}
++
++	reader.Close()
++	writer.Close()
++	<-serverDone
++}
+
+--- a/ssh/agent/keyring.go
++++ b/ssh/agent/keyring.go
+@@ -32,8 +32,10 @@
+ 
+ var errLocked = errors.New("agent: locked")
+ 
+-// NewKeyring returns an Agent that holds keys in memory.  It is safe
+-// for concurrent use by multiple goroutines.
++// NewKeyring returns an Agent that holds keys in memory.  It is safe for
++// concurrent use by multiple goroutines.
++//
++// The returned Agent only supports the "lifetime" constraint.
+ func NewKeyring() Agent {
+ 	return &keyring{}
+ }
+--- a/ssh/agent/keyring_test.go
++++ b/ssh/agent/keyring_test.go
+@@ -144,3 +144,18 @@
+ 		t.Fatal("adding a key with unsupported constraints succeeded")
+ 	}
+ }
++
++func TestAddKeyWithConfirmBeforeUse(t *testing.T) {
++	agent, cleanup := startKeyringAgent(t)
++	defer cleanup()
++
++	key := testPrivateKeys["rsa"]
++
++	err := agent.Add(AddedKey{
++		PrivateKey:       key,
++		ConfirmBeforeUse: true,
++	})
++	if err == nil {
++		t.Fatal("adding a key with confirm before use constraint succeeded")
++	}
++}
+--- a/ssh/test/agent_unix_test.go
++++ b/ssh/test/agent_unix_test.go
+@@ -24,9 +24,8 @@
+ 		t.Fatalf("Error adding key: %s", err)
+ 	}
+ 	if err := keyring.Add(agent.AddedKey{
+-		PrivateKey:       testPrivateKeys["ecdsa"],
+-		ConfirmBeforeUse: true,
+-		LifetimeSecs:     3600,
++		PrivateKey:   testPrivateKeys["ecdsa"],
++		LifetimeSecs: 3600,
+ 	}); err != nil {
+ 		t.Fatalf("Error adding key with constraints: %s", err)
+ 	}
+
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -131,11 +131,17 @@ func (r RejectionReason) String() string {
+ 	return fmt.Sprintf("unknown reason %d", int(r))
+ }
+ 
+-func min(a uint32, b int) uint32 {
+-	if a < uint32(b) {
+-		return a
++// minPayloadSize returns min(limit, length) clamped to a uint32. It is used
++// to compute the size of the next channel data packet from the remaining
++// payload. The comparison is done in int64 because length is an int — on
++// 64-bit systems len(data) can exceed 2^32, and a direct uint32(length)
++// cast would silently truncate to 0 at every multiple of 2^32, causing
++// WriteExtended's loop to spin without making progress.
++func minPayloadSize(limit uint32, length int) uint32 {
++	if int64(length) > int64(limit) {
++		return limit
+ 	}
+-	return uint32(b)
++	return uint32(length)
+ }
+ 
+ type channelDirection uint8
+@@ -251,7 +257,7 @@ func (ch *channel) WriteExtended(data []byte, extendedCode uint32) (n int, err e
+ 	ch.writeMu.Unlock()
+ 
+ 	for len(data) > 0 {
+-		space := min(ch.maxRemotePayload, len(data))
++		space := minPayloadSize(ch.maxRemotePayload, len(data))
+ 		if space, err = ch.remoteWin.reserve(space); err != nil {
+ 			return n, err
+ 		}
+--- /dev/null
++++ b/ssh/channel_test.go
+@@ -0,0 +1,140 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ssh
++
++import (
++	"math/bits"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++func TestMinPayloadSize(t *testing.T) {
++	// 4 GiB (2^32). Declared as a var (not a const) so that int(bigPayload)
++	// is a runtime conversion: a constant conversion would fail to compile
++	// on 32-bit platforms with "constant 4294967296 overflows int". On
++	// 32-bit the value truncates to 0 at runtime, but the is64Bit cases
++	// that reference it are skipped by the runtime check below.
++	var bigPayload int64 = 1 << 32
++
++	tests := []struct {
++		name       string
++		maxPayload uint32
++		dataLen    int
++		want       uint32
++		is64Bit    bool // Flag to run only on 64-bit architectures
++	}{
++		{
++			name:       "Normal Case - Data fits in payload",
++			maxPayload: 32768,
++			dataLen:    1000,
++			want:       1000,
++		},
++		{
++			name:       "Normal Case - Data larger than payload",
++			maxPayload: 32768,
++			dataLen:    50000,
++			want:       32768,
++		},
++		{
++			name:       "Boundary Case - Data zero",
++			maxPayload: 32768,
++			dataLen:    0,
++			want:       0,
++		},
++		{
++			name:       "Overflow Case - Data is exactly 4GB (1<<32)",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload),
++			want:       32768,
++			is64Bit:    true,
++		},
++		{
++			name:       "Overflow Case - Data is 4GB + small amount",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload + 100),
++			want:       32768,
++			is64Bit:    true,
++		},
++	}
++
++	is64Bit := bits.UintSize == 64
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.is64Bit && !is64Bit {
++				t.Skip("Skipping test requiring 64-bit int")
++			}
++			got := minPayloadSize(tt.maxPayload, tt.dataLen)
++			if got != tt.want {
++				t.Errorf("minPayloadSize(%d, %d) = %d; want %d", tt.maxPayload, tt.dataLen, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestWriteExtendedNoInfiniteLoopOnLargeWrite is an end-to-end regression
++// test for the integer-overflow bug in WriteExtended. Before the fix, a
++// write whose len(data) was a multiple of 2^32 caused minPayloadSize to
++// return 0; WriteExtended then spun forever, reserving 0 bytes per
++// iteration and never advancing the data slice.
++//
++// We exercise the real WriteExtended path with a slice whose declared
++// length is exactly 2^32. Allocating 4 GiB is unnecessary: each iteration
++// only reads up to maxRemotePayload bytes from the head of the slice, and
++// the loop blocks in remoteWin.reserve() once the channel window is
++// exhausted — before the slice base advances past the underlying buffer.
++//
++// With the fix, the loop blocks in reserve(); we detect that via
++// waitWriterBlocked(), then close the window to let WriteExtended return.
++// With the bug, the loop never blocks and the test times out.
++//
++//go:nocheckptr
++func TestWriteExtendedNoInfiniteLoopOnLargeWrite(t *testing.T) {
++	if bits.UintSize < 64 {
++		t.Skip("test requires 64-bit int to construct a slice with len >= 2^32")
++	}
++
++	reader, writer, mux := channelPair(t)
++	defer reader.Close()
++	defer writer.Close()
++	defer mux.Close()
++
++	// Sized to hold the full pre-update remote window so that no iteration
++	// reads past the backing buffer before reserve() blocks.
++	backing := make([]byte, channelWindowSize)
++	var bigLen int64 = 1 << 32
++	bigSlice := unsafe.Slice(&backing[0], int(bigLen))
++
++	done := make(chan int, 1)
++	go func() {
++		n, _ := writer.Write(bigSlice)
++		done <- n
++	}()
++
++	blocked := make(chan struct{})
++	go func() {
++		writer.remoteWin.waitWriterBlocked()
++		close(blocked)
++	}()
++
++	select {
++	case <-blocked:
++		// Good — the loop made progress and is now blocked in reserve().
++		// Close the window to let WriteExtended return.
++		writer.remoteWin.close()
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not block in reserve within 2s — minPayloadSize likely returned 0 (integer overflow regression)")
++	}
++
++	select {
++	case n := <-done:
++		if n == 0 {
++			t.Fatalf("WriteExtended returned n=0; expected progress")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not return after closing the window")
++	}
++}
+
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -530,7 +530,17 @@ func (ch *channel) Reject(reason RejectionReason, message string) error {
+ 		Language: "en",
+ 	}
+ 	ch.decided = true
+-	return ch.sendMessage(reject)
++	err := ch.sendMessage(reject)
++
++	// Remove the channel from the mux to prevent memory leaks.
++	// Do not call ch.close() here: no goroutine holds a reference to a
++	// rejected channel's internal channels (msg, incomingRequests), so
++	// removing it from chanList is sufficient for GC. Calling close()
++	// would race with the mux loop goroutine (handlePacket or dropAll),
++	// causing a panic from closing an already-closed channel.
++	ch.mux.chanList.remove(ch.localId)
++
++	return err
+ }
+ 
+ func (ch *channel) Read(data []byte) (int, error) {
+--- a/ssh/mux_test.go
++++ b/ssh/mux_test.go
+@@ -825,6 +825,50 @@ func TestMuxChannelWindowDeferredUpdates(t *testing.T) {
+ 	}
+ }
+ 
++func TestMuxChannelRejectRemovesFromMux(t *testing.T) {
++	serverMux, clientMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	var wg sync.WaitGroup
++	t.Cleanup(wg.Wait)
++	wg.Add(1)
++
++	go func() {
++		defer wg.Done()
++
++		// The server waits for the channel creation request
++		newCh, ok := <-serverMux.incomingChannels
++		if !ok {
++			t.Error("failed to accept channel")
++			return
++		}
++		ch := newCh.(*channel)
++
++		if serverMux.chanList.getChan(ch.localId) == nil {
++			t.Errorf("channel %d is not in the chanList before Reject", ch.localId)
++		}
++
++		if err := ch.Reject(Prohibited, "rejecting this channel"); err != nil {
++			t.Errorf("Reject failed: %v", err)
++		}
++
++		if serverMux.chanList.getChan(ch.localId) != nil {
++			t.Errorf("channel %d is still in the chanList after Reject", ch.localId)
++		}
++	}()
++
++	_, _, err := clientMux.OpenChannel("test_leak", nil)
++
++	if err == nil {
++		t.Fatal("expected an error (channel rejected), but got nil")
++	}
++
++	if _, ok := err.(*OpenChannelError); !ok {
++		t.Errorf("expected *OpenChannelError, got: %T", err)
++	}
++}
++
+ // Don't ship code with debug=true.
+ func TestDebug(t *testing.T) {
+ 	if debugMux {
