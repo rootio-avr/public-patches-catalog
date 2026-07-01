@@ -4,6 +4,7 @@ This patch is based on org.springframework.boot:spring-boot version 3.5.3, which
 unknown
 
 ## Affected CVEs:
+- CVE-2026-40992
 - CVE-2026-41001
 
 ## How to Apply:
