@@ -99,6 +99,361 @@
  	sessionID := []byte{134, 180, 134, 194, 62, 145, 171, 82, 119, 149, 254, 196, 125, 173, 177, 145, 187, 85, 53,
  		183, 44, 150, 219, 129, 166, 195, 19, 33, 209, 246, 175, 121}
 
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -530,7 +530,17 @@ func (ch *channel) Reject(reason RejectionReason, message string) error {
+ 		Language: "en",
+ 	}
+ 	ch.decided = true
+-	return ch.sendMessage(reject)
++	err := ch.sendMessage(reject)
++
++	// Remove the channel from the mux to prevent memory leaks.
++	// Do not call ch.close() here: no goroutine holds a reference to a
++	// rejected channel's internal channels (msg, incomingRequests), so
++	// removing it from chanList is sufficient for GC. Calling close()
++	// would race with the mux loop goroutine (handlePacket or dropAll),
++	// causing a panic from closing an already-closed channel.
++	ch.mux.chanList.remove(ch.localId)
++
++	return err
+ }
+ 
+ func (ch *channel) Read(data []byte) (int, error) {
+--- a/ssh/mux_test.go
++++ b/ssh/mux_test.go
+@@ -825,6 +825,50 @@ func TestMuxChannelWindowDeferredUpdates(t *testing.T) {
+ 	}
+ }
+ 
++func TestMuxChannelRejectRemovesFromMux(t *testing.T) {
++	serverMux, clientMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++
++	var wg sync.WaitGroup
++	t.Cleanup(wg.Wait)
++	wg.Add(1)
++
++	go func() {
++		defer wg.Done()
++
++		// The server waits for the channel creation request
++		newCh, ok := <-serverMux.incomingChannels
++		if !ok {
++			t.Error("failed to accept channel")
++			return
++		}
++		ch := newCh.(*channel)
++
++		if serverMux.chanList.getChan(ch.localId) == nil {
++			t.Errorf("channel %d is not in the chanList before Reject", ch.localId)
++		}
++
++		if err := ch.Reject(Prohibited, "rejecting this channel"); err != nil {
++			t.Errorf("Reject failed: %v", err)
++		}
++
++		if serverMux.chanList.getChan(ch.localId) != nil {
++			t.Errorf("channel %d is still in the chanList after Reject", ch.localId)
++		}
++	}()
++
++	_, _, err := clientMux.OpenChannel("test_leak", nil)
++
++	if err == nil {
++		t.Fatal("expected an error (channel rejected), but got nil")
++	}
++
++	if _, ok := err.(*OpenChannelError); !ok {
++		t.Errorf("expected *OpenChannelError, got: %T", err)
++	}
++}
++
+ // Don't ship code with debug=true.
+ func TestDebug(t *testing.T) {
+ 	if debugMux {
+
+--- a/ssh/server.go
++++ b/ssh/server.go
+@@ -223,8 +223,10 @@
+ type ServerConn struct {
+ 	Conn
+ 
+-	// If the succeeding authentication callback returned a
+-	// non-nil Permissions pointer, it is stored here.
++	// If the succeeding authentication callback returned a non-nil Permissions
++	// pointer, it is stored here. These are the permissions from the final,
++	// successful authentication method. Permissions returned by callbacks that
++	// return PartialSuccessError are not preserved and must be nil.
+ 	Permissions *Permissions
+ }
+ 
+@@ -796,6 +798,13 @@
+ 		var failureMsg userAuthFailureMsg
+ 
+ 		if partialSuccess, ok := authErr.(*PartialSuccessError); ok {
++			// Permissions are not preserved between authentication steps. To
++			// avoid confusion about the final state of the connection, we
++			// disallow returning non-nil Permissions combined with
++			// PartialSuccessError.
++			if perms != nil {
++				return nil, errors.New("ssh: permissions must be nil when returning PartialSuccessError")
++			}
+ 			// After a partial success error we don't allow changing the user
+ 			// name and execute the NoClientAuthCallback.
+ 			partialSuccessReturned = true
+
+--- a/ssh/agent/keyring.go
++++ b/ssh/agent/keyring.go
+@@ -152,6 +152,11 @@ func (r *keyring) Add(key AddedKey) error {
+ 	if r.locked {
+ 		return errLocked
+ 	}
++
++	if key.ConfirmBeforeUse {
++		return errors.New("agent: confirm before use constraint is not supported")
++	}
++
+ 	signer, err := ssh.NewSignerFromKey(key.PrivateKey)
+ 
+ 	if err != nil {
+--- a/ssh/agent/keyring_test.go
++++ b/ssh/agent/keyring_test.go
+@@ -120,3 +120,18 @@ func TestAddDuplicateKey(t *testing.T) {
+ 		t.Fatal("key with the updated comment not found")
+ 	}
+ }
++
++func TestAddKeyWithConfirmBeforeUse(t *testing.T) {
++	agent, cleanup := startKeyringAgent(t)
++	defer cleanup()
++
++	key := testPrivateKeys["rsa"]
++
++	err := agent.Add(AddedKey{
++		PrivateKey:       key,
++		ConfirmBeforeUse: true,
++	})
++	if err == nil {
++		t.Fatal("adding a key with confirm before use constraint succeeded")
++	}
++}
+--- a/ssh/test/agent_unix_test.go
++++ b/ssh/test/agent_unix_test.go
+@@ -24,9 +24,8 @@ func TestAgentForward(t *testing.T) {
+ 		t.Fatalf("Error adding key: %s", err)
+ 	}
+ 	if err := keyring.Add(agent.AddedKey{
+-		PrivateKey:       testPrivateKeys["ecdsa"],
+-		ConfirmBeforeUse: true,
+-		LifetimeSecs:     3600,
++		PrivateKey:   testPrivateKeys["ecdsa"],
++		LifetimeSecs: 3600,
+ 	}); err != nil {
+ 		t.Fatalf("Error adding key with constraints: %s", err)
+ 	}
+
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -131,11 +131,17 @@ func (r RejectionReason) String() string {
+ 	return fmt.Sprintf("unknown reason %d", int(r))
+ }
+ 
+-func min(a uint32, b int) uint32 {
+-	if a < uint32(b) {
+-		return a
++// minPayloadSize returns min(limit, length) clamped to a uint32. It is used
++// to compute the size of the next channel data packet from the remaining
++// payload. The comparison is done in int64 because length is an int — on
++// 64-bit systems len(data) can exceed 2^32, and a direct uint32(length)
++// cast would silently truncate to 0 at every multiple of 2^32, causing
++// WriteExtended's loop to spin without making progress.
++func minPayloadSize(limit uint32, length int) uint32 {
++	if int64(length) > int64(limit) {
++		return limit
+ 	}
+-	return uint32(b)
++	return uint32(length)
+ }
+ 
+ type channelDirection uint8
+@@ -251,7 +257,7 @@ func (ch *channel) WriteExtended(data []byte, extendedCode uint32) (n int, err e
+ 	ch.writeMu.Unlock()
+ 
+ 	for len(data) > 0 {
+-		space := min(ch.maxRemotePayload, len(data))
++		space := minPayloadSize(ch.maxRemotePayload, len(data))
+ 		if space, err = ch.remoteWin.reserve(space); err != nil {
+ 			return n, err
+ 		}
+--- /dev/null
++++ b/ssh/channel_test.go
+@@ -0,0 +1,140 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ssh
++
++import (
++	"math/bits"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++func TestMinPayloadSize(t *testing.T) {
++	// 4 GiB (2^32). Declared as a var (not a const) so that int(bigPayload)
++	// is a runtime conversion: a constant conversion would fail to compile
++	// on 32-bit platforms with "constant 4294967296 overflows int". On
++	// 32-bit the value truncates to 0 at runtime, but the is64Bit cases
++	// that reference it are skipped by the runtime check below.
++	var bigPayload int64 = 1 << 32
++
++	tests := []struct {
++		name       string
++		maxPayload uint32
++		dataLen    int
++		want       uint32
++		is64Bit    bool // Flag to run only on 64-bit architectures
++	}{
++		{
++			name:       "Normal Case - Data fits in payload",
++			maxPayload: 32768,
++			dataLen:    1000,
++			want:       1000,
++		},
++		{
++			name:       "Normal Case - Data larger than payload",
++			maxPayload: 32768,
++			dataLen:    50000,
++			want:       32768,
++		},
++		{
++			name:       "Boundary Case - Data zero",
++			maxPayload: 32768,
++			dataLen:    0,
++			want:       0,
++		},
++		{
++			name:       "Overflow Case - Data is exactly 4GB (1<<32)",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload),
++			want:       32768,
++			is64Bit:    true,
++		},
++		{
++			name:       "Overflow Case - Data is 4GB + small amount",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload + 100),
++			want:       32768,
++			is64Bit:    true,
++		},
++	}
++
++	is64Bit := bits.UintSize == 64
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.is64Bit && !is64Bit {
++				t.Skip("Skipping test requiring 64-bit int")
++			}
++			got := minPayloadSize(tt.maxPayload, tt.dataLen)
++			if got != tt.want {
++				t.Errorf("minPayloadSize(%d, %d) = %d; want %d", tt.maxPayload, tt.dataLen, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestWriteExtendedNoInfiniteLoopOnLargeWrite is an end-to-end regression
++// test for the integer-overflow bug in WriteExtended. Before the fix, a
++// write whose len(data) was a multiple of 2^32 caused minPayloadSize to
++// return 0; WriteExtended then spun forever, reserving 0 bytes per
++// iteration and never advancing the data slice.
++//
++// We exercise the real WriteExtended path with a slice whose declared
++// length is exactly 2^32. Allocating 4 GiB is unnecessary: each iteration
++// only reads up to maxRemotePayload bytes from the head of the slice, and
++// the loop blocks in remoteWin.reserve() once the channel window is
++// exhausted — before the slice base advances past the underlying buffer.
++//
++// With the fix, the loop blocks in reserve(); we detect that via
++// waitWriterBlocked(), then close the window to let WriteExtended return.
++// With the bug, the loop never blocks and the test times out.
++//
++//go:nocheckptr
++func TestWriteExtendedNoInfiniteLoopOnLargeWrite(t *testing.T) {
++	if bits.UintSize < 64 {
++		t.Skip("test requires 64-bit int to construct a slice with len >= 2^32")
++	}
++
++	reader, writer, mux := channelPair(t)
++	defer reader.Close()
++	defer writer.Close()
++	defer mux.Close()
++
++	// Sized to hold the full pre-update remote window so that no iteration
++	// reads past the backing buffer before reserve() blocks.
++	backing := make([]byte, channelWindowSize)
++	var bigLen int64 = 1 << 32
++	bigSlice := unsafe.Slice(&backing[0], int(bigLen))
++
++	done := make(chan int, 1)
++	go func() {
++		n, _ := writer.Write(bigSlice)
++		done <- n
++	}()
++
++	blocked := make(chan struct{})
++	go func() {
++		writer.remoteWin.waitWriterBlocked()
++		close(blocked)
++	}()
++
++	select {
++	case <-blocked:
++		// Good — the loop made progress and is now blocked in reserve().
++		// Close the window to let WriteExtended return.
++		writer.remoteWin.close()
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not block in reserve within 2s — minPayloadSize likely returned 0 (integer overflow regression)")
++	}
++
++	select {
++	case n := <-done:
++		if n == 0 {
++			t.Fatalf("WriteExtended returned n=0; expected progress")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not return after closing the window")
++	}
++}
+
+--- a/ssh/certs.go
++++ b/ssh/certs.go
+@@ -348,6 +348,9 @@ func (c *CertChecker) CheckHostKey(addr string, remote net.Addr, key PublicKey)
+ 	if cert.CertType != HostCert {
+ 		return fmt.Errorf("ssh: certificate presented as a host key has type %d", cert.CertType)
+ 	}
++	if c.IsHostAuthority == nil {
++		return errors.New("ssh: cannot verify certificate, IsHostAuthority not set")
++	}
+ 	if !c.IsHostAuthority(cert.SignatureKey, addr) {
+ 		return fmt.Errorf("ssh: no authorities for hostname: %v", addr)
+ 	}
+@@ -375,6 +378,9 @@ func (c *CertChecker) Authenticate(conn ConnMetadata, pubKey PublicKey) (*Permis
+ 	if cert.CertType != UserCert {
+ 		return nil, fmt.Errorf("ssh: cert has type %d", cert.CertType)
+ 	}
++	if c.IsUserAuthority == nil {
++		return nil, errors.New("ssh: cannot verify certificate, IsUserAuthority not set")
++	}
+ 	if !c.IsUserAuthority(cert.SignatureKey) {
+ 		return nil, fmt.Errorf("ssh: certificate signed by unrecognized authority")
+ 	}
+
 --- a/ssh/server.go
 +++ b/ssh/server.go
 @@ -773,6 +773,13 @@
@@ -115,3 +470,15 @@
 
  		authErrs = append(authErrs, authErr)
 
+
+--- a/ssh/cipher.go
++++ b/ssh/cipher.go
+@@ -405,7 +405,7 @@ func (c *gcmCipher) readCipherPacket(seqNum uint32, r io.Reader) ([]byte, error)
+ 		return nil, fmt.Errorf("ssh: illegal padding %d", padding)
+ 	}
+ 
+-	if int(padding+1) >= len(plain) {
++	if int(padding)+1 >= len(plain) {
+ 		return nil, fmt.Errorf("ssh: padding %d too large", padding)
+ 	}
+ 	plain = plain[1 : length-uint32(padding)]
