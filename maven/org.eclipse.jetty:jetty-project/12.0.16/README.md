@@ -9,6 +9,7 @@ unknown
 - CVE-2026-1605
 - CVE-2026-2332
 - CVE-2026-5795
+- CVE-2025-11143
 
 ## How to Apply:
 1. Clone or download the source code for org.eclipse.jetty:jetty-project
