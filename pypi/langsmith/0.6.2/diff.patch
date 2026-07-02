@@ -1,0 +1,407 @@
+--- a/langsmith/client.py
++++ b/langsmith/client.py
+@@ -468,6 +468,36 @@
+     return ls_utils.LangSmithRetry(**retry_params)  # type: ignore
+
+
++_SENSITIVE_REDIRECT_HEADERS = frozenset(
++    {"x-api-key", "x-tenant-id", "x-organization-id", "cookie"}
++)
++
++
++def _install_safe_redirect_hook(session: requests.Session) -> None:
++    """Strip sensitive headers on cross-origin redirects.
++
++    `requests` only strips `Authorization` by default; LangSmith also uses
++    `x-api-key` (and workspace/cookie headers) which must not leak to
++    third-party hosts via open redirects.
++    """
++    original_rebuild_auth = session.rebuild_auth
++
++    def rebuild_auth(prepared_request: Any, response: Any) -> None:
++        original_rebuild_auth(prepared_request, response)
++        headers = prepared_request.headers
++        try:
++            original_host = urllib_parse.urlparse(response.request.url).hostname
++            redirect_host = urllib_parse.urlparse(prepared_request.url).hostname
++        except Exception:
++            return
++        if original_host != redirect_host:
++            for header in list(headers.keys()):
++                if header.lower() in _SENSITIVE_REDIRECT_HEADERS:
++                    del headers[header]
++
++    session.rebuild_auth = rebuild_auth  # type: ignore[method-assign]
++
++
+ def close_session(session: requests.Session) -> None:
+     """Close the session.
+
+@@ -881,4 +911,5 @@
+         session_ = session if session else requests.Session()
++        _install_safe_redirect_hook(session_)
+         self.session = session_
+         self._info = (
+             info
+--- a/tests/unit_tests/test_client.py
++++ b/tests/unit_tests/test_client.py
+@@ -4853,1 +4853,55 @@
+                 assert len(tag_post_calls) == 0
++
++
++class TestLangSmithSessionRedirectHeaders:
++    """Tests for stripping sensitive headers on cross-origin redirects."""
++
++    def _make_prepared(self, url: str, headers: dict) -> requests.PreparedRequest:
++        prepared = requests.PreparedRequest()
++        prepared.prepare(method="POST", url=url, headers=headers, data="{}")
++        return prepared
++
++    def _make_response(self, url: str) -> requests.Response:
++        response = requests.Response()
++        response.url = url
++        response.request = requests.PreparedRequest()
++        response.request.prepare(method="POST", url=url, headers={}, data="{}")
++        return response
++
++    def _make_session(self) -> requests.Session:
++        from langsmith.client import _install_safe_redirect_hook
++
++        session = requests.Session()
++        _install_safe_redirect_hook(session)
++        return session
++
++    def test_strips_x_api_key_on_cross_origin_redirect(self) -> None:
++        session = self._make_session()
++        response = self._make_response("https://api.smith.langchain.com/runs")
++        prepared = self._make_prepared(
++            "https://evil.example.com/steal",
++            {"x-api-key": "secret", "X-Tenant-Id": "ws"},
++        )
++        session.rebuild_auth(prepared, response)
++        assert "x-api-key" not in {k.lower() for k in prepared.headers}
++        assert "x-tenant-id" not in {k.lower() for k in prepared.headers}
++
++    def test_preserves_x_api_key_on_same_origin_redirect(self) -> None:
++        session = self._make_session()
++        response = self._make_response("https://api.smith.langchain.com/runs")
++        prepared = self._make_prepared(
++            "https://api.smith.langchain.com/runs/v2",
++            {"x-api-key": "secret"},
++        )
++        session.rebuild_auth(prepared, response)
++        assert prepared.headers.get("x-api-key") == "secret"
++
++    def test_default_session_has_safe_redirect_hook(self) -> None:
++        client = Client(api_url="http://localhost:1984", api_key="test")
++        response = self._make_response("http://localhost:1984/runs")
++        prepared = self._make_prepared(
++            "https://evil.example.com/steal",
++            {"x-api-key": "test"},
++        )
++        client.session.rebuild_auth(prepared, response)
++        assert "x-api-key" not in {k.lower() for k in prepared.headers}
+
+--- a/langsmith/client.py
++++ b/langsmith/client.py
+@@ -248,6 +248,19 @@
+         return False
+ 
+ 
++def _validate_public_prompt_pull(
++    prompt_identifier: str, *, dangerously_pull_public_prompt: bool
++) -> None:
++    owner, _, _ = ls_utils.parse_prompt_identifier(prompt_identifier)
++    if owner != "-" and not dangerously_pull_public_prompt:
++        raise ValueError(
++            "Pulling a public prompt by owner/name is disabled by default because "
++            "prompts may contain untrusted serialized LangChain objects. If you "
++            "trust this prompt, set `dangerously_pull_public_prompt=True` to "
++            "acknowledge the risk."
++        )
++
++
+ def _process_prompt_manifest(
+     prompt_object: Any,
+     *,
+@@ -8165,6 +8178,7 @@
+         *,
+         include_model: Optional[bool] = False,
+         skip_cache: bool = False,
++        dangerously_pull_public_prompt: bool = False,
+     ) -> ls_schemas.PromptCommit:
+         """Pull a prompt object from the LangSmith API.
+ 
+@@ -8173,11 +8187,19 @@
+             include_model (Optional[bool]): Whether to include model information.
+             skip_cache (bool): Whether to skip the prompt cache. Defaults to `False`.
++            dangerously_pull_public_prompt (bool): Set to `True` to allow pulling
++                a public prompt by owner/name (for example, `username/promptname`).
++                Only do this for trusted prompts. Defaults to `False`.
+ 
+         Returns:
+             PromptCommit: The prompt object.
+ 
+         Raises:
+             ValueError: If no commits are found for the prompt.
+         """
++        _validate_public_prompt_pull(
++            prompt_identifier,
++            dangerously_pull_public_prompt=dangerously_pull_public_prompt,
++        )
++
+         # Try cache first if enabled
+         if not skip_cache and self._cache is not None:
+@@ -8261,6 +8283,7 @@
+         secrets: dict[str, str] | None = None,
+         secrets_from_env: bool = False,
+         skip_cache: bool = False,
++        dangerously_pull_public_prompt: bool = False,
+     ) -> Any:
+         """Pull a prompt and return it as a LangChain `PromptTemplate`.
+ 
+@@ -8280,6 +8303,9 @@
+                 **SECURITY NOTE**: Should only be set to `True` when pulling trusted
+                 prompts.
+             skip_cache: Whether to skip the prompt cache. Defaults to `False`.
++            dangerously_pull_public_prompt: Set to `True` to allow pulling a
++                public prompt by owner/name (for example, `username/promptname`).
++                Only do this for trusted prompts. Defaults to `False`.
+ 
+         Returns:
+             Any: The prompt object in the specified format.
+@@ -8304,7 +8330,10 @@
+             langsmith package) depends on.
+         """
+         prompt_object = self.pull_prompt_commit(
+-            prompt_identifier, include_model=include_model, skip_cache=skip_cache
++            prompt_identifier,
++            include_model=include_model,
++            skip_cache=skip_cache,
++            dangerously_pull_public_prompt=dangerously_pull_public_prompt,
+         )
+         return _process_prompt_manifest(
+             prompt_object,
+--- a/langsmith/async_client.py
++++ b/langsmith/async_client.py
+@@ -1691,6 +1691,7 @@
+         *,
+         include_model: Optional[bool] = False,
+         skip_cache: bool = False,
++        dangerously_pull_public_prompt: bool = False,
+     ) -> ls_schemas.PromptCommit:
+         """Pull a prompt object from the LangSmith API.
+ 
+@@ -1700,11 +1701,19 @@
+             skip_cache: Whether to skip the prompt cache.
+ 
+                 Defaults to `False`.
++            dangerously_pull_public_prompt: Set to `True` to allow pulling a
++                public prompt by owner/name (for example, `username/promptname`).
++                Only do this for trusted prompts. Defaults to `False`.
+ 
+         Returns:
+             The prompt object.
+ 
+         Raises:
+             ValueError: If no commits are found for the prompt.
+         """
++        ls_client._validate_public_prompt_pull(
++            prompt_identifier,
++            dangerously_pull_public_prompt=dangerously_pull_public_prompt,
++        )
++
+         # Try cache first if enabled
+@@ -1791,6 +1800,7 @@
+         secrets: dict[str, str] | None = None,
+         secrets_from_env: bool = False,
+         skip_cache: bool = False,
++        dangerously_pull_public_prompt: bool = False,
+     ) -> Any:
+         """Pull a prompt and return it as a LangChain `PromptTemplate`.
+ 
+@@ -1810,6 +1820,9 @@
+                 **SECURITY NOTE**: Should only be set to `True` when pulling trusted
+                 prompts.
+             skip_cache: Whether to skip the prompt cache. Defaults to `False`.
++            dangerously_pull_public_prompt: Set to `True` to allow pulling a
++                public prompt by owner/name (for example, `username/promptname`).
++                Only do this for trusted prompts. Defaults to `False`.
+ 
+         Returns:
+             The prompt object in the specified format.
+@@ -1834,7 +1847,10 @@
+             langsmith package) depends on.
+         """
+         prompt_object = await self.pull_prompt_commit(
+-            prompt_identifier, include_model=include_model, skip_cache=skip_cache
++            prompt_identifier,
++            include_model=include_model,
++            skip_cache=skip_cache,
++            dangerously_pull_public_prompt=dangerously_pull_public_prompt,
+         )
+         return ls_client._process_prompt_manifest(
+             prompt_object,
+
+# GHSA-f4xh-w4cj-qxq8: correct and unify attachment filesystem guard
+#
+# The guard meant to require dangerously_allow_filesystem=True before reading
+# an attachment from disk only matched (tuple, Path). JSON/dict input arrives
+# as list/str, so the check never fired and arbitrary file paths were opened.
+#
+# Replace the three copy-pasted, identically-broken checks in create_run,
+# update_run and multipart_ingest with a single fail-closed helper that keys
+# off the data type (inline bytes vs. anything else), and give a clearer
+# error message that distinguishes a malformed attachment from a
+# filesystem-path attempt.
+#
+# Upstream fix: langchain-ai/langsmith-sdk@9c5515620f9bfa2145fc65d6f4353c4c8a3e96b6
+--- a/langsmith/client.py
++++ b/langsmith/client.py
+@@ -620,6 +620,42 @@
+             pool_kwargs["blocksize"] = self._blocksize
+         return super().init_poolmanager(connections, maxsize, block, **pool_kwargs)
+
++
++def _attachment_references_filesystem(attachment: Any) -> bool:
++    """Return True if an attachment is a filesystem path rather than inline bytes.
++
++    Serialization opens any attachment data that isn't ``bytes`` as a file path
++    (see ``serialized_run_operation_to_multipart_parts_and_context``). Inline data
++    is ``bytes`` or a 2-element ``(content_type, bytes)``; anything else is treated
++    as a filesystem reference (fail closed). Unlike the old ``(tuple, Path)`` guard,
++    this also catches JSON/dict-shaped input (``list``/``str``).
++    """
++    if isinstance(attachment, bytes):
++        return False
++    if isinstance(attachment, (tuple, list)) and len(attachment) == 2:
++        return not isinstance(attachment[1], bytes)
++    return True
++
++
++def _reject_filesystem_attachments(
++    attachments: Optional[dict],
++    dangerously_allow_filesystem: bool,
++) -> None:
++    """Raise unless every attachment is inline data, or filesystem access is opted in.
++
++    Centralizes the guard that previously lived (incorrectly) in three places.
++    See GHSA-f4xh-w4cj-qxq8.
++    """
++    if dangerously_allow_filesystem or not attachments:
++        return
++    for attachment in attachments.values():
++        if _attachment_references_filesystem(attachment):
++            raise ValueError(
++                "Attachments must be inline bytes or a (content_type, bytes) pair. "
++                "To load an attachment from a filesystem path, set "
++                "dangerously_allow_filesystem=True."
++            )
++
+
+ class Client:
+     """Client for interacting with the LangSmith API."""
+@@ -1819,16 +1855,9 @@
+             run_create["extra"]["metadata"]["revision_id"] = revision_id
+         run_create = self._run_transform(run_create, copy=False)
+         self._insert_runtime_env([run_create])
+-        if run_create.get("attachments") is not None:
+-            for attachment in run_create["attachments"].values():
+-                if (
+-                    isinstance(attachment, tuple)
+-                    and isinstance(attachment[1], Path)
+-                    and not dangerously_allow_filesystem
+-                ):
+-                    raise ValueError(
+-                        "Must set dangerously_allow_filesystem=True to allow passing in Paths for attachments."
+-                    )
++        _reject_filesystem_attachments(
++            run_create.get("attachments"), dangerously_allow_filesystem
++        )
+         # If process_buffered_run_ops is enabled, collect run ops in batches
+         # before batching
+         if self._process_buffered_run_ops and not kwargs.get("is_run_ops_buffer_flush"):
+@@ -2525,16 +2554,10 @@
+         )
+
+         for op in serialized_ops:
+-            if isinstance(op, SerializedRunOperation) and op.attachments:
+-                for attachment in op.attachments.values():
+-                    if (
+-                        isinstance(attachment, tuple)
+-                        and isinstance(attachment[1], Path)
+-                        and not dangerously_allow_filesystem
+-                    ):
+-                        raise ValueError(
+-                            "Must set dangerously_allow_filesystem=True to allow passing in Paths for attachments."
+-                        )
++            if isinstance(op, SerializedRunOperation):
++                _reject_filesystem_attachments(
++                    op.attachments, dangerously_allow_filesystem
++                )
+
+         # sent the runs in multipart requests
+         self._multipart_ingest_ops(serialized_ops)
+@@ -2772,15 +2795,7 @@
+         if start_time is not None:
+             data["start_time"] = start_time.isoformat()
+         if attachments:
+-            for _, attachment in attachments.items():
+-                if (
+-                    isinstance(attachment, tuple)
+-                    and isinstance(attachment[1], Path)
+-                    and not dangerously_allow_filesystem
+-                ):
+-                    raise ValueError(
+-                        "Must set dangerously_allow_filesystem=True to allow passing in Paths for attachments."
+-                    )
++            _reject_filesystem_attachments(attachments, dangerously_allow_filesystem)
+             data["attachments"] = attachments
+         use_multipart = (
+             (self.tracing_queue is not None or self.compressed_traces is not None)
+
+--- a/langsmith/run_trees.py
++++ b/langsmith/run_trees.py
+@@ -34,6 +34,16 @@ class WriteReplica(TypedDict, total=False):
+     updates: Optional[dict]
+
+
++_HEADER_SAFE_REPLICA_FIELDS: frozenset[str] = frozenset({"project_name", "updates"})
++
++
++def _filter_replica_for_headers(replica: WriteReplica) -> WriteReplica:
++    return cast(
++        WriteReplica,
++        {k: v for k, v in replica.items() if k in _HEADER_SAFE_REPLICA_FIELDS},
++    )
++
++
+ LANGSMITH_PREFIX = "langsmith-"
+ LANGSMITH_DOTTED_ORDER = sys.intern(f"{LANGSMITH_PREFIX}trace")
+ LANGSMITH_DOTTED_ORDER_BYTES = LANGSMITH_DOTTED_ORDER.encode("utf-8")
+@@ -960,8 +970,11 @@ class _Baggage:
+                                 )
+                             )
+                         elif isinstance(replica_item, dict):
+-                            # New WriteReplica format: preserve as dict
+-                            parsed_replicas.append(cast(WriteReplica, replica_item))
++                            parsed_replicas.append(
++                                _filter_replica_for_headers(
++                                    cast(WriteReplica, replica_item)
++                                )
++                            )
+                         else:
+                             logger.warning(
+                                 f"Unknown replica format in baggage: {replica_item}"
+@@ -1001,11 +1014,6 @@ class _Baggage:
+             items.append(
+                 f"{LANGSMITH_PREFIX}project={urllib.parse.quote(self.project_name)}"
+             )
+-        if self.replicas:
+-            serialized_replicas = _dumps_json(self.replicas)
+-            items.append(
+-                f"{LANGSMITH_PREFIX}replicas={urllib.parse.quote(serialized_replicas)}"
+-            )
+         return ",".join(items)
+
+
