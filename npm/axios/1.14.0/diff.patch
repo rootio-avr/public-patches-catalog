@@ -812,6 +812,321 @@ Last-Update: 2026-05-30
        const value = options[opt];
        const result = value === undefined || validator(value, opt, options);
 
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -188,7 +188,7 @@
+  *
+  * @returns {http.ClientRequestArgs}
+  */
+-function setProxy(options, configProxy, location) {
++function setProxy(options, configProxy, location, isRedirect) {
+   let proxy = configProxy;
+   if (!proxy && proxy !== false) {
+     if (shouldBypassProxy(location)) {
+@@ -200,6 +200,17 @@
+       proxy = new URL(proxyUrl);
+     }
+   }
++  // CVE-2026-44486: On redirect re-invocation, strip any stale Proxy-Authorization
++  // header carried over from the prior request (e.g. new target no longer uses a
++  // proxy, or uses a different proxy). Skip on the initial request so user-supplied
++  // headers are preserved. Header names are case-insensitive, so remove every variant.
++  if (isRedirect && options.headers) {
++    for (const name of Object.keys(options.headers)) {
++      if (name.toLowerCase() === 'proxy-authorization') {
++        delete options.headers[name];
++      }
++    }
++  }
+   if (proxy) {
+     // Basic proxy authorization
+     if (proxy.username) {
+@@ -236,7 +247,7 @@
+   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
+     // Configure proxy for redirected request, passing the original config proxy to apply
+     // the exact same logic as if the redirected request was performed by axios directly.
+-    setProxy(redirectOptions, configProxy, redirectOptions.href);
++    setProxy(redirectOptions, configProxy, redirectOptions.href, true);
+   };
+ }
+
+diff --git a/lib/adapters/fetch.js b/lib/adapters/fetch.js
+--- a/lib/adapters/fetch.js
++++ b/lib/adapters/fetch.js
+@@ -11,6 +11,7 @@
+ } from '../helpers/progressEventReducer.js';
+ import resolveConfig from '../helpers/resolveConfig.js';
+ import settle from '../core/settle.js';
++import estimateDataURLDecodedBytes from '../helpers/estimateDataURLDecodedBytes.js';
+ 
+ const DEFAULT_CHUNK_SIZE = 64 * 1024;
+ 
+@@ -161,8 +162,13 @@
+       headers,
+       withCredentials = 'same-origin',
+       fetchOptions,
++      maxContentLength,
++      maxBodyLength,
+     } = resolveConfig(config);
+ 
++    const hasMaxContentLength = utils.isNumber(maxContentLength) && maxContentLength > -1;
++    const hasMaxBodyLength = utils.isNumber(maxBodyLength) && maxBodyLength > -1;
++
+     let _fetch = envFetch || fetch;
+ 
+     responseType = responseType ? (responseType + '').toLowerCase() : 'text';
+@@ -184,6 +190,41 @@
+     let requestContentLength;
+ 
+     try {
++      // Enforce maxContentLength for data: URLs up-front so we never materialize
++      // an oversized payload. The HTTP adapter applies the same check (see http.js
++      // "if (protocol === 'data:')" branch).
++      if (hasMaxContentLength && typeof url === 'string' && url.startsWith('data:')) {
++        const estimated = estimateDataURLDecodedBytes(url);
++        if (estimated > maxContentLength) {
++          throw new AxiosError(
++            'maxContentLength size of ' + maxContentLength + ' exceeded',
++            AxiosError.ERR_BAD_RESPONSE,
++            config,
++            request
++          );
++        }
++      }
++
++      // Enforce maxBodyLength against the outbound request body before dispatch.
++      // Mirrors http.js behavior (ERR_BAD_REQUEST / 'Request body larger than
++      // maxBodyLength limit'). Skip when the body length cannot be determined
++      // (e.g. a live ReadableStream supplied by the caller).
++      if (hasMaxBodyLength && method !== 'get' && method !== 'head') {
++        const outboundLength = await resolveBodyLength(headers, data);
++        if (
++          typeof outboundLength === 'number' &&
++          isFinite(outboundLength) &&
++          outboundLength > maxBodyLength
++        ) {
++          throw new AxiosError(
++            'Request body larger than maxBodyLength limit',
++            AxiosError.ERR_BAD_REQUEST,
++            config,
++            request
++          );
++        }
++      }
++
+       if (
+         onUploadProgress &&
+         supportsRequestStream &&
+@@ -237,10 +278,28 @@
+         ? _fetch(request, fetchOptions)
+         : _fetch(url, resolvedOptions));
+ 
++      // Cheap pre-check: if the server honestly declares a content-length that
++      // already exceeds the cap, reject before we start streaming.
++      if (hasMaxContentLength) {
++        const declaredLength = utils.toFiniteNumber(response.headers.get('content-length'));
++        if (declaredLength != null && declaredLength > maxContentLength) {
++          throw new AxiosError(
++            'maxContentLength size of ' + maxContentLength + ' exceeded',
++            AxiosError.ERR_BAD_RESPONSE,
++            config,
++            request
++          );
++        }
++      }
++
+       const isStreamResponse =
+         supportsResponseStream && (responseType === 'stream' || responseType === 'response');
+ 
+-      if (supportsResponseStream && (onDownloadProgress || (isStreamResponse && unsubscribe))) {
++      if (
++        supportsResponseStream &&
++        response.body &&
++        (onDownloadProgress || hasMaxContentLength || (isStreamResponse && unsubscribe))
++      ) {
+         const options = {};
+ 
+         ['status', 'statusText', 'headers'].forEach((prop) => {
+@@ -257,8 +316,24 @@
+             )) ||
+           [];
+ 
++        let bytesRead = 0;
++        const onChunkProgress = (loadedBytes) => {
++          if (hasMaxContentLength) {
++            bytesRead = loadedBytes;
++            if (bytesRead > maxContentLength) {
++              throw new AxiosError(
++                'maxContentLength size of ' + maxContentLength + ' exceeded',
++                AxiosError.ERR_BAD_RESPONSE,
++                config,
++                request
++              );
++            }
++          }
++          onProgress && onProgress(loadedBytes);
++        };
++
+         response = new Response(
+-          trackStream(response.body, DEFAULT_CHUNK_SIZE, onProgress, () => {
++          trackStream(response.body, DEFAULT_CHUNK_SIZE, onChunkProgress, () => {
+             flush && flush();
+             unsubscribe && unsubscribe();
+           }),
+@@ -272,6 +347,33 @@
+         response,
+         config
+       );
++
++      // Fallback enforcement for environments without ReadableStream support
++      // (legacy runtimes). Detect materialized size from typed output; skip
++      // streams/Response passthrough since the user will read those themselves.
++      if (hasMaxContentLength && !supportsResponseStream && !isStreamResponse) {
++        let materializedSize;
++        if (responseData != null) {
++          if (typeof responseData.byteLength === 'number') {
++            materializedSize = responseData.byteLength;
++          } else if (typeof responseData.size === 'number') {
++            materializedSize = responseData.size;
++          } else if (typeof responseData === 'string') {
++            materializedSize =
++              typeof TextEncoder === 'function'
++                ? new TextEncoder().encode(responseData).byteLength
++                : responseData.length;
++          }
++        }
++        if (typeof materializedSize === 'number' && materializedSize > maxContentLength) {
++          throw new AxiosError(
++            'maxContentLength size of ' + maxContentLength + ' exceeded',
++            AxiosError.ERR_BAD_RESPONSE,
++            config,
++            request
++          );
++        }
++      }
+ 
+       !isStreamResponse && unsubscribe && unsubscribe();
+ 
+diff --git a/lib/helpers/estimateDataURLDecodedBytes.js b/lib/helpers/estimateDataURLDecodedBytes.js
+--- a/lib/helpers/estimateDataURLDecodedBytes.js
++++ b/lib/helpers/estimateDataURLDecodedBytes.js
+@@ -69,5 +69,32 @@
+     return bytes > 0 ? bytes : 0;
+   }
+ 
+-  return Buffer.byteLength(body, 'utf8');
++  if (typeof Buffer !== 'undefined' && typeof Buffer.byteLength === 'function') {
++    return Buffer.byteLength(body, 'utf8');
++  }
++
++  // Compute UTF-8 byte length directly from UTF-16 code units without allocating
++  // a byte buffer (TextEncoder.encode would defeat the DoS guard on large bodies).
++  // Using body.length here would undercount non-ASCII (e.g. '€' is 1 code unit
++  // but 3 UTF-8 bytes).
++  let bytes = 0;
++  for (let i = 0, len = body.length; i < len; i++) {
++    const c = body.charCodeAt(i);
++    if (c < 0x80) {
++      bytes += 1;
++    } else if (c < 0x800) {
++      bytes += 2;
++    } else if (c >= 0xd800 && c <= 0xdbff && i + 1 < len) {
++      const next = body.charCodeAt(i + 1);
++      if (next >= 0xdc00 && next <= 0xdfff) {
++        bytes += 4;
++        i++;
++      } else {
++        bytes += 3;
++      }
++    } else {
++      bytes += 3;
++    }
++  }
++  return bytes;
+ }
+
+--- a/lib/core/mergeConfig.js
++++ b/lib/core/mergeConfig.js
+@@ -70,9 +70,9 @@ export default function mergeConfig(config1, config2) {
+ 
+   // eslint-disable-next-line consistent-return
+   function mergeDirectKeys(a, b, prop) {
+-    if (prop in config2) {
++    if (utils.hasOwnProp(config2, prop)) {
+       return getMergedValue(a, b);
+-    } else if (prop in config1) {
++    } else if (utils.hasOwnProp(config1, prop)) {
+       return getMergedValue(undefined, a);
+     }
+   }
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -411,8 +411,12 @@ function merge(/* obj1, obj2, obj3, ... */) {
+     }
+ 
+     const targetKey = (caseless && findKey(result, key)) || key;
+-    if (isPlainObject(result[targetKey]) && isPlainObject(val)) {
+-      result[targetKey] = merge(result[targetKey], val);
++    // Read via own-prop only — a bare `result[targetKey]` walks the prototype
++    // chain, so a polluted Object.prototype value could surface here and get
++    // copied into the merged result. See GHSA-898c-q2cr-xwhg.
++    const existing = hasOwnProperty(result, targetKey) ? result[targetKey] : undefined;
++    if (isPlainObject(existing) && isPlainObject(val)) {
++      result[targetKey] = merge(existing, val);
+     } else if (isPlainObject(val)) {
+       result[targetKey] = merge({}, val);
+     } else if (isArray(val)) {
+@@ -445,6 +449,9 @@ const extend = (a, b, thisArg, { allOwnKeys } = {}) => {
+     (val, key) => {
+       if (thisArg && isFunction(val)) {
+         Object.defineProperty(a, key, {
++          // Null-proto descriptor so a polluted Object.prototype.get cannot
++          // hijack defineProperty's accessor-vs-data resolution.
++          __proto__: null,
+           value: bind(val, thisArg),
+           writable: true,
+           enumerable: true,
+@@ -452,6 +459,7 @@ const extend = (a, b, thisArg, { allOwnKeys } = {}) => {
+         });
+       } else {
+         Object.defineProperty(a, key, {
++          __proto__: null,
+           value: val,
+           writable: true,
+           enumerable: true,
+@@ -490,12 +498,14 @@ const stripBOM = (content) => {
+ const inherits = (constructor, superConstructor, props, descriptors) => {
+   constructor.prototype = Object.create(superConstructor.prototype, descriptors);
+   Object.defineProperty(constructor.prototype, 'constructor', {
++    __proto__: null,
+     value: constructor,
+     writable: true,
+     enumerable: false,
+     configurable: true,
+   });
+   Object.defineProperty(constructor, 'super', {
++    __proto__: null,
+     value: superConstructor.prototype,
+   });
+   props && Object.assign(constructor.prototype, props);
+--- a/lib/adapters/adapters.js
++++ b/lib/adapters/adapters.js
+@@ -25,11 +25,13 @@ const knownAdapters = {
+ utils.forEach(knownAdapters, (fn, value) => {
+   if (fn) {
+     try {
+-      Object.defineProperty(fn, 'name', { value });
++      // Null-proto descriptors so a polluted Object.prototype.get cannot turn
++      // these data descriptors into accessor descriptors on the way in.
++      Object.defineProperty(fn, 'name', { __proto__: null, value });
+     } catch (e) {
+       // eslint-disable-next-line no-empty
+     }
+-    Object.defineProperty(fn, 'adapterName', { value });
++    Object.defineProperty(fn, 'adapterName', { __proto__: null, value });
+   }
+ });
+
 CVE-2026-44492: axios NO_PROXY IPv4-mapped IPv6 bypass / SSRF
 
 Backport rationale
@@ -1005,84 +1320,27 @@ IPv4 dotted hostnames for both request URLs and NO_PROXY entries.
          );
        }
 
---- a/lib/core/mergeConfig.js
-+++ b/lib/core/mergeConfig.js
-@@ -70,9 +70,9 @@ export default function mergeConfig(config1, config2) {
- 
-   // eslint-disable-next-line consistent-return
-   function mergeDirectKeys(a, b, prop) {
--    if (prop in config2) {
-+    if (utils.hasOwnProp(config2, prop)) {
-       return getMergedValue(a, b);
--    } else if (prop in config1) {
-+    } else if (utils.hasOwnProp(config1, prop)) {
-       return getMergedValue(undefined, a);
-     }
-   }
---- a/lib/utils.js
-+++ b/lib/utils.js
-@@ -411,8 +411,12 @@ function merge(/* obj1, obj2, obj3, ... */) {
-     }
- 
-     const targetKey = (caseless && findKey(result, key)) || key;
--    if (isPlainObject(result[targetKey]) && isPlainObject(val)) {
--      result[targetKey] = merge(result[targetKey], val);
-+    // Read via own-prop only — a bare `result[targetKey]` walks the prototype
-+    // chain, so a polluted Object.prototype value could surface here and get
-+    // copied into the merged result. See GHSA-898c-q2cr-xwhg.
-+    const existing = hasOwnProperty(result, targetKey) ? result[targetKey] : undefined;
-+    if (isPlainObject(existing) && isPlainObject(val)) {
-+      result[targetKey] = merge(existing, val);
-     } else if (isPlainObject(val)) {
-       result[targetKey] = merge({}, val);
-     } else if (isArray(val)) {
-@@ -445,6 +449,9 @@ const extend = (a, b, thisArg, { allOwnKeys } = {}) => {
-     (val, key) => {
-       if (thisArg && isFunction(val)) {
-         Object.defineProperty(a, key, {
-+          // Null-proto descriptor so a polluted Object.prototype.get cannot
-+          // hijack defineProperty's accessor-vs-data resolution.
-+          __proto__: null,
-           value: bind(val, thisArg),
-           writable: true,
-           enumerable: true,
-@@ -452,6 +459,7 @@ const extend = (a, b, thisArg, { allOwnKeys } = {}) => {
-         });
-       } else {
-         Object.defineProperty(a, key, {
-+          __proto__: null,
-           value: val,
-           writable: true,
-           enumerable: true,
-@@ -490,12 +498,14 @@ const stripBOM = (content) => {
- const inherits = (constructor, superConstructor, props, descriptors) => {
-   constructor.prototype = Object.create(superConstructor.prototype, descriptors);
-   Object.defineProperty(constructor.prototype, 'constructor', {
-+    __proto__: null,
-     value: constructor,
-     writable: true,
-     enumerable: false,
-     configurable: true,
-   });
-   Object.defineProperty(constructor, 'super', {
-+    __proto__: null,
-     value: superConstructor.prototype,
-   });
-   props && Object.assign(constructor.prototype, props);
---- a/lib/adapters/adapters.js
-+++ b/lib/adapters/adapters.js
-@@ -25,11 +25,13 @@ const knownAdapters = {
- utils.forEach(knownAdapters, (fn, value) => {
-   if (fn) {
-     try {
--      Object.defineProperty(fn, 'name', { value });
-+      // Null-proto descriptors so a polluted Object.prototype.get cannot turn
-+      // these data descriptors into accessor descriptors on the way in.
-+      Object.defineProperty(fn, 'name', { __proto__: null, value });
-     } catch (e) {
-       // eslint-disable-next-line no-empty
-     }
--    Object.defineProperty(fn, 'adapterName', { value });
-+    Object.defineProperty(fn, 'adapterName', { __proto__: null, value });
-   }
- });
+--- a/lib/helpers/cookies.js
++++ b/lib/helpers/cookies.js
+@@ -30,8 +30,19 @@ export default platform.hasStandardBrowserEnv
+
+       read(name) {
+         if (typeof document === 'undefined') return null;
+-        const match = document.cookie.match(new RegExp('(?:^|; )' + name + '=([^;]*)'));
+-        return match ? decodeURIComponent(match[1]) : null;
++        // Match name=value by splitting on the literal "; " separator instead of building a
++        // RegExp from `name` — interpolating an unescaped string into a RegExp would let
++        // metacharacters (e.g. `.+?` in an attacker-influenced cookie name) cause ReDoS or
++        // match the wrong cookie.
++        const cookies = document.cookie.split('; ');
++        for (let i = 0; i < cookies.length; i++) {
++          const cookie = cookies[i];
++          const eq = cookie.indexOf('=');
++          if (eq !== -1 && cookie.slice(0, eq) === name) {
++            return decodeURIComponent(cookie.slice(eq + 1));
++          }
++        }
++        return null;
+       },
+
+       remove(name) {
