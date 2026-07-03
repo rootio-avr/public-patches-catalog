@@ -1879,6 +1879,259 @@ diff --git a/tests/test_payload.py b/tests/test_payload.py
      p = payload.BytesPayload(b"data")
      assert p.content_type == "application/octet-stream"
 
+diff --git a/aiohttp/cookiejar.py b/aiohttp/cookiejar.py
+--- a/aiohttp/cookiejar.py
++++ b/aiohttp/cookiejar.py
+@@ -34,6 +34,9 @@
+ 
+ CookieItem = Union[str, "Morsel[str]"]
+ 
++# Not persisted; the absolute deadline is saved instead.
++_RELATIVE_EXPIRY_ATTRS = frozenset(("max-age", "expires"))
++
+ 
+ class _RestrictedCookieUnpickler(pickle.Unpickler):
+     """A restricted unpickler that only allows cookie-related types.
+@@ -136,21 +139,30 @@
+             :class:`str` or :class:`pathlib.Path` instance.
+         """
+         file_path = pathlib.Path(file_path)
+-        data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]] = {}
++        data: Dict[str, Dict[str, Dict[str, Union[str, bool, float]]]] = {}
+         for (domain, path), cookie in self._cookies.items():
+             key = f"{domain}|{path}"
+             data[key] = {}
+             for name, morsel in cookie.items():
+-                morsel_data: Dict[str, Union[str, bool]] = {
++                morsel_data: Dict[str, Union[str, bool, float]] = {
+                     "key": morsel.key,
+                     "value": morsel.value,
+                     "coded_value": morsel.coded_value,
+                 }
+-                # Save all morsel attributes that have values
++                # Skip relative expiry; the absolute deadline is saved below.
+                 for attr in morsel._reserved:  # type: ignore[attr-defined]
++                    if attr in _RELATIVE_EXPIRY_ATTRS:
++                        continue
+                     attr_val = morsel[attr]
+                     if attr_val:
+                         morsel_data[attr] = attr_val
++                # Persist host-only scope; otherwise host-only cookies reload as
++                # domain cookies and leak to subdomains (CVE-2026-54279).
++                if (domain, name) in self._host_only_cookies:
++                    morsel_data["host_only"] = True
++                # Persist the absolute deadline so Max-Age does not reset on load.
++                if (exp := self._expirations.get((domain, path, name))) is not None:
++                    morsel_data["expires_timestamp"] = exp.timestamp()
+                 data[key][name] = morsel_data
+         with file_path.open(mode="w", encoding="utf-8") as f:
+             json.dump(data, f, indent=2)
+@@ -170,34 +182,34 @@
+         try:
+             with file_path.open(mode="r", encoding="utf-8") as f:
+                 data = json.load(f)
+-            self._cookies = self._load_json_data(data)
++            self._load_json_data(data)
+         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+             # Fall back to legacy pickle format with restricted unpickler
+             with file_path.open(mode="rb") as f:
+                 self._cookies = _RestrictedCookieUnpickler(f).load()
+ 
+     def _load_json_data(
+-        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]]
+-    ) -> "DefaultDict[Tuple[str, str], SimpleCookie[str]]":
+-        """Load cookies from parsed JSON data."""
+-        cookies: "DefaultDict[Tuple[str, str], SimpleCookie[str]]" = defaultdict(
+-            SimpleCookie
+-        )
++        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool, float]]]]
++    ) -> None:
++        """Replace contents, routing cookies through update_cookies().
++
++        Routing through :meth:`update_cookies` rebuilds host-only scope and
++        path/domain normalization. The persisted absolute deadline is then
++        re-applied so a Max-Age cookie does not have its expiry reset to
++        ``now + Max-Age`` on load (CVE-2026-54279).
++        """
++        self.clear()
+         for compound_key, cookie_data in data.items():
+             domain, path = compound_key.split("|", 1)
+-            key = (domain, path)
+             for name, morsel_data in cookie_data.items():
+                 morsel: Morsel[str] = Morsel()
+-                morsel_key = morsel_data["key"]
+-                morsel_value = morsel_data["value"]
+-                morsel_coded_value = morsel_data["coded_value"]
+                 # Use __setstate__ to bypass validation, same pattern
+                 # used in _build_morsel and _cookie_helpers.
+                 morsel.__setstate__(  # type: ignore[attr-defined]
+                     {
+-                        "key": morsel_key,
+-                        "value": morsel_value,
+-                        "coded_value": morsel_coded_value,
++                        "key": morsel_data["key"],
++                        "value": morsel_data["value"],
++                        "coded_value": morsel_data["coded_value"],
+                     }
+                 )
+                 # Restore morsel attributes
+@@ -206,10 +218,25 @@
+                         "key",
+                         "value",
+                         "coded_value",
++                        "host_only",
++                        "expires_timestamp",
+                     ):
+                         morsel[attr] = morsel_data[attr]
+-                cookies[key][name] = morsel
+-        return cookies
++                # Drop the domain so update_cookies() re-marks it host-only.
++                if morsel_data.get("host_only"):
++                    morsel["domain"] = ""
++                response_url = (
++                    URL.build(scheme="https", host=domain) if domain else URL()
++                )
++                self.update_cookies({name: morsel}, response_url)
++                # Restore the absolute deadline; update_cookies() schedules none
++                # because we stripped max-age/expires before saving.
++                if (exp := morsel_data.get("expires_timestamp")) is not None:
++                    when = datetime.datetime.fromtimestamp(
++                        float(exp), tz=datetime.timezone.utc
++                    )
++                    self._expire_cookie(when, domain, path, name)
++        self._do_expiration()
+ 
+     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
+         if predicate is None:
+diff --git a/tests/test_cookiejar.py b/tests/test_cookiejar.py
+--- a/tests/test_cookiejar.py
++++ b/tests/test_cookiejar.py
+@@ -938,3 +938,124 @@
+     cookies = list(jar)
+     assert len(cookies) == 1
+     assert cookies[0].value == "__import__('os').system('echo PWNED')"
++def test_save_load_json_preserves_host_only_scope(tmp_path) -> None:
++    """CVE-2026-54279: host-only cookies must not leak to subdomains after save/load."""
++    file_path = pathlib.Path(str(tmp_path)) / "host_only.json"
++    issuer = URL("https://auth.example.com/login")
++    subdomain = URL("https://sub.auth.example.com/")
++
++    jar_save = CookieJar()
++    jar_save.update_cookies({"sid": "hostonly"}, response_url=issuer)
++    assert ("auth.example.com", "sid") in jar_save._host_only_cookies
++    assert "sid" not in jar_save.filter_cookies(subdomain)
++    assert "sid" in jar_save.filter_cookies(issuer)
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    assert ("auth.example.com", "sid") in jar_load._host_only_cookies
++    assert "sid" not in jar_load.filter_cookies(subdomain)
++    assert "sid" in jar_load.filter_cookies(issuer)
++
++
++def test_save_load_json_domain_cookie_still_matches_subdomain(tmp_path) -> None:
++    """An explicit Domain cookie must still match subdomains after save/load."""
++    file_path = pathlib.Path(str(tmp_path)) / "domain.json"
++    url = URL("https://example.com/")
++    subdomain = URL("https://sub.example.com/")
++
++    jar_save = CookieJar()
++    sc = SimpleCookie()
++    sc["sid"] = "domaincookie"
++    sc["sid"]["domain"] = "example.com"
++    sc["sid"]["path"] = "/"
++    jar_save.update_cookies(sc, response_url=url)
++    assert ("example.com", "sid") not in jar_save._host_only_cookies
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    assert ("example.com", "sid") not in jar_load._host_only_cookies
++    assert "sid" in jar_load.filter_cookies(subdomain)
++    assert "sid" in jar_load.filter_cookies(url)
++
++
++def test_save_load_json_preserves_max_age_deadline(tmp_path) -> None:
++    """Absolute Max-Age deadlines must survive a save/load round-trip."""
++    file_path = pathlib.Path(str(tmp_path)) / "max_age.json"
++    url = URL("https://example.com/")
++
++    jar_save = CookieJar()
++    sc = SimpleCookie()
++    sc["sid"] = "x"
++    sc["sid"]["domain"] = "example.com"
++    sc["sid"]["path"] = "/"
++    sc["sid"]["max-age"] = "3600"
++    jar_save.update_cookies(sc, response_url=url)
++    expirations = dict(jar_save._expirations)
++    assert expirations
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    assert dict(jar_load._expirations) == expirations
++    assert "sid" in jar_load.filter_cookies(url)
++
++
++def test_save_load_json_drops_expired_cookie(tmp_path) -> None:
++    """A persisted deadline in the past must drop the cookie on load."""
++    import json as _json
++
++    file_path = pathlib.Path(str(tmp_path)) / "expired.json"
++    url = URL("https://example.com/")
++
++    jar_save = CookieJar()
++    sc = SimpleCookie()
++    sc["sid"] = "x"
++    sc["sid"]["domain"] = "example.com"
++    sc["sid"]["path"] = "/"
++    sc["sid"]["expires"] = "Tue, 1 Jan 2999 12:00:00 GMT"
++    jar_save.update_cookies(sc, response_url=url)
++    jar_save.save(file_path=file_path)
++    data = _json.loads(file_path.read_text())
++    _, cookies = next(iter(data.items()))
++    cookies["sid"]["expires_timestamp"] = 0.0
++    file_path.write_text(_json.dumps(data))
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    assert len(jar_load) == 0
++    assert "sid" not in jar_load.filter_cookies(url)
++
++
++def test_load_json_old_format_without_new_keys(tmp_path) -> None:
++    """JSON files without host_only/expires_timestamp still load."""
++    import json as _json
++
++    file_path = pathlib.Path(str(tmp_path)) / "old.json"
++    file_path.write_text(
++        _json.dumps(
++            {
++                "example.com|/": {
++                    "sid": {
++                        "key": "sid",
++                        "value": "x",
++                        "coded_value": "x",
++                        "domain": "example.com",
++                        "max-age": "3600",
++                    }
++                }
++            }
++        )
++    )
++    url = URL("https://example.com/")
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    assert "sid" in jar_load.filter_cookies(url)
++    assert any(key[2] == "sid" for key in jar_load._expirations)
+
 diff --git a/setup.py b/setup.py
 --- a/setup.py
 +++ b/setup.py
