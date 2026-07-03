@@ -4,6 +4,7 @@ This patch is based on protobufjs version 7.5.5, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-44288
 - CVE-2026-44289
 - CVE-2026-44290
 - CVE-2026-44291
@@ -11,7 +12,7 @@ unknown
 - CVE-2026-45740
 - CVE-2026-44292
 - CVE-2026-44294
-- CVE-2026-44288
+- CVE-2026-48712
 
 ## How to Apply:
 1. Clone or download the source code for protobufjs
