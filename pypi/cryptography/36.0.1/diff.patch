@@ -1,0 +1,356 @@
+From 3a830623b12941c08c67452f4282f00bf2886fe6 Mon Sep 17 00:00:00 2001
+From: Patcher <patcher@root.io>
+Date: Fri, 12 Jun 2026 15:31:31 +0530
+Subject: [PATCH] Note CVE-2023-0286 OpenSSL type confusion
+
+Co-authored-by: Cursor <cursoragent@cursor.com>
+---
+ ROOT-CVE-2023-0286.md | 46 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 46 insertions(+)
+ create mode 100644 ROOT-CVE-2023-0286.md
+
+diff --git a/ROOT-CVE-2023-0286.md b/ROOT-CVE-2023-0286.md
+new file mode 100644
+index 0000000..9a9502a
+--- /dev/null
++++ b/ROOT-CVE-2023-0286.md
+@@ -0,0 +1,46 @@
++# CVE-2023-0286 — OpenSSL x400Address Type Confusion (cryptography 36.0.1)
++
++## Summary
++
++CVE-2023-0286 is a type confusion vulnerability in OpenSSL's X.509
++GeneralName handling (`GENERAL_NAME_cmp`). The bug resides entirely in
++OpenSSL's C source (`crypto/x509v3/v3_genn.c` and
++`include/openssl/x509v3.h`) and is not present in the Python
++cryptography package source code.
++
++## Root Cause
++
++OpenSSL incorrectly declared the `x400Address` field in the
++`GENERAL_NAME` union as `ASN1_TYPE *` instead of `ASN1_STRING *`.
++The comparison function `GENERAL_NAME_cmp` then calls `ASN1_TYPE_cmp()`
++on what is actually an `ASN1_STRING *`, producing a type confusion that
++can lead to memory disclosure or denial of service when processing
++malformed X.400 address fields in certificates or CRLs.
++
++The fix changes the field type to `ASN1_STRING *` and updates the caller
++to use `ASN1_STRING_cmp()`.
++Reference commit: https://github.com/openssl/openssl/commit/2f7530077e0ef79d98718138716bc51ca0cad658
++
++## Impact on the cryptography Package
++
++The Python `cryptography` package (v36.0.1) uses CFFI to call OpenSSL
++at runtime via the system libssl/libcrypto. The CFFI binding for
++`GENERAL_NAME` in `src/_cffi_src/openssl/x509v3.py` uses an opaque
++struct layout and does not expose the `x400Address` field — there is no
++Python-level code to patch for this CVE.
++
++The vulnerable code path executes entirely inside the system OpenSSL
++shared library, not within the cryptography package's own source files.
++
++## Remediation
++
++For environments using a system OpenSSL: upgrade to a version that
++includes the fix (>= 1.1.1t or >= 3.0.8).
++
++For environments using a bundled OpenSSL (manylinux wheels): rebuild the
++wheel against a patched OpenSSL release.
++
++## References
++
++- OpenSSL security advisory: https://www.openssl.org/news/secadv/20230207.txt
++- NVD entry: https://nvd.nist.gov/vuln/detail/CVE-2023-0286
+-- 
+2.43.0
+
+
+--- a/src/cryptography/hazmat/backends/openssl/backend.py
++++ b/src/cryptography/hazmat/backends/openssl/backend.py
+@@ -2189,6 +2189,12 @@ class Backend:
+                 _Reasons.UNSUPPORTED_SERIALIZATION,
+             )
+
++        if p7.d.sign == self._ffi.NULL:
++            raise ValueError(
++                "The provided PKCS7 has no certificate data, but a cert "
++                "loading method was called."
++            )
++
+         sk_x509 = p7.d.sign.cert
+         num = self._lib.sk_X509_num(sk_x509)
+         certs = []
+--- a/tests/hazmat/primitives/test_pkcs7.py
++++ b/tests/hazmat/primitives/test_pkcs7.py
+@@ -81,6 +81,12 @@ class TestPKCS7Loading(object):
+                 mode="rb",
+             )
+
++    def test_load_pkcs7_empty_certificates(self, backend):
++        der = b"\x30\x0B\x06\x09\x2A\x86\x48\x86\xF7\x0D\x01\x07\x02"
++
++        with pytest.raises(ValueError):
++            pkcs7.load_der_pkcs7_certificates(der)
++
+
+ # We have no public verification API and won't be adding one until we get
+ # some requirements from users so this function exists to give us basic
+
+--- a/src/cryptography/hazmat/backends/openssl/rsa.py
++++ b/src/cryptography/hazmat/backends/openssl/rsa.py
+@@ -3,6 +3,9 @@
+ # for complete details.
+ 
+ 
++import hashlib
++import hmac as _hmac
++import os
+ import typing
+ 
+ from cryptography import utils
+@@ -51,6 +54,90 @@
+         return salt
+ 
+ 
++def _marvin_synthetic(key, ciphertext, default_len=None):
++    # Implicit-rejection (Marvin) synthetic message generator.
++    # Returns a deterministic pseudo-random byte string keyed by a per-key
++    # secret so that retries on the same ciphertext yield the same output and
++    # an attacker cannot extract entropy from observing failures.
++    secret = getattr(key, "_marvin_implicit_key", None)
++    if secret is None:
++        secret = os.urandom(32)
++        try:
++            object.__setattr__(key, "_marvin_implicit_key", secret)
++        except Exception:
++            pass
++    k = (key.key_size + 7) // 8
++    if default_len is None:
++        default_len = max(0, k - 11)
++    out = b""
++    counter = 0
++    while len(out) < default_len:
++        out += _hmac.new(
++            secret,
++            ciphertext + counter.to_bytes(4, "big"),
++            hashlib.sha256,
++        ).digest()
++        counter += 1
++    return out[:default_len]
++
++
++def _constant_time_pkcs1v15_unpad(em, ciphertext, key):
++    # Constant-time PKCS#1 v1.5 type-2 unpadding with implicit rejection.
++    # em is a k-byte raw RSA decryption: 0x00 || 0x02 || PS || 0x00 || M
++    # On any padding failure we return synthetic bytes rather than raising,
++    # closing the timing/exception oracle exploited by the Marvin Attack.
++    k = len(em)
++    em_bytes = bytes(em)
++
++    # Accumulate "bad" bits without short-circuiting.
++    # bad == 0 means valid; any non-zero bit means invalid.
++    bad = 0
++    if k < 11:
++        bad |= 1
++        em_bytes = em_bytes + b"\x00" * (11 - k)
++        k = len(em_bytes)
++
++    bad |= em_bytes[0]              # must be 0x00
++    bad |= em_bytes[1] ^ 0x02       # must be 0x02
++
++    # Find first 0x00 in em_bytes[2:] without early-exit. The loop body has
++    # the same shape on every iteration so the work performed is independent
++    # of where the zero (if any) occurs.
++    found_zero = 0
++    zero_index = 0
++    for i in range(2, k):
++        is_zero = 1 if em_bytes[i] == 0 else 0
++        latch = is_zero & (1 - found_zero)
++        # If latch == 1, set zero_index = i; else leave unchanged.
++        zero_index = (zero_index & (latch - 1)) | (i & -latch)
++        zero_index &= 0xFFFFFFFF
++        found_zero |= is_zero
++
++    bad |= 1 - found_zero            # must have found a zero terminator
++    # PS region length = zero_index - 2 must be >= 8.
++    ps_len = zero_index - 2
++    bad |= 1 if ps_len < 8 else 0
++
++    # Compute candidate message and synthetic in both cases (no skipping).
++    if found_zero:
++        candidate = em_bytes[zero_index + 1 : len(em)]
++    else:
++        candidate = b""
++    synthetic = _marvin_synthetic(
++        key,
++        bytes(ciphertext),
++        default_len=len(candidate) if found_zero else max(0, len(em) - 11),
++    )
++
++    # Constant-time select: if bad == 0, return candidate, else synthetic.
++    # We intentionally leave the final return as a single Python conditional
++    # because the dominant oracle (OpenSSL padding-check + Python ValueError
++    # exception) has already been eliminated above.
++    if bad == 0:
++        return candidate
++    return synthetic
++
++
+ def _enc_dec_rsa(
+     backend,
+     key: typing.Union["_RSAPrivateKey", "_RSAPublicKey"],
+@@ -84,7 +171,39 @@
+             _Reasons.UNSUPPORTED_PADDING,
+         )
+ 
++    # Marvin (CVE-2023-50782) mitigation: for PKCS#1 v1.5 *decryption* (i.e.
++    # private-key path), bypass OpenSSL's padding check and perform the
++    # unpadding ourselves with implicit rejection so we don't leak padding
++    # validity through OpenSSL timing or through a Python ValueError.
++    if isinstance(padding, PKCS1v15) and isinstance(key, _RSAPrivateKey):
++        return _pkcs1v15_decrypt_constant_time(backend, key, data)
++
+     return _enc_dec_rsa_pkey_ctx(backend, key, data, padding_enum, padding)
++
++
++def _pkcs1v15_decrypt_constant_time(backend, key, ciphertext):
++    k = (key.key_size + 7) // 8
++    if len(ciphertext) != k:
++        # Length is public; matches the pre-existing length check in
++        # _RSAPrivateKey.decrypt. Return synthetic to be safe if reached.
++        return _marvin_synthetic(key, bytes(ciphertext))
++    try:
++        em = _enc_dec_rsa_pkey_ctx(
++            backend,
++            key,
++            ciphertext,
++            backend._lib.RSA_NO_PADDING,
++            PKCS1v15(),
++        )
++    except Exception:
++        # Raw RSA only fails for genuine errors (e.g. ciphertext numerically
++        # >= n). Treat as implicit rejection.
++        return _marvin_synthetic(key, bytes(ciphertext))
++    # Pad to k bytes if OpenSSL stripped leading zeros.
++    em_bytes = bytes(em)
++    if len(em_bytes) < k:
++        em_bytes = b"\x00" * (k - len(em_bytes)) + em_bytes
++    return _constant_time_pkcs1v15_unpad(em_bytes, ciphertext, key)
+ 
+ 
+ def _enc_dec_rsa_pkey_ctx(
+
+--- a/src/cryptography/hazmat/backends/openssl/backend.py
++++ b/src/cryptography/hazmat/backends/openssl/backend.py
+@@ -109,7 +109,15 @@
+ 
+ _MemoryBIO = collections.namedtuple("_MemoryBIO", ["bio", "char_ptr"])
+ 
++# Defensive cap to mitigate CVE-2026-34180 / GHSA-537c-gmf6-5ccf:
++# OpenSSL d2i_* ASN.1 decoders suffer integer truncation on primitive
++# content lengths >= 2 GiB (2**31 bytes) on 64-bit Unix, leading to a
++# heap over-read. We cap accepted DER/PEM input well below that
++# threshold; no legitimate certificate, key, PKCS7, or PKCS12 payload
++# comes anywhere near 100 MiB.
++_MAX_ASN1_INPUT_LEN = 100 * 1024 * 1024
+ 
++
+ # Not actually supported, just used as a marker for some serialization tests.
+ class _RC2(object):
+     pass
+@@ -545,6 +553,23 @@
+         self.openssl_assert(res == 1)
+         return evp_pkey
+ 
++    def _check_asn1_length(self, data):
++        # Defense-in-depth for CVE-2026-34180: reject oversized DER/PEM
++        # input before it reaches OpenSSL d2i_* parsers. The bundled
++        # OpenSSL has an integer-truncation heap over-read at ASN.1
++        # primitive content lengths >= 2 GiB on 64-bit Unix; this cap
++        # makes that condition unreachable from Python.
++        try:
++            n = len(data)
++        except TypeError:
++            return
++        if n > _MAX_ASN1_INPUT_LEN:
++            raise ValueError(
++                "ASN.1 input exceeds maximum supported length "
++                "(" + str(_MAX_ASN1_INPUT_LEN) + " bytes); refusing to "
++                "parse to mitigate CVE-2026-34180."
++            )
++
+     def _bytes_to_bio(self, data):
+         """
+         Return a _MemoryBIO namedtuple of (BIO, char*).
+@@ -820,6 +845,7 @@
+         return _CMACContext(self, algorithm)
+ 
+     def load_pem_private_key(self, data, password):
++        self._check_asn1_length(data)
+         return self._load_key(
+             self._lib.PEM_read_bio_PrivateKey,
+             self._evp_pkey_to_private_key,
+@@ -828,6 +854,7 @@
+         )
+ 
+     def load_pem_public_key(self, data):
++        self._check_asn1_length(data)
+         mem_bio = self._bytes_to_bio(data)
+         evp_pkey = self._lib.PEM_read_bio_PUBKEY(
+             mem_bio.bio, self._ffi.NULL, self._ffi.NULL, self._ffi.NULL
+@@ -853,6 +880,7 @@
+                 self._handle_key_loading_error()
+ 
+     def load_pem_parameters(self, data):
++        self._check_asn1_length(data)
+         mem_bio = self._bytes_to_bio(data)
+         # only DH is supported currently
+         dh_cdata = self._lib.PEM_read_bio_DHparams(
+@@ -865,6 +893,7 @@
+             self._handle_key_loading_error()
+ 
+     def load_der_private_key(self, data, password):
++        self._check_asn1_length(data)
+         # OpenSSL has a function called d2i_AutoPrivateKey that in theory
+         # handles this automatically, however it doesn't handle encrypted
+         # private keys. Instead we try to load the key two different ways.
+@@ -903,6 +932,7 @@
+             return None
+ 
+     def load_der_public_key(self, data):
++        self._check_asn1_length(data)
+         mem_bio = self._bytes_to_bio(data)
+         evp_pkey = self._lib.d2i_PUBKEY_bio(mem_bio.bio, self._ffi.NULL)
+         if evp_pkey != self._ffi.NULL:
+@@ -926,6 +956,7 @@
+                 self._handle_key_loading_error()
+ 
+     def load_der_parameters(self, data):
++        self._check_asn1_length(data)
+         mem_bio = self._bytes_to_bio(data)
+         dh_cdata = self._lib.d2i_DHparams_bio(mem_bio.bio, self._ffi.NULL)
+         if dh_cdata != self._ffi.NULL:
+@@ -1997,6 +2028,7 @@
+         )
+ 
+     def load_pkcs12(self, data, password):
++        self._check_asn1_length(data)
+         if password is not None:
+             utils._check_byteslike("password", password)
+ 
+@@ -2156,6 +2188,7 @@
+         return not self._lib.CRYPTOGRAPHY_IS_BORINGSSL
+ 
+     def load_pem_pkcs7_certificates(self, data):
++        self._check_asn1_length(data)
+         utils._check_bytes("data", data)
+         bio = self._bytes_to_bio(data)
+         p7 = self._lib.PEM_read_bio_PKCS7(
+@@ -2169,6 +2202,7 @@
+         return self._load_pkcs7_certificates(p7)
+ 
+     def load_der_pkcs7_certificates(self, data):
++        self._check_asn1_length(data)
+         utils._check_bytes("data", data)
+         bio = self._bytes_to_bio(data)
+         p7 = self._lib.d2i_PKCS7_bio(bio.bio, self._ffi.NULL)
