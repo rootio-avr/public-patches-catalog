@@ -1,6 +1,6 @@
-# glibc : 2.39-0ubuntu8.7.root.io.3
+# glibc : 2.39-0ubuntu8.7.root.io.4
 
-This patch is based on glibc version 2.39-0ubuntu8.7.root.io.3, which is available at:
+This patch is based on glibc version 2.39-0ubuntu8.7.root.io.4, which is available at:
 https://sources.debian.org/src/glibc/2.39-0ubuntu8.7/
 
 ## Affected CVEs:
@@ -8,6 +8,7 @@ https://sources.debian.org/src/glibc/2.39-0ubuntu8.7/
 - CVE-2026-4046
 - CVE-2026-4438
 - CVE-2026-5435
+- CVE-2026-6238
 
 ## How to Apply:
 1. Obtain the source package: `apt source glibc`
