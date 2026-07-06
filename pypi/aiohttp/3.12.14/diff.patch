@@ -1687,3 +1687,353 @@ Author: Sam Bull <git@sambull.org>
                              auth = None
                              headers.pop(hdrs.AUTHORIZATION, None)
 
+
+--- a/CHANGES/12706.bugfix.rst
++++ b/CHANGES/12706.bugfix.rst
+@@ -0,0 +1 @@
++Fixed invalid bytes being allowed in multipart/payload headers -- by :user:`Dreamsorcerer`.
+--- a/aiohttp/payload.py
++++ b/aiohttp/payload.py
+@@ -35,6 +35,7 @@
+     parse_mimetype,
+     sentinel,
+ )
++from .http_writer import _safe_header
+ from .streams import StreamReader
+ from .typedefs import JSONEncoder, _CIMultiDict
+ 
+@@ -209,9 +210,10 @@
+     @property
+     def _binary_headers(self) -> bytes:
+         return (
+-            "".join([k + ": " + v + "\r\n" for k, v in self.headers.items()]).encode(
+-                "utf-8"
+-            )
++            "".join(
++                _safe_header(k) + ": " + _safe_header(v) + "\r\n"
++                for k, v in self.headers.items()
++            ).encode("utf-8")
+             + b"\r\n"
+         )
+ 
+--- a/tests/test_payload.py
++++ b/tests/test_payload.py
+@@ -101,6 +101,21 @@ def test_payload_content_type() -> None:
+     assert p.content_type == "application/json"
+ 
+ 
++@pytest.mark.parametrize("bad_byte", ("\r", "\n", "\x00"))
++def test_binary_headers_reject_injection_in_value(bad_byte: str) -> None:
++    p = Payload("test", headers={"X-Custom": f"value{bad_byte}Injected: bad"})
++    with pytest.raises(ValueError, match="header injection"):
++        p._binary_headers
++
++
++@pytest.mark.parametrize("bad_byte", ("\r", "\n", "\x00"))
++def test_binary_headers_reject_injection_in_name(bad_byte: str) -> None:
++    p = Payload("test")
++    p.headers[f"X-Custom{bad_byte}Injected"] = "value"
++    with pytest.raises(ValueError, match="header injection"):
++        p._binary_headers
++
++
+ def test_bytes_payload_default_content_type() -> None:
+     p = payload.BytesPayload(b"data")
+     assert p.content_type == "application/octet-stream"
+
+--- a/aiohttp/client_reqrep.py
++++ b/aiohttp/client_reqrep.py
+@@ -248,6 +248,7 @@ class ConnectionKey(NamedTuple):
+     proxy: Optional[URL]
+     proxy_auth: Optional[BasicAuth]
+     proxy_headers_hash: Optional[int]  # hash(CIMultiDict)
++    server_hostname: Optional[str] = None
+
+
+ def _is_expected_content_type(
+@@ -957,6 +958,7 @@ class ClientRequest:
+                 self.proxy,
+                 self.proxy_auth,
+                 h,
++                self.server_hostname,
+             ),
+         )
+
+
+--- a/aiohttp/cookiejar.py
++++ b/aiohttp/cookiejar.py
+@@ -123,14 +123,53 @@
+         return self._quote_cookie
+ 
+     def save(self, file_path: PathLike) -> None:
++        # Persist the cookies mapping alongside host-only scoping and
++        # absolute expiration deadlines so that round-tripping through
++        # save()/load() does not silently widen a host-only cookie to
++        # all subdomains (CVE-2026-54279) or reset relative deadlines.
+         file_path = pathlib.Path(file_path)
++        data = {
++            "cookies": self._cookies,
++            "host_only_cookies": self._host_only_cookies,
++            "expirations": self._expirations,
++        }
+         with file_path.open(mode="wb") as f:
+-            pickle.dump(self._cookies, f, pickle.HIGHEST_PROTOCOL)
++            pickle.dump(data, f, pickle.HIGHEST_PROTOCOL)
+ 
+     def load(self, file_path: PathLike) -> None:
+         file_path = pathlib.Path(file_path)
+         with file_path.open(mode="rb") as f:
+-            self._cookies = pickle.load(f)
++            data = pickle.load(f)
++        # New persistence format is a plain ``dict`` with the marker keys
++        # ``cookies``/``host_only_cookies``/``expirations``. The legacy
++        # format pickled ``self._cookies`` directly, which is a
++        # ``defaultdict`` keyed by ``(domain, path)`` tuples and therefore
++        # cannot collide with these string keys.
++        if (
++            isinstance(data, dict)
++            and "cookies" in data
++            and "host_only_cookies" in data
++        ):
++            self._cookies = data["cookies"]
++            self._host_only_cookies = set(data.get("host_only_cookies") or ())
++            self._expirations = dict(data.get("expirations") or {})
++            # Rebuild the expiration heap from the restored deadlines so
++            # _do_expiration() can drop anything that has elapsed since
++            # the file was written.
++            self._expire_heap = [
++                (when, key) for key, when in self._expirations.items()
++            ]
++            heapq.heapify(self._expire_heap)
++            self._do_expiration()
++        else:
++            # Legacy pickle: just the cookies mapping. ``host_only_cookies``
++            # cannot be recovered from the file, so a previously host-only
++            # cookie loaded from an old file will widen to subdomains -- the
++            # documented migration loss called out in the GHSA advisory.
++            self._cookies = data
++            self._host_only_cookies = set()
++            self._expirations = {}
++            self._expire_heap = []
+ 
+     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
+         if predicate is None:
+--- a/tests/test_cookiejar.py
++++ b/tests/test_cookiejar.py
+@@ -1603,3 +1603,84 @@
+     # Verify cache is reused efficiently
+     assert ("", "") in jar._morsel_cache
+     assert "universal" in jar._morsel_cache[("", "")]
++
++
++def test_save_load_preserves_host_only_scope(tmp_path, loop) -> None:
++    """CVE-2026-54279: save/load must keep host-only cookies off subdomains."""
++    file_path = pathlib.Path(str(tmp_path)) / "host_only.cookie"
++    issuer = URL("https://auth.example.com/login")
++    subdomain = URL("https://sub.auth.example.com/")
++
++    jar_save = CookieJar(loop=loop)
++    jar_save.update_cookies({"sid": "hostonly"}, response_url=issuer)
++    # Sanity: host-only scoping holds before persistence.
++    assert "sid" not in jar_save.filter_cookies(subdomain)
++    assert ("auth.example.com", "sid") in jar_save._host_only_cookies
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar(loop=loop)
++    jar_load.load(file_path=file_path)
++
++    # Host-only scoping survives the round-trip.
++    assert ("auth.example.com", "sid") in jar_load._host_only_cookies
++    assert "sid" not in jar_load.filter_cookies(subdomain)
++    assert "sid" in jar_load.filter_cookies(issuer)
++
++
++def test_save_load_domain_cookie_still_matches_subdomain(tmp_path, loop) -> None:
++    """An explicit Domain cookie remains valid for subdomains after save/load."""
++    file_path = pathlib.Path(str(tmp_path)) / "domain.cookie"
++    subdomain = URL("https://sub.example.com/")
++
++    jar_save = CookieJar(loop=loop)
++    jar_save.update_cookies_from_headers(
++        ["sid=domaincookie; Domain=example.com"], URL("https://example.com/")
++    )
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar(loop=loop)
++    jar_load.load(file_path=file_path)
++
++    assert jar_load._host_only_cookies == set()
++    assert "sid" in jar_load.filter_cookies(subdomain)
++
++
++def test_save_load_preserves_expirations(tmp_path, loop) -> None:
++    """Absolute expiration deadlines survive a save/load roundtrip."""
++    file_path = pathlib.Path(str(tmp_path)) / "max_age.cookie"
++    url = URL("https://example.com/")
++
++    jar_save = CookieJar(loop=loop)
++    jar_save.update_cookies_from_headers(
++        ["sid=x; Max-Age=3600; Domain=example.com"], url
++    )
++    expirations = dict(jar_save._expirations)
++    assert expirations, "Max-Age cookie must schedule an expiration"
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar(loop=loop)
++    jar_load.load(file_path=file_path)
++
++    # The deadline restores as the original absolute time, not now + Max-Age.
++    assert dict(jar_load._expirations) == expirations
++    assert "sid" in jar_load.filter_cookies(url)
++
++
++def test_load_legacy_pickle_format(tmp_path, loop, cookies_to_receive) -> None:
++    """Legacy save files (raw pickled ``_cookies``) still load successfully."""
++    file_path = pathlib.Path(str(tmp_path)) / "legacy.cookie"
++    jar_seed = CookieJar(loop=loop)
++    jar_seed.update_cookies(cookies_to_receive)
++    # Write the legacy on-disk format: just the cookies mapping.
++    with file_path.open("wb") as f:
++        pickle.dump(jar_seed._cookies, f, pickle.HIGHEST_PROTOCOL)
++
++    jar_load = CookieJar(loop=loop)
++    jar_load.load(file_path=file_path)
++
++    # Cookies survived; host-only state is empty (documented migration loss).
++    assert jar_load._host_only_cookies == set()
++    loaded = SimpleCookie()
++    for cookie in jar_load:
++        loaded[cookie.key] = cookie
++    assert loaded == cookies_to_receive
+
+Backport of upstream commit 1ac92dae2f30f311cfda08e7a431e76b9cb41a28
+("Payload close on disconnect", PR #12831; 3.14 backport: a762eda5).
+
+Fixes CVE-2026-54280: Response.write_eof() did not close the Payload body
+when the underlying write() raised (e.g. client disconnect mid-write or
+task cancellation). The payload's close() was therefore skipped, leaking
+file descriptors / other resources held by the payload. Wrapping the
+write call in try/finally guarantees close() runs on every code path.
+
+Adapted to aiohttp 3.12.14: the runtime hunk applies verbatim. The test
+hunk imports asyncio, Payload, and AbstractStreamWriter (none were
+imported in 3.12.14's test module), and uses the locally-imported
+Response symbol instead of web.Response (matches 3.12.14 import style).
+The CHANGES/12831.bugfix.rst changelog file from the upstream commit is
+intentionally omitted.
+
+Origin: upstream, https://github.com/aio-libs/aiohttp/commit/1ac92dae2f30f311cfda08e7a431e76b9cb41a28
+Bug: https://nvd.nist.gov/vuln/detail/CVE-2026-54280
+
+--- a/aiohttp/web_response.py
++++ b/aiohttp/web_response.py
+@@ -779,8 +779,10 @@
+         if body is None or self._must_be_empty_body:
+             await super().write_eof()
+         elif isinstance(self._body, Payload):
+-            await self._body.write(self._payload_writer)
+-            await self._body.close()
++            try:
++                await self._body.write(self._payload_writer)
++            finally:
++                await self._body.close()
+             await super().write_eof()
+         else:
+             await super().write_eof(cast(bytes, body))
+--- a/tests/test_web_response.py
++++ b/tests/test_web_response.py
+@@ -1,3 +1,4 @@
++import asyncio
+ import collections.abc
+ import datetime
+ import gzip
+@@ -14,10 +15,11 @@
+ from re_assert import Matches
+
+ from aiohttp import HttpVersion, HttpVersion10, HttpVersion11, hdrs
++from aiohttp.abc import AbstractStreamWriter
+ from aiohttp.helpers import ETag
+ from aiohttp.http_writer import StreamWriter, _serialize_headers
+ from aiohttp.multipart import BodyPartReader, MultipartWriter
+-from aiohttp.payload import BytesPayload, StringPayload
++from aiohttp.payload import BytesPayload, Payload, StringPayload
+ from aiohttp.test_utils import make_mocked_request
+ from aiohttp.web import ContentCoding, Response, StreamResponse, json_response
+
+@@ -1346,6 +1348,76 @@
+     await resp.write_eof()
+     await resp.write_eof()
+     writer.write_eof.assert_called_once_with(data)
++
++
++class _ClosingPayload(Payload):
++    """Payload test double that records whether close() ran."""
++
++    def __init__(self) -> None:
++        super().__init__(None)
++        self.close_called = False
++        self.started = asyncio.Event()
++        self.release = asyncio.Event()
++        self.fail = False
++
++    async def write(self, writer: AbstractStreamWriter) -> None:
++        self.started.set()
++        if self.fail:
++            raise ConnectionResetError("client gone")
++        await self.release.wait()
++
++    async def close(self) -> None:
++        self.close_called = True
++        await super().close()
++
++    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
++        assert False
++
++
++async def test_write_eof_closes_payload_on_success() -> None:
++    writer = mock.create_autospec(AbstractStreamWriter, spec_set=True, instance=True)
++    req = make_request("GET", "/", writer=writer)
++    payload = _ClosingPayload()
++    payload.release.set()
++    resp = Response(body=payload)
++
++    await resp.prepare(req)
++    await resp.write_eof()
++
++    assert payload.close_called
++    assert writer.write_eof.called
++
++
++async def test_write_eof_closes_payload_on_write_error() -> None:
++    writer = mock.create_autospec(AbstractStreamWriter, spec_set=True, instance=True)
++    req = make_request("GET", "/", writer=writer)
++    payload = _ClosingPayload()
++    payload.fail = True
++    resp = Response(body=payload)
++
++    await resp.prepare(req)
++    with pytest.raises(ConnectionResetError):
++        await resp.write_eof()
++
++    assert payload.close_called
++    assert not writer.write_eof.called
++
++
++async def test_write_eof_closes_payload_on_cancel() -> None:
++    writer = mock.create_autospec(AbstractStreamWriter, spec_set=True, instance=True)
++    req = make_request("GET", "/", writer=writer)
++    payload = _ClosingPayload()
++    resp = Response(body=payload)
++
++    await resp.prepare(req)
++    task = asyncio.ensure_future(resp.write_eof())
++    await payload.started.wait()
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++    assert payload.close_called
++    assert not writer.write_eof.called
+
+
+ def test_set_text_with_content_type() -> None:
