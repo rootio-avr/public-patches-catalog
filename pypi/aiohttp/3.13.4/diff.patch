@@ -1,0 +1,1525 @@
+--- a/aiohttp/cookiejar.py
++++ b/aiohttp/cookiejar.py
+@@ -4,6 +4,7 @@
+ import datetime
+ import heapq
+ import itertools
++import json
+ import os  # noqa
+ import pathlib
+ import pickle
+@@ -48,6 +49,41 @@
+ _SIMPLE_COOKIE = SimpleCookie()
+ 
+ 
++class _RestrictedCookieUnpickler(pickle.Unpickler):
++    """A restricted unpickler that only allows cookie-related types.
++
++    This prevents arbitrary code execution when loading pickled cookie data
++    from untrusted sources. Only types that are expected in a serialized
++    CookieJar are permitted.
++
++    See: https://docs.python.org/3/library/pickle.html#restricting-globals
++    """
++
++    _ALLOWED_CLASSES: frozenset[tuple[str, str]] = frozenset(
++        {
++            # Core cookie types
++            ("http.cookies", "SimpleCookie"),
++            ("http.cookies", "Morsel"),
++            # Container types used by CookieJar._cookies
++            ("collections", "defaultdict"),
++            # builtins that pickle uses for reconstruction
++            ("builtins", "tuple"),
++            ("builtins", "set"),
++            ("builtins", "frozenset"),
++            ("builtins", "dict"),
++        }
++    )
++
++    def find_class(self, module: str, name: str) -> type:
++        if (module, name) not in self._ALLOWED_CLASSES:
++            raise pickle.UnpicklingError(
++                f"Forbidden class: {module}.{name}. "
++                "CookieJar.load() only allows cookie-related types for security. "
++                "See https://docs.python.org/3/library/pickle.html#restricting-globals"
++            )
++        return super().find_class(module, name)  # type: ignore[no-any-return]
++
++
+ class CookieJar(AbstractCookieJar):
+     """Implements cookie storage adhering to RFC 6265."""
+ 
+@@ -123,14 +159,84 @@
+         return self._quote_cookie
+ 
+     def save(self, file_path: PathLike) -> None:
++        """Save cookies to a file using JSON format.
++
++        :param file_path: Path to file where cookies will be serialized,
++            :class:`str` or :class:`pathlib.Path` instance.
++        """
+         file_path = pathlib.Path(file_path)
+-        with file_path.open(mode="wb") as f:
+-            pickle.dump(self._cookies, f, pickle.HIGHEST_PROTOCOL)
++        data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]] = {}
++        for (domain, path), cookie in self._cookies.items():
++            key = f"{domain}|{path}"
++            data[key] = {}
++            for name, morsel in cookie.items():
++                morsel_data: Dict[str, Union[str, bool]] = {
++                    "key": morsel.key,
++                    "value": morsel.value,
++                    "coded_value": morsel.coded_value,
++                }
++                # Save all morsel attributes that have values
++                for attr in morsel._reserved:  # type: ignore[attr-defined]
++                    attr_val = morsel[attr]
++                    if attr_val:
++                        morsel_data[attr] = attr_val
++                data[key][name] = morsel_data
++        with file_path.open(mode="w", encoding="utf-8") as f:
++            json.dump(data, f, indent=2)
+ 
+     def load(self, file_path: PathLike) -> None:
++        """Load cookies from a file.
++
++        Tries to load JSON format first. Falls back to loading legacy
++        pickle format (using a restricted unpickler) for backward
++        compatibility with existing cookie files.
++
++        :param file_path: Path to file from where cookies will be
++            imported, :class:`str` or :class:`pathlib.Path` instance.
++        """
+         file_path = pathlib.Path(file_path)
+-        with file_path.open(mode="rb") as f:
+-            self._cookies = pickle.load(f)
++        # Try JSON format first
++        try:
++            with file_path.open(mode="r", encoding="utf-8") as f:
++                data = json.load(f)
++            self._cookies = self._load_json_data(data)
++        except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
++            # Fall back to legacy pickle format with restricted unpickler
++            with file_path.open(mode="rb") as f:
++                self._cookies = _RestrictedCookieUnpickler(f).load()
++
++    def _load_json_data(
++        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]]
++    ) -> "DefaultDict[Tuple[str, str], SimpleCookie]":
++        """Load cookies from parsed JSON data."""
++        cookies: DefaultDict[Tuple[str, str], SimpleCookie] = defaultdict(SimpleCookie)
++        for compound_key, cookie_data in data.items():
++            domain, path = compound_key.split("|", 1)
++            key = (domain, path)
++            for name, morsel_data in cookie_data.items():
++                morsel: Morsel[str] = Morsel()
++                morsel_key = morsel_data["key"]
++                morsel_value = morsel_data["value"]
++                morsel_coded_value = morsel_data["coded_value"]
++                # Use __setstate__ to bypass validation, same pattern
++                # used in _build_morsel and _cookie_helpers.
++                morsel.__setstate__(  # type: ignore[attr-defined]
++                    {
++                        "key": morsel_key,
++                        "value": morsel_value,
++                        "coded_value": morsel_coded_value,
++                    }
++                )
++                # Restore morsel attributes
++                for attr in morsel._reserved:  # type: ignore[attr-defined]
++                    if attr in morsel_data and attr not in (
++                        "key",
++                        "value",
++                        "coded_value",
++                    ):
++                        morsel[attr] = morsel_data[attr]
++                cookies[key][name] = morsel
++        return cookies
+ 
+     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
+         if predicate is None:
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -95,6 +95,11 @@
+             bb.functions[func].can_block_in(
+                 "aiohttp/web_urldispatcher.py", "add_static"
+             )
++        # save/load is not async, so we must allow this:
++        for func in ("io.TextIOWrapper.read", "io.BufferedReader.read"):
++            bb.functions[func].can_block_in("aiohttp/cookiejar.py", "load")
++        for func in ("io.TextIOWrapper.write", "io.BufferedWriter.write"):
++            bb.functions[func].can_block_in("aiohttp/cookiejar.py", "save")
+         # Note: coverage.py uses locking internally which can cause false positives
+         # in blockbuster when it instruments code. This is particularly problematic
+         # on Windows where it can lead to flaky test failures.
+--- a/tests/test_cookiejar.py
++++ b/tests/test_cookiejar.py
+@@ -9,6 +9,7 @@
+ import unittest
+ from http.cookies import BaseCookie, Morsel, SimpleCookie
+ from operator import not_
++from pathlib import Path
+ from typing import List, Set
+ from unittest import mock
+ 
+@@ -1621,3 +1622,191 @@
+     # Verify cache is reused efficiently
+     assert ("", "") in jar._morsel_cache
+     assert "universal" in jar._morsel_cache[("", "")]
++
++
++# === Security tests for restricted unpickler and JSON save/load ===
++
++
++async def test_load_rejects_malicious_pickle(tmp_path: Path) -> None:
++    """Verify CookieJar.load() blocks arbitrary code execution via pickle.
++
++    A crafted pickle payload using os.system (or any non-cookie class)
++    must be rejected by the restricted unpickler.
++    """
++    import os
++
++    file_path = tmp_path / "malicious.pkl"
++
++    class RCEPayload:
++        def __reduce__(self) -> tuple[object, ...]:
++            return (os.system, ("echo PWNED",))
++
++    with open(file_path, "wb") as f:
++        pickle.dump(RCEPayload(), f, pickle.HIGHEST_PROTOCOL)
++
++    jar = CookieJar()
++    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
++        jar.load(file_path)
++
++
++async def test_load_rejects_eval_payload(tmp_path: Path) -> None:
++    """Verify CookieJar.load() blocks eval-based pickle payloads."""
++    file_path = tmp_path / "eval_payload.pkl"
++
++    class EvalPayload:
++        def __reduce__(self) -> tuple[object, ...]:
++            return (eval, ("__import__('os').system('echo PWNED')",))
++
++    with open(file_path, "wb") as f:
++        pickle.dump(EvalPayload(), f, pickle.HIGHEST_PROTOCOL)
++
++    jar = CookieJar()
++    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
++        jar.load(file_path)
++
++
++async def test_load_rejects_subprocess_payload(tmp_path: Path) -> None:
++    """Verify CookieJar.load() blocks subprocess-based pickle payloads."""
++    import subprocess
++
++    file_path = tmp_path / "subprocess_payload.pkl"
++
++    class SubprocessPayload:
++        def __reduce__(self) -> tuple[object, ...]:
++            return (subprocess.call, (["echo", "PWNED"],))
++
++    with open(file_path, "wb") as f:
++        pickle.dump(SubprocessPayload(), f, pickle.HIGHEST_PROTOCOL)
++
++    jar = CookieJar()
++    with pytest.raises(pickle.UnpicklingError, match="Forbidden class"):
++        jar.load(file_path)
++
++
++async def test_load_falls_back_to_pickle(
++    tmp_path: Path,
++    cookies_to_receive: SimpleCookie,
++) -> None:
++    """Verify load() falls back to restricted pickle for legacy cookie files.
++
++    Existing cookie files saved with older versions of aiohttp used pickle.
++    load() should detect that the file is not JSON and fall back to the
++    restricted pickle unpickler for backward compatibility.
++    """
++    file_path = tmp_path / "legit.pkl"
++
++    # Write a legacy pickle file directly (as old aiohttp save() would)
++    jar_save = CookieJar()
++    jar_save.update_cookies(cookies_to_receive)
++    with file_path.open(mode="wb") as f:
++        pickle.dump(jar_save._cookies, f, pickle.HIGHEST_PROTOCOL)
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    jar_test = SimpleCookie()
++    for cookie in jar_load:
++        jar_test[cookie.key] = cookie
++
++    assert jar_test == cookies_to_receive
++
++
++async def test_save_load_json_roundtrip(
++    tmp_path: Path,
++    cookies_to_receive: SimpleCookie,
++) -> None:
++    """Verify save/load roundtrip preserves cookies via JSON format."""
++    file_path = tmp_path / "cookies.json"
++
++    jar_save = CookieJar()
++    jar_save.update_cookies(cookies_to_receive)
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    saved_cookies = SimpleCookie()
++    for cookie in jar_save:
++        saved_cookies[cookie.key] = cookie
++
++    loaded_cookies = SimpleCookie()
++    for cookie in jar_load:
++        loaded_cookies[cookie.key] = cookie
++
++    assert saved_cookies == loaded_cookies
++
++
++async def test_save_load_json_partitioned_cookies(tmp_path: Path) -> None:
++    """Verify save/load roundtrip works with partitioned cookies."""
++    file_path = tmp_path / "partitioned.json"
++
++    jar_save = CookieJar()
++    jar_save.update_cookies_from_headers(
++        ["session=cookie; Partitioned"], URL("https://example.com/")
++    )
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    # Compare individual cookie values (same approach as test_save_load_partitioned_cookies)
++    saved = list(jar_save)
++    loaded = list(jar_load)
++    assert len(saved) == len(loaded)
++    for s, lo in zip(saved, loaded):
++        assert s.key == lo.key
++        assert s.value == lo.value
++        assert s["domain"] == lo["domain"]
++        assert s["path"] == lo["path"]
++
++
++async def test_json_format_is_safe(tmp_path: Path) -> None:
++    """Verify the JSON file format cannot execute code on load."""
++    import json
++
++    file_path = tmp_path / "safe.json"
++
++    # Write something that might look dangerous but is just data
++    malicious_data = {
++        "evil.com|/": {
++            "session": {
++                "key": "session",
++                "value": "__import__('os').system('echo PWNED')",
++                "coded_value": "__import__('os').system('echo PWNED')",
++            }
++        }
++    }
++    with open(file_path, "w") as f:
++        json.dump(malicious_data, f)
++
++    jar = CookieJar()
++    jar.load(file_path=file_path)
++
++    # The "malicious" string is just a cookie value, not executed code
++    cookies = list(jar)
++    assert len(cookies) == 1
++    assert cookies[0].value == "__import__('os').system('echo PWNED')"
++
++
++async def test_save_load_json_secure_cookies(tmp_path: Path) -> None:
++    """Verify save/load preserves Secure and HttpOnly flags."""
++    file_path = tmp_path / "secure.json"
++
++    jar_save = CookieJar()
++    jar_save.update_cookies_from_headers(
++        ["token=abc123; Secure; HttpOnly; Path=/; Domain=example.com"],
++        URL("https://example.com/"),
++    )
++    jar_save.save(file_path=file_path)
++
++    jar_load = CookieJar()
++    jar_load.load(file_path=file_path)
++
++    loaded_cookies = list(jar_load)
++    assert len(loaded_cookies) == 1
++    cookie = loaded_cookies[0]
++    assert cookie.key == "token"
++    assert cookie.value == "abc123"
++    assert cookie["secure"] is True
++    assert cookie["httponly"] is True
++    assert cookie["domain"] == "example.com"
+
+--- a/CHANGES/12540.bugfix.rst
++++ b/CHANGES/12540.bugfix.rst
+@@ -0,0 +1 @@
++Fixed per-request ``cookies`` not being dropped on cross-origin redirects -- by :user:`Dreamsorcerer`.
+--- a/aiohttp/client.py
++++ b/aiohttp/client.py
+@@ -892,6 +892,7 @@
+ 
+                         if url.origin() != redirect_origin:
+                             auth = None
++                            cookies = None
+                             headers.pop(hdrs.AUTHORIZATION, None)
+                             headers.pop(hdrs.COOKIE, None)
+                             headers.pop(hdrs.PROXY_AUTHORIZATION, None)
+--- a/tests/test_client_functional.py
++++ b/tests/test_client_functional.py
+@@ -3564,8 +3564,20 @@
+     async with aiohttp.ClientSession(
+         connector=connector, auth=aiohttp.BasicAuth("user", "pass")
+     ) as client:
+-        resp = await client.get(url_from)
+-        assert resp.status == 200
++        async with client.get(
++            url_from,
++            headers={
++                "Proxy-Authorization": "Basic dXNlcjpwYXNz",
++                "Cookie": "a=b",
++            },
++        ) as resp:
++            assert resp.status == 200
++        async with client.get(
++            url_from,
++            headers={"Proxy-Authorization": "Basic dXNlcjpwYXNz"},
++            cookies={"a": "b"},
++        ) as resp:
++            assert resp.status == 200
+ 
+ 
+ async def test_drop_auth_on_redirect_to_other_host_with_global_auth_and_base_url(
+
+--- /dev/null
++++ b/CHANGES/12830.bugfix.rst
+@@ -0,0 +1 @@
++Bounded the number of parsed-but-unhandled pipelined HTTP/1 requests buffered per connection on the server; once the queue reaches an internal limit the parser stops emitting and the transport is paused, resuming as the request handler drains the queue, so a client keeping one handler busy can no longer accumulate an unbounded backlog of pipelined requests -- by :user:`bdraco`.
+--- a/docs/spelling_wordlist.txt
++++ b/docs/spelling_wordlist.txt
+@@ -250,6 +250,7 @@ peername
+ performant
+ pickleable
+ ping
++pipelined
+ pipelining
+ pluggable
+ plugin
+--- a/aiohttp/base_protocol.py
++++ b/aiohttp/base_protocol.py
+@@ -5,6 +5,13 @@
+ from .helpers import set_exception
+ from .tcp_helpers import tcp_nodelay
+
++# Raised by transport.pause_reading()/resume_reading() when the transport
++# does not support flow control; safe to ignore.
++# NOTE: Catch these with a plain try/except/pass, never contextlib.suppress():
++# pause/resume run on the hot read path and suppress() is ~6x slower than
++# try/except here (it builds a context manager and unpacks this tuple per call).
++PAUSE_RESUME_READING_ERRORS = (AttributeError, NotImplementedError, RuntimeError)
++
+
+ class BaseProtocol(asyncio.Protocol):
+     __slots__ = (
+--- a/aiohttp/http_parser.py
++++ b/aiohttp/http_parser.py
+@@ -255,6 +255,7 @@
+         response_with_body: bool = True,
+         read_until_eof: bool = False,
+         auto_decompress: bool = True,
++        max_msg_queue_size: int = 0,
+     ) -> None:
+         self.protocol = protocol
+         self.loop = loop
+@@ -275,6 +276,9 @@
+         self._headers_parser = HeadersParser(
+             max_line_size, max_headers, max_field_size, self.lax
+         )
++        # Stop emitting messages once this many are queued unconsumed (0 = off).
++        self._max_msg_queue_size = max_msg_queue_size
++        self._msg_in_flight = 0
+
+     @abc.abstractmethod
+     def parse_message(self, lines: List[bytes]) -> _MsgT: ...
+@@ -282,6 +286,11 @@
+     @abc.abstractmethod
+     def _is_chunked_te(self, te: str) -> bool: ...
+
++    def message_consumed(self) -> None:
++        """Protocol drained a queued message; free a slot for parsing."""
++        if self._msg_in_flight > 0:
++            self._msg_in_flight -= 1
++
+     def feed_eof(self) -> Optional[_MsgT]:
+         if self._payload_parser is not None:
+             self._payload_parser.feed_eof()
+@@ -325,6 +334,15 @@
+             # read HTTP message (request/response line + headers), \r\n\r\n
+             # and split by lines
+             if self._payload_parser is None and not self._upgraded:
++                if (
++                    self._max_msg_queue_size
++                    and self._msg_in_flight >= self._max_msg_queue_size
++                ):
++                    # Queue full: buffer the rest and stop. Safe pause point;
++                    # any preceding body is consumed before the next request
++                    # line. Resumes via feed_data(b"") when the queue drains.
++                    self._tail = data[start_pos:]
++                    break
+                 pos = data.find(SEP, start_pos)
+                 # consume \r\n
+                 if pos == start_pos and not self._lines:
+@@ -460,6 +478,8 @@
+                             payload = EMPTY_PAYLOAD
+
+                         messages.append((msg, payload))
++                        if self._max_msg_queue_size:
++                            self._msg_in_flight += 1
+                         should_close = msg.should_close
+                 else:
+                     self._tail = data[start_pos:]
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -313,6 +313,8 @@
+         list    _messages
+         object  _payload
+         bint    _payload_error
++        Py_ssize_t _msg_in_flight
++        Py_ssize_t _max_msg_queue_size
+         object  _payload_exception
+         object  _last_error
+         bint    _auto_decompress
+@@ -345,6 +347,7 @@
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+         bint auto_decompress=True,
++        Py_ssize_t max_msg_queue_size=0,
+     ):
+         cparser.llhttp_settings_init(self._csettings)
+         cparser.llhttp_init(self._cparser, mode, self._csettings)
+@@ -357,6 +360,8 @@
+         self._payload = None
+         self._payload_error = 0
+         self._payload_exception = payload_exception
++        self._msg_in_flight = 0
++        self._max_msg_queue_size = max_msg_queue_size
+         self._messages = []
+
+         self._raw_name = EMPTY_BYTES
+@@ -533,5 +538,10 @@
+     ### Public API ###
+
++    def message_consumed(self):
++        # Protocol drained a queued message; free a slot for parsing.
++        if self._msg_in_flight > 0:
++            self._msg_in_flight -= 1
++
+     def feed_eof(self):
+         cdef bytes desc
+
+@@ -608,12 +618,12 @@
+         size_t max_line_size=8190, size_t max_headers=128,
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+-        bint auto_decompress=True,
++        bint auto_decompress=True, Py_ssize_t max_msg_queue_size=0,
+     ):
+         self._init(cparser.HTTP_REQUEST, protocol, loop, limit, timer,
+                    max_line_size, max_headers, max_field_size,
+                    payload_exception, response_with_body, read_until_eof,
+-                   auto_decompress)
++                   auto_decompress, max_msg_queue_size)
+
+     cdef object _on_status_complete(self):
+         cdef int idx1, idx2
+
+
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -27,7 +27,7 @@
+ from propcache import under_cached_property
+
+ from .abc import AbstractAccessLogger, AbstractStreamWriter
+-from .base_protocol import BaseProtocol
++from .base_protocol import PAUSE_RESUME_READING_ERRORS, BaseProtocol
+ from .helpers import ceil_timeout
+ from .http import (
+     HttpProcessingError,
+@@ -45,6 +45,11 @@
+
+ __all__ = ("RequestHandler", "RequestPayloadError", "PayloadAccessError")
+
++# Max parsed-but-unhandled pipelined requests buffered per connection before
++# reading is paused. Bounds memory a client can pin by keeping one handler busy
++# and pipelining behind it; reading resumes as the queue drains.
++MAX_MSG_QUEUE_SIZE = 32
++
+ if TYPE_CHECKING:
+     import ssl
+
+@@ -158,6 +163,9 @@
+         "_keepalive_timeout",
+         "_lingering_time",
+         "_messages",
++        "_max_msg_queue_size",
++        "_msg_queue_resume_size",
++        "_msg_queue_paused",
+         "_message_tail",
+         "_handler_waiter",
+         "_waiter",
+@@ -199,6 +207,12 @@
+         timeout_ceil_threshold: float = 5,
+     ):
+         super().__init__(loop)
++        self._max_msg_queue_size = MAX_MSG_QUEUE_SIZE
++        # Low-water mark: resume reading once the queue drains to half the limit
++        # so we refill in batches instead of churning pause/resume per request.
++        self._msg_queue_resume_size = MAX_MSG_QUEUE_SIZE // 2
++        # Track whether reading is paused due to a full queue.
++        self._msg_queue_paused = False
+
+         # _request_count is the number of requests processed with the same connection.
+         self._request_count = 0
+@@ -236,6 +250,7 @@
+             max_headers=max_headers,
+             payload_exception=RequestPayloadError,
+             auto_decompress=auto_decompress,
++            max_msg_queue_size=MAX_MSG_QUEUE_SIZE,
+         )
+
+         self._timeout_ceil_threshold: float = 5
+@@ -428,6 +443,14 @@
+                 # don't set result twice
+                 waiter.set_result(None)
+
++            # Queue full: pause the transport (the parser already stopped
++            # emitting). start() resumes as it drains the queue.
++            if (
++                not self._msg_queue_paused
++                and len(self._messages) >= self._max_msg_queue_size
++            ):
++                self._pause_msg_queue_reading()
++
+             self._upgrade = upgraded
+             if upgraded and tail:
+                 self._message_tail = tail
+@@ -443,6 +466,40 @@
+             if eof:
+                 self.close()
+
++    def resume_reading(self) -> None:
++        # Stay paused for the message-queue reason even when the transport
++        # would otherwise be resumed (e.g. payload backpressure released).
++        if self._msg_queue_paused:
++            return
++        super().resume_reading()
++
++    def _pause_msg_queue_reading(self) -> None:
++        self._msg_queue_paused = True
++        if self.transport is not None:
++            try:
++                self.transport.pause_reading()
++            except PAUSE_RESUME_READING_ERRORS:
++                # Transport lacks flow control; nothing to pause. Intentionally
++                # ignored (see PAUSE_RESUME_READING_ERRORS; do not use suppress).
++                pass
++
++    def _resume_msg_queue_reading(self) -> None:
++        if not self._upgrade:
++            # Reparse buffered pipelined requests while still marked paused so
++            # a refill past the limit does not re-pause an already-paused
++            # transport; only resume below once it stayed under the limit.
++            self.data_received(b"")
++            if len(self._messages) >= self._max_msg_queue_size:
++                return
++        self._msg_queue_paused = False
++        if not self._reading_paused and self.transport is not None:
++            try:
++                self.transport.resume_reading()
++            except PAUSE_RESUME_READING_ERRORS:
++                # Transport lacks flow control; nothing to resume. Intentionally
++                # ignored (see PAUSE_RESUME_READING_ERRORS; do not use suppress).
++                pass
++
+     def keep_alive(self, val: bool) -> None:
+         """Set keep-alive connection mode.
+
+@@ -573,6 +630,16 @@
+
+             message, payload = self._messages.popleft()
+
++            # Free a parser slot; resume reading once drained to low water so
++            # pipelining keeps flowing while this request is handled.
++            if self._request_parser is not None:
++                self._request_parser.message_consumed()
++            if (
++                self._msg_queue_paused
++                and len(self._messages) <= self._msg_queue_resume_size
++            ):
++                self._resume_msg_queue_reading()
++
+             # time is only fetched if logging is enabled as otherwise
+             # its thrown away and never used.
+             start = loop.time() if self._logging_enabled else None
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -116,6 +116,78 @@
+     assert "RawResponseMessageC" in dir(aiohttp.http_parser)
+
+
++_PIPELINED_GET = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
++
++
++def _build_py_request_parser(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++    max_msg_queue_size: int,
++) -> Any:
++    # Tests target the Python parser explicitly: the queue-cap with parser-side
++    # pause is only implemented in the Python parser in this backport. The
++    # transport-level pause in RequestHandler still bounds both parser paths.
++    from aiohttp.http_parser import HttpRequestParserPy
++
++    return HttpRequestParserPy(
++        protocol,
++        loop,
++        2**16,
++        max_line_size=8190,
++        max_headers=128,
++        max_field_size=8190,
++        max_msg_queue_size=max_msg_queue_size,
++    )
++
++
++def test_max_msg_queue_size_caps_emitted_messages(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 4)
++    messages, upgraded, _tail = parser.feed_data(_PIPELINED_GET * 10)
++    assert len(messages) == 4
++    assert not upgraded
++
++
++def test_max_msg_queue_size_resumes_after_consume(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    limit = 4
++    total = 10
++    parser = _build_py_request_parser(protocol, loop, limit)
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * total)
++    seen = 0
++    while messages:
++        assert len(messages) <= limit
++        seen += len(messages)
++        for _msg, _payload in messages:
++            parser.message_consumed()
++        messages, _upgraded, _tail = parser.feed_data(b"")
++    assert seen == total
++
++
++def test_max_msg_queue_size_zero_is_unbounded(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 0)
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 50)
++    assert len(messages) == 50
++
++
++def test_message_consumed_underflow_is_ignored(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 4)
++    # No message is in flight; consuming must not underflow the counter.
++    parser.message_consumed()
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 4)
++    assert len(messages) == 4
++
++
+ def test_parse_headers(parser: Any) -> None:
+     text = b"""GET /test HTTP/1.1\r
+ test: a line\r
+--- a/tests/test_web_functional.py
++++ b/tests/test_web_functional.py
+@@ -26,7 +26,7 @@
+ from aiohttp.hdrs import CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING
+ from aiohttp.pytest_plugin import AiohttpClient, AiohttpServer
+ from aiohttp.typedefs import Handler
+-from aiohttp.web_protocol import RequestHandler
++from aiohttp.web_protocol import MAX_MSG_QUEUE_SIZE, RequestHandler
+
+ try:
+     import brotlicffi as brotli
+@@ -1681,6 +1681,140 @@
+     await resp.release()
+
+
++async def test_http1_pipelined_requests_are_count_limited(
++    aiohttp_server: AiohttpServer,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Requests pipelined behind a busy handler must not grow unbounded.
++
++    A client can keep one handler active and pipeline many complete requests
++    behind it; the per-connection queue stays bounded by MAX_MSG_QUEUE_SIZE.
++    """
++    from contextlib import suppress
++
++    pipelined_requests = 500
++    slow_handler_started = asyncio.Event()
++    queue_observed = asyncio.Event()
++    max_queued = 0
++    data_received = RequestHandler.data_received
++
++    def observe_data_received(self: RequestHandler, data: bytes) -> None:
++        nonlocal max_queued
++        data_received(self, data)
++        if self._request_in_progress and self._messages:
++            max_queued = max(max_queued, len(self._messages))
++            queue_observed.set()
++
++    monkeypatch.setattr(RequestHandler, "data_received", observe_data_received)
++
++    async def slow_handler(request: web.Request) -> web.Response:
++        slow_handler_started.set()
++        await asyncio.sleep(0.5)
++        return web.Response(text="slow")
++
++    async def fast_handler(request: web.Request) -> NoReturn:
++        # The pipelined requests are only counted, never handled: the test
++        # closes the connection while the slow handler still holds the loop.
++        assert False
++
++    app = web.Application()
++    app.router.add_get("/slow", slow_handler)
++    app.router.add_get("/x", fast_handler)
++    server = await aiohttp_server(app)
++
++    def raw_get(path: str) -> bytes:
++        return (
++            f"GET {path} HTTP/1.1\r\nHost: localhost\r\n"
++            "Connection: keep-alive\r\n\r\n"
++        ).encode("ascii")
++
++    reader, writer = await asyncio.open_connection(server.host, server.port)
++    try:
++        writer.write(raw_get("/slow"))
++        await writer.drain()
++        await asyncio.wait_for(slow_handler_started.wait(), 1)
++
++        writer.write(raw_get("/x") * pipelined_requests)
++        await writer.drain()
++        await asyncio.wait_for(queue_observed.wait(), 1)
++    finally:
++        writer.close()
++        with suppress(ConnectionResetError, BrokenPipeError):
++            await writer.wait_closed()
++
++    # Tight lower bound also catches over-aggressive pausing (e.g. clamping to 1).
++    assert MAX_MSG_QUEUE_SIZE // 2 < max_queued <= MAX_MSG_QUEUE_SIZE
++
++
++async def test_http1_pipelined_queue_resumes_after_drain(
++    aiohttp_server: AiohttpServer,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A paused pipeline queue resumes reading once handlers drain it.
++
++    Once enough requests are pipelined behind a busy handler to fill the queue,
++    reading is paused; as the handlers drain the queue past the low-water mark
++    reading must resume so the remaining buffered requests are still served.
++    """
++    from contextlib import suppress
++
++    # Several times the limit so the queue refills and re-pauses while draining.
++    pipelined_requests = MAX_MSG_QUEUE_SIZE * 3
++    first_started = asyncio.Event()
++    release_first = asyncio.Event()
++    resumed = asyncio.Event()
++    handled: list = []
++    all_handled = asyncio.Event()
++
++    resume = RequestHandler._resume_msg_queue_reading
++
++    def observe_resume(self: RequestHandler) -> None:
++        resume(self)
++        resumed.set()
++
++    monkeypatch.setattr(RequestHandler, "_resume_msg_queue_reading", observe_resume)
++
++    async def handler(request: web.Request) -> web.Response:
++        if request.path == "/first":
++            first_started.set()
++            await release_first.wait()
++        handled.append(request.path)
++        if len(handled) == pipelined_requests + 1:
++            all_handled.set()
++        return web.Response()
++
++    app = web.Application()
++    app.router.add_get("/{tail:.*}", handler)
++    server = await aiohttp_server(app)
++
++    def raw_get(path: str) -> bytes:
++        return (
++            f"GET {path} HTTP/1.1\r\nHost: localhost\r\n"
++            "Connection: keep-alive\r\n\r\n"
++        ).encode("ascii")
++
++    reader, writer = await asyncio.open_connection(server.host, server.port)
++    try:
++        writer.write(raw_get("/first"))
++        await writer.drain()
++        await asyncio.wait_for(first_started.wait(), 1)
++
++        writer.write(b"".join(raw_get(f"/r{i}") for i in range(pipelined_requests)))
++        await writer.drain()
++
++        # Let the busy handler finish so the queue drains and reading resumes.
++        release_first.set()
++        await asyncio.wait_for(resumed.wait(), 5)
++        # Every pipelined request is still served only if reading resumed.
++        await asyncio.wait_for(all_handled.wait(), 5)
++    finally:
++        writer.close()
++        with suppress(ConnectionResetError, BrokenPipeError):
++            await writer.wait_closed()
++
++    assert len(handled) == pipelined_requests + 1
++
++
+ async def test_app_max_client_size(aiohttp_client) -> None:
+     async def handler(request):
+         await request.post()
+
+--- a/aiohttp/_websocket/reader_py.py
++++ b/aiohttp/_websocket/reader_py.py
+@@ -208,12 +208,6 @@ class WebSocketReader:
+                 if opcode != OP_CODE_CONTINUATION:
+                     self._opcode = opcode
+                 self._partial += payload
+-                if self._max_msg_size and len(self._partial) >= self._max_msg_size:
+-                    raise WebSocketError(
+-                        WSCloseCode.MESSAGE_TOO_BIG,
+-                        f"Message size {len(self._partial)} "
+-                        f"exceeds limit {self._max_msg_size}",
+-                    )
+                 return
+ 
+             has_partial = bool(self._partial)
+@@ -236,13 +230,6 @@ class WebSocketReader:
+             else:
+                 assembled_payload = payload
+ 
+-            if self._max_msg_size and len(assembled_payload) >= self._max_msg_size:
+-                raise WebSocketError(
+-                    WSCloseCode.MESSAGE_TOO_BIG,
+-                    f"Message size {len(assembled_payload)} "
+-                    f"exceeds limit {self._max_msg_size}",
+-                )
+-
+             # Decompress process must to be done after all packets
+             # received.
+             if compressed:
+@@ -376,6 +363,19 @@ class WebSocketReader:
+                         "Received frame with non-zero reserved bits",
+                     )
+ 
++                if opcode not in {
++                    OP_CODE_CONTINUATION,
++                    OP_CODE_TEXT,
++                    OP_CODE_BINARY,
++                    OP_CODE_CLOSE,
++                    OP_CODE_PING,
++                    OP_CODE_PONG,
++                }:
++                    raise WebSocketError(
++                        WSCloseCode.PROTOCOL_ERROR,
++                        f"Unexpected opcode={opcode!r}",
++                    )
++
+                 if opcode > 0x7 and fin == 0:
+                     raise WebSocketError(
+                         WSCloseCode.PROTOCOL_ERROR,
+@@ -428,6 +428,22 @@ class WebSocketReader:
+                 else:
+                     self._payload_bytes_to_read = len_flag
+ 
++                # Reject oversized data frames before buffering any payload
++                # bytes. Control frames are capped at 125 bytes (checked in
++                # READ_HEADER) so only text/binary/continuation need this.
++                if self._max_msg_size and self._frame_opcode in {
++                    OP_CODE_TEXT,
++                    OP_CODE_BINARY,
++                    OP_CODE_CONTINUATION,
++                }:
++                    projected_size = self._payload_bytes_to_read + len(self._partial)
++                    if projected_size >= self._max_msg_size:
++                        raise WebSocketError(
++                            WSCloseCode.MESSAGE_TOO_BIG,
++                            f"Message size {projected_size} "
++                            f"exceeds limit {self._max_msg_size}",
++                        )
++
+                 self._state = READ_PAYLOAD_MASK if self._has_mask else READ_PAYLOAD
+ 
+             # read payload mask
+--- a/tests/test_websocket_parser.py
++++ b/tests/test_websocket_parser.py
+@@ -643,6 +643,74 @@ def test_compressed_msg_too_large(out) -> None:
+     assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
+ 
+ 
++@pytest.mark.parametrize("fin", (0x80, 0x00), ids=("fin", "non-fin"))
++def test_msg_too_large_at_header(out: WebSocketDataQueue, fin: int) -> None:
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    # Header alone: TEXT, 64-bit length, declares 1 MiB of payload.
++    header = PACK_LEN3(fin | WSMsgType.TEXT, 127, 1024 * 1024)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 1048576 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(header)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++def test_msg_too_large_across_fragments(out: WebSocketDataQueue) -> None:
++    # Individual fragments fit under max_msg_size but accumulate past it.
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    first = build_frame(b"a" * 100, WSMsgType.TEXT, is_fin=False)
++    parser._feed_data(first)
++    middle = build_frame(b"b" * 100, WSMsgType.CONTINUATION, is_fin=False)
++    parser._feed_data(middle)
++
++    # Third 100-byte fragment would push the accumulated total to 300.
++    last = build_frame(b"c" * 100, WSMsgType.CONTINUATION, is_fin=False)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 300 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(last)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++def test_msg_too_large_text_after_non_fin_text(out: WebSocketDataQueue) -> None:
++    # Protocol-violating sequence: a fresh TEXT arrives while a fragmented
++    # message is still open.
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    first = build_frame(b"a" * 200, WSMsgType.TEXT, is_fin=False)
++    parser._feed_data(first)
++
++    # Second TEXT header alone announces 100 bytes; 100 + 200 partial = 300.
++    second_header = PACK_LEN1(WSMsgType.TEXT, 100)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 300 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(second_header)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++@pytest.mark.parametrize(
++    "opcode",
++    (0x3, 0x4, 0x5, 0x6, 0x7, 0xB, 0xC, 0xD, 0xE, 0xF),
++    ids=lambda v: f"0x{v:x}",
++)
++def test_reserved_opcode_rejected_at_header(
++    out: WebSocketDataQueue, opcode: int
++) -> None:
++    # RFC 6455 reserves opcodes 0x3-0x7 (non-control) and 0xB-0xF (control).
++    parser = WebSocketReader(out, max_msg_size=256, compress=False)
++
++    header = PACK_LEN3(0x80 | opcode, 127, 1024 * 1024)
++    with pytest.raises(WebSocketError, match=rf"^Unexpected opcode={opcode}$") as ctx:
++        parser._feed_data(header)
++    assert ctx.value.code == WSCloseCode.PROTOCOL_ERROR
++
++
+ class TestWebSocketError:
+     def test_ctor(self) -> None:
+         err = WebSocketError(WSCloseCode.PROTOCOL_ERROR, "Something invalid")
+
+--- a/aiohttp/client_reqrep.py
++++ b/aiohttp/client_reqrep.py
+@@ -255,6 +255,7 @@ class ConnectionKey(NamedTuple):
+     proxy: Optional[URL]
+     proxy_auth: Optional[BasicAuth]
+     proxy_headers_hash: Optional[int]  # hash(CIMultiDict)
++    server_hostname: Optional[str] = None
+
+
+ def _is_expected_content_type(
+@@ -964,6 +965,7 @@
+                 self.proxy,
+                 self.proxy_auth,
+                 h,
++                self.server_hostname,
+             ),
+         )
+
+--- a/tests/test_client_functional.py
++++ b/tests/test_client_functional.py
+@@ -720,6 +720,37 @@ async def test_ssl_client(
+     assert txt == "Test message"
+
+
++async def test_server_hostname_override_not_reused(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A pooled TLS connection must not be reused for a different server_hostname."""
++    trustme = pytest.importorskip("trustme")
++
++    ca = trustme.CA()
++    cert = ca.issue_cert("first.example")
++    server_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
++    cert.configure_cert(server_ctx)
++    client_ctx = ssl.create_default_context(purpose=ssl.Purpose.SERVER_AUTH)
++    ca.configure_trust(client_ctx)
++
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response(text="ok")
++
++    app = web.Application()
++    app.router.add_route("GET", "/", handler)
++    server = await aiohttp_server(app, ssl=server_ctx)
++    url = server.make_url("/")
++
++    connector = aiohttp.TCPConnector(ssl=client_ctx, limit=1, limit_per_host=1)
++    async with aiohttp.ClientSession(connector=connector) as session:
++        async with session.get(url, server_hostname="first.example") as resp:
++            assert resp.status == 200
++            await resp.read()
++
++        with pytest.raises(aiohttp.ClientConnectorCertificateError):
++            await session.get(url, server_hostname="second.example")
++
++
+ @pytest.mark.skipif(
+     sys.version_info < (3, 11), reason="ssl_shutdown_timeout requires Python 3.11+"
+ )
+--- a/tests/test_client_request.py
++++ b/tests/test_client_request.py
+@@ -1611,6 +1611,22 @@ async def test_connection_key_without_proxy() -> None:
+     await req.close()
+
+
++async def test_connection_key_includes_server_hostname(
++    make_request: _RequestMaker,
++) -> None:
++    """A server_hostname override must be part of the connection reuse key."""
++    url = URL("https://127.0.0.1:8443/")
++    none_req = make_request("GET", url)
++    first = make_request("GET", url, server_hostname="first.example")
++    first_again = make_request("GET", url, server_hostname="first.example")
++    second = make_request("GET", url, server_hostname="second.example")
++
++    assert first.connection_key.server_hostname == "first.example"
++    assert first.connection_key != none_req.connection_key
++    assert first.connection_key != second.connection_key
++    assert first.connection_key == first_again.connection_key
++
++
+ def test_request_info_back_compat() -> None:
+     """Test RequestInfo can be created without real_url."""
+     url = URL("http://example.com")
+
+--- a/aiohttp/streams.py
++++ b/aiohttp/streams.py
+@@ -572,14 +572,21 @@
+         """Read not more than n bytes, or whole buffer if n == -1"""
+         self._timer.assert_timeout()
+ 
+-        chunks = []
++        if n == -1:
++            # Drain only chunks present now; _read_nowait_chunk() can
++            # re-entrantly resume_reading() and refill the buffer.
++            count = len(self._buffer)
++            if count == 1:
++                return self._read_nowait_chunk(-1)
++            return b"".join([self._read_nowait_chunk(-1) for _ in range(count)])
++
++        chunks: list[bytes] = []
+         while self._buffer:
+             chunk = self._read_nowait_chunk(n)
+             chunks.append(chunk)
+-            if n != -1:
+-                n -= len(chunk)
+-                if n == 0:
+-                    break
++            n -= len(chunk)
++            if n == 0:
++                break
+ 
+         return b"".join(chunks) if chunks else b""
+ 
+--- a/tests/test_streams.py
++++ b/tests/test_streams.py
+@@ -1723,3 +1723,31 @@
+ 
+     protocol.resume_reading.assert_called()
+     assert protocol._reading_paused is False
++
++
++async def test_readany_does_not_drain_reentrant_refill(
++    protocol: mock.Mock,
++) -> None:
++    """A single readany() must not reassemble data fed re-entrantly.
++
++    Draining below the low water mark resumes reading, which can synchronously
++    refill the buffer (e.g. decompressing another chunk). Joining that refill in
++    one call would reassemble an unbounded body.
++    """
++    loop = asyncio.get_running_loop()
++    stream = streams.StreamReader(protocol, limit=4, loop=loop)
++
++    refills = [b"second", b"third"]
++
++    def resume_reading() -> None:
++        if refills:
++            stream.feed_data(refills.pop(0))
++
++    protocol.resume_reading.side_effect = resume_reading
++
++    stream.feed_data(b"first")
++
++    # Popping "first" refills "second", but this readany() returns only "first".
++    assert await stream.readany() == b"first"
++    assert await stream.readany() == b"second"
++    assert await stream.readany() == b"third"
+--- a/tests/test_web_functional.py
++++ b/tests/test_web_functional.py
+@@ -4,6 +4,8 @@
+ import pathlib
+ import socket
+ import sys
++import zlib
++from contextlib import suppress
+ from typing import Any, Dict, Generator, NoReturn, Optional, Tuple
+ from unittest import mock
+ 
+@@ -24,6 +26,7 @@
+ from aiohttp.compression_utils import ZLibBackend, ZLibCompressObjProtocol
+ from aiohttp.hdrs import CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING
+ from aiohttp.pytest_plugin import AiohttpClient, AiohttpServer
++from aiohttp.streams import StreamReader
+ from aiohttp.typedefs import Handler
+ from aiohttp.web_protocol import RequestHandler
+ 
+@@ -1681,6 +1684,65 @@
+     assert 200 == resp.status
+ 
+     await resp.release()
++
++
++@pytest.mark.parametrize("decompressed_size", [4 * 1024 * 1024, 32 * 1024 * 1024])
++async def test_unread_compressed_body_drain_is_bounded(
++    aiohttp_server: AiohttpServer,
++    monkeypatch: pytest.MonkeyPatch,
++    decompressed_size: int,
++) -> None:
++    """Draining an unread compressed body stays bounded by the read buffer.
++
++    A handler that rejects before reading still drains the payload during
++    lingering close; a small compressed body must not force a large transient
++    allocation (a deflate-bomb style DoS).
++    """
++    drain_reads: list[int] = []
++    drained = asyncio.Event()
++    readany = StreamReader.readany
++
++    async def record_readany(self: StreamReader) -> bytes:
++        data = await readany(self)
++        assert data
++        drain_reads.append(len(data))
++        drained.set()
++        return data
++
++    monkeypatch.setattr(StreamReader, "readany", record_readany)
++
++    async def handler(request: web.Request) -> web.Response:
++        return web.Response(status=401)
++
++    app = web.Application(client_max_size=1024)
++    app.router.add_post("/", handler)
++    server = await aiohttp_server(app)
++
++    body = zlib.compress(b"a" * decompressed_size)
++    assert len(body) < decompressed_size
++    head = (
++        b"POST / HTTP/1.1\r\n"
++        b"Host: localhost\r\n"
++        b"Content-Encoding: deflate\r\n"
++        b"Content-Length: %d\r\n"
++        b"Connection: keep-alive\r\n\r\n"
++    ) % len(body)
++
++    reader, writer = await asyncio.open_connection(server.host, server.port)
++    try:
++        writer.write(head + body)
++        await writer.drain()
++        status_line = await asyncio.wait_for(reader.readline(), 5)
++        assert status_line.startswith(b"HTTP/1.1 401 ")
++        await asyncio.wait_for(drained.wait(), 5)
++    finally:
++        writer.close()
++        with suppress(ConnectionResetError, BrokenPipeError):
++            await writer.wait_closed()
++
++    # Bounded by the buffer, not the decompressed size.
++    assert max(drain_reads) <= 3 * 2**18
++    assert max(drain_reads) < decompressed_size
+ 
+ 
+ async def test_app_max_client_size(aiohttp_client) -> None:
+
+--- a/aiohttp/cookiejar.py
++++ b/aiohttp/cookiejar.py
+@@ -48,6 +48,9 @@ _FORMAT_DOMAIN_REVERSED = "{1}.{0}".format
+ _MIN_SCHEDULED_COOKIE_EXPIRATION = 100
+ _SIMPLE_COOKIE = SimpleCookie()
+ 
++# Not persisted; the absolute deadline is saved instead.
++_RELATIVE_EXPIRY_ATTRS = frozenset(("max-age", "expires"))
++
+ 
+ class _RestrictedCookieUnpickler(pickle.Unpickler):
+     """A restricted unpickler that only allows cookie-related types.
+@@ -165,21 +168,28 @@ class CookieJar(AbstractCookieJar):
+             :class:`str` or :class:`pathlib.Path` instance.
+         """
+         file_path = pathlib.Path(file_path)
+-        data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]] = {}
++        data: Dict[str, Dict[str, Dict[str, Union[str, bool, float]]]] = {}
+         for (domain, path), cookie in self._cookies.items():
+             key = f"{domain}|{path}"
+             data[key] = {}
+             for name, morsel in cookie.items():
+-                morsel_data: Dict[str, Union[str, bool]] = {
++                morsel_data: Dict[str, Union[str, bool, float]] = {
+                     "key": morsel.key,
+                     "value": morsel.value,
+                     "coded_value": morsel.coded_value,
+                 }
+-                # Save all morsel attributes that have values
++                # Skip relative expiry; the absolute deadline is saved below.
+                 for attr in morsel._reserved:  # type: ignore[attr-defined]
++                    if attr in _RELATIVE_EXPIRY_ATTRS:
++                        continue
+                     attr_val = morsel[attr]
+                     if attr_val:
+                         morsel_data[attr] = attr_val
++                # Persist or it reloads as a domain cookie and leaks to subdomains.
++                if (domain, name) in self._host_only_cookies:
++                    morsel_data["host_only"] = True
++                if (exp := self._expirations.get((domain, path, name))) is not None:
++                    morsel_data["expires_timestamp"] = exp
+                 data[key][name] = morsel_data
+         with file_path.open(mode="w", encoding="utf-8") as f:
+             json.dump(data, f, indent=2)
+@@ -191,6 +201,9 @@ class CookieJar(AbstractCookieJar):
+         pickle format (using a restricted unpickler) for backward
+         compatibility with existing cookie files.
+ 
++        Replaces the current jar contents; loaded cookies pass through the
++        same acceptance rules as :meth:`update_cookies`.
++
+         :param file_path: Path to file from where cookies will be
+             imported, :class:`str` or :class:`pathlib.Path` instance.
+         """
+@@ -199,32 +212,28 @@ class CookieJar(AbstractCookieJar):
+         try:
+             with file_path.open(mode="r", encoding="utf-8") as f:
+                 data = json.load(f)
+-            self._cookies = self._load_json_data(data)
++            self._load_json_data(data)
+         except (json.JSONDecodeError, UnicodeDecodeError, ValueError):
+             # Fall back to legacy pickle format with restricted unpickler
+             with file_path.open(mode="rb") as f:
+                 self._cookies = _RestrictedCookieUnpickler(f).load()
+ 
+     def _load_json_data(
+-        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool]]]]
+-    ) -> "DefaultDict[Tuple[str, str], SimpleCookie]":
+-        """Load cookies from parsed JSON data."""
+-        cookies: DefaultDict[Tuple[str, str], SimpleCookie] = defaultdict(SimpleCookie)
++        self, data: Dict[str, Dict[str, Dict[str, Union[str, bool, float]]]]
++    ) -> None:
++        """Replace contents, routing cookies through update_cookies()."""
++        self.clear()
+         for compound_key, cookie_data in data.items():
+             domain, path = compound_key.split("|", 1)
+-            key = (domain, path)
+             for name, morsel_data in cookie_data.items():
+                 morsel: Morsel[str] = Morsel()
+-                morsel_key = morsel_data["key"]
+-                morsel_value = morsel_data["value"]
+-                morsel_coded_value = morsel_data["coded_value"]
+                 # Use __setstate__ to bypass validation, same pattern
+                 # used in _build_morsel and _cookie_helpers.
+                 morsel.__setstate__(  # type: ignore[attr-defined]
+                     {
+-                        "key": morsel_key,
+-                        "value": morsel_value,
+-                        "coded_value": morsel_coded_value,
++                        "key": morsel_data["key"],
++                        "value": morsel_data["value"],
++                        "coded_value": morsel_data["coded_value"],
+                     }
+                 )
+                 # Restore morsel attributes
+@@ -235,8 +244,17 @@ class CookieJar(AbstractCookieJar):
+                         "coded_value",
+                     ):
+                         morsel[attr] = morsel_data[attr]
+-                cookies[key][name] = morsel
+-        return cookies
++                # Drop the domain so update_cookies() re-marks it host-only.
++                if morsel_data.get("host_only"):
++                    morsel["domain"] = ""
++                response_url = (
++                    URL.build(scheme="https", host=domain) if domain else URL()
++                )
++                self.update_cookies({name: morsel}, response_url)
++                # Restore the absolute deadline; update_cookies() schedules none.
++                if (exp := morsel_data.get("expires_timestamp")) is not None:
++                    self._expire_cookie(float(exp), domain, path, name)
++        self._do_expiration()
+ 
+     def clear(self, predicate: Optional[ClearCookiePredicate] = None) -> None:
+         if predicate is None:
+
+--- /dev/null
++++ b/CHANGES/12831.bugfix.rst
+@@ -0,0 +1 @@
++Fixed :meth:`aiohttp.web.Response.write_eof` skipping ``Payload.close()`` when the body write was interrupted by an error or cancellation, for example when a client disconnects mid-response; the payload close hook now runs in a ``finally`` so a :class:`~aiohttp.payload.Payload` body always releases its resources -- by :user:`bdraco`.
+--- a/aiohttp/web_response.py
++++ b/aiohttp/web_response.py
+@@ -779,8 +779,10 @@ class Response(StreamResponse):
+         if body is None or self._must_be_empty_body:
+             await super().write_eof()
+         elif isinstance(self._body, Payload):
+-            await self._body.write(self._payload_writer)
+-            await self._body.close()
++            try:
++                await self._body.write(self._payload_writer)
++            finally:
++                await self._body.close()
+             await super().write_eof()
+         else:
+             await super().write_eof(cast(bytes, body))
+--- a/tests/test_web_response.py
++++ b/tests/test_web_response.py
+@@ -1,23 +1,24 @@
++import asyncio
+ import collections.abc
+ import datetime
+ import gzip
+ import io
+ import json
+ import sys
+ from concurrent.futures import ThreadPoolExecutor
+ from typing import AsyncIterator, Optional
+ from unittest import mock
+
+ import aiosignal
+ import pytest
+ from multidict import CIMultiDict, CIMultiDictProxy, MultiDict
+ from re_assert import Matches
+
+ from aiohttp import HttpVersion, HttpVersion10, HttpVersion11, hdrs, web
+ from aiohttp.abc import AbstractStreamWriter
+ from aiohttp.helpers import ETag
+ from aiohttp.http_writer import StreamWriter, _serialize_headers
+ from aiohttp.multipart import BodyPartReader, MultipartWriter
+-from aiohttp.payload import BytesPayload, StringPayload
++from aiohttp.payload import BytesPayload, Payload, StringPayload
+ from aiohttp.test_utils import make_mocked_request
+ from aiohttp.web import ContentCoding, Response, StreamResponse, json_response
+@@ -1370,6 +1371,76 @@ async def test_consecutive_write_eof() -> None:
+     writer.write_eof.assert_called_once_with(data)
+
+
++class _ClosingPayload(Payload):
++    """Payload test double that records whether close() ran."""
++
++    def __init__(self) -> None:
++        super().__init__(None)
++        self.close_called = False
++        self.started = asyncio.Event()
++        self.release = asyncio.Event()
++        self.fail = False
++
++    async def write(self, writer: AbstractStreamWriter) -> None:
++        self.started.set()
++        if self.fail:
++            raise ConnectionResetError("client gone")
++        await self.release.wait()
++
++    async def close(self) -> None:
++        self.close_called = True
++        await super().close()
++
++    def decode(self, encoding: str = "utf-8", errors: str = "strict") -> str:
++        assert False
++
++
++async def test_write_eof_closes_payload_on_success() -> None:
++    writer = mock.create_autospec(AbstractStreamWriter, spec_set=True, instance=True)
++    req = make_request("GET", "/", writer=writer)
++    payload = _ClosingPayload()
++    payload.release.set()
++    resp = web.Response(body=payload)
++
++    await resp.prepare(req)
++    await resp.write_eof()
++
++    assert payload.close_called
++    assert writer.write_eof.called
++
++
++async def test_write_eof_closes_payload_on_write_error() -> None:
++    writer = mock.create_autospec(AbstractStreamWriter, spec_set=True, instance=True)
++    req = make_request("GET", "/", writer=writer)
++    payload = _ClosingPayload()
++    payload.fail = True
++    resp = web.Response(body=payload)
++
++    await resp.prepare(req)
++    with pytest.raises(ConnectionResetError):
++        await resp.write_eof()
++
++    assert payload.close_called
++    assert not writer.write_eof.called
++
++
++async def test_write_eof_closes_payload_on_cancel() -> None:
++    writer = mock.create_autospec(AbstractStreamWriter, spec_set=True, instance=True)
++    req = make_request("GET", "/", writer=writer)
++    payload = _ClosingPayload()
++    resp = web.Response(body=payload)
++
++    await resp.prepare(req)
++    task = asyncio.ensure_future(resp.write_eof())
++    await payload.started.wait()
++    task.cancel()
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++    assert payload.close_called
++    assert not writer.write_eof.called
++
++
+ def test_set_text_with_content_type() -> None:
+     resp = Response()
+     resp.content_type = "text/html"
