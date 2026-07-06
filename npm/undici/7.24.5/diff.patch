@@ -1,0 +1,591 @@
+--- a/docs/docs/api/Client.md
++++ b/docs/docs/api/Client.md
+@@ -24,6 +24,9 @@
+ * **keepAliveTimeoutThreshold** `number | null` (optional) - Default: `2e3` - A number of milliseconds subtracted from server *keep-alive* hints when overriding `keepAliveTimeout` to account for timing inaccuracies caused by e.g. transport latency. Defaults to 2 seconds.
+ * **maxHeaderSize** `number | null` (optional) - Default: `--max-http-header-size` or `16384` - The maximum length of request headers in bytes. Defaults to Node.js' --max-http-header-size or 16KiB.
+ * **maxResponseSize** `number | null` (optional) - Default: `-1` - The maximum length of response body in bytes. Set to `-1` to disable.
++* **webSocket** `WebSocketOptions` (optional) - WebSocket-specific configuration options.
++  * **maxFragments** `number` (optional) - Default: `131072` - Maximum number of fragments in a message. Set to 0 to disable the limit.
++  * **maxPayloadSize** `number` (optional) - Default: `134217728` (128 MB) - Maximum allowed payload size in bytes for WebSocket messages. Applied to uncompressed messages, compressed frame payloads, and decompressed (permessage-deflate) messages. Set to 0 to disable the limit.
+ * **pipelining** `number | null` (optional) - Default: `1` - The amount of concurrent requests to be sent over the single TCP/TLS connection according to [RFC7230](https://tools.ietf.org/html/rfc7230#section-6.3.2). Carefully consider your workload and environment before enabling concurrent requests as pipelining may reduce performance if used incorrectly. Pipelining is sensitive to network stack settings as well as head of line blocking caused by e.g. long running requests. Set to `0` to disable keep-alive connections.
+ * **connect** `ConnectOptions | Function | null` (optional) - Default: `null`.
+ * **strictContentLength** `Boolean` (optional) - Default: `true` - Whether to treat request content length mismatches as errors. If true, an error is thrown when the request content-length header doesn't match the length of the request body. **Security Warning:** Disabling this option can expose your application to HTTP Request Smuggling attacks, where mismatched content-length headers cause servers and proxies to interpret request boundaries differently. This can lead to cache poisoning, credential hijacking, and bypassing security controls. Only disable this in controlled environments where you fully trust the request source.
+--- a/lib/dispatcher/dispatcher-base.js
++++ b/lib/dispatcher/dispatcher-base.js
+@@ -11,6 +11,7 @@
+ 
+ const kOnDestroyed = Symbol('onDestroyed')
+ const kOnClosed = Symbol('onClosed')
++const kWebSocketOptions = Symbol('webSocketOptions')
+ 
+ class DispatcherBase extends Dispatcher {
+   /** @type {boolean} */
+@@ -24,6 +25,24 @@
+ 
+   /** @type {Array<Function>|null} */
+   [kOnClosed] = null
++
++  /**
++   * @param {import('../../types/dispatcher').DispatcherOptions} [opts]
++   */
++  constructor (opts) {
++    super()
++    this[kWebSocketOptions] = opts?.webSocket ?? {}
++  }
++
++  /**
++   * @returns {import('../../types/dispatcher').WebSocketOptions}
++   */
++  get webSocketOptions () {
++    return {
++      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
++      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024 // 128 MB default
++    }
++  }
+ 
+   /** @returns {boolean} */
+   get destroyed () {
+--- a/lib/dispatcher/agent.js
++++ b/lib/dispatcher/agent.js
+@@ -35,7 +35,7 @@
+       throw new InvalidArgumentError('maxOrigins must be a number greater than 0')
+     }
+ 
+-    super()
++    super(options)
+ 
+     if (connect && typeof connect !== 'function') {
+       connect = { ...connect }
+--- a/lib/dispatcher/balanced-pool.js
++++ b/lib/dispatcher/balanced-pool.js
+@@ -54,7 +54,7 @@
+       throw new InvalidArgumentError('factory must be a function.')
+     }
+ 
+-    super()
++    super(opts)
+ 
+     this[kOptions] = { ...util.deepClone(opts) }
+     this[kOptions].interceptors = opts.interceptors
+--- a/lib/dispatcher/client.js
++++ b/lib/dispatcher/client.js
+@@ -114,7 +114,8 @@
+     useH2c,
+     initialWindowSize,
+     connectionWindowSize,
+-    pingInterval
++    pingInterval,
++    webSocket
+   } = {}) {
+     if (keepAlive !== undefined) {
+       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
+@@ -222,7 +223,7 @@
+       throw new InvalidArgumentError('pingInterval must be a positive integer, greater or equal to 0')
+     }
+ 
+-    super()
++    super({ webSocket })
+ 
+     if (typeof connect !== 'function') {
+       connect = buildConnector({
+--- a/lib/dispatcher/pool.js
++++ b/lib/dispatcher/pool.js
+@@ -63,7 +63,7 @@
+       })
+     }
+ 
+-    super()
++    super(options)
+ 
+     this[kConnections] = connections || null
+     this[kUrl] = util.parseOrigin(origin)
+--- a/lib/web/websocket/permessage-deflate.js
++++ b/lib/web/websocket/permessage-deflate.js
+@@ -8,40 +8,35 @@
+ const kBuffer = Symbol('kBuffer')
+ const kLength = Symbol('kLength')
+ 
+-// Default maximum decompressed message size: 4 MB
+-const kDefaultMaxDecompressedSize = 4 * 1024 * 1024
+-
+ class PerMessageDeflate {
+   /** @type {import('node:zlib').InflateRaw} */
+   #inflate
+ 
+   #options = {}
+ 
+-  /** @type {boolean} */
+-  #aborted = false
++  #maxPayloadSize = 0
+ 
+-  /** @type {Function|null} */
+-  #currentCallback = null
+-
+   /**
+    * @param {Map<string, string>} extensions
+    */
+-  constructor (extensions) {
++  constructor (extensions, options) {
+     this.#options.serverNoContextTakeover = extensions.has('server_no_context_takeover')
+     this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
++
++    this.#maxPayloadSize = options.maxPayloadSize
+   }
+ 
++  /**
++   * Decompress a compressed payload.
++   * @param {Buffer} chunk Compressed data
++   * @param {boolean} fin Final fragment flag
++   * @param {Function} callback Callback function
++   */
+   decompress (chunk, fin, callback) {
+     // An endpoint uses the following algorithm to decompress a message.
+     // 1.  Append 4 octets of 0x00 0x00 0xff 0xff to the tail end of the
+     //     payload of the message.
+     // 2.  Decompress the resulting data using DEFLATE.
+-
+-    if (this.#aborted) {
+-      callback(new MessageSizeExceededError())
+-      return
+-    }
+-
+     if (!this.#inflate) {
+       let windowBits = Z_DEFAULT_WINDOWBITS
+ 
+@@ -64,23 +59,12 @@
+       this.#inflate[kLength] = 0
+ 
+       this.#inflate.on('data', (data) => {
+-        if (this.#aborted) {
+-          return
+-        }
+-
+         this.#inflate[kLength] += data.length
+ 
+-        if (this.#inflate[kLength] > kDefaultMaxDecompressedSize) {
+-          this.#aborted = true
++        if (this.#maxPayloadSize > 0 && this.#inflate[kLength] > this.#maxPayloadSize) {
++          callback(new MessageSizeExceededError())
+           this.#inflate.removeAllListeners()
+-          this.#inflate.destroy()
+           this.#inflate = null
+-
+-          if (this.#currentCallback) {
+-            const cb = this.#currentCallback
+-            this.#currentCallback = null
+-            cb(new MessageSizeExceededError())
+-          }
+           return
+         }
+ 
+@@ -93,14 +77,13 @@
+       })
+     }
+ 
+-    this.#currentCallback = callback
+     this.#inflate.write(chunk)
+     if (fin) {
+       this.#inflate.write(tail)
+     }
+ 
+     this.#inflate.flush(() => {
+-      if (this.#aborted || !this.#inflate) {
++      if (!this.#inflate) {
+         return
+       }
+ 
+@@ -108,7 +91,6 @@
+ 
+       this.#inflate[kBuffer].length = 0
+       this.#inflate[kLength] = 0
+-      this.#currentCallback = null
+ 
+       callback(null, full)
+     })
+--- a/lib/web/websocket/receiver.js
++++ b/lib/web/websocket/receiver.js
+@@ -39,18 +39,27 @@
+   /** @type {import('./websocket').Handler} */
+   #handler
+ 
++  /** @type {number} */
++  #maxFragments
++
++  /** @type {number} */
++  #maxPayloadSize
++
+   /**
+    * @param {import('./websocket').Handler} handler
+    * @param {Map<string, string>|null} extensions
++   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
+    */
+-  constructor (handler, extensions) {
++  constructor (handler, extensions, options = {}) {
+     super()
+ 
+     this.#handler = handler
+     this.#extensions = extensions == null ? new Map() : extensions
++    this.#maxFragments = options.maxFragments ?? 0
++    this.#maxPayloadSize = options.maxPayloadSize ?? 0
+ 
+     if (this.#extensions.has('permessage-deflate')) {
+-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
++      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
+     }
+   }
+ 
+@@ -66,6 +75,19 @@
+     this.run(callback)
+   }
+ 
++  #validatePayloadLength () {
++    if (
++      this.#maxPayloadSize > 0 &&
++      !isControlFrame(this.#info.opcode) &&
++      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
++    ) {
++      failWebsocketConnection(this.#handler, 1009, 'Payload size exceeds maximum allowed size')
++      return false
++    }
++
++    return true
++  }
++
+   /**
+    * Runs whenever a new chunk is received.
+    * Callback is called whenever there are no more chunks buffering,
+@@ -154,6 +176,10 @@
+         if (payloadLength <= 125) {
+           this.#info.payloadLength = payloadLength
+           this.#state = parserStates.READ_DATA
++
++          if (!this.#validatePayloadLength()) {
++            return
++          }
+         } else if (payloadLength === 126) {
+           this.#state = parserStates.PAYLOADLENGTH_16
+         } else if (payloadLength === 127) {
+@@ -178,6 +204,10 @@
+ 
+         this.#info.payloadLength = buffer.readUInt16BE(0)
+         this.#state = parserStates.READ_DATA
++
++        if (!this.#validatePayloadLength()) {
++          return
++        }
+       } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
+         if (this.#byteOffset < 8) {
+           return callback()
+@@ -200,6 +230,10 @@
+ 
+         this.#info.payloadLength = lower
+         this.#state = parserStates.READ_DATA
++
++        if (!this.#validatePayloadLength()) {
++          return
++        }
+       } else if (this.#state === parserStates.READ_DATA) {
+         if (this.#byteOffset < this.#info.payloadLength) {
+           return callback()
+@@ -212,7 +246,9 @@
+           this.#state = parserStates.INFO
+         } else {
+           if (!this.#info.compressed) {
+-            this.writeFragments(body)
++            if (!this.writeFragments(body)) {
++              return
++            }
+ 
+             // If the frame is not fragmented, a message has been received.
+             // If the frame is fragmented, it will terminate with a fin bit set
+@@ -224,30 +260,42 @@
+ 
+             this.#state = parserStates.INFO
+           } else {
+-            this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
+-              if (error) {
+-                // Use 1009 (Message Too Big) for decompression size limit errors
+-                const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+-                failWebsocketConnection(this.#handler, code, error.message)
+-                return
+-              }
++            this.#extensions.get('permessage-deflate').decompress(
++              body,
++              this.#info.fin,
++              (error, data) => {
++                if (error) {
++                  const code = error instanceof MessageSizeExceededError ? 1009 : 1007
++                  failWebsocketConnection(this.#handler, code, error.message)
++                  return
++                }
+ 
+-              this.writeFragments(data)
++                if (!this.writeFragments(data)) {
++                  return
++                }
+ 
+-              if (!this.#info.fin) {
+-                this.#state = parserStates.INFO
+-                this.#loop = true
+-                this.run(callback)
+-                return
+-              }
++                // Check cumulative fragment size
++                if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
++                  failWebsocketConnection(this.#handler, 1009, new MessageSizeExceededError().message)
++                  return
++                }
+ 
+-              websocketMessageReceived(this.#handler, this.#info.binaryType, this.consumeFragments())
++                if (!this.#info.fin) {
++                  this.#state = parserStates.INFO
++                  this.#loop = true
++                  this.run(callback)
++                  return
++                }
+ 
+-              this.#loop = true
+-              this.#state = parserStates.INFO
+-              this.run(callback)
+-            })
++                websocketMessageReceived(this.#handler, this.#info.binaryType, this.consumeFragments())
+ 
++                this.#loop = true
++                this.#state = parserStates.INFO
++                this.run(callback)
++              },
++              this.#fragmentsBytes
++            )
++
+             this.#loop = false
+             break
+           }
+@@ -305,8 +353,17 @@
+   }
+ 
+   writeFragments (fragment) {
++    if (
++      this.#maxFragments > 0 &&
++      this.#fragments.length === this.#maxFragments
++    ) {
++      failWebsocketConnection(this.#handler, 1008, 'Too many message fragments')
++      return false
++    }
++
+     this.#fragmentsBytes += fragment.length
+     this.#fragments.push(fragment)
++    return true
+   }
+ 
+   consumeFragments () {
+--- a/lib/web/websocket/stream/websocketstream.js
++++ b/lib/web/websocket/stream/websocketstream.js
+@@ -258,7 +258,14 @@
+   #onConnectionEstablished (response, parsedExtensions) {
+     this.#handler.socket = response.socket
+ 
+-    const parser = new ByteParser(this.#handler, parsedExtensions)
++    // Get options from dispatcher options
++    const maxFragments = this.#handler.controller.dispatcher?.webSocketOptions?.maxFragments
++    const maxPayloadSize = this.#handler.controller.dispatcher?.webSocketOptions?.maxPayloadSize
++
++    const parser = new ByteParser(this.#handler, parsedExtensions, {
++      maxFragments,
++      maxPayloadSize
++    })
+     parser.on('drain', () => this.#handler.onParserDrain())
+     parser.on('error', (err) => this.#handler.onParserError(err))
+ 
+@@ -284,12 +291,6 @@
+       start: (controller) => {
+         this.#readableStreamController = controller
+       },
+-      pull (controller) {
+-        let chunk
+-        while (controller.desiredSize > 0 && (chunk = response.socket.read()) !== null) {
+-          controller.enqueue(chunk)
+-        }
+-      },
+       cancel: (reason) => this.#cancel(reason)
+     })
+ 
+@@ -338,7 +339,7 @@
+       try {
+         chunk = utf8Decode(data)
+       } catch {
+-        failWebsocketConnection(this.#handler, 'Received invalid UTF-8 in text frame.')
++        failWebsocketConnection(this.#handler, 1007, 'Received invalid UTF-8 in text frame.')
+         return
+       }
+     } else if (type === opcodes.BINARY) {
+--- a/lib/web/websocket/websocket.js
++++ b/lib/web/websocket/websocket.js
+@@ -468,7 +468,14 @@
+     // once this happens, the connection is open
+     this.#handler.socket = response.socket
+ 
+-    const parser = new ByteParser(this.#handler, parsedExtensions)
++    const webSocketOptions = this.#handler.controller.dispatcher?.webSocketOptions
++    const maxFragments = webSocketOptions?.maxFragments
++    const maxPayloadSize = webSocketOptions?.maxPayloadSize
++
++    const parser = new ByteParser(this.#handler, parsedExtensions, {
++      maxFragments,
++      maxPayloadSize
++    })
+     parser.on('drain', () => this.#handler.onParserDrain())
+     parser.on('error', (err) => this.#handler.onParserError(err))
+ 
+--- a/types/client.d.ts
++++ b/types/client.d.ts
+@@ -107,6 +107,8 @@
+      * @default 60000
+      */
+     pingInterval?: number;
++    /** WebSocket-specific configuration options. */
++    webSocket?: WebSocketOptions;
+   }
+   export interface SocketInfo {
+     localAddress?: string
+@@ -117,6 +119,20 @@
+     timeout?: number
+     bytesWritten?: number
+     bytesRead?: number
++  }
++  export interface WebSocketOptions {
++    /**
++     * Maximum number of fragments in a message. Set to 0 to disable the limit.
++     * @default 131072
++     */
++    maxFragments?: number;
++    /**
++     * Maximum allowed payload size in bytes for WebSocket messages.
++     * Applied to uncompressed messages, compressed frame payloads, and decompressed (permessage-deflate) messages.
++     * Set to 0 to disable the limit.
++     * @default 134217728 (128 MB)
++     */
++    maxPayloadSize?: number;
+   }
+ }
+ 
+
+--- a/lib/dispatcher/socks5-proxy-agent.js
++++ b/lib/dispatcher/socks5-proxy-agent.js
+@@ -17,7 +17,7 @@
+ const kProxyUrl = Symbol('proxy url')
+ const kProxyHeaders = Symbol('proxy headers')
+ const kProxyAuth = Symbol('proxy auth')
+-const kPool = Symbol('pool')
++const kPools = Symbol('pools')
+ const kConnector = Symbol('connector')
+
+ // Static flag to ensure warning is only emitted once per process
+@@ -65,8 +65,8 @@
+       servername: options.proxyTls?.servername || url.hostname
+     })
+
+-    // Pool for the actual HTTP connections (with SOCKS5 tunnel connect function)
+-    this[kPool] = null
++    // Pools for the actual HTTP connections (with SOCKS5 tunnel connect function), keyed by origin
++    this[kPools] = new Map()
+   }
+
+   /**
+@@ -177,9 +177,11 @@
+     debug('dispatching request to', origin, 'via SOCKS5')
+
+     try {
+-      // Create Pool with custom connect function if we don't have one yet
+-      if (!this[kPool] || this[kPool].destroyed || this[kPool].closed) {
+-        this[kPool] = new Pool(origin, {
++      const originKey = String(origin)
++      let pool = this[kPools].get(originKey)
++      // Create a Pool per origin so requests are not routed to the wrong host
++      if (!pool || pool.destroyed || pool.closed) {
++        pool = new Pool(origin, {
+           pipelining: opts.pipelining,
+           connections: opts.connections,
+           connect: async (connectOpts, callback) => {
+@@ -219,10 +221,11 @@
+             }
+           }
+         })
++        this[kPools].set(originKey, pool)
+       }
+
+-      // Dispatch the request through the pool
+-      return this[kPool][kDispatch](opts, handler)
++      // Dispatch the request through the per-origin pool
++      return pool[kDispatch](opts, handler)
+     } catch (err) {
+       debug('dispatch error:', err)
+       if (typeof handler.onError === 'function') {
+@@ -234,15 +237,21 @@
+   }
+
+   async [kClose] () {
+-    if (this[kPool]) {
+-      await this[kPool].close()
++    const closePromises = []
++    for (const pool of this[kPools].values()) {
++      closePromises.push(pool.close())
+     }
++    this[kPools].clear()
++    await Promise.all(closePromises)
+   }
+
+   async [kDestroy] (err) {
+-    if (this[kPool]) {
+-      await this[kPool].destroy(err)
++    const destroyPromises = []
++    for (const pool of this[kPools].values()) {
++      destroyPromises.push(pool.destroy(err))
+     }
++    this[kPools].clear()
++    await Promise.all(destroyPromises)
+   }
+ }
+
+
+--- a/lib/dispatcher/proxy-agent.js
++++ b/lib/dispatcher/proxy-agent.js
+@@ -142,7 +142,8 @@
+           factory: agentFactory,
+           username: opts.username || username,
+           password: opts.password || password,
+-          proxyTls: opts.proxyTls
++          proxyTls: opts.proxyTls,
++          requestTls: opts.requestTls
+         })
+       }
+
+--- a/lib/dispatcher/socks5-proxy-agent.js
++++ b/lib/dispatcher/socks5-proxy-agent.js
+@@ -19,6 +19,7 @@
+ const kProxyAuth = Symbol('proxy auth')
+ const kPools = Symbol('pools')
+ const kConnector = Symbol('connector')
++const kRequestTls = Symbol('request tls settings')
+
+ // Static flag to ensure warning is only emitted once per process
+ let experimentalWarningEmitted = false
+@@ -52,6 +53,7 @@
+
+     this[kProxyUrl] = url
+     this[kProxyHeaders] = options.headers || {}
++    this[kRequestTls] = options.requestTls
+
+     // Extract auth from URL or options
+     this[kProxyAuth] = {
+@@ -201,9 +203,9 @@
+                 }
+                 debug('upgrading to TLS')
+                 finalSocket = tls.connect({
++                  ...this[kRequestTls],
+                   socket,
+-                  servername: targetHost,
+-                  ...connectOpts.tls || {}
++                  servername: this[kRequestTls]?.servername || targetHost
+                 })
+
+                 await new Promise((resolve, reject) => {
