@@ -4,20 +4,24 @@ This patch is based on aiohttp version 3.8.6, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2023-49081
 - CVE-2024-23334
+- CVE-2024-23829
 - CVE-2024-30251
 - CVE-2024-52304
 - CVE-2025-53643
 - CVE-2025-69223
+- CVE-2025-69225
 - CVE-2025-69227
 - CVE-2025-69228
 - CVE-2026-34513
 - CVE-2026-34515
+- CVE-2026-34525
 - CVE-2026-34993
 - CVE-2026-47265
-- CVE-2026-54280
 - CVE-2026-50269
 - CVE-2026-54279
+- CVE-2026-54280
 
 ## How to Apply:
 1. Clone or download the source code for aiohttp
