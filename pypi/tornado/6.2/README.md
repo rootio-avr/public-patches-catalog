@@ -13,6 +13,7 @@ unknown
 - GHSA-78cv-mqj4-43f7
 - GHSA-753j-mpmx-qq6g
 - GHSA-qppv-j76h-2rpx
+- CVE-2023-28370
 
 ## How to Apply:
 1. Clone or download the source code for tornado
