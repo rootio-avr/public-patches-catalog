@@ -11,6 +11,7 @@ unknown
 - GHSA-72r4-9c5j-mj57
 - GHSA-qrv3-253h-g69c
 - GHSA-fr4h-3cph-29xv
+- CVE-2026-55698
 
 ## How to Apply:
 1. Clone or download the source code for pnpm

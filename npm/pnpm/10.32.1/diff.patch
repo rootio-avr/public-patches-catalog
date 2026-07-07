@@ -3506,3 +3506,618 @@
 +  await expect(symlinkDependency(dep, destModulesDir, alias)).resolves.toBeDefined()
 +  expect(fs.existsSync(path.join(destModulesDir, alias))).toBe(true)
 +})
+
+Description: Fix CVE-2026-55698 — verify npm registry signature before executing package-manager switch
+ Malicious repositories could steer automatic package-manager version switching
+ to install and spawn attacker-controlled pnpm bytes (via committed lockfile
+ metadata and/or repository-controlled registry settings). This patch adds
+ verifyPnpmEngineIdentity(), which validates npm registry signatures on staged
+ pnpm/@pnpm/exe installs against embedded npm public keys before linking them
+ into the tools directory and spawning. installPnpmToTools() also isolates the
+ bootstrap install from workspace discovery (--ignore-workspace) and disables
+ recursive version switching in the child process.
+ .
+ Backport of the package-manager identity verification shipped in pnpm 10.34.2
+ (tools/plugin-commands-self-updater). The upstream env-lockfile force-refresh
+ path (resolvePackageManagerIntegrities force:true) is not present on the
+ 10.32.x line; signature verification is the released mitigation for this CVE
+ on 10.x. Use together with the CVE-2026-55697 trusted-registry patch for
+ complete bootstrap hardening.
+Origin: upstream, https://github.com/pnpm/pnpm/releases/tag/v10.34.2
+Bug: https://github.com/pnpm/pnpm/security/advisories/GHSA-w466-c33r-3gjp
+Last-Update: 2026-07-07
+
+--- a/tools/plugin-commands-self-updater/package.json	2026-07-07 17:24:13.931469875 +0530
++++ b/tools/plugin-commands-self-updater/package.json	2026-07-07 17:23:46.117379359 +0530
+@@ -1,6 +1,6 @@
+ {
+   "name": "@pnpm/tools.plugin-commands-self-updater",
+-  "version": "1000.1.53",
++  "version": "1000.1.59",
+   "description": "A command for updating pnpm itself",
+   "keywords": [
+     "pnpm",
+@@ -37,13 +37,20 @@
+     "@pnpm/config": "workspace:*",
+     "@pnpm/error": "workspace:*",
+     "@pnpm/exec.pnpm-cli-runner": "workspace:*",
++    "@pnpm/fetch": "workspace:*",
+     "@pnpm/link-bins": "workspace:*",
++    "@pnpm/lockfile.fs": "workspace:*",
++    "@pnpm/lockfile.types": "workspace:*",
++    "@pnpm/network.auth-header": "workspace:*",
++    "@pnpm/pick-registry-for-package": "workspace:*",
+     "@pnpm/read-project-manifest": "workspace:*",
+     "@pnpm/tools.path": "workspace:*",
++    "@pnpm/types": "workspace:*",
+     "@zkochan/rimraf": "catalog:",
+     "path-temp": "catalog:",
+     "ramda": "catalog:",
+     "render-help": "catalog:",
++    "semver": "catalog:",
+     "symlink-dir": "catalog:"
+   },
+   "peerDependencies": {
+@@ -56,6 +63,7 @@
+     "@pnpm/tools.plugin-commands-self-updater": "workspace:*",
+     "@types/cross-spawn": "catalog:",
+     "@types/ramda": "catalog:",
++    "@types/semver": "catalog:",
+     "cross-spawn": "catalog:",
+     "nock": "catalog:"
+   },
+--- a/tools/plugin-commands-self-updater/tsconfig.json	2026-07-07 17:24:13.931578982 +0530
++++ b/tools/plugin-commands-self-updater/tsconfig.json	2026-07-07 17:23:46.117635556 +0530
+@@ -22,15 +22,33 @@
+       "path": "../../config/config"
+     },
+     {
++      "path": "../../config/pick-registry-for-package"
++    },
++    {
+       "path": "../../env/path"
+     },
+     {
+       "path": "../../exec/pnpm-cli-runner"
+     },
+     {
++      "path": "../../lockfile/fs"
++    },
++    {
++      "path": "../../lockfile/types"
++    },
++    {
++      "path": "../../network/auth-header"
++    },
++    {
++      "path": "../../network/fetch"
++    },
++    {
+       "path": "../../packages/error"
+     },
+     {
++      "path": "../../packages/types"
++    },
++    {
+       "path": "../../pkg-manager/client"
+     },
+     {
+--- a/tools/plugin-commands-self-updater/src/index.ts	2026-07-07 17:24:13.931469875 +0530
++++ b/tools/plugin-commands-self-updater/src/index.ts	2026-07-07 17:23:46.117379359 +0530
+@@ -1,4 +1,5 @@
+ import * as selfUpdate from './selfUpdate.js'
+ export { installPnpmToTools } from './installPnpmToTools.js'
++export { getNpmSigningKeys, verifyPnpmEngineIdentity, type RegistryKey, type VerifyPnpmEngineIdentityOptions } from './verifyPnpmEngineIdentity.js'
+ 
+ export { selfUpdate }
+--- a/exec/pnpm-cli-runner/src/index.ts	2026-07-07 17:24:13.931469875 +0530
++++ b/exec/pnpm-cli-runner/src/index.ts	2026-07-07 17:23:46.117379359 +0530
+@@ -1,10 +1,14 @@
+ import path from 'path'
+ import { sync as execSync } from 'execa'
+ 
+-export function runPnpmCli (command: string[], { cwd }: { cwd: string }): void {
++export function runPnpmCli (
++  command: string[],
++  { cwd, env }: { cwd: string, env?: NodeJS.ProcessEnv }
++): void {
+   const execOpts = {
+     cwd,
+     stdio: 'inherit' as const,
++    ...(env ? { env } : {}),
+   }
+   const execFileName = path.basename(process.execPath).toLowerCase()
+   if (execFileName === 'pnpm' || execFileName === 'pnpm.exe') {
+--- a/tools/plugin-commands-self-updater/src/installPnpmToTools.ts	2026-07-07 17:24:13.931498868 +0530
++++ b/tools/plugin-commands-self-updater/src/installPnpmToTools.ts	2026-07-07 17:23:46.117443396 +0530
+@@ -2,11 +2,14 @@
+ import path from 'path'
+ import { getCurrentPackageName } from '@pnpm/cli-meta'
+ import { runPnpmCli } from '@pnpm/exec.pnpm-cli-runner'
++import { globalWarn } from '@pnpm/logger'
+ import { getToolDirPath } from '@pnpm/tools.path'
+ import { sync as rimraf } from '@zkochan/rimraf'
+ import { fastPathTemp as pathTemp } from 'path-temp'
++import semver from 'semver'
+ import symlinkDir from 'symlink-dir'
+ import { type SelfUpdateCommandOptions } from './selfUpdate.js'
++import { verifyPnpmEngineIdentity } from './verifyPnpmEngineIdentity.js'
+ 
+ export interface InstallPnpmToToolsResult {
+   binDir: string
+@@ -16,10 +19,30 @@
+ 
+ export async function installPnpmToTools (pnpmVersion: string, opts: SelfUpdateCommandOptions): Promise<InstallPnpmToToolsResult> {
+   const currentPkgName = getCurrentPackageName()
++  // pnpm v11 dropped the darwin-x64 artifact from @pnpm/exe because Node.js
++  // SEA injection produces a binary that segfaults at startup on Intel Macs
++  // (pnpm/pnpm#11423, upstream nodejs/node#62893). Self-updating a v10
++  // @pnpm/exe install to v11+ on Intel Mac would leave the user with no
++  // working binary. Transparently swap to the JS-only `pnpm` package, which
++  // runs against the user's system Node.js — typically already present
++  // because v10 @pnpm/exe users tend to manage Node via `pnpm env use`.
++  const targetPkgName = (
++    currentPkgName === '@pnpm/exe' &&
++    process.platform === 'darwin' &&
++    process.arch === 'x64' &&
++    semver.major(pnpmVersion) >= 11
++  )
++    ? 'pnpm'
++    : currentPkgName
++  if (targetPkgName !== currentPkgName) {
++    globalWarn(
++      `Switching from @pnpm/exe to the "pnpm" npm package because @pnpm/exe v${pnpmVersion} no longer ships a binary for Intel macOS (darwin-x64). The new "pnpm" install requires Node.js to be available on PATH. See https://github.com/pnpm/pnpm/issues/11423.`
++    )
++  }
+   const dir = getToolDirPath({
+     pnpmHomeDir: opts.pnpmHomeDir,
+     tool: {
+-      name: currentPkgName,
++      name: targetPkgName,
+       version: pnpmVersion,
+     },
+   })
+@@ -44,7 +67,7 @@
+     // Instead, we link the platform-specific binary in-process after install.
+     runPnpmCli([
+       'add',
+-      `${currentPkgName}@${pnpmVersion}`,
++      `${targetPkgName}@${pnpmVersion}`,
+       '--loglevel=error',
+       '--ignore-scripts',
+       '--config.strict-dep-builds=false',
+@@ -52,10 +75,35 @@
+       // which breaks the junctions on Windows.
+       '--config.node-linker=hoisted',
+       '--config.bin=bin',
+-    ], { cwd: stage })
+-    if (currentPkgName === '@pnpm/exe') {
++      // This is an isolated install into `stage` and must not inherit the
++      // caller's workspace context. Without this, the child's workspace
++      // walk-up from `stage` can discover an ancestor pnpm-workspace.yaml
++      // and treat the caller's project as the workspace root — breaking the
++      // add (it's outside the workspace's packages list) and, before the env
++      // guards below existed, picking up the caller's packageManager field
++      // and re-entering switchCliVersion for a fork bomb. See pnpm/pnpm#11337.
++      '--ignore-workspace',
++    ], {
++      cwd: stage,
++      // Defense in depth against re-entering switchCliVersion in the child,
++      // in case any future code path surfaces a wantedPackageManager without
++      // going through workspace discovery. Both env-var names are set so the
++      // guard works regardless of whether the child reads pnpm's v10
++      // (npm_config_*) or v11+ (pnpm_config_*) convention.
++      env: {
++        ...process.env,
++        npm_config_manage_package_manager_versions: 'false',
++        pnpm_config_pm_on_fail: 'ignore',
++      },
++    })
++    if (targetPkgName === '@pnpm/exe') {
+       linkExePlatformBinary(stage)
+     }
++    // Reached only when the wanted version is not yet in the tools directory
++    // (an actual download), so the signature check does not run on every
++    // invocation. Verify before the staged install is linked into place and
++    // spawned — on failure the stage is removed by the catch below.
++    await verifyPnpmEngineIdentity(stage, targetPkgName, pnpmVersion, opts)
+     // We need the operation of installing pnpm to be atomic.
+     // However, we cannot use a rename as that breaks the command shim created for pnpm.
+     // Hence, we use a symlink.
+--- /dev/null	2026-07-07 10:49:52.123365291 +0530
++++ b/tools/plugin-commands-self-updater/src/npmSigningKeys.ts	2026-07-07 17:23:46.117443396 +0530
+@@ -0,0 +1,29 @@
++/* eslint-disable */
++// GENERATED — npm's public registry signing keys, mirrored from
++// https://registry.npmjs.org/-/npm/v1/keys
++//
++// Refresh with: node tools/plugin-commands-self-updater/scripts/update-npm-signing-keys.mjs --update
++// The release workflow runs `--check` and fails if these drift from npm, so a
++// rotated key cannot silently break (or weaken) signature verification.
++export const NPM_SIGNING_KEYS = [
++  {
++    "expires": "2025-01-29T00:00:00.000Z",
++    "keyid": "SHA256:jl3bwswu80PjjokCgh0o2w5c2U4LhQAE57gj9cz1kzA",
++    "keytype": "ecdsa-sha2-nistp256",
++    "scheme": "ecdsa-sha2-nistp256",
++    "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE1Olb3zMAFFxXKHiIkQO5cJ3Yhl5i6UPp+IhuteBJbuHcA5UogKo0EWtlWwW6KSaKoTNEYL7JlCQiVnkhBktUgg=="
++  },
++  {
++    "expires": null,
++    "keyid": "SHA256:DhQ8wR5APBvFHLF/+Tc+AYvPOdTpcIDqOhxsBHRwC7U",
++    "keytype": "ecdsa-sha2-nistp256",
++    "scheme": "ecdsa-sha2-nistp256",
++    "key": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEY6Ya7W++7aUPzvMTrezH6Ycx3c+HOKYCcNGybJZSCJq/fd7Qa8uuAKtdIkUQtQiEKERhAmE5lMMJhP8OkDOa2g=="
++  }
++] as const satisfies ReadonlyArray<{
++  expires: string | null
++  keyid: string
++  keytype: string
++  scheme: string
++  key: string
++}>
+--- /dev/null	2026-07-07 10:49:52.123365291 +0530
++++ b/tools/plugin-commands-self-updater/src/verifyPnpmEngineIdentity.ts	2026-07-07 17:23:46.117443396 +0530
+@@ -0,0 +1,362 @@
++import crypto from 'crypto'
++import fs from 'fs'
++import path from 'path'
++import url from 'url'
++import util from 'util'
++
++import { PnpmError } from '@pnpm/error'
++import { createFetchFromRegistry, type CreateFetchFromRegistryOptions } from '@pnpm/fetch'
++import { type LockfileObject } from '@pnpm/lockfile.types'
++import { readWantedLockfile } from '@pnpm/lockfile.fs'
++import { createGetAuthHeaderByURI } from '@pnpm/network.auth-header'
++import { pickRegistryForPackage } from '@pnpm/pick-registry-for-package'
++import { type DepPath, type Registries } from '@pnpm/types'
++
++import { NPM_SIGNING_KEYS } from './npmSigningKeys.js'
++
++export interface RegistryKey {
++  expires: string | null
++  key: string
++  keyid: string
++  keytype: string
++  scheme: string
++}
++
++/**
++ * The trusted npm signing keys used to verify package-manager binaries before
++ * pnpm spawns them — npm's public keys embedded in the CLI. There is
++ * deliberately no way to override or disable them at runtime: a verification
++ * off-switch would be a footgun, and npm mirrors work without one (they proxy
++ * the same signed packument, which is verified against these keys). The keys
++ * are refreshed at release time by the update-npm-signing-keys script.
++ */
++export function getNpmSigningKeys (): RegistryKey[] {
++  return NPM_SIGNING_KEYS.map((k) => ({ ...k }))
++}
++
++export interface VerifyPnpmEngineIdentityOptions extends CreateFetchFromRegistryOptions {
++  registries: Registries
++  rawConfig: Record<string, string>
++  retry?: { retries?: number }
++  timeout?: number
++  /**
++   * The npm signing keys to trust. Defaults to {@link getNpmSigningKeys} (npm's
++   * embedded public keys). A test seam only — passing an empty array skips
++   * verification. Not reachable from project config, so it cannot be used to
++   * weaken verification for a real install.
++   */
++  trustedKeys?: RegistryKey[]
++}
++
++interface InstalledPackageToVerify {
++  name: string
++  /** The registry the package was installed from — the packument (and its signatures) is fetched from here. */
++  registry: string
++  version: string
++  /** Integrity of the bytes actually installed on disk (from the staged lockfile). */
++  integrity: string
++}
++
++/**
++ * Verifies that the pnpm engine staged at `stageDir` (and about to be linked
++ * into the tools directory and executed) is genuinely the published `pnpm` /
++ * `@pnpm/exe` — i.e. the bytes recorded in the staged lockfile carry a valid
++ * npm registry signature for their exact `name@version`.
++ *
++ * The wanted pnpm version comes from a repository's `packageManager` field,
++ * so without this check a cloned repository could make pnpm download and run
++ * an arbitrary native binary. Signatures are verified against npm's embedded
++ * public keys (see {@link getNpmSigningKeys}), so a registry cannot answer
++ * with its own key pair; the signed packument is fetched from the configured
++ * registry, which an npm mirror proxies transparently.
++ *
++ * Fails closed: verification failure — including an unreachable registry —
++ * refuses the version switch rather than running an unverified binary. This
++ * runs only when the engine is actually being installed (a tools-directory
++ * cache miss), so it does not add a network round trip to every command.
++ */
++export async function verifyPnpmEngineIdentity (
++  stageDir: string,
++  targetPkgName: string,
++  pnpmVersion: string,
++  opts: VerifyPnpmEngineIdentityOptions
++): Promise<void> {
++  const trustedKeys = opts.trustedKeys ?? getNpmSigningKeys()
++  if (trustedKeys.length === 0) return // test seam: no trusted keys means skip
++
++  const lockfile = await readWantedLockfile(stageDir, { ignoreIncompatible: true })
++  if (lockfile == null) {
++    throw new PnpmError(
++      'PNPM_ENGINE_IDENTITY_UNVERIFIABLE',
++      `Cannot verify the identity of pnpm@${pnpmVersion}: the staged install has no lockfile.`
++    )
++  }
++  const toVerify = collectEnginePackagesToVerify(lockfile, stageDir, targetPkgName, pnpmVersion, opts.registries)
++
++  const getAuthHeader = createGetAuthHeaderByURI({ allSettings: opts.rawConfig })
++  const fetchFromRegistry = createFetchFromRegistry(opts)
++
++  const failures: EngineSignatureFailure[] = []
++  await Promise.all(toVerify.map(async (pkg) => {
++    const failure = await findSignatureFailure(pkg, trustedKeys, { fetchFromRegistry, getAuthHeader, retry: opts.retry, timeout: opts.timeout })
++    if (failure != null) {
++      failures.push({ name: pkg.name, version: pkg.version, ...failure })
++    }
++  }))
++  if (failures.length === 0) return
++
++  failures.sort((a, b) => `${a.name}@${a.version}`.localeCompare(`${b.name}@${b.version}`))
++  const onlyUnreachable = failures.every((f) => f.category === 'unreachable')
++  throw new PnpmError(
++    onlyUnreachable ? 'PNPM_ENGINE_IDENTITY_UNVERIFIABLE' : 'PNPM_ENGINE_IDENTITY_MISMATCH',
++    `Refusing to run pnpm@${pnpmVersion}: its npm registry signature could not be verified ` +
++    `(${failures.map(({ name, version, reason }) => `${name}@${version}: ${reason}`).join('; ')}). ` +
++    'The bytes selected by this install do not match a published, signed pnpm release.',
++    { hint: 'This can indicate a tampered download or a malicious/unreachable registry. Set `manage-package-manager-versions` to `false` to skip the version switch if this is unexpected.' }
++  )
++}
++
++/**
++ * Why a package failed signature verification:
++ * - `invalid`: a registry signature is present but does not validate over the
++ *   installed bytes — a strong tamper signal.
++ * - `absent`: the package/version is not on the registry, or carries no
++ *   signature — suspicious for a package that is expected to be signed.
++ * - `unreachable`: the trust root could not be consulted (the network request
++ *   failed) — typically transient/offline, not evidence of tampering.
++ */
++type SignatureFailureCategory = 'invalid' | 'absent' | 'unreachable'
++
++interface EngineSignatureFailure {
++  name: string
++  version: string
++  reason: string
++  category: SignatureFailureCategory
++}
++
++function collectEnginePackagesToVerify (
++  lockfile: LockfileObject,
++  stageDir: string,
++  targetPkgName: string,
++  version: string,
++  registries: Registries
++): InstalledPackageToVerify[] {
++  const toVerify = [engineComponentToVerify(lockfile, registries, targetPkgName, version)]
++  if (targetPkgName === '@pnpm/exe') {
++    // The bytes actually executed are the host's platform binary, listed as an
++    // optional dependency of `@pnpm/exe`. Verify every platform package the
++    // staged install actually materialized on disk.
++    const optionalDeps = lockfile.packages?.[`@pnpm/exe@${version}` as DepPath]?.optionalDependencies ?? {}
++    for (const [name, platformVersion] of Object.entries(optionalDeps)) {
++      if (!fs.existsSync(path.join(stageDir, 'node_modules', name))) continue
++      toVerify.push(engineComponentToVerify(lockfile, registries, name, platformVersion))
++    }
++  }
++  return toVerify
++}
++
++function engineComponentToVerify (
++  lockfile: LockfileObject,
++  registries: Registries,
++  name: string,
++  version: string
++): InstalledPackageToVerify {
++  const resolution = lockfile.packages?.[`${name}@${version}` as DepPath]?.resolution
++  const integrity = (resolution as { integrity?: unknown } | undefined)?.integrity
++  if (typeof integrity !== 'string' || !integrity) {
++    // pnpm can install a tarball without integrity, so a missing integrity must
++    // fail closed rather than silently exempt that component from verification.
++    throw new PnpmError(
++      'PNPM_ENGINE_IDENTITY_UNVERIFIABLE',
++      `Cannot verify the identity of ${name}@${version}: its integrity metadata is missing from the staged lockfile.`
++    )
++  }
++  return { name, version, registry: pickRegistryForPackage(registries, name), integrity }
++}
++
++interface PackageSignature {
++  keyid: string
++  sig: string
++}
++
++interface PackumentVersion {
++  dist?: {
++    integrity?: string
++    signatures?: unknown
++    tarball?: string
++  }
++}
++
++interface Packument {
++  time?: Record<string, string>
++  versions?: Record<string, PackumentVersion>
++}
++
++interface FetchPackumentContext {
++  fetchFromRegistry: ReturnType<typeof createFetchFromRegistry>
++  getAuthHeader: (uri: string) => string | undefined
++  retry?: { retries?: number }
++  timeout?: number
++}
++
++async function findSignatureFailure (
++  pkg: InstalledPackageToVerify,
++  trustedKeys: RegistryKey[],
++  ctx: FetchPackumentContext
++): Promise<{ reason: string, category: SignatureFailureCategory } | undefined> {
++  let packument: Packument | undefined
++  try {
++    packument = await fetchPackument(pkg, ctx)
++  } catch (err: unknown) {
++    // Fetch-layer errors embed the request URL, which may carry credentials.
++    return { reason: redactTextCredentials(util.types.isNativeError(err) ? err.message : String(err)), category: 'unreachable' }
++  }
++  if (!packument) return { reason: `${pkg.name} is not published on ${redactUrlCredentials(pkg.registry)}`, category: 'absent' }
++
++  const version = packument.versions?.[pkg.version]
++  if (!version) return { reason: `${pkg.name}@${pkg.version} was not found on ${redactUrlCredentials(pkg.registry)}`, category: 'absent' }
++
++  const rawSignatures = version.dist?.signatures
++  if (rawSignatures != null && !Array.isArray(rawSignatures)) {
++    return { reason: `malformed registry signatures metadata for ${pkg.name}@${pkg.version}`, category: 'absent' }
++  }
++  const signatures = rawSignatures ?? []
++  if (!signatures.every(isPackageSignature)) {
++    return { reason: `malformed registry signatures metadata for ${pkg.name}@${pkg.version}`, category: 'absent' }
++  }
++  if (signatures.length === 0) {
++    return { reason: `${pkg.name}@${pkg.version} has no registry signature`, category: 'absent' }
++  }
++
++  // The message is built from the installed integrity, so a signature only
++  // validates when the installed bytes match what the registry signed.
++  return verifyPackageSignatures(pkg, packument.time?.[pkg.version], signatures, trustedKeys)
++}
++
++async function fetchPackument (
++  pkg: InstalledPackageToVerify,
++  ctx: FetchPackumentContext
++): Promise<Packument | undefined> {
++  const registryUrl = pkg.registry.endsWith('/') ? pkg.registry : `${pkg.registry}/`
++  const packumentUrl = toUri(pkg.name, registryUrl)
++
++  const response = await ctx.fetchFromRegistry(packumentUrl, {
++    authHeaderValue: ctx.getAuthHeader(registryUrl),
++    fullMetadata: true,
++    retry: ctx.retry,
++    timeout: ctx.timeout,
++  })
++
++  if (response.status === 404) {
++    return undefined
++  }
++  if (response.status !== 200) {
++    throw new PnpmError(
++      'ENGINE_IDENTITY_PACKUMENT_FETCH_FAIL',
++      `The packument endpoint (at ${redactUrlCredentials(packumentUrl)}) responded with ${response.status}: ${(await response.text()).slice(0, 500)}`
++    )
++  }
++
++  const body: unknown = await response.json()
++  if (!isPackument(body)) {
++    throw new PnpmError(
++      'ENGINE_IDENTITY_PACKUMENT_FETCH_FAIL',
++      `The packument endpoint (at ${redactUrlCredentials(packumentUrl)}) returned an unexpected body. Expected an object with versions; got: ${JSON.stringify(body)?.slice(0, 500) ?? String(body)}`
++    )
++  }
++  return body
++}
++
++// Registry URLs may legally embed basic-auth credentials
++// (https://user:pass@host/); never print those in error messages, which land
++// in terminal output and CI logs.
++function redactUrlCredentials (rawUrl: string): string {
++  try {
++    const parsed = new url.URL(rawUrl)
++    parsed.username = ''
++    parsed.password = ''
++    return parsed.toString()
++  } catch {
++    return rawUrl
++  }
++}
++
++function redactTextCredentials (text: string): string {
++  return text.replace(/([a-z][a-z0-9+.-]*:\/\/)[^@/\s]+@/gi, '$1')
++}
++
++function verifyPackageSignatures (
++  pkg: InstalledPackageToVerify,
++  publishedAt: string | undefined,
++  signatures: PackageSignature[],
++  keys: RegistryKey[]
++): { reason: string, category: SignatureFailureCategory } | undefined {
++  // Registry signatures cover the package identity and content integrity.
++  const message = `${pkg.name}@${pkg.version}:${pkg.integrity}`
++  const publishedTime = publishedAt ? Date.parse(publishedAt) : undefined
++
++  // A package is accepted as soon as ONE signature made by a trusted key
++  // validates. Signatures from unknown/expired/invalid keys are recorded but do
++  // not on their own fail the package — otherwise a key rotation (a packument
++  // carrying multiple signatures) breaks, and a mirror could force a failure
++  // just by appending a junk signature. We fail only when no signature validates
++  // against a trusted key.
++  const failures: string[] = []
++  for (const signature of signatures) {
++    const key = keys.find(({ keyid }) => keyid === signature.keyid)
++    if (!key) {
++      failures.push(`${pkg.name}@${pkg.version} has a registry signature with keyid ${signature.keyid} but no corresponding public key can be found`)
++      continue
++    }
++    // Key expiry is a consistency check, not a security boundary: the publish
++    // time comes from the same unauthenticated packument as the signatures, so
++    // a forger holding an expired trusted key could backdate it anyway. The
++    // signature verification below is what gates acceptance.
++    if (key.expires && publishedTime != null && publishedTime >= Date.parse(key.expires)) {
++      failures.push(`${pkg.name}@${pkg.version} has a registry signature with keyid ${signature.keyid} but the corresponding public key has expired ${key.expires}`)
++      continue
++    }
++    const pem = `-----BEGIN PUBLIC KEY-----\n${key.key}\n-----END PUBLIC KEY-----`
++    // crypto.verify can throw on malformed PEM key material or signature bytes
++    // returned by the registry; treat any failure as an invalid signature so
++    // one bad key doesn't crash the whole verification.
++    let verified: boolean
++    try {
++      const verifier = crypto.createVerify('SHA256')
++      verifier.write(message)
++      verifier.end()
++      verified = verifier.verify(pem, signature.sig, 'base64')
++    } catch {
++      verified = false
++    }
++    if (verified) return undefined
++    failures.push(`${pkg.name}@${pkg.version} has an invalid registry signature with keyid ${signature.keyid}`)
++  }
++  // Prefer an invalid signature from a known key (a tamper signal) over an
++  // unknown-key or expiry reason, since unknown keys may just be junk a mirror
++  // appended.
++  const reason = failures.find((failure) => failure.includes('invalid registry signature')) ??
++    failures[0] ??
++    `${pkg.name}@${pkg.version} has no registry signature from a trusted key`
++  return { reason, category: 'invalid' }
++}
++
++function toUri (pkgName: string, registry: string): string {
++  let encodedName: string
++  if (pkgName[0] === '@') {
++    encodedName = `@${encodeURIComponent(pkgName.slice(1))}`
++  } else {
++    encodedName = encodeURIComponent(pkgName)
++  }
++  return new url.URL(encodedName, registry.endsWith('/') ? registry : `${registry}/`).toString()
++}
++
++function isPackument (body: unknown): body is Packument {
++  return typeof body === 'object' && body != null && typeof (body as Packument).versions === 'object' && (body as Packument).versions != null
++}
++
++function isPackageSignature (signature: unknown): signature is PackageSignature {
++  return typeof signature === 'object' && signature != null &&
++    typeof (signature as PackageSignature).keyid === 'string' &&
++    typeof (signature as PackageSignature).sig === 'string'
++}
