@@ -4,6 +4,7 @@ This patch is based on joserfc version 1.6.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-48990
 - CVE-2026-49852
 
 ## How to Apply:
