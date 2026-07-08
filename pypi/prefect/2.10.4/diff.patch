@@ -1,0 +1,347 @@
+--- a/src/prefect/client/base.py	2026-04-23 06:20:21.476434819 +0000
++++ b/src/prefect/client/base.py	2026-04-23 08:08:34.186193333 +0000
+@@ -1,18 +1,20 @@
+ import copy
+ import sys
+ import threading
++import uuid
+ from collections import defaultdict
+ from contextlib import asynccontextmanager
+-from functools import partial
+-from typing import Callable, ContextManager, Dict, Set, Tuple, Type
++from datetime import datetime, timezone
++from typing import Awaitable, Callable, ContextManager, Dict, Optional, Set, Tuple, Type
+ 
+ import anyio
+ import httpx
+ from asgi_lifespan import LifespanManager
+ from fastapi import FastAPI, status
+-from httpx import HTTPStatusError, Response
++from httpx import HTTPStatusError, Request, Response
+ from typing_extensions import Self
+ 
++from prefect.client.schemas import CsrfToken
+ from prefect.exceptions import PrefectHTTPStatusError
+ from prefect.logging import get_logger
+ from prefect.settings import (
+@@ -162,11 +164,22 @@
+     [Configuring Cloudflare Rate Limiting](https://support.cloudflare.com/hc/en-us/articles/115001635128-Configuring-Rate-Limiting-from-UI)
+     """
+ 
++    def __init__(self, *args, enable_csrf_support: bool = False, **kwargs):
++        self.enable_csrf_support: bool = enable_csrf_support
++        self.csrf_token: Optional[str] = None
++        self.csrf_token_expiration: Optional[datetime] = None
++        self.csrf_client_id: uuid.UUID = uuid.uuid4()
++
++        super().__init__(*args, **kwargs)
++
+     RETRY_MAX = 5
+ 
+     async def _send_with_retry(
+         self,
+-        request: Callable,
++        request: Request,
++        send: Callable[[Request], Awaitable[Response]],
++        send_args: Tuple,
++        send_kwargs: Dict,
+         retry_codes: Set[int] = set(),
+         retry_exceptions: Tuple[Exception, ...] = tuple(),
+     ):
+@@ -183,21 +196,34 @@
+         try_count = 0
+         response = None
+ 
++        is_change_request = request.method.lower() in {"post", "put", "patch", "delete"}
++
++        if self.enable_csrf_support and is_change_request:
++            await self._add_csrf_headers(request=request)
++
+         while try_count <= self.RETRY_MAX:
+             try_count += 1
+             retry_seconds = None
+             exc_info = None
+ 
+             try:
+-                response = await request()
++                response = await send(request, *send_args, **send_kwargs)
+             except retry_exceptions:
+                 if try_count > self.RETRY_MAX:
+                     raise
+                 # Otherwise, we will ignore this error but capture the info for logging
+                 exc_info = sys.exc_info()
+             else:
+-                # We got a response; return immediately if it is not retryable
+-                if response.status_code not in retry_codes:
++                # We got a response; check if it's a CSRF error, otherwise
++                # return immediately if it is not retryable
++                if (
++                    response.status_code == status.HTTP_403_FORBIDDEN
++                    and "Invalid CSRF token" in response.text
++                ):
++                    # We got a CSRF error, clear the token and try again
++                    self.csrf_token = None
++                    await self._add_csrf_headers(request)
++                elif response.status_code not in retry_codes:
+                     return response
+ 
+                 if "Retry-After" in response.headers:
+@@ -240,11 +266,24 @@
+         # We ran out of retries, return the failed response
+         return response
+ 
+-    async def send(self, *args, **kwargs) -> Response:
+-        api_request = partial(super().send, *args, **kwargs)
++    async def send(self, request: Request, *args, **kwargs) -> Response:
++        """
++        Send a request with automatic retry behavior for the following status codes:
++
++        - 403 Forbidden, if the request failed due to CSRF protection
++        - 408 Request Timeout
++        - 429 CloudFlare-style rate limiting
++        - 502 Bad Gateway
++        - 503 Service unavailable
++        - Any additional status codes provided in `PREFECT_CLIENT_RETRY_EXTRA_CODES`
++        """
+ 
++        super_send = super().send
+         response = await self._send_with_retry(
+-            request=api_request,
++            request=request,
++            send=super_send,
++            send_args=args,
++            send_kwargs=kwargs,
+             retry_codes={
+                 status.HTTP_429_TOO_MANY_REQUESTS,
+                 status.HTTP_503_SERVICE_UNAVAILABLE,
+@@ -275,3 +314,34 @@
+         response.raise_for_status()
+ 
+         return response
++
++    async def _add_csrf_headers(self, request: Request):
++        now = datetime.now(timezone.utc)
++
++        if not self.enable_csrf_support:
++            return
++
++        if not self.csrf_token or (
++            self.csrf_token_expiration and now > self.csrf_token_expiration
++        ):
++            token_request = self.build_request(
++                "GET", f"/csrf-token?client={self.csrf_client_id}"
++            )
++
++            try:
++                token_response = await self.send(token_request)
++            except PrefectHTTPStatusError as exc:
++                if exc.response.status_code == status.HTTP_404_NOT_FOUND:
++                    # The token endpoint is not available, likely an older
++                    # server version; disable CSRF support
++                    self.enable_csrf_support = False
++                    return
++
++                raise
++
++            token: CsrfToken = CsrfToken.parse_obj(token_response.json())
++            self.csrf_token = token.token
++            self.csrf_token_expiration = token.expiration
++
++        request.headers["Prefect-Csrf-Token"] = self.csrf_token
++        request.headers["Prefect-Csrf-Client"] = str(self.csrf_client_id)
+--- a/src/prefect/client/cloud.py	2026-04-23 06:20:21.476434819 +0000
++++ b/src/prefect/client/cloud.py	2026-04-23 06:57:09.388108501 +0000
+@@ -8,6 +8,7 @@
+ 
+ import prefect.context
+ import prefect.settings
++from prefect.client.base import PrefectHttpxClient
+ from prefect.client.schemas import Workspace
+ from prefect.exceptions import PrefectException
+ from prefect.settings import PREFECT_API_KEY, PREFECT_CLOUD_API_URL
+@@ -56,7 +57,7 @@
+         httpx_settings["headers"].setdefault("Authorization", f"Bearer {api_key}")
+ 
+         httpx_settings.setdefault("base_url", host)
+-        self._client = httpx.AsyncClient(**httpx_settings)
++        self._client = PrefectHttpxClient(**httpx_settings, enable_csrf_support=False)
+ 
+     async def api_healthcheck(self):
+         """
+--- a/src/prefect/client/orchestration.py	2026-04-23 06:20:21.476434819 +0000
++++ b/src/prefect/client/orchestration.py	2026-04-23 06:59:48.037215458 +0000
+@@ -51,6 +51,7 @@
+     PREFECT_API_REQUEST_TIMEOUT,
+     PREFECT_API_TLS_INSECURE_SKIP_VERIFY,
+     PREFECT_API_URL,
++    PREFECT_CLIENT_CSRF_SUPPORT_ENABLED,
+     PREFECT_CLOUD_API_URL,
+ )
+ from prefect.utilities.collections import AutoEnum
+@@ -216,8 +217,13 @@
+             ),
+         )
+ 
++        enable_csrf_support = (
++            self.server_type != ServerType.CLOUD
++            and PREFECT_CLIENT_CSRF_SUPPORT_ENABLED.value()
++        )
++
+         self._client = PrefectHttpxClient(
+-            **httpx_settings,
++            **httpx_settings, enable_csrf_support=enable_csrf_support
+         )
+ 
+         # See https://www.httpx.org/advanced/#custom-transports
+--- a/src/prefect/client/schemas.py	2026-04-23 06:20:21.476434819 +0000
++++ b/src/prefect/client/schemas.py	2026-04-23 06:52:19.809071502 +0000
+@@ -5,6 +5,7 @@
+ 
+ from prefect.server import schemas
+ from prefect.server.utilities.schemas import PrefectBaseModel
++from prefect.server.utilities.schemas.fields import DateTimeTZ
+ from prefect.settings import PREFECT_CLOUD_API_URL
+ 
+ if TYPE_CHECKING:
+@@ -174,3 +175,16 @@
+ 
+     def __hash__(self):
+         return hash(self.handle)
++
++
++class CsrfToken(PrefectBaseModel):
++    token: str = Field(
++        default=...,
++        description="The CSRF token",
++    )
++    client: str = Field(
++        default=..., description="The client id associated with the CSRF token"
++    )
++    expiration: DateTimeTZ = Field(
++        default=..., description="The expiration time of the CSRF token"
++    )
+--- a/src/prefect/settings.py	2026-04-23 06:20:21.476434819 +0000
++++ b/src/prefect/settings.py	2026-04-23 07:10:32.504556144 +0000
+@@ -554,6 +554,21 @@
+ may result in unexpected behavior.
+ """
+ 
++PREFECT_CLIENT_CSRF_SUPPORT_ENABLED = Setting(bool, default=True)
++"""
++Determines if CSRF token handling is active in the Prefect client for API
++requests.
++
++When enabled (`True`), the client automatically manages CSRF tokens by
++retrieving, storing, and including them in applicable state-changing requests
++(POST, PUT, PATCH, DELETE) to the API.
++
++Disabling this setting (`False`) means the client will not handle CSRF tokens,
++which might be suitable for environments where CSRF protection is disabled.
++
++Defaults to `True`, ensuring CSRF protection is enabled by default.
++"""
++
+ PREFECT_CLOUD_API_URL = Setting(
+     str,
+     default="https://api.prefect.cloud/api",
+@@ -1042,6 +1057,33 @@
+ API with another tool you will need to configure this there instead.
+ """
+ 
++PREFECT_SERVER_CSRF_PROTECTION_ENABLED = Setting(bool, default=False)
++"""
++Controls the activation of CSRF protection for the Prefect server API.
++
++When enabled (`True`), the server enforces CSRF validation checks on incoming
++state-changing requests (POST, PUT, PATCH, DELETE), requiring a valid CSRF
++token to be included in the request headers or body. This adds a layer of
++security by preventing unauthorized or malicious sites from making requests on
++behalf of authenticated users.
++
++It is recommended to enable this setting in production environments where the
++API is exposed to web clients to safeguard against CSRF attacks.
++
++Note: Enabling this setting requires corresponding support in the client for
++CSRF token management. See PREFECT_CLIENT_CSRF_SUPPORT_ENABLED for more.
++"""
++
++PREFECT_SERVER_CSRF_TOKEN_EXPIRATION = Setting(timedelta, default=timedelta(hours=1))
++"""
++Specifies the duration for which a CSRF token remains valid after being issued
++by the server.
++
++The default expiration time is set to 1 hour, which offers a reasonable
++compromise. Adjust this setting based on your specific security requirements
++and usage patterns.
++"""
++
+ PREFECT_UI_ENABLED = Setting(
+     bool,
+     default=True,
+
+--- a/src/prefect/server/api/server.py
++++ b/src/prefect/server/api/server.py
+@@ -515,11 +515,17 @@
+     ui_app = create_ui_app(ephemeral)
+ 
+     # middleware
+     app.add_middleware(
+         CORSMiddleware,
+-        allow_origins=["*"],
+-        allow_methods=["*"],
+-        allow_headers=["*"],
++        allow_origins=prefect.settings.PREFECT_SERVER_CORS_ALLOWED_ORIGINS.value().split(
++            ","
++        ),
++        allow_methods=prefect.settings.PREFECT_SERVER_CORS_ALLOWED_METHODS.value().split(
++            ","
++        ),
++        allow_headers=prefect.settings.PREFECT_SERVER_CORS_ALLOWED_HEADERS.value().split(
++            ","
++        ),
+     )
+ 
+     # Limit the number of concurrent requests when using a SQLite datbase to reduce
+--- a/src/prefect/settings.py
++++ b/src/prefect/settings.py
+@@ -1067,7 +1067,40 @@
+ When enabled, Prefect sends anonymous data (e.g. count of flow runs, package version)
+ on server startup to help us improve our product.
+ """
+ 
++PREFECT_SERVER_CORS_ALLOWED_ORIGINS = Setting(
++    str,
++    default="*",
++)
++"""
++A comma-separated list of origins that are authorized to make cross-origin requests
++to the API.
++
++By default, this is set to `*`, which allows requests from all origins.
++"""
++
++PREFECT_SERVER_CORS_ALLOWED_METHODS = Setting(
++    str,
++    default="*",
++)
++"""
++A comma-separated list of methods that are authorized to make cross-origin requests
++to the API.
++
++By default, this is set to `*`, which allows requests with all methods.
++"""
++
++PREFECT_SERVER_CORS_ALLOWED_HEADERS = Setting(
++    str,
++    default="*",
++)
++"""
++A comma-separated list of headers that are authorized to make cross-origin requests
++to the API.
++
++By default, this is set to `*`, which allows requests with all headers.
++"""
++
+ PREFECT_API_SERVICES_SCHEDULER_ENABLED = Setting(
+     bool,
+     default=True,
