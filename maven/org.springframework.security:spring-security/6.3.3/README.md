@@ -9,6 +9,7 @@ unknown
 - CVE-2025-22228
 - CVE-2026-22732
 - CVE-2026-22748
+- CVE-2026-47838
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework.security:spring-security
