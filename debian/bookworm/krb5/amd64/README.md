@@ -1,6 +1,6 @@
-# krb5 : 1.20.1-2+deb12u4.root.io.8
+# krb5 : 1.20.1-2+deb12u4.root.io.9
 
-This patch is based on krb5 version 1.20.1-2+deb12u4.root.io.8, which is available at:
+This patch is based on krb5 version 1.20.1-2+deb12u4.root.io.9, which is available at:
 https://sources.debian.org/src/krb5/1.20.1-2+deb12u4/
 
 ## Affected CVEs:
@@ -9,6 +9,7 @@ https://sources.debian.org/src/krb5/1.20.1-2+deb12u4/
 - CVE-2018-5709
 - CVE-2026-40356
 - CVE-2026-40355
+- CVE-2026-11850
 
 ## How to Apply:
 1. Obtain the source package: `apt source krb5`
