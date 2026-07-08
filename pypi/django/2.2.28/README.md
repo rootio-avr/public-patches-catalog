@@ -5,8 +5,10 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-64459
-- CVE-2025-64458
+- CVE-2024-45231
+- CVE-2025-48432
 - CVE-2025-57833
+- CVE-2025-64458
 - CVE-2022-36359
 
 ## How to Apply:
