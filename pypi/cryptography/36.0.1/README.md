@@ -8,6 +8,8 @@ unknown
 - CVE-2023-49083
 - CVE-2023-50782
 - GHSA-537c-gmf6-5ccf
+- CVE-2023-23931
+- CVE-2026-26007
 
 ## How to Apply:
 1. Clone or download the source code for cryptography
