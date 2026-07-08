@@ -1,0 +1,174 @@
+--- a/google/protobuf/internal/decoder.py
++++ b/google/protobuf/internal/decoder.py
+@@ -82,6 +82,7 @@
+ 
+ import math
+ import struct
++import threading
+ 
+ from google.protobuf.internal import containers
+ from google.protobuf.internal import encoder
+@@ -94,6 +95,39 @@
+ _DecodeError = message.DecodeError
+ 
+ 
++# Recursion-depth limits for the pure-Python parser.  This protects against
++# unbounded recursion (CVE-2025-4565) when parsing untrusted input that
++# contains deeply nested groups, messages, or a long run of SGROUP tags.
++DEFAULT_RECURSION_LIMIT = 100
++_recursion_limit = DEFAULT_RECURSION_LIMIT
++
++
++def SetRecursionLimit(new_limit):
++  global _recursion_limit
++  _recursion_limit = new_limit
++
++
++# Thread-local current recursion depth.  We use threading.local so concurrent
++# parses on different threads do not interfere with each other.
++_local = threading.local()
++
++
++def _GetCurrentDepth():
++  return getattr(_local, 'depth', 0)
++
++
++def _IncrementRecursionDepth():
++  depth = getattr(_local, 'depth', 0) + 1
++  if depth > _recursion_limit:
++    raise _DecodeError(
++        'Error parsing message: too many levels of nesting.')
++  _local.depth = depth
++
++
++def _DecrementRecursionDepth():
++  _local.depth = getattr(_local, 'depth', 1) - 1
++
++
+ def _VarintDecoder(mask, result_type):
+   """Return an encoder for a basic varint value (does not include tag).
+ 
+@@ -655,7 +689,11 @@
+         if value is None:
+           value = field_dict.setdefault(key, new_default(message))
+         # Read sub-message.
+-        pos = value.add()._InternalParse(buffer, pos, end)
++        _IncrementRecursionDepth()
++        try:
++          pos = value.add()._InternalParse(buffer, pos, end)
++        finally:
++          _DecrementRecursionDepth()
+         # Read end tag.
+         new_pos = pos+end_tag_len
+         if buffer[pos:new_pos] != end_tag_bytes or new_pos > end:
+@@ -672,7 +710,11 @@
+       if value is None:
+         value = field_dict.setdefault(key, new_default(message))
+       # Read sub-message.
+-      pos = value._InternalParse(buffer, pos, end)
++      _IncrementRecursionDepth()
++      try:
++        pos = value._InternalParse(buffer, pos, end)
++      finally:
++        _DecrementRecursionDepth()
+       # Read end tag.
+       new_pos = pos+end_tag_len
+       if buffer[pos:new_pos] != end_tag_bytes or new_pos > end:
+@@ -702,7 +744,12 @@
+         if new_pos > end:
+           raise _DecodeError('Truncated message.')
+         # Read sub-message.
+-        if value.add()._InternalParse(buffer, pos, new_pos) != new_pos:
++        _IncrementRecursionDepth()
++        try:
++          parsed_pos = value.add()._InternalParse(buffer, pos, new_pos)
++        finally:
++          _DecrementRecursionDepth()
++        if parsed_pos != new_pos:
+           # The only reason _InternalParse would return early is if it
+           # encountered an end-group tag.
+           raise _DecodeError('Unexpected end-group tag.')
+@@ -723,7 +770,12 @@
+       if new_pos > end:
+         raise _DecodeError('Truncated message.')
+       # Read sub-message.
+-      if value._InternalParse(buffer, pos, new_pos) != new_pos:
++      _IncrementRecursionDepth()
++      try:
++        parsed_pos = value._InternalParse(buffer, pos, new_pos)
++      finally:
++        _DecrementRecursionDepth()
++      if parsed_pos != new_pos:
+         # The only reason _InternalParse would return early is if it encountered
+         # an end-group tag.
+         raise _DecodeError('Unexpected end-group tag.')
+@@ -809,7 +861,12 @@
+           message_factory.GetMessageClass(message_type)
+         value = field_dict.setdefault(
+             extension, message_type._concrete_class())
+-      if value._InternalParse(buffer, message_start,message_end) != message_end:
++      _IncrementRecursionDepth()
++      try:
++        parsed_pos = value._InternalParse(buffer, message_start, message_end)
++      finally:
++        _DecrementRecursionDepth()
++      if parsed_pos != message_end:
+         # The only reason _InternalParse would return early is if it encountered
+         # an end-group tag.
+         raise _DecodeError('Unexpected end-group tag.')
+@@ -895,7 +952,12 @@
+         raise _DecodeError('Truncated message.')
+       # Read sub-message.
+       submsg.Clear()
+-      if submsg._InternalParse(buffer, pos, new_pos) != new_pos:
++      _IncrementRecursionDepth()
++      try:
++        parsed_pos = submsg._InternalParse(buffer, pos, new_pos)
++      finally:
++        _DecrementRecursionDepth()
++      if parsed_pos != new_pos:
+         # The only reason _InternalParse would return early is if it
+         # encountered an end-group tag.
+         raise _DecodeError('Unexpected end-group tag.')
+@@ -996,7 +1058,13 @@
+     data = buffer[pos:pos+size].tobytes()
+     pos += size
+   elif wire_type == wire_format.WIRETYPE_START_GROUP:
+-    (data, pos) = _DecodeUnknownFieldSet(buffer, pos)
++    # Guard against unbounded recursion through deeply nested unknown groups
++    # or a long run of SGROUP tags (CVE-2025-4565).
++    _IncrementRecursionDepth()
++    try:
++      (data, pos) = _DecodeUnknownFieldSet(buffer, pos)
++    finally:
++      _DecrementRecursionDepth()
+   elif wire_type == wire_format.WIRETYPE_END_GROUP:
+     return (0, -1)
+   else:
+
+--- a/google/protobuf/json_format.py
++++ b/google/protobuf/json_format.py
+@@ -668,14 +668,18 @@
+     if _IsWrapperMessage(message_descriptor):
+       self._ConvertWrapperMessage(value['value'], sub_message,
+                                   '{0}.value'.format(path))
+     elif full_name in _WKTJSONMETHODS:
+-      methodcaller(_WKTJSONMETHODS[full_name][1], value['value'], sub_message,
+-                   '{0}.value'.format(path))(
+-                       self)
++      # For well-known types (including nested Any), use ConvertMessage
++      # to ensure recursion depth is properly tracked
++      self.ConvertMessage(
++          value['value'], sub_message, '{0}.value'.format(path)
++      )
+     else:
+       del value['@type']
+-      self._ConvertFieldValuePair(value, sub_message, path)
+-      value['@type'] = type_url
++      try:
++        self._ConvertFieldValuePair(value, sub_message, path)
++      finally:
++        value['@type'] = type_url
+     # Sets Any message
+     message.value = sub_message.SerializeToString()
+     message.type_url = type_url
