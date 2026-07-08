@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-62727
+- CVE-2026-48710
 
 ## How to Apply:
 1. Clone or download the source code for starlette
