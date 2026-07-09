@@ -7564,3 +7564,1154 @@ index ec2fcda..db1fa11 100644
  function readonly(other, mock) {
  	// Note: other@other(unsafe) mock@other(unsafe) returns@this(unsafe) throws@this(unsafe)
  	if (!mock) return fromWithFactory(readonlyFactory, other);
+
+diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
+index 6d82c39..cd1814f 100644
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -866,8 +866,8 @@ function resetPromiseSpecies(p) {
+  * Without `Suspending`, wasm modules cannot import a JS function as a suspending
+  * import; without `promising`, sandbox cannot promote a wasm function into a JSPI
+  * export. JSPI is the only known path that produces a sandbox-visible Promise whose
+- * prototype crosses realms without bridge interposition — mirrors the existing
+- * `WebAssembly.JSTag` removal (GHSA-9qj6-qjgg-37qq) in spirit.
++ * prototype crosses realms without bridge interposition — same rationale as the
++ * `WebAssembly.JSTag` removal (CVE-2026-26956 / GHSA-ffh4-j6h5-pg66) just below.
+  */
+ if (typeof WebAssembly !== 'undefined') {
+ 	// SECURITY (GHSA-6j2x-vhqr-qr7q): WebAssembly.promising returns Promises with
+@@ -882,6 +882,18 @@ if (typeof WebAssembly !== 'undefined') {
+ 	if (typeof WebAssembly.Suspending !== 'undefined') {
+ 		localReflectDeleteProperty(WebAssembly, 'Suspending');
+ 	}
++	// SECURITY (CVE-2026-26956 / GHSA-ffh4-j6h5-pg66): WebAssembly's `try_table`
++	// instruction with a JSTag catch handler catches JavaScript exceptions at V8's
++	// C++ level -- below JavaScript entirely. This bypasses the transformer's
++	// catch-block instrumentation (which only ever sees JS-level try/catch) and
++	// the bridge proxy layer, letting sandboxed wasm observe a raw host-realm
++	// error object and walk `.constructor.constructor` to the host `Function`
++	// constructor. Removing `WebAssembly.JSTag` closes off installing a JSTag
++	// catch handler at all, the same way removing `.promising`/`.Suspending`
++	// above closes off JSPI.
++	if (typeof WebAssembly.JSTag !== 'undefined') {
++		localReflectDeleteProperty(WebAssembly, 'JSTag');
++	}
+ }
+ 
+ localObject.defineProperty(localObject, 'setPrototypeOf', {
+
+diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
+index cd1814f..5728c4c 100644
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -14,7 +14,9 @@ const {
+ } = global;
+ 
+ const {
+-	freeze: localObjectFreeze
++	freeze: localObjectFreeze,
++	getOwnPropertySymbols: localObjectGetOwnPropertySymbols,
++	getOwnPropertyDescriptors: localObjectGetOwnPropertyDescriptors
+ } = localObject;
+ 
+ const {
+@@ -25,7 +27,8 @@ const {
+ 	has: localReflectHas,
+ 	defineProperty: localReflectDefineProperty,
+ 	setPrototypeOf: localReflectSetPrototypeOf,
+-	getOwnPropertyDescriptor: localReflectGetOwnPropertyDescriptor
++	getOwnPropertyDescriptor: localReflectGetOwnPropertyDescriptor,
++	ownKeys: localReflectOwnKeys
+ } = localReflect;
+ 
+ const speciesSymbol = Symbol.species;
+@@ -92,6 +95,150 @@ function localUnexpected() {
+ 	return new VMError('Should not happen');
+ }
+ 
++/*
++ * Symbol.for protection (CVE-2026-43997 / GHSA-47x8-96vw-5wg6)
++ *
++ * Certain Node.js cross-realm symbols can be exploited for sandbox escapes:
++ *
++ * - 'nodejs.util.inspect.custom': called by util.inspect with the host's inspect
++ *   function as an argument. If sandbox code defines this on an object that is later
++ *   passed to a host API (e.g. `WebAssembly.compileStreaming(obj).catch(...)`, whose
++ *   error-message formatting inspects its argument), Node's internals invoke the
++ *   attacker's function with host-realm context, reaching the host Function
++ *   constructor.
++ * - 'nodejs.rejection': called by EventEmitter on promise rejection when
++ *   captureRejections is enabled; the handler receives error objects that could
++ *   leak host context the same way.
++ *
++ * `Symbol.for`'s registry is agent-wide -- shared across every vm context in this
++ * process, not per-realm -- so sandbox code can otherwise call
++ * `Symbol.for('nodejs.util.inspect.custom')` directly and get the EXACT symbol the
++ * host's own internals use, with no gadget required at all.
++ *
++ * Fix: override Symbol.for to return sandbox-local symbols for these two dangerous
++ * keys instead of the real cross-realm ones, so Node.js internals never recognize a
++ * sandbox-defined property under this key. Cross-realm behavior is preserved for
++ * every other key (still needed for legitimate `Symbol.for` usage/interop).
++ */
++const originalSymbolFor = Symbol.for;
++const blockedSymbolCustomInspect = Symbol('nodejs.util.inspect.custom');
++const blockedSymbolRejection = Symbol('nodejs.rejection');
++
++Symbol.for = function symbolFor(key) {
++	// Convert to string once to prevent toString/toPrimitive bypass and TOCTOU attacks.
++	const keyStr = '' + key;
++	if (keyStr === 'nodejs.util.inspect.custom') {
++		return blockedSymbolCustomInspect;
++	}
++	if (keyStr === 'nodejs.rejection') {
++		return blockedSymbolRejection;
++	}
++	return originalSymbolFor(keyStr);
++};
++
++/*
++ * Cross-realm symbol extraction protection (CVE-2026-43997 / GHSA-47x8-96vw-5wg6)
++ *
++ * Even with Symbol.for overridden above, the real cross-realm symbols can still be
++ * extracted from host objects reachable from the sandbox (e.g. Buffer.prototype, or
++ * any host built-in reached via a `__lookupGetter__('__proto__')` + `Buffer.apply`
++ * prototype walk) via:
++ *   Object.getOwnPropertySymbols(Buffer.prototype)
++ *     .find(s => s.description === 'nodejs.util.inspect.custom')
++ *
++ * Fix: override Object.getOwnPropertySymbols, Reflect.ownKeys,
++ * Object.getOwnPropertyDescriptors, and Object.assign to filter or drop the real
++ * dangerous cross-realm symbols wherever they would otherwise surface. This is the
++ * sandbox-side layer of defense; it is bypassed if the attacker obtains a live
++ * reference to the host's own unmodified Object/Reflect (a wrapped bridge reference
++ * still routes through it, but a fully raw host reference would not) -- lib/bridge.js
++ * carries the matching bridge-boundary filter as the ultimate enforcement layer.
++ */
++const realSymbolCustomInspect = originalSymbolFor('nodejs.util.inspect.custom');
++const realSymbolRejection = originalSymbolFor('nodejs.rejection');
++
++function isDangerousSymbol(sym) {
++	return sym === realSymbolCustomInspect || sym === realSymbolRejection;
++}
++
++localObject.getOwnPropertySymbols = function getOwnPropertySymbols(obj) {
++	const symbols = localReflectApply(localObjectGetOwnPropertySymbols, localObject, [obj]);
++	const result = [];
++	let j = 0;
++	for (let i = 0; i < symbols.length; i++) {
++		if (typeof symbols[i] !== 'symbol' || !isDangerousSymbol(symbols[i])) {
++			localReflectDefineProperty(result, j++, {
++				__proto__: null,
++				value: symbols[i],
++				writable: true,
++				enumerable: true,
++				configurable: true
++			});
++		}
++	}
++	return result;
++};
++
++localReflect.ownKeys = function ownKeys(obj) {
++	const keys = localReflectApply(localReflectOwnKeys, localReflect, [obj]);
++	const result = [];
++	let j = 0;
++	for (let i = 0; i < keys.length; i++) {
++		if (typeof keys[i] !== 'symbol' || !isDangerousSymbol(keys[i])) {
++			localReflectDefineProperty(result, j++, {
++				__proto__: null,
++				value: keys[i],
++				writable: true,
++				enumerable: true,
++				configurable: true
++			});
++		}
++	}
++	return result;
++};
++
++/*
++ * Object.getOwnPropertyDescriptors uses the internal [[OwnPropertyKeys]] which
++ * bypasses the Reflect.ownKeys override above. The result object has dangerous
++ * symbols as property keys, which could then be leaked via
++ * Object.assign/Object.defineProperties to a Proxy whose set/defineProperty trap
++ * captures the key.
++ */
++localObject.getOwnPropertyDescriptors = function getOwnPropertyDescriptors(obj) {
++	const descs = localReflectApply(localObjectGetOwnPropertyDescriptors, localObject, [obj]);
++	localReflectDeleteProperty(descs, realSymbolCustomInspect);
++	localReflectDeleteProperty(descs, realSymbolRejection);
++	return descs;
++};
++
++/*
++ * Object.assign uses the internal [[OwnPropertyKeys]] on source objects, bypassing
++ * the Reflect.ownKeys override above. If a source (e.g. a bridge proxy) has an
++ * enumerable dangerous-symbol property, the symbol would be passed to the target's
++ * [[Set]], which could be a user Proxy trap capturing the key.
++ */
++localObject.assign = function assign(target, ...sources) {
++	if (target === null || target === undefined) {
++		throw new LocalError('Cannot convert undefined or null to object');
++	}
++	const to = localObject(target);
++	for (let s = 0; s < sources.length; s++) {
++		const source = sources[s];
++		if (source === null || source === undefined) continue;
++		const fromObj = localObject(source);
++		const keys = localReflectApply(localReflectOwnKeys, localReflect, [fromObj]);
++		for (let i = 0; i < keys.length; i++) {
++			const key = keys[i];
++			if (typeof key === 'symbol' && isDangerousSymbol(key)) continue;
++			const desc = localReflectApply(localReflectGetOwnPropertyDescriptor, localReflect, [fromObj, key]);
++			if (desc && desc.enumerable === true) {
++				to[key] = fromObj[key];
++			}
++		}
++	}
++	return to;
++};
++
+ // global is originally prototype of host.Object so it can be used to climb up from the sandbox.
+ if (!localReflectSetPrototypeOf(context, localObject.prototype)) throw localUnexpected();
+ 
+
+diff --git a/lib/bridge.js b/lib/bridge.js
+index 0a43037..2d76376 100644
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -713,14 +713,41 @@ function createBridge(otherInit, registerProxy) {
+ 	// SECURITY: Walk `context` and every element of `args`, neutralize species on
+ 	// each host array found, return a flat list of saved-state records.
+ 	function neutralizeArraySpeciesBatch(context, args) {
++		// SECURITY (CVE-2026-44008 / GHSA-9qj6-qjgg-37qq, Defense Invariant #11):
++		// `saved` is a fresh sandbox-realm Array literal in the sandbox-side bridge
++		// closure (this whole function runs per-realm, once with !isHost), so its
++		// prototype chain is attacker-reachable. A naive `saved[saved.length] = x`
++		// would trigger any setter installed on Array.prototype[N] and hand the
++		// saved-state record -- which carries a live reference to the real host
++		// array plus its original property descriptor -- to sandbox-controlled
++		// code before the guarded call ever returns. Use thisReflectDefineProperty
++		// so every appended slot is installed as an own data property, bypassing
++		// the prototype-chain setter. Do NOT replace with `saved[n] =`.
+ 		const saved = [];
++		let savedLen = 0;
+ 		const c = neutralizeArraySpeciesOn(context);
+-		if (c) saved[saved.length] = c;
++		if (c) {
++			thisReflectDefineProperty(saved, savedLen++, {
++				__proto__: null,
++				value: c,
++				writable: true,
++				enumerable: true,
++				configurable: true
++			});
++		}
+ 		if (args) {
+ 			const len = args.length | 0;
+ 			for (let i = 0; i < len; i++) {
+ 				const s = neutralizeArraySpeciesOn(args[i]);
+-				if (s) saved[saved.length] = s;
++				if (s) {
++					thisReflectDefineProperty(saved, savedLen++, {
++						__proto__: null,
++						value: s,
++						writable: true,
++						enumerable: true,
++						configurable: true
++					});
++				}
+ 			}
+ 		}
+ 		return saved;
+
+diff --git a/ROOT-SECURITY-RELEASE.md b/ROOT-SECURITY-RELEASE.md
+new file mode 100644
+index 0000000..1da2282
+--- /dev/null
++++ b/ROOT-SECURITY-RELEASE.md
+@@ -0,0 +1,90 @@
++# Security Advisory False Positives
++
++This file records published CVEs/GHSAs against upstream `vm2` that were investigated
++against this fork (currently based on `3.9.17`, patched forward through the entries
++in `CHANGELOG.md`) and determined **not to apply**, along with the evidence for that
++determination.
++
++Each entry lists a "re-check trigger" — a condition under which the determination
++must be revisited. If this codebase is ever modified in a way that touches the
++described code paths, re-run the verification steps below before trusting the
++"not applicable" conclusion again.
++
++---
++
++## CVE-2026-44009 / GHSA-9vg3-4rfj-wgcm
++
++**Status:** Not applicable to this fork. No code changes made.
++
++**Upstream summary:** "Sandbox breakout via null-proto throw / `handleException`."
++A sandbox-created object with no prototype (`{__proto__: null}`), when thrown and
++caught, or used as a Promise resolution/rejection value, could be wrapped by the
++bridge's `from()` helper in a way that treated it as a host-realm object. The
++resulting proxy's `set` trap then unwrapped any sandbox-side reference to a host
++function written onto it (e.g. `e.f = Buffer.prototype.inspect`) back to the raw
++host function and stored it on the underlying object — which was actually the
++sandbox's own object, readable directly via the original sandbox reference,
++bypassing the proxy entirely. `rawHostFn.constructor` then yields the real host
++`Function` constructor → RCE.
++
++**Root cause in upstream vm2:** An earlier upstream hardening commit (`b57ac2d`,
++made for a different advisory, GHSA-mpf8-4hx2-7cjg) changed `handleException` and
++the sandbox-side `Promise.prototype.then` `onFulfilled` wrapper to use `bridge.from()`
++instead of `bridge.ensureThis()`, for symmetry with a fix elsewhere. `from()`
++unconditionally builds a wrapping proxy for any value with no recognized
++prototype, on the assumption that such a value must be host-realm. That assumption
++is false for a sandbox-created null-proto object, and is exactly what this CVE
++(GHSA-9vg3-4rfj-wgcm) fixes by reverting those two call sites back to `ensureThis()`.
++
++**Why it doesn't apply to this fork:** This fork never carried the `b57ac2d`
++commit, or the `from()`-based `handleException` it introduced. This fork's
++`handleException` (added independently in `lib/setup-sandbox.js` for
++CVE-2026-26332 / GHSA-55hx-c926-fr95) was written using `ensureThis()` from the
++start. `ensureThis()` returns a value with no recognized prototype **unchanged**
++— it never builds a wrapping proxy for such values — so the specific bug pattern
++this CVE fixes does not exist in this fork's `handleException`.
++
++This fork also does not have an `onFulfilled` wrapper on `Promise.prototype.then`
++at all (only `onRejected`, added for CVE-2026-24120), and never implemented the
++`setHostPromiseSanitizers` / host-Promise-boundary sanitization feature that the
++second vulnerable call site in upstream depended on.
++
++**Call sites using `from()`/`bridge.from()` in this fork, and why each is safe**
++(as of the version this file was written against):
++
++| Location | Value wrapped | Why it's safe |
++|---|---|---|
++| `lib/setup-sandbox.js` — `makeFunction()` catch block | Exception from `host.transformAndCheck(...)` | Genuinely host-realm — `host.transformAndCheck` is a real host-side call; the caught value legitimately needs wrapping. |
++| `lib/setup-sandbox.js` — `EvalHandler.apply()` catch block | Exception from `host.transformAndCheck(...)` | Same as above. |
++| `lib/setup-sandbox.js` — `readonly(other, mock)` | `mock`, an embedder-supplied value | Not attacker-reachable: `mock` is supplied by the host embedder wiring up a read-only view, not by sandbox script. Sandbox code has no reference to the underlying mock object identity to exploit the resulting proxy. |
++
++**Verification performed:**
++1. Ran the advisory's canonical PoC (null-proto `throw`, write host function
++   reference onto it via the caught reference, read back via the original
++   sandbox reference) — result: `process is not defined` (ordinary sandbox
++   `ReferenceError`), no escape.
++2. Ran the `Promise.resolve(nullProtoObj).then(onFulfilled)` variant — result:
++   `no-leak`.
++3. Ran the `Promise.reject(nullProtoObj).catch(onRejected)` variant — result:
++   `no-leak`.
++4. Ran the `Promise.reject(nullProtoObj).then(undefined, onRejected)` variant —
++   result: `no-leak`.
++5. Ran the `SuppressedError`-wrapped null-proto variant (exercising
++   `handleException`'s recursive sanitization added for CVE-2026-26332) —
++   result: `null` (no escape).
++6. Confirmed no file was written to disk by the PoC's `child_process.execSync`
++   payload in any of the above.
++7. Statically reviewed every call site of `from(`, `bridge.from(`, and
++   `ensureThis(` in `lib/setup-sandbox.js` and `lib/bridge.js` (table above).
++
++**Re-check trigger:** Re-verify this determination if any of the following change:
++- `handleException` in `lib/setup-sandbox.js` is modified to use `from()` (or
++  `bridge.from()`) instead of `ensureThis()`.
++- An `onFulfilled` wrapper is added to `Promise.prototype.then`/`catch` and uses
++  `from()` on a value that could originate from sandbox code.
++- A host-Promise-boundary sanitization feature (analogous to upstream's
++  `setHostPromiseSanitizers`) is added and wires a fulfillment/rejection
++  sanitizer through `from()` on a value whose realm isn't guaranteed to be host.
++- Any new call site is added that passes a value which could be sandbox-realm
++  (thrown by sandbox code, resolved/rejected by a sandbox-created Promise, etc.)
++  into `from()` / `bridge.from()`.
+
+diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
+index 5728c4c..6e1ee94 100644
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -835,9 +835,18 @@ global.eval = new LocalProxy(localEval, EvalHandler);
+  * Promise sanitization
+  */
+ 
++// SECURITY (CVE-2026-45411 / GHSA-248r-7h7q-cr24): cached here, before any
++// override below replaces `PromisePrototype.then`, so the async-generator
++// sanitization further down can chain onto iterator-result promises using the
++// real native `.then` -- never the sandbox-visible override (which would
++// double-handle the value and could be observed/manipulated via species
++// tricks on intermediate promises).
++let globalPromisePrototypeThen;
++
+ if (localPromise) {
+ 
+ 	const PromisePrototype = localPromise.prototype;
++	globalPromisePrototypeThen = PromisePrototype.then;
+ 
+ 	if (!allowAsync) {
+ 
+@@ -980,6 +989,318 @@ function resetPromiseSpecies(p) {
+ 	if (!pinned) throw new VMError('Unsafe Promise species cannot be reset');
+ }
+ 
++// SECURITY (CVE-2026-45411 / GHSA-248r-7h7q-cr24): Async generator
++// yield*-return thenable exception capture.
++//
++// When sandbox code delegates via `yield*` inside an async generator to an
++// inner async iterator that has no `return` method, and then calls
++// `i.return(thenable)` on the outer generator, the spec requires V8 to
++// `Await` the thenable as part of abrupt-completion processing. V8 does this
++// via the internal `PromiseResolveThenableJob`: it calls `thenable.then(resolve,
++// reject)`, and if that call throws SYNCHRONOUSLY, V8's own C++ machinery
++// catches the throw and the yield* continuation delivers the caught value to
++// sandbox code as an ordinary fulfilled iterator result (`{ value: thrown,
++// done: false }`) -- never as a rejection, never through a JS `catch` block.
++//
++// Both of this file's existing sanitization chokepoints assume an explicit
++// catch or an explicit `.then()`/`.catch()` call:
++//   1. The transformer rewrites every `catch (e) {` into
++//      `catch (e) { e = handleException(e); ...` -- irrelevant here, there is
++//      no source-level catch; V8 catches internally.
++//   2. The `globalPromise.prototype.then`/`catch` overrides above only fire
++//      when SANDBOX CODE calls `.then`/`.catch`. V8's internal `Await`
++//      (used by `await` and by this abrupt-completion path) is specified via
++//      `PerformPromiseThen`, an internal operation that never goes through
++//      the user-visible `.then` property.
++//
++// A host-realm value (e.g. a `RangeError` thrown by V8's OWN C++ code if the
++// recursion inside the thenable's `.then` blows the stack at just the right
++// depth) can therefore reach sandbox code completely unsanitized, and
++// `e.constructor.constructor("return process")()` is RCE from there.
++//
++// Fix, in two layers, mirroring the upstream advisory fix:
++//
++// Layer 1 -- iterator-result sanitization: wrap
++// %AsyncGeneratorPrototype%.next/.return/.throw so every returned promise
++// routes its fulfilled `.value` and any rejection through `handleException`
++// before it can reach sandbox code.
++//
++// Layer 2 -- thenable-argument sanitization: Layer 1 alone is bypassable,
++// because the (sandbox-controlled) inner iterator can hand the captured value
++// back wrapped in a closure (`{ value: () => v, done: false }`) rather than
++// as a plain value -- `handleException` sees only the closure and passes it
++// through unchanged. So the first argument to `.next`/`.return`/`.throw` --
++// the only argument V8 ever awaits on this path -- is ALWAYS replaced with a
++// sandbox-realm wrapper whose `.then` is a fixed function (`safeThen`) that:
++//   - reads the user value's `.then` exactly once,
++//   - if it's callable, invokes it with sanitizing resolve/reject callbacks
++//     and converts any synchronous throw to a sanitized rejection,
++//   - if it's NOT callable (the common case -- most values passed to
++//     `.return(x)` are not thenables), ALWAYS resolves with a `{__proto__:
++//     null}` shadow copying every own property of `value` except `.then`.
++// That last point is deliberately unconditional, not merely "when a `.then`
++// accessor is detected": a getter that returns non-function on our read and
++// then self-replaces with a real function before V8's own read (a
++// self-mutating TOCTOU) would defeat any detection-based heuristic here.
++// Never trusting a `.then` slot we did not install ourselves is the only
++// invariant that holds against an adversarial getter. The trade-off is that
++// identity is not preserved for ordinary (non-thenable) values passed to
++// `i.return(x)` -- callers that need the exact same reference back should
++// keep their own copy outside the call.
++let localAsyncGeneratorPrototype = null;
++try {
++	// %AsyncGeneratorPrototype% sits two prototype levels above an instance:
++	// the instance's own [[Prototype]] is the per-function prototype (unique
++	// to each async generator function -- wrapping that level would only
++	// affect this one internal probe generator), and ITS [[Prototype]] is the
++	// shared intrinsic that actually owns next/return/throw for every async
++	// generator in the sandbox.
++	const localAsyncGenInstance = localEval('(async function*(){})()');
++	localAsyncGeneratorPrototype = localReflectGetPrototypeOf(localReflectGetPrototypeOf(localAsyncGenInstance));
++} catch (e) {
++	// Async generators unavailable on this Node version -- nothing to wrap.
++}
++
++if (localAsyncGeneratorPrototype && globalPromisePrototypeThen) {
++
++	const origAsyncGenNext = localAsyncGeneratorPrototype.next;
++	const origAsyncGenReturn = localAsyncGeneratorPrototype.return;
++	const origAsyncGenThrow = localAsyncGeneratorPrototype.throw;
++
++	// handleException(e) can itself throw (e.g. a hostile getter on
++	// .error/.suppressed escaping its own try/catch). Letting that throw
++	// escape uncaught here would hand the ORIGINAL unsanitized value to
++	// sandbox code via whatever path the caller falls back to -- defeating
++	// the whole point. Always fall back to a definitely-safe sandbox-realm
++	// error value instead.
++	function safeSanitize(e) {
++		let result;
++		try {
++			result = handleException(e);
++		} catch (sanEx) {
++			try {
++				result = new VMError('Exception sanitization failed');
++			} catch (vmEx) {
++				try {
++					result = new LocalError('Exception sanitization failed');
++				} catch (errEx) {
++					result = undefined;
++				}
++			}
++		}
++		return result;
++	}
++
++	function sanitizeAsyncIteratorResultPromise(promise) {
++		// SECURITY: chain via the cached NATIVE then, not the sandbox-visible
++		// override above -- avoids double-handling and keeps this sanitization
++		// step immune to species manipulation on intermediate promises.
++		return localReflectApply(globalPromisePrototypeThen, promise, [
++			function sanitizeFulfilledIterResult(result) {
++				if (result === null || (typeof result !== 'object' && typeof result !== 'function')) return result;
++				let value;
++				try {
++					value = result.value;
++				} catch (ex) {
++					return result;
++				}
++				const sanitized = safeSanitize(value);
++				if (sanitized === value) return result;
++				let done;
++				try {
++					done = !!result.done;
++				} catch (ex) {
++					done = false;
++				}
++				// Build a fresh result -- never mutate an attacker-controlled shape.
++				return {value: sanitized, done};
++			},
++			function sanitizeRejectedIterResult(error) {
++				throw safeSanitize(error);
++			}
++		]);
++	}
++
++	function makeNonThenableShadow(value) {
++		const shadow = {__proto__: null};
++		let keys;
++		try {
++			keys = localReflectOwnKeys(value);
++		} catch (ex) {
++			return shadow;
++		}
++		if (!localArrayIsArray(keys)) return shadow;
++		for (let i = 0; i < keys.length; i++) {
++			const k = keys[i];
++			if (k === 'then') continue;
++			let desc;
++			try {
++				desc = localReflectGetOwnPropertyDescriptor(value, k);
++			} catch (ex) {
++				continue;
++			}
++			if (!desc) continue;
++			try {
++				localReflectDefineProperty(shadow, k, desc);
++			} catch (ex) {
++				// best effort -- non-configurable/non-writable conflicts
++			}
++		}
++		return shadow;
++	}
++
++	function sanitizeThenableArg(value) {
++		if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return value;
++		// ALWAYS wrap -- never pre-read `value.then` here. A getter could
++		// legitimately answer differently between our read and V8's, and
++		// pre-reading would only create a second TOCTOU window.
++		return {
++			then: function safeThen(resolve, reject) {
++				// Read the user's `.then` exactly once. V8 captured this
++				// `safeThen` function (a fixed reference) at PromiseResolve
++				// time and will not itself re-read `.then` on `value` --
++				// only our own code below touches `value.then`.
++				let userThen;
++				try {
++					userThen = value.then;
++				} catch (e) {
++					if (typeof reject === 'function') {
++						try {
++							reject(safeSanitize(e));
++						} catch (rejectEx) {
++							/* best effort */
++						}
++						return undefined;
++					}
++					throw safeSanitize(e);
++				}
++				if (typeof userThen !== 'function') {
++					// Not a thenable on this read. Always resolve with a
++					// shadow that has no `.then` anywhere in its chain, so
++					// V8's subsequent re-resolution of the value it receives
++					// cannot observe a `.then` we didn't already vet -- this
++					// holds even against a getter that returns non-function
++					// here and only later self-replaces with a real function.
++					if (typeof resolve === 'function') {
++						let shadow;
++						try {
++							shadow = makeNonThenableShadow(value);
++						} catch (shadowEx) {
++							shadow = {__proto__: null};
++						}
++						try {
++							resolve(shadow);
++						} catch (resolveEx) {
++							/* best effort */
++						}
++					}
++					return undefined;
++				}
++				// Wrap resolve so any nested thenable handed to it
++				// (`{ then(r){ r(innerThenable) } }`) is itself sanitized
++				// before V8 schedules another PromiseResolveThenableJob.
++				const safeResolve = typeof resolve === 'function'
++					? function safeResolveCallback(v) {
++						let safe;
++						try {
++							safe = sanitizeThenableArg(v);
++						} catch (wrapEx) {
++							safe = v;
++						}
++						return resolve(safe);
++					}
++					: resolve;
++				const safeReject = typeof reject === 'function'
++					? function safeRejectCallback(r) {
++						return reject(safeSanitize(r));
++					}
++					: reject;
++				try {
++					return localReflectApply(userThen, value, [safeResolve, safeReject]);
++				} catch (e) {
++					const sanitized = safeSanitize(e);
++					if (typeof reject === 'function') {
++						try {
++							reject(sanitized);
++						} catch (rejectEx) {
++							/* best effort */
++						}
++						return undefined;
++					}
++					throw sanitized;
++				}
++			}
++		};
++	}
++
++	function wrapAsyncGenMethod(orig) {
++		// Object-method shorthand (rather than a bare `function` expression)
++		// so `this` inside the wrapper is the async generator instance V8
++		// invoked the method on, not the wrapping object literal itself.
++		return {
++			asyncGenSanitizedWrapper(...callArgs) {
++				// Sanitize the first argument -- the only one V8 ever awaits
++				// on the yield*-abrupt-completion path -- before delegating
++				// to the native method. The args container is built with
++				// `__proto__: null` rather than a `[]` literal: a plain array
++				// literal inherits sandbox `Array.prototype`, and a
++				// sandbox-installed setter on `Array.prototype['0']` would
++				// intercept the raw user value on `args[0] = callArgs[0]`
++				// below, before sanitizeThenableArg ever runs.
++				const len = callArgs.length;
++				const args = {__proto__: null, length: len};
++				for (let i = 0; i < len; i++) {
++					args[i] = callArgs[i];
++				}
++				if (len > 0) {
++					args[0] = sanitizeThenableArg(args[0]);
++				}
++				let res;
++				try {
++					res = localReflectApply(orig, this, args);
++				} catch (e) {
++					throw safeSanitize(e);
++				}
++				if (res === null || (typeof res !== 'object' && typeof res !== 'function')) return res;
++				return sanitizeAsyncIteratorResultPromise(res);
++			}
++		}.asyncGenSanitizedWrapper;
++	}
++
++	// Installed non-writable/non-configurable so sandbox code cannot delete
++	// or replace the wrapper -- even without a reference to the original
++	// native method, substituting the wrapper would let sandbox code
++	// interpose its own logic on V8's yield* protocol invocations.
++	if (typeof origAsyncGenNext === 'function') {
++		if (!localReflectDefineProperty(localAsyncGeneratorPrototype, 'next', {
++			__proto__: null,
++			value: wrapAsyncGenMethod(origAsyncGenNext),
++			writable: false,
++			enumerable: false,
++			configurable: false
++		})) throw localUnexpected();
++	}
++	if (typeof origAsyncGenReturn === 'function') {
++		if (!localReflectDefineProperty(localAsyncGeneratorPrototype, 'return', {
++			__proto__: null,
++			value: wrapAsyncGenMethod(origAsyncGenReturn),
++			writable: false,
++			enumerable: false,
++			configurable: false
++		})) throw localUnexpected();
++	}
++	if (typeof origAsyncGenThrow === 'function') {
++		if (!localReflectDefineProperty(localAsyncGeneratorPrototype, 'throw', {
++			__proto__: null,
++			value: wrapAsyncGenMethod(origAsyncGenThrow),
++			writable: false,
++			enumerable: false,
++			configurable: false
++		})) throw localUnexpected();
++	}
++
++}
++
+ /*
+  * WebAssembly JSPI protection (GHSA-6j2x-vhqr-qr7q)
+  *
+
+diff --git a/lib/nodevm.js b/lib/nodevm.js
+index 4ace53c..8467095 100644
+--- a/lib/nodevm.js
++++ b/lib/nodevm.js
+@@ -239,6 +239,55 @@ class NodeVM extends VM {
+ 			bufferAllocLimit
+ 		} = options;
+ 
++		// SECURITY (CVE-2026-47137 / GHSA-m4wx-m65x-ghrr, supersedes
++		// GHSA-8hg8-63c5-gwmx): a truthy `nesting` injects NESTING_OVERRIDE into
++		// `resolverFromOptions` (lib/resolver-compat.js), which exposes the `vm2`
++		// package to the sandbox. When `requireOpts` is not an actual require-config
++		// object, `resolverFromOptions`'s `if (!options) { ... }` branch (or, for a
++		// truthy non-object value, its destructuring of a value with no matching
++		// properties) builds a resolver whose ONLY builtin is `vm2` -- a pure escape
++		// primitive: sandbox code does `require('vm2')`, constructs an inner NodeVM
++		// with attacker-chosen `require` config unconstrained by the outer config,
++		// and reaches `child_process` for full host RCE.
++		//
++		// This check runs AFTER destructuring and against `requireOpts`/`nesting`
++		// (the defaulted values that actually drive `resolverFromOptions`), not
++		// against the raw `options.require`/`options.nesting` -- the guard above
++		// (checking `options.nesting === true && options.require === false` on the
++		// raw input) is trivially bypassed by simply omitting `require` (or passing
++		// `undefined`/`null`/`0`/`''`/a non-`true` truthy `nesting`): the
++		// destructuring default (`require: requireOpts = false`) collapses every one
++		// of those shapes right back to the exact insecure configuration the guard
++		// above was meant to reject. Checking the post-destructuring values closes
++		// every shape that reaches the insecure resolver, not just the single
++		// literal `{nesting: true, require: false}` pair.
++		//
++		// The guard mirrors the resolver's actual reachability on two axes:
++		//   1. `nesting` truthiness, not strict `=== true` -- the override a few
++		//      lines below is gated by `nesting && NESTING_OVERRIDE`, which fires
++		//      for ANY truthy value.
++		//   2. `requireOpts` must be an actual (non-null) object -- a truthy
++		//      non-object value (`true`, a number, a string, a function) destructures
++		//      to all-`undefined` inside `resolverFromOptions` and falls into the
++		//      same insecure branch as an outright falsy value.
++		// The documented escape hatch -- a truthy `nesting` plus an explicit
++		// `require` config object, even `{}` -- continues to work; a real object
++		// is the developer's deliberate acknowledgment of the tradeoff.
++		if (nesting && (typeof requireOpts !== 'object' || requireOpts === null)) {
++			throw new VMError(
++				'NodeVM `nesting` requires an explicit `require` config object. '
++				+ '`nesting` is an escape hatch that exposes `vm2` to the sandbox '
++				+ "(sandbox code can require('vm2') and construct nested VMs "
++				+ 'unconstrained by the outer config). With `require` set to anything '
++				+ 'other than a config object (`false`, omitted, `true`, a number, a '
++				+ 'string, a function), the resolver exposes ONLY `vm2` -- a pure '
++				+ 'escape primitive. To deny all requires, remove `nesting`. To allow '
++				+ 'nested VMs, pass an explicit `require` config (e.g. `require: '
++				+ '{ builtin: [] }`) so the tradeoff is visible. Context: '
++				+ 'GHSA-m4wx-m65x-ghrr (supersedes GHSA-8hg8-63c5-gwmx).'
++			);
++		}
++
+ 		// Throw this early
+ 		if (sandbox && 'object' !== typeof sandbox) {
+ 			throw new VMError('Sandbox must be an object.');
+
+diff --git a/ROOT-SECURITY-RELEASE.md b/ROOT-SECURITY-RELEASE.md
+index 1da2282..924fa2a 100644
+--- a/ROOT-SECURITY-RELEASE.md
++++ b/ROOT-SECURITY-RELEASE.md
+@@ -88,3 +88,80 @@ second vulnerable call site in upstream depended on.
+ - Any new call site is added that passes a value which could be sandbox-realm
+   (thrown by sandbox code, resolved/rejected by a sandbox-created Promise, etc.)
+   into `from()` / `bridge.from()`.
++
++---
++
++## CVE-2026-47208 / GHSA-76w7-j9cq-rx2j
++
++**Status:** Not applicable to this fork. No code changes made.
++
++**Upstream summary:** "Promise species hijack in the `localPromise` swallow tail."
++Upstream's `localPromise` (a `class localPromise extends globalPromise` introduced
++by a separate, unrequested hardening commit, GHSA-hw58-p9xv-2mjh) attaches an
++internal "swallow tail" to every sandbox-constructed Promise, inside its own
++constructor: `apply(globalPromisePrototypeThen, this, [undefined,
++localPromiseSwallow])`. This call invokes the cached *native* host
++`Promise.prototype.then` on `this` — and host `then` resolves its downstream child
++via the species protocol (`SpeciesConstructor(this, %Promise%)`, i.e. it reads
++`this.constructor[Symbol.species]`). Every sibling call site that touches a host
++`then` (the `.then`/`.catch` overrides, the `Reflect.apply` wrapper) already
++bookends the call with `resetPromiseSpecies(this)` to pin the species to
++`localPromise`; the swallow-tail call inside the constructor was the one site that
++didn't. A sandbox subclass — `class FakePromise extends Promise { static get
++[Symbol.species]() { return ct } }` with `new FakePromise(r => r())` — hijacks the
++downstream child's constructor to a user function `ct`, which receives V8's
++internal `(resolve, reject)` capability and re-binds it to sandbox-controlled
++collectors. Combined with the "deep recursion + `e.stack`" primitive (used in
++several other CVEs in this series) to produce a genuine host-realm `RangeError`,
++the raw host error reaches the sandbox collector unsanitized, and
++`ex.constructor.constructor("return process")()` yields RCE.
++
++**Why it doesn't apply to this fork:** This fork's `localPromise` (in
++`lib/setup-sandbox.js`) is `Promise: localPromise` destructured directly from
++`global` — the plain native sandbox-realm `Promise`, not a subclass, with no
++custom constructor and no "swallow tail" mechanism at all. There is no code
++anywhere in this fork that automatically invokes a host `.then()` call as a side
++effect of constructing a Promise, so the specific hook this CVE's exploit hijacks
++(the swallow-tail call inside `localPromise`'s constructor) does not exist to be
++hijacked.
++
++This fork does have one other call site that invokes the native host `.then()`
++directly — `sanitizeAsyncIteratorResultPromise` in the CVE-2026-45411 /
++GHSA-248r-7h7q-cr24 async-generator fix (`apply(globalPromisePrototypeThen,
++promise, [...])`). Upstream's own "Considered Attack Surfaces" analysis for this
++exact advisory explicitly addresses that call site and concludes it is *not*
++vulnerable to the same pattern: the `promise` there is created internally by V8's
++async generator machinery via `NewPromiseCapability(%Promise%)` (spec-mandated to
++use the intrinsic constructor directly, bypassing species resolution for its own
++creation), and sandbox code never obtains a reference to it before this fork's
++sanitization wraps it — so there is no window for sandbox code to install a
++malicious `.constructor`/`[Symbol.species]` on it beforehand.
++
++**Verification performed:**
++1. Statically confirmed `localPromise` is `global.Promise` directly (no
++   subclass, no constructor override, no `localPromiseSwallow`-equivalent
++   anywhere in `lib/setup-sandbox.js`).
++2. Ran the canonical PoC setup directly: constructed
++   `class FakePromise extends Promise { static get [Symbol.species]() { return
++   ct } }` with `ct` set to a marker function, then `new FakePromise(r => r())`
++   — the marker was **never invoked** (`ctCalled === false`). The exploit's own
++   foundational primitive does not fire in this fork, because there is no
++   internal code path that reads `FakePromise[Symbol.species]` during Promise
++   construction.
++3. Ran the full advisory PoC (deep-recursion binary search + `doCatch`
++   collector) end-to-end — the collector's promise never settles (the awaiting
++   async function hangs indefinitely, consistent with `ct` never being invoked
++   to resolve it), rather than surfacing any host value.
++
++**Re-check trigger:** Re-verify this determination if any of the following change:
++- `lib/setup-sandbox.js` gains a `localPromise` subclass of `Promise`, or any
++  other mechanism that automatically invokes a host `.then()`/`.catch()` call as
++  a side effect of sandbox code constructing a Promise (a "swallow tail" or
++  equivalent).
++- `sanitizeAsyncIteratorResultPromise` (or any future call site) is changed so
++  that the promise passed to `apply(globalPromisePrototypeThen, ...)` could be a
++  value sandbox code has a reference to (and could mutate `.constructor`/
++  `[Symbol.species]` on) before the call is made.
++- Any new call site is added that invokes a native host `Promise.prototype.then`
++  on a `this` whose `.constructor` is sandbox-writable, without first calling
++  `resetPromiseSpecies(this)`.
+
+diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
+index 6e1ee94..aacdddc 100644
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -962,6 +962,23 @@ if (localPromise) {
+ 			};
+ 		}
+ 
++		// SECURITY (CVE-2026-47210 / GHSA-qvjj-29qf-hp7p): Promise.prototype.finally
++		// reads `SpeciesConstructor(promise, %Promise%)` directly at spec step 3 --
++		// before it ever calls .then() internally. The .then override above (and
++		// its resetPromiseSpecies call) only fires once .then() is actually invoked,
++		// so a sandboxed `.finally()` call reaches the native, unguarded species
++		// lookup first via the prototype chain (LocalPromiseSubclass extends
++		// globalPromise), the same species-hijack class the .then override closes.
++		if (typeof PromisePrototype.finally === 'function') {
++			overrideWithProxy(PromisePrototype, 'finally', PromisePrototype.finally, {
++				__proto__: null,
++				apply(target, thiz, args) {
++					resetPromiseSpecies(thiz);
++					return localReflectApply(target, thiz, args);
++				}
++			});
++		}
++
+ 	}
+ 
+ 	Object.freeze(global.Promise);
+
+diff --git a/lib/bridge.js b/lib/bridge.js
+index 2d76376..6671b83 100644
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -116,9 +116,25 @@ const thisSymbolToStringTag = Symbol.toStringTag;
+ const thisSymbolIterator = Symbol.iterator;
+ const thisSymbolNodeJSUtilInspectCustom = Symbol.for('nodejs.util.inspect.custom');
+ const thisSymbolNodeJSRejection = Symbol.for('nodejs.rejection');
+-
+-// SECURITY (GHSA-47x8-96vw-5wg6 / AIKIDO-2026-10719): Sentinel for
+-// cross-realm symbols that MUST NEVER cross the bridge as usable primitives.
++// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): the prior allowlist of just these
++// two symbols missed seven other dangerous Node-internal `nodejs.*` cross-realm
++// symbols. `nodejs.util.promisify.custom` hooks `util.promisify(fn)`; the four stream
++// brand symbols drive `Stream.is{Readable,Writable,Duplex,Transform}` duck typing; the
++// two webstream symbols expose closed-promise resolution and controller error
++// dispatch. Captured here, at module load, for the same reason as the two above --
++// before any sandbox code runs and before setup-sandbox.js's `Symbol.for` override
++// takes effect.
++const thisSymbolNodeJSUtilPromisifyCustom = Symbol.for('nodejs.util.promisify.custom');
++const thisSymbolNodeJSStreamReadable = Symbol.for('nodejs.stream.readable');
++const thisSymbolNodeJSStreamWritable = Symbol.for('nodejs.stream.writable');
++const thisSymbolNodeJSStreamDuplex = Symbol.for('nodejs.stream.duplex');
++const thisSymbolNodeJSStreamTransform = Symbol.for('nodejs.stream.transform');
++const thisSymbolNodeJSWebstreamIsClosedPromise = Symbol.for('nodejs.webstream.isClosedPromise');
++const thisSymbolNodeJSWebstreamControllerErrorFunction = Symbol.for('nodejs.webstream.controllerErrorFunction');
++
++// SECURITY (GHSA-47x8-96vw-5wg6 / AIKIDO-2026-10719, expanded by CVE-2026-47135 /
++// GHSA-m5q2-4fm3-vfqp): Sentinel for cross-realm symbols that MUST NEVER cross the
++// bridge as usable primitives.
+ //
+ // Sandbox code that reaches host `Object.getOwnPropertySymbols(Buffer.prototype)`
+ // (via a `__lookupGetter__('__proto__')` + `Buffer.apply` proto-walk, or via
+@@ -128,16 +144,45 @@ const thisSymbolNodeJSRejection = Symbol.for('nodejs.rejection');
+ // causes Node's internal error formatter to invoke the sandbox-provided
+ // function with the raw host `inspect` argument -> `.constructor` reaches
+ // host `Function` -> RCE. `Symbol.for('nodejs.rejection')` opens an
+-// analogous path via unhandled promise rejection formatting.
++// analogous path via unhandled promise rejection formatting. The seven symbols
++// added by CVE-2026-47135 open equivalent host-context-invocation paths through
++// util.promisify, the stream subsystem's duck-typing checks, and webstream
++// internals.
+ //
+ // The three host->sandbox conversion chokepoints (thisFromOtherWithFactory,
+ // thisEnsureThis, thisFromOtherForThrow) all consult this sentinel and drop
+ // dangerous symbols to `undefined` at the boundary. Container-scrub in
+ // apply/construct traps and the ownKeys rewrite provide defense-in-depth.
+ function isDangerousCrossRealmSymbol(key) {
+-	return key === thisSymbolNodeJSUtilInspectCustom || key === thisSymbolNodeJSRejection;
++	return (
++		key === thisSymbolNodeJSUtilInspectCustom ||
++		key === thisSymbolNodeJSRejection ||
++		key === thisSymbolNodeJSUtilPromisifyCustom ||
++		key === thisSymbolNodeJSStreamReadable ||
++		key === thisSymbolNodeJSStreamWritable ||
++		key === thisSymbolNodeJSStreamDuplex ||
++		key === thisSymbolNodeJSStreamTransform ||
++		key === thisSymbolNodeJSWebstreamIsClosedPromise ||
++		key === thisSymbolNodeJSWebstreamControllerErrorFunction
++	);
+ }
+ 
++// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): shared list mirroring
++// isDangerousCrossRealmSymbol's membership test, for call sites that need to iterate
++// (scrubbing a result container, deleting every dangerous slot) rather than test a
++// single value.
++const dangerousCrossRealmSymbols = [
++	thisSymbolNodeJSUtilInspectCustom,
++	thisSymbolNodeJSRejection,
++	thisSymbolNodeJSUtilPromisifyCustom,
++	thisSymbolNodeJSStreamReadable,
++	thisSymbolNodeJSStreamWritable,
++	thisSymbolNodeJSStreamDuplex,
++	thisSymbolNodeJSStreamTransform,
++	thisSymbolNodeJSWebstreamIsClosedPromise,
++	thisSymbolNodeJSWebstreamControllerErrorFunction
++];
++
+ /**
+  * VMError.
+  *
+@@ -1050,6 +1095,15 @@ function createBridge(otherInit, registerProxy) {
+ 			// Covers plain assignment, Reflect.set, and Object.assign -- all
+ 			// three funnel through this trap.
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
++			// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): refuse
++			// sandbox-originated writes whose key is a known dangerous Node.js
++			// cross-realm symbol. Even if the read-direction filter and the
++			// sandbox-side Symbol.for override should both prevent the sandbox
++			// from ever surfacing such a symbol primitive, this trap is the
++			// structural last line of defense.
++			if (!isHost && typeof key === 'symbol' && isDangerousCrossRealmSymbol(key)) {
++				throw new VMError(OPNA);
++			}
+ 			if (key === '__proto__' && !thisOtherHasOwnProperty(object, key)) {
+ 				return this.setPrototypeOf(target, value);
+ 			}
+@@ -1263,6 +1317,12 @@ function createBridge(otherInit, registerProxy) {
+ 			// prototype or constructor. Covers Object.defineProperty and
+ 			// Reflect.defineProperty.
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
++			// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): mirror the set
++			// trap -- refuse dangerous-symbol-keyed property installation on any
++			// host object.
++			if (!isHost && typeof prop === 'symbol' && isDangerousCrossRealmSymbol(prop)) {
++				throw new VMError(OPNA);
++			}
+ 			if (!thisReflectSetPrototypeOf(desc, null)) throw thisUnexpected();
+ 
+ 			desc = this.definePropertyDesc(target, prop, desc);
+@@ -1323,6 +1383,14 @@ function createBridge(otherInit, registerProxy) {
+ 			// hasOwnProperty, toString, etc. from every host object of that
+ 			// class.
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
++			// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): refuse
++			// sandbox-originated deletes whose key is a dangerous cross-realm
++			// symbol -- otherwise sandbox code could strip a host-set hook
++			// (e.g. delete a Node-installed nodejs.util.inspect.custom) and
++			// substitute its own behavior.
++			if (!isHost && typeof prop === 'symbol' && isDangerousCrossRealmSymbol(prop)) {
++				throw new VMError(OPNA);
++			}
+ 			try {
+ 				return otherReflectDeleteProperty(object, prop) === true;
+ 			} catch (e) { // @other(unsafe)
+@@ -1684,12 +1752,15 @@ function createBridge(otherInit, registerProxy) {
+ 		// any own property keyed by a dangerous cross-realm symbol. Using the
+ 		// host's Reflect.deleteProperty avoids any proxy invariants that apply
+ 		// to the sandbox-local descriptor filter.
+-		try {
+-			otherReflectDeleteProperty(ret, thisSymbolNodeJSUtilInspectCustom);
+-		} catch (e) { /* best effort */ }
+-		try {
+-			otherReflectDeleteProperty(ret, thisSymbolNodeJSRejection);
+-		} catch (e) { /* best effort */ }
++		// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): scrub every known
++		// dangerous nodejs.* symbol, not just the original two. Iterate the shared
++		// list so a future addition to isDangerousCrossRealmSymbol automatically
++		// extends this scrub.
++		for (let i = 0; i < dangerousCrossRealmSymbols.length; i++) {
++			try {
++				otherReflectDeleteProperty(ret, dangerousCrossRealmSymbols[i]);
++			} catch (e) { /* best effort */ }
++		}
+ 	}
+ 
+ 	function thisEnsureThis(other) {
+diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
+index aacdddc..3f9065e 100644
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -115,23 +115,65 @@ function localUnexpected() {
+  * `Symbol.for('nodejs.util.inspect.custom')` directly and get the EXACT symbol the
+  * host's own internals use, with no gadget required at all.
+  *
+- * Fix: override Symbol.for to return sandbox-local symbols for these two dangerous
+- * keys instead of the real cross-realm ones, so Node.js internals never recognize a
+- * sandbox-defined property under this key. Cross-realm behavior is preserved for
+- * every other key (still needed for legitimate `Symbol.for` usage/interop).
++ * Fix (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): override Symbol.for to deny the entire
++ * `nodejs.` namespace -- any key starting with `nodejs.` is mapped to a sandbox-local
++ * symbol, so the canonical extraction path cannot produce a real cross-realm symbol
++ * regardless of which internal feature the attacker targets, present or future. A
++ * per-key cache preserves `Symbol.for(k) === Symbol.for(k)` identity inside the
++ * sandbox. Cross-realm behavior is preserved for every other key (still needed for
++ * legitimate `Symbol.for` usage/interop). The original fix here allowlisted only
++ * `nodejs.util.inspect.custom` and `nodejs.rejection`, leaving other Node-internal
++ * `nodejs.*` symbols (util.promisify, stream brands, webstream internals --
++ * CVE-2026-47135) extractable.
+  */
+ const originalSymbolFor = Symbol.for;
+ const blockedSymbolCustomInspect = Symbol('nodejs.util.inspect.custom');
+ const blockedSymbolRejection = Symbol('nodejs.rejection');
++// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): captured at module load, before
++// sandbox code can run, so prefix-matching `Symbol.for` keys against the `nodejs.`
++// namespace below cannot be subverted by an attacker who later monkey-patches
++// `String.prototype.startsWith` from inside the sandbox.
++const localStringStartsWith = global.String.prototype.startsWith;
++
++// Per-key cache for `nodejs.*` symbols so `Symbol.for(k) === Symbol.for(k)` still
++// holds inside the sandbox. Built via the cached Reflect primitives so a sandbox-side
++// override of `Object.prototype` / proxies cannot intercept reads or writes here.
++const blockedNodejsSymbolCache = { __proto__: null };
++localReflectDefineProperty(blockedNodejsSymbolCache, 'nodejs.util.inspect.custom', {
++	__proto__: null,
++	value: blockedSymbolCustomInspect,
++	writable: true,
++	enumerable: false,
++	configurable: false
++});
++localReflectDefineProperty(blockedNodejsSymbolCache, 'nodejs.rejection', {
++	__proto__: null,
++	value: blockedSymbolRejection,
++	writable: true,
++	enumerable: false,
++	configurable: false
++});
+ 
+ Symbol.for = function symbolFor(key) {
+ 	// Convert to string once to prevent toString/toPrimitive bypass and TOCTOU attacks.
+ 	const keyStr = '' + key;
+-	if (keyStr === 'nodejs.util.inspect.custom') {
+-		return blockedSymbolCustomInspect;
+-	}
+-	if (keyStr === 'nodejs.rejection') {
+-		return blockedSymbolRejection;
++	// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): deny the entire `nodejs.`
++	// namespace. The prior allowlist of two specific keys missed seven other
++	// dangerous Node-internal symbols and would miss any future addition. The
++	// `nodejs.` prefix is owned by Node for internal cross-realm hooks; sandbox code
++	// has no legitimate reason to register symbols under it.
++	if (localReflectApply(localStringStartsWith, keyStr, ['nodejs.'])) {
++		const cached = blockedNodejsSymbolCache[keyStr];
++		if (typeof cached === 'symbol') return cached;
++		const fresh = Symbol(keyStr);
++		localReflectDefineProperty(blockedNodejsSymbolCache, keyStr, {
++			__proto__: null,
++			value: fresh,
++			writable: true,
++			enumerable: false,
++			configurable: false
++		});
++		return fresh;
+ 	}
+ 	return originalSymbolFor(keyStr);
+ };
+@@ -156,9 +198,30 @@ Symbol.for = function symbolFor(key) {
+  */
+ const realSymbolCustomInspect = originalSymbolFor('nodejs.util.inspect.custom');
+ const realSymbolRejection = originalSymbolFor('nodejs.rejection');
++// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): pre-cache every known dangerous
++// `nodejs.*` cross-realm symbol so `isDangerousSymbol` can identify them in
++// extraction paths (Reflect.ownKeys, Object.assign, ...). Identity check against
++// these references is the structural test -- `description`-string matching is
++// forgeable from sandbox code. Adding new entries here automatically extends every
++// filter that iterates this list. Must stay in sync with lib/bridge.js's
++// isDangerousCrossRealmSymbol / dangerousCrossRealmSymbols.
++const realDangerousSymbols = [
++	realSymbolCustomInspect,
++	realSymbolRejection,
++	originalSymbolFor('nodejs.util.promisify.custom'),
++	originalSymbolFor('nodejs.stream.readable'),
++	originalSymbolFor('nodejs.stream.writable'),
++	originalSymbolFor('nodejs.stream.duplex'),
++	originalSymbolFor('nodejs.stream.transform'),
++	originalSymbolFor('nodejs.webstream.isClosedPromise'),
++	originalSymbolFor('nodejs.webstream.controllerErrorFunction')
++];
+ 
+ function isDangerousSymbol(sym) {
+-	return sym === realSymbolCustomInspect || sym === realSymbolRejection;
++	for (let i = 0; i < realDangerousSymbols.length; i++) {
++		if (sym === realDangerousSymbols[i]) return true;
++	}
++	return false;
+ }
+ 
+ localObject.getOwnPropertySymbols = function getOwnPropertySymbols(obj) {
+@@ -206,8 +269,12 @@ localReflect.ownKeys = function ownKeys(obj) {
+  */
+ localObject.getOwnPropertyDescriptors = function getOwnPropertyDescriptors(obj) {
+ 	const descs = localReflectApply(localObjectGetOwnPropertyDescriptors, localObject, [obj]);
+-	localReflectDeleteProperty(descs, realSymbolCustomInspect);
+-	localReflectDeleteProperty(descs, realSymbolRejection);
++	// SECURITY (CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp): drop every known dangerous
++	// cross-realm symbol slot, not just the original two. Iterates
++	// `realDangerousSymbols` so additions stay in sync.
++	for (let i = 0; i < realDangerousSymbols.length; i++) {
++		localReflectDeleteProperty(descs, realDangerousSymbols[i]);
++	}
+ 	return descs;
+ };
+ 
