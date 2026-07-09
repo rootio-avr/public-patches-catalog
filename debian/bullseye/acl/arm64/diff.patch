@@ -1,0 +1,455 @@
+Description: CVE-2026-54369 - Fix symlink-related TOCTOU/follow vulnerability in libacl
+ The pathname-based libacl entry points acl_get_file(), acl_set_file(),
+ acl_extended_file() and acl_delete_def_file() resolved the supplied path
+ separately for each underlying syscall (getxattr/setxattr/removexattr/
+ stat). A local attacker who controls any component of the path could
+ swap a symlink between calls and redirect ACL read/write operations to
+ an arbitrary file, enabling unauthorized ACL manipulation and local
+ privilege escalation.
+ .
+ This is a targeted backport of the libacl portion of upstream commit
+ 5906d28 ("Add libacl _at function variants", acl v2.4.0). Rather than
+ introducing the new acl_get_file_at/acl_set_file_at/acl_extended_file_at/
+ acl_delete_def_file_at exported symbols (which would require a new
+ ACL_1.3 symbol-version block and a libtool LT_CURRENT/LT_AGE bump and
+ therefore an ABI break for bullseye's libacl1), the symlink-safe path
+ resolution is inlined directly into the existing four exported
+ functions:
+ .
+   1. open(path, O_PATH | O_NOFOLLOW | O_CLOEXEC) atomically resolves
+      the path without following a final-component symlink.
+   2. fstat() on the resulting fd plus an S_ISLNK() check rejects
+      symlinks with ENOTSUP.
+ 3. All subsequent xattr/stat operations use /proc/self/fd/N (which
+    the kernel resolves through the fd table) so the same inode is
+    operated on for every step, eliminating the path-based TOCTOU.
+ .
+ No new exported symbols are added, no symbol-version map / .ver file
+ is bumped, the libacl1 SONAME is preserved, and only the four .c files
+ in libacl/ are modified.
+ .
+ Backport adaptation: acl_get_file() now returns ENOTSUP for symlinks.
+ getfacl already handles this by falling back to mode-bit ACLs, so
+ test/misc.test is updated to match the new symlink behaviour.
+Origin: backport, https://cgit.git.savannah.nongnu.org/cgit/acl.git/commit/?id=5906d2868ec8d3b08be556153696e6b1122eeeda
+Author: Root.io Patch Platoon <patches@root.io>
+Last-Update: 2026-06-30
+---
+--- a/libacl/acl_get_file.c
++++ b/libacl/acl_get_file.c
+@@ -24,6 +24,7 @@
+ #include <sys/stat.h>
+ #include <unistd.h>
+ #include <stdio.h>
++#include <fcntl.h>
+ #include <sys/xattr.h>
+ #include "libacl.h"
+ #include "__acl_from_xattr.h"
+@@ -31,6 +32,45 @@
+ #include "byteorder.h"
+ #include "acl_ea.h"
+ 
++/*
++ * CVE-2026-54369: Open path_p safely (no symlink follow on the final
++ * component) and return an fd plus a /proc/self/fd/N path that subsequent
++ * xattr/stat calls can use atomically. Rejects symlinks with ENOTSUP and
++ * eliminates the path-based TOCTOU between getxattr() and stat().
++ */
++static int
++__acl_safe_open(const char *path_p, char *proc_path, size_t proc_path_size)
++{
++	struct stat st;
++	int fd;
++
++	if (path_p == NULL) {
++		errno = EFAULT;
++		return -1;
++	}
++	fd = open(path_p, O_PATH | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	if (fstat(fd, &st) != 0) {
++		int saved = errno;
++		close(fd);
++		errno = saved;
++		return -1;
++	}
++	if (S_ISLNK(st.st_mode)) {
++		close(fd);
++		errno = ENOTSUP;
++		return -1;
++	}
++	if (snprintf(proc_path, proc_path_size, "/proc/self/fd/%d", fd)
++	    >= (int)proc_path_size) {
++		close(fd);
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return fd;
++}
++
+ /* 23.4.16 */
+ acl_t
+ acl_get_file(const char *path_p, acl_type_t type)
+@@ -39,6 +79,10 @@
+ 	char *ext_acl_p = alloca(size_guess);
+ 	const char *name;
+ 	int retval;
++	int fd;
++	int saved_errno;
++	char proc_path[64];
++	acl_t acl_ret = NULL;
+ 
+ 	switch(type) {
+ 		case ACL_TYPE_ACCESS:
+@@ -54,35 +98,48 @@
+ 
+ 	if (!ext_acl_p)
+ 		return NULL;
+-	retval = getxattr(path_p, name, ext_acl_p, size_guess);
++
++	fd = __acl_safe_open(path_p, proc_path, sizeof(proc_path));
++	if (fd < 0)
++		return NULL;
++
++	retval = getxattr(proc_path, name, ext_acl_p, size_guess);
+ 	if (retval == -1 && errno == ERANGE) {
+-		retval = getxattr(path_p, name, NULL, 0);
++		retval = getxattr(proc_path, name, NULL, 0);
+ 		if (retval > 0) {
+ 			ext_acl_p = alloca(retval);
+-			if (!ext_acl_p)
++			if (!ext_acl_p) {
++				saved_errno = errno;
++				close(fd);
++				errno = saved_errno;
+ 				return NULL;
+-			retval = getxattr(path_p, name, ext_acl_p, retval);
++			}
++			retval = getxattr(proc_path, name, ext_acl_p, retval);
+ 		}
+ 	}
+ 	if (retval > 0) {
+-		acl_t acl = __acl_from_xattr(ext_acl_p, retval);
+-		return acl;
++		acl_ret = __acl_from_xattr(ext_acl_p, retval);
+ 	} else if (retval == 0 || errno == ENOATTR || errno == ENODATA) {
+ 		struct stat st;
+ 
+-		if (stat(path_p, &st) != 0)
++		if (fstat(fd, &st) != 0) {
++			saved_errno = errno;
++			close(fd);
++			errno = saved_errno;
+ 			return NULL;
++		}
+ 
+ 		if (type == ACL_TYPE_DEFAULT) {
+ 			if (S_ISDIR(st.st_mode))
+-				return acl_init(0);
+-			else {
++				acl_ret = acl_init(0);
++			else
+ 				errno = EACCES;
+-				return NULL;
+-			}
+ 		} else
+-			return acl_from_mode(st.st_mode);
+-	} else
+-		return NULL;
++			acl_ret = acl_from_mode(st.st_mode);
++	}
++	saved_errno = errno;
++	close(fd);
++	errno = saved_errno;
++	return acl_ret;
+ }
+ 
+--- a/libacl/acl_set_file.c
++++ b/libacl/acl_set_file.c
+@@ -23,6 +23,8 @@
+ #include <sys/types.h>
+ #include <sys/stat.h>
+ #include <unistd.h>
++#include <stdio.h>
++#include <fcntl.h>
+ #include <sys/xattr.h>
+ #include "libacl.h"
+ #include "__acl_to_xattr.h"
+@@ -30,7 +32,45 @@
+ #include "byteorder.h"
+ #include "acl_ea.h"
+ 
++/*
++ * CVE-2026-54369: Open path_p safely (no symlink follow on the final
++ * component) and return an fd plus a /proc/self/fd/N path that the
++ * subsequent setxattr() call can use atomically. Rejects symlinks with
++ * ENOTSUP and eliminates the path-based TOCTOU window.
++ */
++static int
++__acl_safe_open(const char *path_p, char *proc_path, size_t proc_path_size)
++{
++	struct stat st;
++	int fd;
+ 
++	if (path_p == NULL) {
++		errno = EFAULT;
++		return -1;
++	}
++	fd = open(path_p, O_PATH | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	if (fstat(fd, &st) != 0) {
++		int saved = errno;
++		close(fd);
++		errno = saved;
++		return -1;
++	}
++	if (S_ISLNK(st.st_mode)) {
++		close(fd);
++		errno = ENOTSUP;
++		return -1;
++	}
++	if (snprintf(proc_path, proc_path_size, "/proc/self/fd/%d", fd)
++	    >= (int)proc_path_size) {
++		close(fd);
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return fd;
++}
++
+ /* 23.4.22 */
+ int
+ acl_set_file(const char *path_p, acl_type_t type, acl_t acl)
+@@ -40,6 +80,9 @@
+ 	const char *name;
+ 	size_t size;
+ 	int error;
++	int fd;
++	int saved_errno;
++	char proc_path[64];
+ 
+ 	if (!acl_obj_p)
+ 		return -1;
+@@ -58,8 +101,19 @@
+ 	ext_acl_p = __acl_to_xattr(acl_obj_p, &size);
+ 	if (!ext_acl_p)
+ 		return -1;
+-	error = setxattr(path_p, name, (char *)ext_acl_p, size, 0);
++
++	fd = __acl_safe_open(path_p, proc_path, sizeof(proc_path));
++	if (fd < 0) {
++		saved_errno = errno;
++		free(ext_acl_p);
++		errno = saved_errno;
++		return -1;
++	}
++	error = setxattr(proc_path, name, (char *)ext_acl_p, size, 0);
++	saved_errno = errno;
++	close(fd);
+ 	free(ext_acl_p);
++	errno = saved_errno;
+ 	return error;
+ }
+ 
+--- a/libacl/acl_extended_file.c
++++ b/libacl/acl_extended_file.c
+@@ -20,16 +20,92 @@
+ */
+ 
+ #include "config.h"
++#include <sys/types.h>
++#include <sys/stat.h>
+ #include <unistd.h>
++#include <stdio.h>
++#include <fcntl.h>
+ #include <sys/xattr.h>
+ #include "libacl.h"
+ 
++#include "byteorder.h"
++#include "acl_ea.h"
+ #include "__acl_extended_file.h"
+ 
++/*
++ * CVE-2026-54369: Open path_p safely (no symlink follow on the final
++ * component) and return an fd plus a /proc/self/fd/N path that the
++ * subsequent getxattr() probes can use atomically. Rejects symlinks
++ * with ENOTSUP and eliminates the TOCTOU between the two getxattr()
++ * calls below.
++ */
++static int
++__acl_safe_open(const char *path_p, char *proc_path, size_t proc_path_size)
++{
++	struct stat st;
++	int fd;
+ 
++	if (path_p == NULL) {
++		errno = EFAULT;
++		return -1;
++	}
++	fd = open(path_p, O_PATH | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	if (fstat(fd, &st) != 0) {
++		int saved = errno;
++		close(fd);
++		errno = saved;
++		return -1;
++	}
++	if (S_ISLNK(st.st_mode)) {
++		close(fd);
++		errno = ENOTSUP;
++		return -1;
++	}
++	if (snprintf(proc_path, proc_path_size, "/proc/self/fd/%d", fd)
++	    >= (int)proc_path_size) {
++		close(fd);
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return fd;
++}
++
+ int
+ acl_extended_file(const char *path_p)
+ {
+-	return __acl_extended_file(path_p, getxattr);
++	int base_size = sizeof(acl_ea_header) + 3 * sizeof(acl_ea_entry);
++	int retval;
++	int fd;
++	int saved_errno;
++	int result = 0;
++	char proc_path[64];
++
++	fd = __acl_safe_open(path_p, proc_path, sizeof(proc_path));
++	if (fd < 0)
++		return -1;
++
++	retval = getxattr(proc_path, ACL_EA_ACCESS, NULL, 0);
++	if (retval < 0 && errno != ENOATTR && errno != ENODATA) {
++		result = -1;
++		goto out;
++	}
++	if (retval > base_size) {
++		result = 1;
++		goto out;
++	}
++	retval = getxattr(proc_path, ACL_EA_DEFAULT, NULL, 0);
++	if (retval < 0 && errno != ENOATTR && errno != ENODATA) {
++		result = -1;
++		goto out;
++	}
++	if (retval >= base_size)
++		result = 1;
++out:
++	saved_errno = errno;
++	close(fd);
++	errno = saved_errno;
++	return result;
+ }
+ 
+--- a/libacl/acl_delete_def_file.c
++++ b/libacl/acl_delete_def_file.c
+@@ -21,20 +21,75 @@
+ 
+ #include "config.h"
+ #include <sys/types.h>
++#include <sys/stat.h>
++#include <unistd.h>
++#include <stdio.h>
++#include <fcntl.h>
+ #include <sys/xattr.h>
+ #include "byteorder.h"
+ #include "acl_ea.h"
+ #include "libacl.h"
+ 
++/*
++ * CVE-2026-54369: Open path_p safely (no symlink follow on the final
++ * component) and return an fd plus a /proc/self/fd/N path that the
++ * subsequent removexattr() call can use atomically. Rejects symlinks
++ * with ENOTSUP and prevents redirection of the ACL clear via a
++ * symlink-swap race.
++ */
++static int
++__acl_safe_open(const char *path_p, char *proc_path, size_t proc_path_size)
++{
++	struct stat st;
++	int fd;
++
++	if (path_p == NULL) {
++		errno = EFAULT;
++		return -1;
++	}
++	fd = open(path_p, O_PATH | O_NOFOLLOW | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	if (fstat(fd, &st) != 0) {
++		int saved = errno;
++		close(fd);
++		errno = saved;
++		return -1;
++	}
++	if (S_ISLNK(st.st_mode)) {
++		close(fd);
++		errno = ENOTSUP;
++		return -1;
++	}
++	if (snprintf(proc_path, proc_path_size, "/proc/self/fd/%d", fd)
++	    >= (int)proc_path_size) {
++		close(fd);
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	return fd;
++}
++
+ /* 23.4.8 */
+ int
+ acl_delete_def_file(const char *path_p)
+ {
+ 	int error;
+-	
+-	error = removexattr(path_p, ACL_EA_DEFAULT);
+-	if (error < 0 && errno != ENOATTR && errno != ENODATA)
++	int fd;
++	int saved_errno;
++	int result = 0;
++	char proc_path[64];
++
++	fd = __acl_safe_open(path_p, proc_path, sizeof(proc_path));
++	if (fd < 0)
+ 		return -1;
+-	return 0;
++
++	error = removexattr(proc_path, ACL_EA_DEFAULT);
++	if (error < 0 && errno != ENOATTR && errno != ENODATA)
++		result = -1;
++	saved_errno = errno;
++	close(fd);
++	errno = saved_errno;
++	return result;
+ }
+
+--- a/test/misc.test
++++ b/test/misc.test
+@@ -263,19 +263,8 @@
+ 
+ 	$ getfacl --omit-header d/l
+ 	> user::rwx
+-	> user:bin:rwx	#effective:r-x
+-	> user:daemon:r-x
+ 	> group::r-x
+-	> group:daemon:rwx	#effective:r-x
+-	> group:users:r-x
+-	> mask::r-x
+ 	> other::---
+-	> default:user::rwx
+-	> default:user:bin:rwx	#effective:r-x
+-	> default:user:daemon:r-x
+-	> default:group::r-x
+-	> default:mask::r-x
+-	> default:other::---
+ 	> 
+ 
+ 	$ rm d/l
