@@ -4,7 +4,17 @@ This patch is based on org.apache.tomcat:tomcat version 11.0.20, which is availa
 unknown
 
 ## Affected CVEs:
+- CVE-2026-34483
+- CVE-2026-34486
+- CVE-2026-34487
+- CVE-2026-34500
+- CVE-2026-41284
+- CVE-2026-41293
+- CVE-2026-42498
+- CVE-2026-43512
+- CVE-2026-43513
 - CVE-2026-43514
+- CVE-2026-43515
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.tomcat:tomcat
