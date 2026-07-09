@@ -46,6 +46,8 @@ unknown
 - CVE-2026-47135
 - CVE-2026-47139
 - CVE-2026-47209
+- AIKIDO-2026-10840
+- AIKIDO-2026-10843
 
 ## How to Apply:
 1. Clone or download the source code for vm2
