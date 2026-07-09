@@ -1,7 +1,7 @@
-# tiff : 4.2.0-1+deb11u7.root.io.15
+# tiff : 4.2.0-1+deb11u8.root.io.16
 
-This patch is based on tiff version 4.2.0-1+deb11u7.root.io.15, which is available at:
-https://sources.debian.org/src/tiff/4.2.0-1+deb11u7/
+This patch is based on tiff version 4.2.0-1+deb11u8.root.io.16, which is available at:
+https://sources.debian.org/src/tiff/4.2.0-1+deb11u8/
 
 ## Affected CVEs:
 - CVE-2023-52355
@@ -11,7 +11,7 @@ https://sources.debian.org/src/tiff/4.2.0-1+deb11u7/
 - CVE-2025-8176
 - CVE-2025-61144
 - CVE-2025-61145
-- CVE-2026-4775
+- CVE-2026-12912
 
 ## How to Apply:
 1. Obtain the source package: `apt source tiff`
