@@ -5,7 +5,17 @@ unknown
 
 ## Affected CVEs:
 - CVE-2019-10768
+- CVE-2019-14863
+- CVE-2020-7676
+- CVE-2023-26116
+- CVE-2023-26117
+- CVE-2023-26118
+- CVE-2024-8372
+- CVE-2024-8373
 - CVE-2024-21490
+- CVE-2025-0716
+- GHSA-5cp4-xmrw-59wf
+- GHSA-28hp-fgcr-2r4h
 
 ## How to Apply:
 1. Clone or download the source code for angular
