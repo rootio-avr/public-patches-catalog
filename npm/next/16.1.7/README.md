@@ -4,12 +4,16 @@ This patch is based on next version 16.1.7, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-44572
 - CVE-2026-44573
 - CVE-2026-44574
 - CVE-2026-44575
+- CVE-2026-44576
 - CVE-2026-44577
 - CVE-2026-44578
 - CVE-2026-44579
+- CVE-2026-44580
+- CVE-2026-44581
 - CVE-2026-45109
 - GHSA-8h8q-6873-q5fj
 - GHSA-q4gf-8mx6-v5v3
