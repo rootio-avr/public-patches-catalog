@@ -1,0 +1,312 @@
+--- a/src/dotenv/main.py
++++ b/src/dotenv/main.py
+@@ -1,7 +1,8 @@
+ import io
+ import logging
+ import os
+-import shutil
++import pathlib
++import stat
+ import sys
+ import tempfile
+ from collections import OrderedDict
+@@ -13,9 +14,7 @@
+ from .variables import parse_variables
+ 
+ # A type alias for a string path to be used for the paths in this file.
+-# These paths may flow to `open()` and `shutil.move()`; `shutil.move()`
+-# only accepts string paths, not byte paths or file descriptors. See
+-# https://github.com/python/typeshed/pull/6832.
++# These paths may flow to `open()` and `os.replace()`.
+ StrPath = Union[str, 'os.PathLike[str]']
+ 
+ logger = logging.getLogger(__name__)
+@@ -130,18 +129,55 @@
+ def rewrite(
+     path: StrPath,
+     encoding: Optional[str],
++    follow_symlinks: bool = False,
+ ) -> Iterator[Tuple[IO[str], IO[str]]]:
+-    if not os.path.isfile(path):
+-        with open(path, mode="w", encoding=encoding) as source:
+-            source.write("")
+-    with tempfile.NamedTemporaryFile(mode="w", encoding=encoding, delete=False) as dest:
++    if follow_symlinks:
++        path = os.path.realpath(path)
++
++    try:
++        source: IO[str] = open(path, encoding=encoding)
+         try:
+-            with open(path, encoding=encoding) as source:
++            path_stat = os.lstat(path)
++            original_mode: Optional[int] = (
++                stat.S_IMODE(path_stat.st_mode)
++                if stat.S_ISREG(path_stat.st_mode)
++                else None
++            )
++        except BaseException:
++            source.close()
++            raise
++    except FileNotFoundError:
++        source = io.StringIO("")
++        original_mode = None
++
++    with tempfile.NamedTemporaryFile(
++        mode="w",
++        encoding=encoding,
++        delete=False,
++        prefix=".tmp_",
++        dir=os.path.dirname(os.path.abspath(path)),
++    ) as dest:
++        dest_path = pathlib.Path(dest.name)
++        error = None
++
++        try:
++            with source:
+                 yield (source, dest)
++        except BaseException as err:
++            error = err
++
++    if error is None:
++        try:
++            if original_mode is not None:
++                os.chmod(dest_path, original_mode)
++
++            os.replace(dest_path, path)
+         except BaseException:
+-            os.unlink(dest.name)
++            dest_path.unlink(missing_ok=True)
+             raise
+-    shutil.move(dest.name, path)
++    else:
++        dest_path.unlink(missing_ok=True)
++        raise error from None
+ 
+ 
+ def set_key(
+@@ -151,12 +187,16 @@
+     quote_mode: str = "always",
+     export: bool = False,
+     encoding: Optional[str] = "utf-8",
++    follow_symlinks: bool = False,
+ ) -> Tuple[Optional[bool], str, str]:
+     """
+     Adds or Updates a key/value to the given .env
+ 
+-    If the .env path given doesn't exist, fails instead of risking creating
+-    an orphan .env somewhere in the filesystem
++    The target .env file is created if it doesn't exist.
++
++    This function doesn't follow symlinks by default, to avoid accidentally
++    modifying a file at a potentially untrusted path. If you don't need this
++    protection and need symlinks to be followed, use `follow_symlinks`.
+     """
+     if quote_mode not in ("always", "auto", "never"):
+         raise ValueError(f"Unknown quote_mode: {quote_mode}")
+@@ -175,7 +215,7 @@
+     else:
+         line_out = f"{key_to_set}={value_out}\n"
+ 
+-    with rewrite(dotenv_path, encoding=encoding) as (source, dest):
++    with rewrite(dotenv_path, encoding=encoding, follow_symlinks=follow_symlinks) as (source, dest):
+         replaced = False
+         missing_newline = False
+         for mapping in with_warn_for_invalid_lines(parse_stream(source)):
+@@ -198,19 +238,24 @@
+     key_to_unset: str,
+     quote_mode: str = "always",
+     encoding: Optional[str] = "utf-8",
++    follow_symlinks: bool = False,
+ ) -> Tuple[Optional[bool], str]:
+     """
+     Removes a given key from the given `.env` file.
+ 
+     If the .env path given doesn't exist, fails.
+     If the given key doesn't exist in the .env, fails.
++
++    This function doesn't follow symlinks by default, to avoid accidentally
++    modifying a file at a potentially untrusted path. If you don't need this
++    protection and need symlinks to be followed, use `follow_symlinks`.
+     """
+     if not os.path.exists(dotenv_path):
+         logger.warning("Can't delete from %s - it doesn't exist.", dotenv_path)
+         return None, key_to_unset
+ 
+     removed = False
+-    with rewrite(dotenv_path, encoding=encoding) as (source, dest):
++    with rewrite(dotenv_path, encoding=encoding, follow_symlinks=follow_symlinks) as (source, dest):
+         for mapping in with_warn_for_invalid_lines(parse_stream(source)):
+             if mapping.key == key_to_unset:
+                 removed = True
+--- a/src/dotenv/cli.py
++++ b/src/dotenv/cli.py
+@@ -80,7 +80,11 @@
+ @click.argument('key', required=True)
+ @click.argument('value', required=True)
+ def set(ctx: click.Context, key: Any, value: Any) -> None:
+-    """Store the given key/value."""
++    """Store the given key/value.
++
++    This doesn't follow symlinks, to avoid accidentally modifying a file at a
++    potentially untrusted path.
++    """
+     file = ctx.obj['FILE']
+     quote = ctx.obj['QUOTE']
+     export = ctx.obj['EXPORT']
+@@ -112,7 +116,11 @@
+ @click.pass_context
+ @click.argument('key', required=True)
+ def unset(ctx: click.Context, key: Any) -> None:
+-    """Removes the given key."""
++    """Removes the given key.
++
++    This doesn't follow symlinks, to avoid accidentally modifying a file at a
++    potentially untrusted path.
++    """
+     file = ctx.obj['FILE']
+     quote = ctx.obj['QUOTE']
+     success, key = unset_key(file, key, quote)
+--- a/tests/test_main.py
++++ b/tests/test_main.py
+@@ -2,6 +2,7 @@
+ import logging
+ import os
+ import sys
++import stat
+ import textwrap
+ from unittest import mock
+ 
+@@ -62,6 +63,76 @@
+     assert open(dotenv_file, "r", encoding=encoding).read() == "a='é'\n"
+ 
+ 
++def test_set_key_preserves_file_mode(dotenv_file):
++    with open(dotenv_file, "w") as f:
++        f.write("a=x\n")
++    os.chmod(dotenv_file, 0o640)
++    mode_before = stat.S_IMODE(os.stat(dotenv_file).st_mode)
++
++    dotenv.set_key(dotenv_file, "a", "y")
++
++    mode_after = stat.S_IMODE(os.stat(dotenv_file).st_mode)
++    assert mode_before == mode_after
++
++
++def test_rewrite_closes_file_handle_on_lstat_failure(tmp_path):
++    dotenv_path = str(tmp_path / ".env")
++    with open(dotenv_path, "w") as f:
++        f.write("a=x\n")
++    real_open = open
++    opened_handles = []
++
++    def tracking_open(*args, **kwargs):
++        handle = real_open(*args, **kwargs)
++        opened_handles.append(handle)
++        return handle
++
++    with mock.patch("dotenv.main.os.lstat", side_effect=FileNotFoundError):
++        with mock.patch("dotenv.main.open", side_effect=tracking_open):
++            dotenv.set_key(dotenv_path, "a", "x")
++
++    assert opened_handles, "expected at least one file to be opened"
++    assert all(handle.closed for handle in opened_handles)
++
++
++def test_set_key_symlink_to_existing_file(tmp_path):
++    target = tmp_path / "target.env"
++    target.write_text("a=x\n")
++    symlink = tmp_path / ".env"
++    symlink.symlink_to(target)
++
++    dotenv.set_key(str(symlink), "a", "y")
++
++    assert target.read_text() == "a=x\n"
++    assert not symlink.is_symlink()
++    assert "a='y'" in symlink.read_text()
++    assert stat.S_IMODE(symlink.stat().st_mode) == 0o600
++
++
++def test_set_key_symlink_to_missing_file(tmp_path):
++    target = tmp_path / "nx"
++    symlink = tmp_path / ".env"
++    symlink.symlink_to(target)
++
++    dotenv.set_key(str(symlink), "a", "x")
++
++    assert not target.exists()
++    assert not symlink.is_symlink()
++    assert symlink.read_text() == "a='x'\n"
++
++
++def test_set_key_follow_symlinks(tmp_path):
++    target = tmp_path / "target.env"
++    target.write_text("a=x\n")
++    symlink = tmp_path / ".env"
++    symlink.symlink_to(target)
++
++    dotenv.set_key(str(symlink), "a", "y", follow_symlinks=True)
++
++    assert target.read_text() == "a='y'\n"
++    assert symlink.is_symlink()
++
++
+ def test_set_key_permission_error(dotenv_file):
+     os.chmod(dotenv_file, 0o000)
+ 
+@@ -199,6 +270,45 @@
+     )
+ 
+ 
++def test_unset_key_symlink_to_existing_file(tmp_path):
++    target = tmp_path / "target.env"
++    target.write_text("a=x\n")
++    symlink = tmp_path / ".env"
++    symlink.symlink_to(target)
++
++    dotenv.unset_key(str(symlink), "a")
++
++    assert target.read_text() == "a=x\n"
++    assert not symlink.is_symlink()
++    assert symlink.read_text() == ""
++
++
++def test_unset_key_symlink_to_missing_file(tmp_path):
++    target = tmp_path / "nx"
++    symlink = tmp_path / ".env"
++    symlink.symlink_to(target)
++    logger = logging.getLogger("dotenv.main")
++
++    with mock.patch.object(logger, "warning") as mock_warning:
++        result = dotenv.unset_key(str(symlink), "a")
++
++    assert result == (None, "a")
++    assert symlink.is_symlink()
++    mock_warning.assert_called_once()
++
++
++def test_unset_key_follow_symlinks(tmp_path):
++    target = tmp_path / "target.env"
++    target.write_text("a=b\n")
++    symlink = tmp_path / ".env"
++    symlink.symlink_to(target)
++
++    dotenv.unset_key(str(symlink), "a", follow_symlinks=True)
++
++    assert target.read_text() == ""
++    assert symlink.is_symlink()
++
++
+ def prepare_file_hierarchy(path):
+     """
+     Create a temporary folder structure like the following:
+@@ -206,8 +316,8 @@
+         test_find_dotenv0/
+         └── child1
+             ├── child2
+-            │   └── child3
+-            │       └── child4
++            │   └── child3
++            │       └── child4
+             └── .env
+ 
+     Then try to automatically `find_dotenv` starting in `child4`
