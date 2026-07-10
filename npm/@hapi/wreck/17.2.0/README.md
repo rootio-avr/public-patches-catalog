@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-44979
+- CVE-2026-48022
 
 ## How to Apply:
 1. Clone or download the source code for @hapi/wreck
