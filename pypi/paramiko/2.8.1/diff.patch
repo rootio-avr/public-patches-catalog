@@ -1,0 +1,279 @@
+Backport of upstream paramiko fix for CVE-2023-48795 (Terrapin attack).
+
+Implements the SSH "strict kex" mode (kex-strict-{c,s}-v00@openssh.com)
+together with sequence-number reset on NEWKEYS, MessageOrderError on
+out-of-order pre-NEWKEYS packets, and a hard error on sequence-number
+rollover during the initial key exchange.
+
+Adapted from upstream paramiko commits:
+  773a174 - Basic strict-kex-mode agreement mechanics
+  75e311d - Enforce zero seqno on kexinit
+  f4dedac - Raise new exception type when unexpected messages appear
+  fa46de7 - Reset sequence numbers on rekey
+  96db1e2 - Raise exception when sequence numbers rollover during initial kex
+  33508c9 - Expand MessageOrderError use to handle more packet types
+
+Backported for paramiko 2.8.1 (pypi). Test files from upstream are not
+included because the upstream regression tests rely on a pytest-style
+server() helper, BadSeqPacketizer fixture and tests/_util.py extensions
+that do not exist in 2.8.1's unittest-based test harness; backporting
+them would require backporting the entire test infrastructure.
+
+--- a/paramiko/__init__.py
++++ b/paramiko/__init__.py
+@@ -42,6 +42,7 @@
+     ChannelException,
+     ConfigParseError,
+     CouldNotCanonicalize,
++    MessageOrderError,
+     PasswordRequiredException,
+     ProxyCommandFailure,
+     SSHException,
+--- a/paramiko/ssh_exception.py
++++ b/paramiko/ssh_exception.py
+@@ -220,3 +220,13 @@
+     """
+ 
+     pass
++
++
++class MessageOrderError(SSHException):
++    """
++    Out-of-order protocol messages were received, violating "strict kex" mode.
++
++    .. versionadded:: 2.8.1+CVE-2023-48795
++    """
++
++    pass
+--- a/paramiko/packet.py
++++ b/paramiko/packet.py
+@@ -86,6 +86,7 @@
+         self.__need_rekey = False
+         self.__init_count = 0
+         self.__remainder = bytes()
++        self._initial_kex_done = False
+ 
+         # used for noticing when to re-key:
+         self.__sent_bytes = 0
+@@ -130,6 +131,12 @@
+     def closed(self):
+         return self.__closed
+ 
++    def reset_seqno_out(self):
++        self.__sequence_number_out = 0
++
++    def reset_seqno_in(self):
++        self.__sequence_number_in = 0
++
+     def set_log(self, log):
+         """
+         Set the Python log object to use for logging.
+@@ -425,9 +432,12 @@
+                 out += compute_hmac(
+                     self.__mac_key_out, payload, self.__mac_engine_out
+                 )[: self.__mac_size_out]
+-            self.__sequence_number_out = (
+-                self.__sequence_number_out + 1
+-            ) & xffffffff
++            next_seq = (self.__sequence_number_out + 1) & xffffffff
++            if next_seq == 0 and not self._initial_kex_done:
++                raise SSHException(
++                    "Sequence number rolled over during initial kex!"
++                )
++            self.__sequence_number_out = next_seq
+             self.write_all(out)
+ 
+             self.__sent_bytes += len(out)
+@@ -531,7 +541,12 @@
+ 
+         msg = Message(payload[1:])
+         msg.seqno = self.__sequence_number_in
+-        self.__sequence_number_in = (self.__sequence_number_in + 1) & xffffffff
++        next_seq = (self.__sequence_number_in + 1) & xffffffff
++        if next_seq == 0 and not self._initial_kex_done:
++            raise SSHException(
++                "Sequence number rolled over during initial kex!"
++            )
++        self.__sequence_number_in = next_seq
+ 
+         # check for rekey
+         raw_packet_size = packet_size + self.__mac_size_in + 4
+--- a/paramiko/transport.py
++++ b/paramiko/transport.py
+@@ -107,6 +107,7 @@
+     SSHException,
+     BadAuthenticationType,
+     ChannelException,
++    MessageOrderError,
+     ProxyCommandFailure,
+ )
+ from paramiko.util import retry_on_signal, ClosingContextManager, clamp_value
+@@ -310,6 +311,7 @@
+         gss_kex=False,
+         gss_deleg_creds=True,
+         disabled_algorithms=None,
++        strict_kex=True,
+     ):
+         """
+         Create a new SSH session over an existing socket, or socket-like
+@@ -360,6 +362,10 @@
+             If given, must be a dictionary mapping algorithm type to an
+             iterable of algorithm identifiers, which will be disabled for the
+             lifetime of the transport.
++        :param bool strict_kex:
++            Whether to advertise (and implement, if peer also advertises
++            support for) the OpenSSH "strict kex" mode that mitigates the
++            Terrapin attack (CVE-2023-48795). Default: ``True``.
+ 
+             Keys should match the last word in the class' builtin algorithm
+             tuple attributes, such as ``"ciphers"`` to disable names within
+@@ -383,6 +389,8 @@
+         """
+         self.active = False
+         self.hostname = None
++        self.advertise_strict_kex = strict_kex
++        self.agreed_on_strict_kex = False
+ 
+         if isinstance(sock, string_types):
+             # convert "host:port" into (host, port)
+@@ -2012,6 +2020,20 @@
+         # be empty.)
+         return reply
+ 
++    def _enforce_strict_kex(self, ptype):
++        """
++        Conditionally raise `MessageOrderError` during strict initial kex.
++
++        This method should only be called inside code that handles non-KEXINIT
++        messages; it does not interrogate ``ptype`` besides using it to log
++        more accurately.
++        """
++        if self.agreed_on_strict_kex and not self.initial_kex_done:
++            name = MSG_NAMES.get(ptype, "msg {}".format(ptype))
++            raise MessageOrderError(
++                "In strict-kex mode, but was sent {!r}!".format(name)
++            )
++
+     def run(self):
+         # (use the exposed "run" method, because if we specify a thread target
+         # of a private method, threading.Thread will keep a reference to it
+@@ -2056,16 +2078,21 @@
+                     except NeedRekeyException:
+                         continue
+                     if ptype == MSG_IGNORE:
++                        self._enforce_strict_kex(ptype)
+                         continue
+                     elif ptype == MSG_DISCONNECT:
+                         self._parse_disconnect(m)
+                         break
+                     elif ptype == MSG_DEBUG:
++                        self._enforce_strict_kex(ptype)
+                         self._parse_debug(m)
+                         continue
+                     if len(self._expected_packet) > 0:
+                         if ptype not in self._expected_packet:
+-                            raise SSHException(
++                            exc_class = SSHException
++                            if self.agreed_on_strict_kex:
++                                exc_class = MessageOrderError
++                            raise exc_class(
+                                 "Expecting packet from {!r}, got {:d}".format(
+                                     self._expected_packet, ptype
+                                 )
+@@ -2278,10 +2305,17 @@
+         else:
+             available_server_keys = self.preferred_keys
+ 
++        # Build kex algos list, optionally advertising strict-kex support
++        # (CVE-2023-48795 mitigation).
++        kex_algos = list(self.preferred_kex)
++        if self.advertise_strict_kex:
++            which = "s" if self.server_mode else "c"
++            kex_algos.append("kex-strict-{}-v00@openssh.com".format(which))
++
+         m = Message()
+         m.add_byte(cMSG_KEXINIT)
+         m.add_bytes(os.urandom(16))
+-        m.add_list(self.preferred_kex)
++        m.add_list(kex_algos)
+         m.add_list(available_server_keys)
+         m.add_list(self.preferred_ciphers)
+         m.add_list(self.preferred_ciphers)
+@@ -2338,6 +2372,36 @@
+             + str(kex_follows),
+         )
+ 
++        # Record, and strip out, strict-kex non-algorithm marker
++        # (CVE-2023-48795 mitigation).
++        self._remote_strict_kex = None
++        to_pop = []
++        for i, algo in enumerate(kex_algo_list):
++            if algo.startswith("kex-strict-"):
++                # NOTE: this is what we are expecting from the /remote/ end.
++                which = "c" if self.server_mode else "s"
++                expected = "kex-strict-{}-v00@openssh.com".format(which)
++                self.agreed_on_strict_kex = (
++                    algo == expected and self.advertise_strict_kex
++                )
++                self._log(
++                    DEBUG,
++                    "Strict kex mode: {}".format(self.agreed_on_strict_kex),
++                )
++                to_pop.insert(0, i)
++        for i in to_pop:
++            kex_algo_list.pop(i)
++
++        # Strict-kex: KEXINIT must arrive on a zero seqno during initial kex.
++        if (
++            self.agreed_on_strict_kex
++            and not self.initial_kex_done
++            and m.seqno != 0
++        ):
++            raise MessageOrderError(
++                "In strict-kex mode, but KEXINIT was not the first packet!"
++            )
++
+         # as a server, we pick the first item in the client's list that we
+         # support.
+         # as a client, we pick the first item in our list that the server
+@@ -2531,6 +2595,14 @@
+         ):
+             self._log(DEBUG, "Switching on inbound compression ...")
+             self.packetizer.set_inbound_compressor(compress_in())
++        # Reset inbound sequence number if strict-kex mode is active
++        # (CVE-2023-48795 mitigation).
++        if self.agreed_on_strict_kex:
++            self._log(
++                DEBUG,
++                "Resetting inbound seqno after NEWKEYS due to strict mode",
++            )
++            self.packetizer.reset_seqno_in()
+ 
+     def _activate_outbound(self):
+         """switch on newly negotiated encryption parameters for
+@@ -2538,6 +2610,14 @@
+         m = Message()
+         m.add_byte(cMSG_NEWKEYS)
+         self._send_message(m)
++        # Reset outbound sequence number if strict-kex mode is active
++        # (CVE-2023-48795 mitigation).
++        if self.agreed_on_strict_kex:
++            self._log(
++                DEBUG,
++                "Resetting outbound seqno after NEWKEYS due to strict mode",
++            )
++            self.packetizer.reset_seqno_out()
+         block_size = self._cipher_info[self.local_cipher]["block-size"]
+         if self.server_mode:
+             IV_out = self._compute_key("B", block_size)
+@@ -2600,7 +2680,9 @@
+             self.auth_handler = AuthHandler(self)
+         if not self.initial_kex_done:
+             # this was the first key exchange
+-            self.initial_kex_done = True
++            # (also signal the packetizer, since it tracks this for the
++            # CVE-2023-48795 sequence-number-rollover check).
++            self.initial_kex_done = self.packetizer._initial_kex_done = True
+         # send an event?
+         if self.completion_event is not None:
+             self.completion_event.set()
