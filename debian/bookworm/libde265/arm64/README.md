@@ -1,12 +1,14 @@
-# libde265 : 1.0.11-1+deb12u2.root.io.6
+# libde265 : 1.0.11-1+deb12u2.root.io.7
 
-This patch is based on libde265 version 1.0.11-1+deb12u2.root.io.6, which is available at:
+This patch is based on libde265 version 1.0.11-1+deb12u2.root.io.7, which is available at:
 https://sources.debian.org/src/libde265/1.0.11-1+deb12u2/
 
 ## Affected CVEs:
 - CVE-2023-51792
 - CVE-2025-61147
 - CVE-2026-33164
+- CVE-2026-49295
+- CVE-2026-49346
 - CVE-2024-38949
 
 ## How to Apply:
