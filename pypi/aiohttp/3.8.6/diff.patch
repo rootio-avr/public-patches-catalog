@@ -3873,3 +3873,1030 @@ Files in the upstream commit deliberately NOT included (do not exist in 3.8.6):
  
  
  def test_set_text_with_content_type() -> None:
+
+--- a/aiohttp/streams.py
++++ b/aiohttp/streams.py
+@@ -114,10 +114,15 @@
+         self._high_water = limit * 2
+         if loop is None:
+             loop = asyncio.get_event_loop()
++        # Ensure high_water_chunks >= 3 so it's always > low_water_chunks.
++        self._high_water_chunks = max(3, limit // 4)
++        # Use max(2, ...) because there's always at least 1 chunk split remaining
++        # (the current position), so we need low_water >= 2 to allow resume.
++        self._low_water_chunks = max(2, self._high_water_chunks // 2)
+         self._loop = loop
+         self._size = 0
+         self._cursor = 0
+-        self._http_chunk_splits: Optional[List[int]] = None
++        self._http_chunk_splits: Optional[Deque[int]] = None
+         self._buffer: Deque[bytes] = collections.deque()
+         self._buffer_offset = 0
+         self._eof = False
+@@ -254,7 +259,7 @@
+                 raise RuntimeError(
+                     "Called begin_http_chunk_receiving when" "some data was already fed"
+                 )
+-            self._http_chunk_splits = []
++            self._http_chunk_splits = collections.deque()
+ 
+     def end_http_chunk_receiving(self) -> None:
+         if self._http_chunk_splits is None:
+@@ -280,6 +285,15 @@
+ 
+         self._http_chunk_splits.append(self.total_bytes)
+ 
++        # If we get too many small chunks before self._high_water is reached, then any
++        # .read() call becomes computationally expensive, and could block the event loop
++        # for too long, hence an additional self._high_water_chunks here.
++        if (
++            len(self._http_chunk_splits) > self._high_water_chunks
++            and not self._protocol._reading_paused
++        ):
++            self._protocol.pause_reading()
++
+         # wake up readchunk when end of http chunk received
+         waiter = self._waiter
+         if waiter is not None:
+@@ -411,7 +425,7 @@
+                 raise self._exception
+ 
+             while self._http_chunk_splits:
+-                pos = self._http_chunk_splits.pop(0)
++                pos = self._http_chunk_splits.popleft()
+                 if pos == self._cursor:
+                     return (b"", True)
+                 if pos > self._cursor:
+@@ -483,9 +497,16 @@
+         chunk_splits = self._http_chunk_splits
+         # Prevent memory leak: drop useless chunk splits
+         while chunk_splits and chunk_splits[0] < self._cursor:
+-            chunk_splits.pop(0)
++            chunk_splits.popleft()
+ 
+-        if self._size < self._low_water and self._protocol._reading_paused:
++        if (
++            self._protocol._reading_paused
++            and self._size < self._low_water
++            and (
++                self._http_chunk_splits is None
++                or len(self._http_chunk_splits) < self._low_water_chunks
++            )
++        ):
+             self._protocol.resume_reading()
+         return data
+ 
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -1264,7 +1264,8 @@
+     parser.feed_data(b"4\r\ndata\r\n4\r\nline\r\n0\r\n\r\n")
+ 
+     assert b"dataline" == b"".join(d for d in payload._buffer)
+-    assert [4, 8] == payload._http_chunk_splits
++    assert payload._http_chunk_splits is not None
++    assert [4, 8] == list(payload._http_chunk_splits)
+     assert payload.is_eof()
+ 
+ 
+@@ -1279,7 +1280,8 @@
+     )
+ 
+     assert b"dataline" == b"".join(d for d in payload._buffer)
+-    assert [4, 8] == payload._http_chunk_splits
++    assert payload._http_chunk_splits is not None
++    assert [4, 8] == list(payload._http_chunk_splits)
+     assert payload.is_eof()
+ 
+     assert len(messages) == 1
+@@ -1303,12 +1305,13 @@
+     parser.feed_data(b"test: test\r\n")
+ 
+     assert b"dataline" == b"".join(d for d in payload._buffer)
+-    assert [4, 8] == payload._http_chunk_splits
++    assert payload._http_chunk_splits is not None
++    assert [4, 8] == list(payload._http_chunk_splits)
+     assert not payload.is_eof()
+ 
+     parser.feed_data(b"\r\n")
+     assert b"dataline" == b"".join(d for d in payload._buffer)
+-    assert [4, 8] == payload._http_chunk_splits
++    assert [4, 8] == list(payload._http_chunk_splits)
+     assert payload.is_eof()
+ 
+ 
+@@ -1319,7 +1322,8 @@
+     parser.feed_data(b"4;test\r\ndata\r\n4\r\nline\r\n0\r\ntest: test\r\n\r\n")
+ 
+     assert b"dataline" == b"".join(d for d in payload._buffer)
+-    assert [4, 8] == payload._http_chunk_splits
++    assert payload._http_chunk_splits is not None
++    assert [4, 8] == list(payload._http_chunk_splits)
+     assert payload.is_eof()
+ 
+ 
+--- a/tests/test_streams.py
++++ b/tests/test_streams.py
+@@ -1538,3 +1538,173 @@
+     assert await stream.readany() == b"first"
+     assert await stream.readany() == b"second"
+     assert await stream.readany() == b"third"
++
++
++async def test_stream_reader_pause_on_high_water_chunks(
++    protocol: mock.Mock,
++) -> None:
++    """Test that reading is paused when chunk count exceeds high water mark."""
++    loop = asyncio.get_event_loop()
++    # Use small limit so high_water_chunks is small: limit // 4 = 10
++    stream = streams.StreamReader(protocol, limit=40, loop=loop)
++
++    assert stream._high_water_chunks == 10
++    assert stream._low_water_chunks == 5
++
++    # Feed chunks until we exceed high_water_chunks
++    for i in range(12):
++        stream.begin_http_chunk_receiving()
++        stream.feed_data(b"x")  # 1 byte per chunk
++        stream.end_http_chunk_receiving()
++
++    # pause_reading should have been called when chunk count exceeded 10
++    protocol.pause_reading.assert_called()
++
++
++async def test_stream_reader_resume_on_low_water_chunks(
++    protocol: mock.Mock,
++) -> None:
++    """Test that reading resumes when chunk count drops below low water mark."""
++    loop = asyncio.get_event_loop()
++    # Use small limit so high_water_chunks is small: limit // 4 = 10
++    stream = streams.StreamReader(protocol, limit=40, loop=loop)
++
++    assert stream._high_water_chunks == 10
++    assert stream._low_water_chunks == 5
++
++    # Feed chunks until we exceed high_water_chunks
++    for i in range(12):
++        stream.begin_http_chunk_receiving()
++        stream.feed_data(b"x")  # 1 byte per chunk
++        stream.end_http_chunk_receiving()
++
++    # Simulate that reading was paused
++    protocol._reading_paused = True
++    protocol.pause_reading.reset_mock()
++
++    # Read data to reduce both size and chunk count
++    # Reading will consume chunks and reduce _http_chunk_splits
++    data = await stream.read(10)
++    assert data == b"xxxxxxxxxx"
++
++    # resume_reading should have been called when both size and chunk count
++    # dropped below their respective low water marks
++    protocol.resume_reading.assert_called()
++
++
++async def test_stream_reader_no_resume_when_chunks_still_high(
++    protocol: mock.Mock,
++) -> None:
++    """Test that reading doesn't resume if chunk count is still above low water."""
++    loop = asyncio.get_event_loop()
++    # Use small limit so high_water_chunks is small: limit // 4 = 10
++    stream = streams.StreamReader(protocol, limit=40, loop=loop)
++
++    # Feed many chunks
++    for i in range(12):
++        stream.begin_http_chunk_receiving()
++        stream.feed_data(b"x")
++        stream.end_http_chunk_receiving()
++
++    # Simulate that reading was paused
++    protocol._reading_paused = True
++
++    # Read only a few bytes - chunk count will still be high
++    data = await stream.read(2)
++    assert data == b"xx"
++
++    # resume_reading should NOT be called because chunk count is still >= low_water_chunks
++    protocol.resume_reading.assert_not_called()
++
++
++async def test_stream_reader_read_non_chunked_response(
++    protocol: mock.Mock,
++) -> None:
++    """Test that non-chunked responses work correctly (no chunk tracking)."""
++    loop = asyncio.get_event_loop()
++    stream = streams.StreamReader(protocol, limit=40, loop=loop)
++
++    # Non-chunked: just feed data without begin/end_http_chunk_receiving
++    stream.feed_data(b"Hello World")
++
++    # _http_chunk_splits should be None for non-chunked responses
++    assert stream._http_chunk_splits is None
++
++    # Reading should work without issues
++    data = await stream.read(5)
++    assert data == b"Hello"
++
++    data = await stream.read(6)
++    assert data == b" World"
++
++
++async def test_stream_reader_resume_non_chunked_when_paused(
++    protocol: mock.Mock,
++) -> None:
++    """Test that resume works for non-chunked responses when paused due to size."""
++    loop = asyncio.get_event_loop()
++    # Small limit so we can trigger pause via size
++    stream = streams.StreamReader(protocol, limit=10, loop=loop)
++
++    # Feed data that exceeds high_water (limit * 2 = 20)
++    stream.feed_data(b"x" * 25)
++
++    # Simulate that reading was paused due to size
++    protocol._reading_paused = True
++    protocol.pause_reading.assert_called()
++
++    # Read enough to drop below low_water (limit = 10)
++    data = await stream.read(20)
++    assert data == b"x" * 20
++
++    # resume_reading should be called (size is now 5 < low_water 10)
++    protocol.resume_reading.assert_called()
++
++
++@pytest.mark.parametrize("limit", [1, 2, 4])
++async def test_stream_reader_small_limit_resumes_reading(
++    protocol: mock.Mock,
++    limit: int,
++) -> None:
++    """Test that small limits still allow resume_reading to be called.
++
++    Even with very small limits, high_water_chunks should be at least 3
++    and low_water_chunks should be at least 2, with high > low to ensure
++    proper flow control.
++    """
++    loop = asyncio.get_event_loop()
++    stream = streams.StreamReader(protocol, limit=limit, loop=loop)
++
++    # Verify minimum thresholds are enforced and high > low
++    assert stream._high_water_chunks >= 3
++    assert stream._low_water_chunks >= 2
++    assert stream._high_water_chunks > stream._low_water_chunks
++
++    # Set up pause/resume side effects
++    def pause_reading() -> None:
++        protocol._reading_paused = True
++
++    protocol.pause_reading.side_effect = pause_reading
++
++    def resume_reading() -> None:
++        protocol._reading_paused = False
++
++    protocol.resume_reading.side_effect = resume_reading
++
++    # Feed 4 chunks (triggers pause at > high_water_chunks which is >= 3)
++    for char in b"abcd":
++        stream.begin_http_chunk_receiving()
++        stream.feed_data(bytes([char]))
++        stream.end_http_chunk_receiving()
++
++    # Reading should now be paused
++    assert protocol._reading_paused is True
++    assert protocol.pause_reading.called
++
++    # Read all data - should resume (chunk count drops below low_water_chunks)
++    data = stream.read_nowait()
++    assert data == b"abcd"
++    assert stream._size == 0
++
++    protocol.resume_reading.assert_called()
++    assert protocol._reading_paused is False
+
+Description: Fix CVE-2026-22815 - Limit max headers to prevent uncapped memory usage
+ Insufficient restrictions in header handling could cause uncapped memory
+ usage. An application could cause memory exhaustion when receiving an
+ attacker-controlled request or response. This minimal backport reduces the
+ default max_headers from 32768 to 128 (matching upstream 3.13.4) and adds
+ an explicit per-request header-count enforcement check in both the Python
+ and Cython HTTP parsers, raising BadHttpMessage("Too many headers received")
+ when the limit is exceeded. Backported from aio-libs/aiohttp commit
+ 0c2e9da51126238a421568eb7c5b53e5b5d17b36 with adaptation for v3.8.6 (the
+ LineTooLong signature change, max_field_size accounting overhaul, trailer
+ enforcement, and client.py/client_proto.py threading were intentionally
+ omitted to keep the backport focused on the core CVE control surface).
+ Tests backported: test_max_headers_exceeded, test_max_headers_under_limit,
+ and test_max_headers_default_changed cover both the Python and C parsers.
+ Upstream trailer-count tests omitted because trailer enforcement is not
+ included in this backport.
+Origin: upstream, https://github.com/aio-libs/aiohttp/commit/0c2e9da51126238a421568eb7c5b53e5b5d17b36
+Author: Sam Bull <git@sambull.org>
+Last-Update: 2026-06-08
+
+--- a/aiohttp/http_parser.py
++++ b/aiohttp/http_parser.py
+@@ -157,7 +157,7 @@ class HeadersParser:
+     def __init__(
+         self,
+         max_line_size: int = 8190,
+-        max_headers: int = 32768,
++        max_headers: int = 128,
+         max_field_size: int = 8190,
+         lax: bool = False,
+     ) -> None:
+@@ -274,7 +274,7 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
+         loop: Optional[asyncio.AbstractEventLoop] = None,
+         limit: int = 2**16,
+         max_line_size: int = 8190,
+-        max_headers: int = 32768,
++        max_headers: int = 128,
+         max_field_size: int = 8190,
+         timer: Optional[BaseTimerContext] = None,
+         code: Optional[int] = None,
+@@ -364,6 +364,10 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
+                     if SEP == b"\n":  # For lax response parsing
+                         line = line.rstrip(b"\r")
+                     self._lines.append(line)
++                    # CVE-2026-22815: enforce per-message header-count cap.
++                    # +2 accounts for the start-line and the terminating empty line.
++                    if len(self._lines) > self.max_headers + 2:
++                        raise BadHttpMessage("Too many headers received")
+                     start_pos = pos + len(SEP)
+ 
+                     # \r\n\r\n found
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -348,7 +348,7 @@ cdef class HttpParser:
+         self, cparser.llhttp_type mode,
+         object protocol, object loop, int limit,
+         object timer=None,
+-        size_t max_line_size=8190, size_t max_headers=32768,
++        size_t max_line_size=8190, size_t max_headers=128,
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+         bint auto_decompress=True,
+@@ -412,6 +412,9 @@ cdef class HttpParser:
+                 self._seen_singletons.add(name)
+ 
+             self._headers.add(name, value)
++            # CVE-2026-22815: enforce per-message header-count cap.
++            if len(self._raw_headers) + 1 > self._max_headers:
++                raise BadHttpMessage("Too many headers received")
+ 
+             if name is CONTENT_ENCODING:
+                 self._content_encoding = value
+@@ -603,7 +606,7 @@ cdef class HttpRequestParser(HttpParser):
+ 
+     def __init__(
+         self, protocol, loop, int limit, timer=None,
+-        size_t max_line_size=8190, size_t max_headers=32768,
++        size_t max_line_size=8190, size_t max_headers=128,
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+         bint auto_decompress=True,
+@@ -667,7 +670,7 @@ cdef class HttpResponseParser(HttpParser):
+ 
+     def __init__(
+         self, protocol, loop, int limit, timer=None,
+-            size_t max_line_size=8190, size_t max_headers=32768,
++            size_t max_line_size=8190, size_t max_headers=128,
+             size_t max_field_size=8190, payload_exception=None,
+             bint response_with_body=True, bint read_until_eof=False,
+             bint auto_decompress=True
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -172,7 +172,7 @@ class RequestHandler(BaseProtocol):
+         access_log_format: str = AccessLogger.LOG_FORMAT,
+         debug: bool = False,
+         max_line_size: int = 8190,
+-        max_headers: int = 32768,
++        max_headers: int = 128,
+         max_field_size: int = 8190,
+         lingering_time: float = 10.0,
+         read_bufsize: int = 2**16,
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -819,6 +819,50 @@ def test_max_header_value_size_continuation_under_limit(parser) -> None:
+     assert msg.url == URL("/test")
+ 
+ 
++@pytest.fixture(params=REQUEST_PARSERS, ids=_gen_ids(REQUEST_PARSERS))
++def parser_limited_headers(loop: Any, protocol: Any, request: Any) -> Any:
++    return request.param(
++        protocol,
++        loop,
++        2**16,
++        max_line_size=8190,
++        max_headers=128,
++        max_field_size=8190,
++    )
++
++
++def test_max_headers_exceeded(parser_limited_headers: Any) -> None:
++    # CVE-2026-22815: 129 headers must raise BadHttpMessage
++    headers = b"".join(b"X-Header-%d: Value\r\n" % i for i in range(129))
++    text = b"GET /test HTTP/1.1\r\n" + headers + b"\r\n"
++
++    with pytest.raises(http_exceptions.BadHttpMessage, match="Too many headers received"):
++        parser_limited_headers.feed_data(text)
++
++
++def test_max_headers_under_limit(parser_limited_headers: Any) -> None:
++    # CVE-2026-22815: exactly 128 headers must succeed
++    headers = b"".join(b"X-Header-%d: Value\r\n" % i for i in range(128))
++    text = b"GET /test HTTP/1.1\r\n" + headers + b"\r\n"
++
++    messages, upgrade, tail = parser_limited_headers.feed_data(text)
++    assert len(messages) == 1
++    assert len(messages[0][0].headers) == 128
++
++
++@pytest.mark.parametrize("parser_cls", REQUEST_PARSERS, ids=_gen_ids(REQUEST_PARSERS))
++def test_max_headers_default_changed(
++    loop: Any, protocol: Any, parser_cls: Any
++) -> None:
++    # CVE-2026-22815: verify default max_headers changed from 32768 to 128
++    p = parser_cls(protocol, loop, 2**16)
++    headers = b"".join(b"X-Header-%d: Value\r\n" % i for i in range(129))
++    text = b"GET /test HTTP/1.1\r\n" + headers + b"\r\n"
++
++    with pytest.raises(http_exceptions.BadHttpMessage, match="Too many headers received"):
++        p.feed_data(text)
++
++
+ def test_http_request_parser(parser) -> None:
+     text = b"GET /path HTTP/1.1\r\n\r\n"
+     messages, upgrade, tail = parser.feed_data(text)
+
+--- a/aiohttp/_http_writer.pyx
++++ b/aiohttp/_http_writer.pyx
+@@ -128,6 +128,7 @@ def _serialize_headers(str status_line, headers):
+     for key, val in headers.items():
+         _safe_header(to_str(key))
+         _safe_header(to_str(val))
++    _safe_header(status_line)
+
+     try:
+         if _write_str(&writer, status_line) < 0:
+--- a/aiohttp/http_writer.py
++++ b/aiohttp/http_writer.py
+@@ -183,6 +183,7 @@ def _safe_header(string: str) -> str:
+
+
+ def _py_serialize_headers(status_line: str, headers: "CIMultiDict[str]") -> bytes:
++    _safe_header(status_line)
+     headers_gen = (_safe_header(k) + ": " + _safe_header(v) for k, v in headers.items())
+     line = status_line + "\r\n" + "\r\n".join(headers_gen) + "\r\n\r\n"
+     return line.encode("utf-8")
+--- a/aiohttp/web_exceptions.py
++++ b/aiohttp/web_exceptions.py
+@@ -99,6 +99,8 @@ class HTTPException(Response, Exception):
+                 "body argument is deprecated for http web exceptions",
+                 DeprecationWarning,
+             )
++        if reason is not None and ("\r" in reason or "\n" in reason):
++            raise ValueError("Reason cannot contain \\r or \\n")
+         Response.__init__(
+             self,
+             status=self.status_code,
+--- a/aiohttp/web_response.py
++++ b/aiohttp/web_response.py
+@@ -146,6 +146,8 @@ class StreamResponse(BaseClass, HeadersMixin):
+                 reason = _RESPONSES[self._status][0]
+             except Exception:
+                 reason = ""
++        elif "\r" in reason or "\n" in reason:
++            raise ValueError("Reason cannot contain \\r or \\n")
+         self._reason = reason
+
+     @property
+--- a/tests/test_web_exceptions.py
++++ b/tests/test_web_exceptions.py
+@@ -240,3 +240,18 @@ def test_unicode_text_body_unauthorized() -> None:
+     ):
+         resp = web.HTTPUnauthorized(body="text")
+     assert resp.status == 401
++
++
++def test_multiline_reason() -> None:
++    with pytest.raises(ValueError, match=r"Reason cannot contain"):
++        web.HTTPOk(reason="Bad\r\nInjected-header: foo")
++
++
++def test_reason_with_cr() -> None:
++    with pytest.raises(ValueError, match=r"Reason cannot contain"):
++        web.HTTPOk(reason="OK\rSet-Cookie: evil=1")
++
++
++def test_reason_with_lf() -> None:
++    with pytest.raises(ValueError, match=r"Reason cannot contain"):
++        web.HTTPOk(reason="OK\nSet-Cookie: evil=1")
+--- a/tests/test_web_response.py
++++ b/tests/test_web_response.py
+@@ -847,6 +847,32 @@ def test_set_status_with_reason() -> None:
+     assert "Everithing is fine!" == resp.reason
+
+
++def test_set_status_reason_with_cr() -> None:
++    from aiohttp import web
++
++    resp = web.StreamResponse()
++
++    with pytest.raises(ValueError, match="Reason cannot contain"):
++        resp.set_status(200, "OK\rSet-Cookie: evil=1")
++
++
++def test_set_status_reason_with_lf() -> None:
++    from aiohttp import web
++
++    resp = web.StreamResponse()
++
++    with pytest.raises(ValueError, match="Reason cannot contain"):
++        resp.set_status(200, "OK\nSet-Cookie: evil=1")
++
++
++def test_set_status_reason_with_crlf() -> None:
++    from aiohttp import web
++
++    resp = web.StreamResponse()
++
++    with pytest.raises(ValueError, match="Reason cannot contain"):
++        resp.set_status(200, "OK\r\nSet-Cookie: evil=1")
++
+ async def test_start_force_close() -> None:
+     req = make_request("GET", "/")
+     resp = StreamResponse()
+
+Description: Fix CVE-2026-34517 - check multipart max_size during iteration
+ aiohttp's Request.post() previously read non-file multipart form fields entirely
+ into memory via `await field.read(decode=True)` before enforcing client_max_size,
+ allowing a remote attacker to force significant temporary memory allocation by
+ sending a multipart request with an oversized non-file field. The size check
+ happened only after the full field was buffered, enabling memory-based denial
+ of service even though the request was ultimately rejected with HTTP 413.
+ .
+ Backport of upstream PR #12216 / commit 9cc4b917 ("Check multipart max_size
+ during iteration") adapted for aiohttp 3.8.6: master uses field.decode_iter()
+ (an async generator API not present in 3.8.6), so this backport accumulates
+ raw bytes via field.read_chunk() with an incremental size check, then performs
+ the decoding once via the synchronous field.decode(bytes) method available in
+ 3.8.6's multipart.py. form-data does not support compression, so a post-decode
+ size re-check is unnecessary, matching the upstream fix's comment.
+Origin: backport, https://github.com/aio-libs/aiohttp/commit/9cc4b917c54833a22f65edae7963d16a6eeb1f54
+Bug: https://github.com/aio-libs/aiohttp/security/advisories/GHSA-3wq7-rqq7-wx6j
+Author: Sam Bull <git@sambull.org>
+Last-Update: 2026-06-12
+
+--- a/aiohttp/web_request.py
++++ b/aiohttp/web_request.py
+@@ -738,17 +738,23 @@
+                         out.add(field.name, ff)
+                     else:
+                         # deal with ordinary data
+-                        value = await field.read(decode=True)
++                        raw_data = bytearray()
++                        chunk = await field.read_chunk()
++                        while chunk:
++                            size += len(chunk)
++                            if 0 < max_size < size:
++                                raise HTTPRequestEntityTooLarge(
++                                    max_size=max_size, actual_size=size
++                                )
++                            raw_data.extend(chunk)
++                            chunk = await field.read_chunk()
++                        # form-data doesn't support compression, so don't need to check size again.
++                        value = field.decode(bytes(raw_data))
+                         if field_ct is None or field_ct.startswith("text/"):
+                             charset = field.get_charset(default="utf-8")
+                             out.add(field.name, value.decode(charset))
+                         else:
+                             out.add(field.name, value)
+-                        size += len(value)
+-                        if 0 < max_size < size:
+-                            raise HTTPRequestEntityTooLarge(
+-                                max_size=max_size, actual_size=size
+-                            )
+                 else:
+                     raise ValueError(
+                         "To decode nested multipart you need " "to use custom reader",
+
+Description: Fix CVE-2026-34516 - enforce multipart part header limits
+ Multipart form parsing did not apply the server max_field_size and max_headers
+ limits when reading headers for each MIME part, allowing attackers to send
+ oversized or excessively numerous part headers and exhaust memory. This backport
+ threads RequestHandler limits into MultipartReader, caps readline length during
+ part header parsing, and raises BadHttpMessage/LineTooLong when limits are exceeded.
+ StreamReader.readline/readuntil gain an optional max_size parameter (raising
+ LineTooLong instead of ValueError) so the same limits can be enforced consistently.
+ .
+ Adapted for aiohttp 3.8.6 on top of prior local backports (multipart reader
+ __init__ includes boundary/_mimetype validation from CVE-2024-30251 and related
+ hooks; test import layout differs from pristine 3.8.6). Previous patch context
+ targeted the unmodified upstream MultipartReader constructor and failed to apply.
+Origin: backport, adapted from aiohttp 3.10.11 CVE-2026-34516 patch
+Author: Sam Bull <git@sambull.org>
+Last-Update: 2026-07-09
+
+
+--- a/aiohttp/multipart.py
++++ b/aiohttp/multipart.py
+@@ -36,6 +36,7 @@
+ )
+ from .helpers import CHAR, TOKEN, parse_mimetype, reify
+ from .http import HeadersParser
++from .http_exceptions import BadHttpMessage
+ from .payload import (
+     JsonPayload,
+     LookupError,
+@@ -579,7 +580,14 @@
+     #: Body part reader class for non multipart/* content types.
+     part_reader_cls = BodyPartReader
+ 
+-    def __init__(self, headers: Mapping[str, str], content: StreamReader) -> None:
++    def __init__(
++        self,
++        headers: Mapping[str, str],
++        content: StreamReader,
++        *,
++        max_field_size: int = 8190,
++        max_headers: int = 128,
++    ) -> None:
+         self._mimetype = parse_mimetype(headers[CONTENT_TYPE])
+         assert self._mimetype.type == "multipart", "multipart/* content type expected"
+         if "boundary" not in self._mimetype.parameters:
+@@ -592,6 +600,8 @@
+         self._content = content
+         self._default_charset: Optional[str] = None
+         self._last_part: Optional[Union["MultipartReader", BodyPartReader]] = None
++        self._max_field_size = max_field_size
++        self._max_headers = max_headers
+         self._at_eof = False
+         self._at_bof = True
+         self._unread: List[bytes] = []
+@@ -693,7 +703,12 @@
+         if mimetype.type == "multipart":
+             if self.multipart_reader_cls is None:
+                 return type(self)(headers, self._content)
+-            return self.multipart_reader_cls(headers, self._content)
++            return self.multipart_reader_cls(
++                headers,
++                self._content,
++                max_field_size=self._max_field_size,
++                max_headers=self._max_headers,
++            )
+         else:
+             return self.part_reader_cls(
+                 self._boundary,
+@@ -755,12 +770,14 @@
+     async def _read_headers(self) -> "CIMultiDictProxy[str]":
+         lines = []
+         while True:
+-            chunk = await self._content.readline()
+-            chunk = chunk.strip()
++            chunk = await self._content.readline(max_line_length=self._max_field_size)
++            chunk = chunk.rstrip(b"\r\n")
+             lines.append(chunk)
+             if not chunk:
+                 break
+-        parser = HeadersParser()
++            if len(lines) > self._max_headers:
++                raise BadHttpMessage("Too many headers received")
++        parser = HeadersParser(max_field_size=self._max_field_size)
+         headers, raw_headers = parser.parse_headers(lines)
+         return headers
+ 
+--- a/aiohttp/streams.py
++++ b/aiohttp/streams.py
+@@ -5,6 +5,7 @@
+ 
+ from .base_protocol import BaseProtocol
+ from .helpers import BaseTimerContext, set_exception, set_result
++from .http_exceptions import LineTooLong
+ from .log import internal_logger
+ from .typedefs import Final
+ 
+@@ -321,10 +322,12 @@
+         finally:
+             self._waiter = None
+ 
+-    async def readline(self) -> bytes:
+-        return await self.readuntil()
++    async def readline(self, *, max_line_length: Optional[int] = None) -> bytes:
++        return await self.readuntil(max_size=max_line_length)
+ 
+-    async def readuntil(self, separator: bytes = b"\n") -> bytes:
++    async def readuntil(
++        self, separator: bytes = b"\n", *, max_size: Optional[int] = None
++    ) -> bytes:
+         seplen = len(separator)
+         if seplen == 0:
+             raise ValueError("Separator should be at least one-byte string")
+@@ -335,6 +338,7 @@
+         chunk = b""
+         chunk_size = 0
+         not_enough = True
++        max_size = max_size or self._high_water
+ 
+         while not_enough:
+             while self._buffer and not_enough:
+@@ -347,8 +351,8 @@
+                 if ichar:
+                     not_enough = False
+ 
+-                if chunk_size > self._high_water:
+-                    raise ValueError("Chunk too big")
++                if chunk_size > max_size:
++                    raise LineTooLong(repr(chunk[:100]) + "...", str(max_size), str(chunk_size))
+ 
+             if self._eof:
+                 break
+@@ -556,7 +560,7 @@
+     def feed_data(self, data: bytes, n: int = 0) -> None:
+         pass
+ 
+-    async def readline(self) -> bytes:
++    async def readline(self, *, max_line_length: Optional[int] = None) -> bytes:
+         return b""
+ 
+     async def read(self, n: int = -1) -> bytes:
+--- a/aiohttp/test_utils.py
++++ b/aiohttp/test_utils.py
+@@ -662,6 +662,9 @@
+ 
+     if protocol is sentinel:
+         protocol = mock.Mock()
++        protocol.max_field_size = 8190
++        protocol.max_line_size = 8190
++        protocol.max_headers = 128
+         protocol.transport = transport
+ 
+     if writer is sentinel:
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -132,6 +132,9 @@
+     KEEPALIVE_RESCHEDULE_DELAY = 1
+ 
+     __slots__ = (
++        "max_field_size",
++        "max_headers",
++        "max_line_size",
+         "_request_count",
+         "_keepalive",
+         "_manager",
+@@ -187,6 +190,10 @@
+         self._request_handler: Optional[_RequestHandler] = manager.request_handler
+         self._request_factory: Optional[_RequestFactory] = manager.request_factory
+ 
++        self.max_line_size = max_line_size
++        self.max_headers = max_headers
++        self.max_field_size = max_field_size
++
+         self._tcp_keepalive = tcp_keepalive
+         # placeholder to be replaced on keepalive timeout setup
+         self._keepalive_time = 0.0
+--- a/aiohttp/web_request.py
++++ b/aiohttp/web_request.py
+@@ -690,7 +690,12 @@
+ 
+     async def multipart(self) -> MultipartReader:
+         """Return async iterator to process BODY as multipart."""
+-        return MultipartReader(self._headers, self._payload)
++        return MultipartReader(
++            self._headers,
++            self._payload,
++            max_field_size=self._protocol.max_field_size,
++            max_headers=self._protocol.max_headers,
++        )
+ 
+     async def post(self) -> "MultiDictProxy[Union[str, bytes, FileField]]":
+         """Return POST parameters."""
+--- a/tests/test_multipart.py
++++ b/tests/test_multipart.py
+@@ -2,6 +2,7 @@
+ import io
+ import json
+ import sys
++from typing import Optional
+ import zlib
+ from unittest import mock
+ 
+@@ -64,7 +65,7 @@
+     def at_eof(self):
+         return self.content.tell() == len(self.content.getbuffer())
+ 
+-    async def readline(self):
++    async def readline(self, *, max_line_length: Optional[int] = None) -> bytes:
+         return self.content.readline()
+ 
+     def unread_data(self, data):
+--- a/tests/test_streams.py
++++ b/tests/test_streams.py
+@@ -13,6 +13,7 @@
+ 
+ from aiohttp import streams
+ from aiohttp.helpers import PY_311
++from aiohttp.http_exceptions import LineTooLong
+ 
+ DATA = b"line1\nline2\nline3\n"
+ 
+@@ -330,7 +331,7 @@
+         stream.feed_data(b"li")
+         stream.feed_data(b"ne1\nline2\n")
+ 
+-        with pytest.raises(ValueError):
++        with pytest.raises(LineTooLong):
+             await stream.readline()
+         # The buffer should contain the remaining data after exception
+         stream.feed_eof()
+@@ -351,7 +352,7 @@
+ 
+         loop.call_soon(cb)
+ 
+-        with pytest.raises(ValueError):
++        with pytest.raises(LineTooLong):
+             await stream.readline()
+         data = await stream.read()
+         assert b"chunk3\n" == data
+@@ -439,7 +440,7 @@
+         stream.feed_data(b"li")
+         stream.feed_data(b"ne1&line2&")
+ 
+-        with pytest.raises(ValueError):
++        with pytest.raises(LineTooLong):
+             await stream.readuntil(b"&")
+         # The buffer should contain the remaining data after exception
+         stream.feed_eof()
+@@ -460,7 +461,7 @@
+ 
+         loop.call_soon(cb)
+ 
+-        with pytest.raises(ValueError):
++        with pytest.raises(LineTooLong):
+             await stream.readuntil(b"$")
+         data = await stream.read()
+         assert b"chunk3#" == data
+--- a/tests/test_web_request.py
++++ b/tests/test_web_request.py
+@@ -12,6 +12,7 @@
+ 
+ from aiohttp import HttpVersion
+ from aiohttp.base_protocol import BaseProtocol
++from aiohttp.http_exceptions import BadHttpMessage, LineTooLong
+ from aiohttp.helpers import DEBUG
+ from aiohttp.http_parser import RawRequestMessage
+ from aiohttp.streams import StreamReader
+@@ -691,6 +692,56 @@
+     result["a_file"].file.close()
+ 
+ 
++async def test_multipart_formdata_headers_too_many(protocol) -> None:
++    many = b"".join(f"X-{i}: a\r\n".encode() for i in range(130))
++    body = (
++        b"--b\r\n"
++        b'Content-Disposition: form-data; name="a"\r\n' + many + b"\r\n1\r\n"
++        b"--b--\r\n"
++    )
++    content_type = "multipart/form-data; boundary=b"
++    payload = StreamReader(protocol, 2**16, loop=asyncio.get_event_loop())
++    payload.feed_data(body)
++    payload.feed_eof()
++    req = make_mocked_request(
++        "POST",
++        "/",
++        headers={"CONTENT-TYPE": content_type},
++        payload=payload,
++    )
++
++    with pytest.raises(BadHttpMessage, match="Too many headers received"):
++        await req.post()
++
++
++async def test_multipart_formdata_header_too_long(protocol) -> None:
++    k = b"t" * 4100
++    body = (
++        b"--b\r\n"
++        b'Content-Disposition: form-data; name="a"\r\n'
++        + k
++        + b":"
++        + k
++        + b"\r\n"
++        + b"\r\n1\r\n"
++        b"--b--\r\n"
++    )
++    content_type = "multipart/form-data; boundary=b"
++    payload = StreamReader(protocol, 2**16, loop=asyncio.get_event_loop())
++    payload.feed_data(body)
++    payload.feed_eof()
++    req = make_mocked_request(
++        "POST",
++        "/",
++        headers={"CONTENT-TYPE": content_type},
++        payload=payload,
++    )
++
++    match = "400, message:\n  Got more than 8190 bytes"
++    with pytest.raises(LineTooLong, match=match):
++        await req.post()
++
++
+ async def test_make_too_big_request_limit_None(protocol) -> None:
+     payload = StreamReader(protocol, 2**16, loop=asyncio.get_event_loop())
+     large_file = 1024**2 * b"x"
+
+Description: Fix CVE-2025-69224 - Reject non-ascii characters in some headers
+ The pure-Python HTTP parser uses .lower() without an isascii() guard on
+ Content-Encoding and Transfer-Encoding header values. Non-ASCII characters
+ whose case-fold maps to ASCII control keywords (e.g., U+212A KELVIN SIGN
+ -> 'k', ligatures U+FB06/U+FB02 -> 'st'/'fl') smuggle past the comparison.
+ A proxy that compares case-sensitively will disagree with aiohttp on
+ framing/encoding, enabling HTTP request smuggling.
+ .
+ Backported from upstream commit 32677f2adfd907420c078dda6b79225c6f4ebce0
+ (cherry-pick of 5affd64). Adapted to aiohttp 3.8.6:
+ - Inlined isascii() guard around existing CONTENT_ENCODING enc.lower()
+   check (target lacks _is_supported_upgrade helper and zstd encoding).
+ - Inlined isascii() guard around existing Transfer-Encoding chunked
+   comparison (target lacks _is_chunked_te helper).
+ - Same isascii() guard added to the Cython parser CONTENT_ENCODING check.
+ - Upgrade header hunks omitted: target's pyx uses cparser.upgrade flag
+   (llhttp-derived, not vulnerable) and the pure-Python parser does not
+   inspect the Upgrade header value (only Connection: upgrade).
+Origin: upstream, https://github.com/aio-libs/aiohttp/commit/32677f2adfd907420c078dda6b79225c6f4ebce0
+Author: Sam Bull <git@sambull.org>
+Last-Update: 2026-06-12
+
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -436,8 +436,7 @@ cdef class HttpParser:
+         enc = self._content_encoding
+         if enc is not None:
+             self._content_encoding = None
+-            enc = enc.lower()
+-            if enc in ('gzip', 'deflate', 'br'):
++            if enc.isascii() and enc.lower() in ('gzip', 'deflate', 'br'):
+                 encoding = enc
+ 
+         if self._cparser.type == cparser.HTTP_REQUEST:
+--- a/aiohttp/http_parser.py
++++ b/aiohttp/http_parser.py
+@@ -526,14 +526,17 @@ class HttpParser(abc.ABC, Generic[_MsgT]):
+         # encoding
+         enc = headers.get(hdrs.CONTENT_ENCODING)
+         if enc:
+-            enc = enc.lower()
+-            if enc in ("gzip", "deflate", "br"):
+-                encoding = enc
++            # .lower() can transform non-ascii characters (e.g. ligatures),
++            # so only accept ascii values (CVE-2025-69224).
++            if enc.isascii():
++                enc = enc.lower()
++                if enc in ("gzip", "deflate", "br"):
++                    encoding = enc
+ 
+         # chunking
+         te = headers.get(hdrs.TRANSFER_ENCODING)
+         if te is not None:
+-            if "chunked" == te.lower():
++            if te.isascii() and "chunked" == te.lower():
+                 chunked = True
+             else:
+                 raise BadHttpMessage("Request has invalid `Transfer-Encoding`")
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -413,3 +413,17 @@
+     assert isinstance(payload, streams.StreamReader)
++
++
++def test_te_header_non_ascii(parser: Any) -> None:
++    # K = Kelvin sign, not valid ascii.
++    text = "GET /test HTTP/1.1\r\nTransfer-Encoding: chunKed\r\n\r\n"
++    with pytest.raises(http_exceptions.BadHttpMessage):
++        parser.feed_data(text.encode())
++
++
++def test_upgrade_header_non_ascii(parser: Any) -> None:
++    # K = Kelvin sign, not valid ascii.
++    text = "GET /test HTTP/1.1\r\nUpgrade: websocKet\r\n\r\n"
++    messages, upgrade, tail = parser.feed_data(text.encode())
++    assert not upgrade
+ 
+ 
+ def test_request_te_chunked_with_content_length(parser: Any) -> None:
+@@ -484,3 +498,18 @@
+     assert msg.compression is None
++
++
++@pytest.mark.parametrize(
++    "enc",
++    (
++        "zﬆd".encode(),  # "ﬆ".upper() == "ST"
++        "deﬂate".encode(),  # "ﬂ".upper() == "FL"
++    ),
++)
++def test_compression_non_ascii(parser: Any, enc: bytes) -> None:
++    text = b"GET /test HTTP/1.1\r\ncontent-encoding: " + enc + b"\r\n\r\n"
++    messages, upgrade, tail = parser.feed_data(text)
++    msg = messages[0][0]
++    # Non-ascii input should not evaluate to a valid encoding scheme.
++    assert msg.compression is None
+ 
+ 
+ def test_url_connect(parser: Any) -> None:
