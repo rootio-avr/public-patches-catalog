@@ -1,6 +1,6 @@
-# curl : 8.14.1-2+deb13u3.root.io.10
+# curl : 8.14.1-2+deb13u3.root.io.11
 
-This patch is based on curl version 8.14.1-2+deb13u3.root.io.10, which is available at:
+This patch is based on curl version 8.14.1-2+deb13u3.root.io.11, which is available at:
 https://sources.debian.org/src/curl/8.14.1-2+deb13u3/
 
 ## Affected CVEs:
@@ -20,7 +20,9 @@ https://sources.debian.org/src/curl/8.14.1-2+deb13u3/
 - CVE-2026-4873
 - CVE-2026-5545
 - CVE-2026-7168
+- CVE-2026-8286
 - CVE-2026-8932
+- CVE-2026-9080
 - CVE-2026-9545
 - CVE-2026-12064
 
