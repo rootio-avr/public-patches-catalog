@@ -4,6 +4,7 @@ This patch is based on jwcrypto version 1.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2023-6681
 - CVE-2024-28102
 
 ## How to Apply:
