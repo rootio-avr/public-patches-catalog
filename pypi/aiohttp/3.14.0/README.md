@@ -4,7 +4,12 @@ This patch is based on aiohttp version 3.14.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-54273
+- CVE-2026-54274
 - CVE-2026-54275
+- CVE-2026-54276
+- CVE-2026-54277
+- CVE-2026-54278
 - CVE-2026-54279
 - CVE-2026-54280
 

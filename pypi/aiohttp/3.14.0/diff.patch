@@ -1,3 +1,466 @@
+--- a/aiohttp/base_protocol.py
++++ b/aiohttp/base_protocol.py
+@@ -5,6 +5,8 @@
+ from .helpers import set_exception
+ from .tcp_helpers import tcp_nodelay
+ 
++PAUSE_RESUME_READING_ERRORS = (AttributeError, NotImplementedError, RuntimeError)
++
+ if TYPE_CHECKING:
+     from .http_parser import HttpParser
+ 
+--- a/aiohttp/http_parser.py
++++ b/aiohttp/http_parser.py
+@@ -275,6 +275,7 @@
+         response_with_body: bool = True,
+         read_until_eof: bool = False,
+         auto_decompress: bool = True,
++        max_msg_queue_size: int = 0,
+     ) -> None:
+         self.protocol = protocol
+         self.loop = loop
+@@ -300,6 +301,9 @@
+         self._headers_parser = HeadersParser(
+             max_line_size, max_headers, max_field_size, self.lax
+         )
++        # Stop emitting messages once this many are queued unconsumed (0 = off).
++        self._max_msg_queue_size = max_msg_queue_size
++        self._msg_in_flight = 0
+ 
+     @abc.abstractmethod
+     def parse_message(self, lines: list[bytes]) -> _MsgT: ...
+@@ -307,6 +311,11 @@
+     @abc.abstractmethod
+     def _is_chunked_te(self, te: str) -> bool: ...
+ 
++    def message_consumed(self) -> None:
++        """Protocol drained a queued message; free a slot for parsing."""
++        if self._msg_in_flight > 0:
++            self._msg_in_flight -= 1
++
+     def pause_reading(self) -> None:
+         assert self._payload_parser is not None
+         self._payload_parser.pause_reading()
+@@ -353,6 +362,15 @@
+             # read HTTP message (request/response line + headers), \r\n\r\n
+             # and split by lines
+             if self._payload_parser is None and not self._upgraded:
++                if (
++                    self._max_msg_queue_size
++                    and self._msg_in_flight >= self._max_msg_queue_size
++                ):
++                    # Queue full: buffer the rest and stop. Safe pause point;
++                    # any preceding body is consumed before the next request
++                    # line. Resumes via feed_data(b"") when the queue drains.
++                    self._tail = data[start_pos:]
++                    break
+                 pos = data.find(SEP, start_pos)
+                 # consume \r\n
+                 if pos == start_pos and not self._lines:
+@@ -497,6 +515,8 @@
+                             payload = EMPTY_PAYLOAD
+ 
+                         messages.append((msg, payload))
++                        if self._max_msg_queue_size:
++                            self._msg_in_flight += 1
+                         should_close = msg.should_close
+                 else:
+                     self._tail = data[start_pos:]
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -327,6 +327,8 @@
+         object  _payload
+         unsigned long long _content_length_expected
+         bint    _payload_error
++        Py_ssize_t _msg_in_flight
++        Py_ssize_t _max_msg_queue_size
+         object  _payload_exception
+         object  _last_error
+         bint    _auto_decompress
+@@ -358,7 +360,7 @@
+         size_t max_line_size=8190, size_t max_headers=128,
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+-        bint auto_decompress=True,
++        bint auto_decompress=True, Py_ssize_t max_msg_queue_size=0,
+     ):
+         cparser.llhttp_settings_init(self._csettings)
+         cparser.llhttp_init(self._cparser, mode, self._csettings)
+@@ -377,6 +379,8 @@
+         self._payload = None
+         self._payload_error = 0
+         self._payload_exception = payload_exception
++        self._msg_in_flight = 0
++        self._max_msg_queue_size = max_msg_queue_size
+         self._messages = []
+ 
+         self._raw_name = b""
+@@ -552,6 +556,11 @@
+ 
+     ### Public API ###
+ 
++    def message_consumed(self):
++        # Protocol drained a queued message; free a slot for parsing.
++        if self._msg_in_flight > 0:
++            self._msg_in_flight -= 1
++
+     def pause_reading(self):
+         assert self._payload is not None
+         self._paused = True
+@@ -678,12 +687,12 @@
+         size_t max_line_size=8190, size_t max_headers=128,
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+-        bint auto_decompress=True,
++        bint auto_decompress=True, Py_ssize_t max_msg_queue_size=0,
+     ):
+         self._init(cparser.HTTP_REQUEST, protocol, loop, limit, timer,
+                    max_line_size, max_headers, max_field_size,
+                    payload_exception, response_with_body, read_until_eof,
+-                   auto_decompress)
++                   auto_decompress, max_msg_queue_size)
+ 
+     cdef object _on_status_complete(self):
+         cdef int idx1, idx2
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -16,7 +16,7 @@
+ from propcache import under_cached_property
+ 
+ from .abc import AbstractAccessLogger, AbstractStreamWriter
+-from .base_protocol import BaseProtocol
++from .base_protocol import PAUSE_RESUME_READING_ERRORS, BaseProtocol
+ from .helpers import DEFAULT_CHUNK_SIZE, ceil_timeout
+ from .http import (
+     HttpProcessingError,
+@@ -37,6 +37,11 @@
+ 
+ __all__ = ("RequestHandler", "RequestPayloadError", "PayloadAccessError")
+ 
++# Max parsed-but-unhandled pipelined requests buffered per connection before
++# reading is paused. Bounds memory a client can pin by keeping one handler busy
++# and pipelining behind it; reading resumes as the queue drains.
++MAX_MSG_QUEUE_SIZE = 32
++
+ if TYPE_CHECKING:
+     import ssl
+ 
+@@ -146,6 +151,9 @@
+         "_keepalive_timeout",
+         "_lingering_time",
+         "_messages",
++        "_max_msg_queue_size",
++        "_msg_queue_resume_size",
++        "_msg_queue_paused",
+         "_message_tail",
+         "_handler_waiter",
+         "_waiter",
+@@ -195,6 +203,7 @@
+             max_headers=max_headers,
+             payload_exception=RequestPayloadError,
+             auto_decompress=auto_decompress,
++            max_msg_queue_size=MAX_MSG_QUEUE_SIZE,
+         )
+         super().__init__(loop, parser)
+ 
+@@ -219,6 +228,11 @@
+ 
+         self._messages: deque[_MsgType] = deque()
+         self._message_tail = b""
++        self._max_msg_queue_size = MAX_MSG_QUEUE_SIZE
++        # Low-water mark: resume reading once the queue drains to half the limit.
++        self._msg_queue_resume_size = MAX_MSG_QUEUE_SIZE // 2
++        # Track whether reading is paused due to a full queue.
++        self._msg_queue_paused = False
+         self._data_received_cb: Callable[[], None] | None = None
+ 
+         self._waiter: asyncio.Future[None] | None = None
+@@ -431,6 +445,14 @@
+                 # don't set result twice
+                 waiter.set_result(None)
+ 
++            # Queue full: pause the transport so the client cannot pile up
++            # more requests; start() resumes as it drains the queue.
++            if (
++                not self._msg_queue_paused
++                and len(self._messages) >= self._max_msg_queue_size
++            ):
++                self._pause_msg_queue_reading()
++
+             self._upgraded = upgraded
+             if upgraded and tail:
+                 self._message_tail = tail
+@@ -447,6 +469,36 @@
+             if eof:
+                 self.close()
+ 
++    def resume_reading(self) -> None:
++        # Stay paused for the message-queue reason even when the transport
++        # would otherwise be resumed (e.g. payload backpressure released).
++        if self._msg_queue_paused:
++            return
++        super().resume_reading()
++
++    def _pause_msg_queue_reading(self) -> None:
++        self._msg_queue_paused = True
++        if self.transport is not None:
++            try:
++                self.transport.pause_reading()
++            except PAUSE_RESUME_READING_ERRORS:
++                pass
++
++    def _resume_msg_queue_reading(self) -> None:
++        if not self._upgrade:
++            # Reparse buffered pipelined requests while still marked paused so
++            # a refill past the limit does not re-pause an already-paused
++            # transport; only resume below once it stayed under the limit.
++            self.data_received(b"")
++            if len(self._messages) >= self._max_msg_queue_size:
++                return
++        self._msg_queue_paused = False
++        if not self._reading_paused and self.transport is not None:
++            try:
++                self.transport.resume_reading()
++            except PAUSE_RESUME_READING_ERRORS:
++                pass
++
+     def keep_alive(self, val: bool) -> None:
+         """Set keep-alive connection mode.
+ 
+@@ -579,6 +631,16 @@
+ 
+             message, payload = self._messages.popleft()
+ 
++            # Free a parser slot; resume reading once drained to low water so
++            # pipelining keeps flowing while this request is handled.
++            if self._parser is not None:
++                self._parser.message_consumed()
++            if (
++                self._msg_queue_paused
++                and len(self._messages) <= self._msg_queue_resume_size
++            ):
++                self._resume_msg_queue_reading()
++
+             # time is only fetched if logging is enabled as otherwise
+             # its thrown away and never used.
+             start = loop.time() if self._logging_enabled else None
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -159,6 +159,78 @@
+     assert "RawResponseMessageC" in dir(aiohttp.http_parser)
+ 
+ 
++_PIPELINED_GET = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
++
++
++def _build_py_request_parser(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++    max_msg_queue_size: int,
++) -> Any:
++    # Tests target the Python parser explicitly: the queue-cap with parser-side
++    # pause is only implemented in the Python parser in this backport. The
++    # transport-level pause in RequestHandler still bounds both parser paths.
++    from aiohttp.http_parser import HttpRequestParserPy
++
++    return HttpRequestParserPy(
++        protocol,
++        loop,
++        2**16,
++        max_line_size=8190,
++        max_headers=128,
++        max_field_size=8190,
++        max_msg_queue_size=max_msg_queue_size,
++    )
++
++
++def test_max_msg_queue_size_caps_emitted_messages(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 4)
++    messages, upgraded, _tail = parser.feed_data(_PIPELINED_GET * 10)
++    assert len(messages) == 4
++    assert not upgraded
++
++
++def test_max_msg_queue_size_resumes_after_consume(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    limit = 4
++    total = 10
++    parser = _build_py_request_parser(protocol, loop, limit)
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * total)
++    seen = 0
++    while messages:
++        assert len(messages) <= limit
++        seen += len(messages)
++        for _msg, _payload in messages:
++            parser.message_consumed()
++        messages, _upgraded, _tail = parser.feed_data(b"")
++    assert seen == total
++
++
++def test_max_msg_queue_size_zero_is_unbounded(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 0)
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 50)
++    assert len(messages) == 50
++
++
++def test_message_consumed_underflow_is_ignored(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 4)
++    # No message is in flight; consuming must not underflow the counter.
++    parser.message_consumed()
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 4)
++    assert len(messages) == 4
++
++
+ def test_parse_headers(parser: Any) -> None:
+     text = b"""GET /test HTTP/1.1\r
+ Host: a\r
+
+--- a/aiohttp/_websocket/reader_py.py
++++ b/aiohttp/_websocket/reader_py.py
+@@ -208,12 +208,6 @@
+                 if opcode != OP_CODE_CONTINUATION:
+                     self._opcode = opcode
+                 self._partial += payload
+-                if self._max_msg_size and len(self._partial) >= self._max_msg_size:
+-                    raise WebSocketError(
+-                        WSCloseCode.MESSAGE_TOO_BIG,
+-                        f"Message size {len(self._partial)} "
+-                        f"exceeds limit {self._max_msg_size}",
+-                    )
+                 return
+ 
+             has_partial = bool(self._partial)
+@@ -382,6 +376,19 @@
+                         "Received fragmented control frame",
+                     )
+ 
++                if opcode not in {
++                    OP_CODE_CONTINUATION,
++                    OP_CODE_TEXT,
++                    OP_CODE_BINARY,
++                    OP_CODE_CLOSE,
++                    OP_CODE_PING,
++                    OP_CODE_PONG,
++                }:
++                    raise WebSocketError(
++                        WSCloseCode.PROTOCOL_ERROR,
++                        "Unexpected opcode={!r}".format(opcode),
++                    )
++
+                 has_mask = (second_byte >> 7) & 1
+                 length = second_byte & 0x7F
+ 
+@@ -428,6 +435,21 @@
+                 else:
+                     self._payload_bytes_to_read = len_flag
+ 
++                # Reject oversized data frames before buffering any payload
++                # bytes. Control frames are capped at 125 bytes (checked in
++                # READ_HEADER) so only text/binary/continuation need this.
++                if self._max_msg_size and self._frame_opcode in {
++                    OP_CODE_TEXT,
++                    OP_CODE_BINARY,
++                    OP_CODE_CONTINUATION,
++                }:
++                    projected_size = self._payload_bytes_to_read + len(self._partial)
++                    if projected_size >= self._max_msg_size:
++                        raise WebSocketError(
++                            WSCloseCode.MESSAGE_TOO_BIG,
++                            f"Message size {projected_size} exceeds limit {self._max_msg_size}",
++                        )
++
+                 self._state = READ_PAYLOAD_MASK if self._has_mask else READ_PAYLOAD
+ 
+             # read payload mask
+--- a/tests/test_websocket_parser.py
++++ b/tests/test_websocket_parser.py
+@@ -643,6 +643,74 @@
+     assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
+ 
+ 
++@pytest.mark.parametrize("fin", (0x80, 0x00), ids=("fin", "non-fin"))
++def test_msg_too_large_at_header(out, fin) -> None:
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    # Header alone: TEXT, 64-bit length, declares 1 MiB of payload.
++    header = PACK_LEN3(fin | WSMsgType.TEXT, 127, 1024 * 1024)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 1048576 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(header)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++def test_msg_too_large_across_fragments(out) -> None:
++    # Individual fragments fit under max_msg_size but accumulate past it.
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    first = build_frame(b"a" * 100, WSMsgType.TEXT, is_fin=False)
++    parser._feed_data(first)
++    middle = build_frame(b"b" * 100, WSMsgType.CONTINUATION, is_fin=False)
++    parser._feed_data(middle)
++
++    # Third 100-byte fragment would push the accumulated total to 300.
++    last = build_frame(b"c" * 100, WSMsgType.CONTINUATION, is_fin=False)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 300 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(last)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++def test_msg_too_large_text_after_non_fin_text(out) -> None:
++    # Protocol-violating sequence: a fresh TEXT arrives while a fragmented
++    # message is still open.
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    first = build_frame(b"a" * 200, WSMsgType.TEXT, is_fin=False)
++    parser._feed_data(first)
++
++    # Second TEXT header alone announces 100 bytes; 100 + 200 partial = 300.
++    second_header = PACK_LEN1(WSMsgType.TEXT, 100)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 300 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(second_header)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++@pytest.mark.parametrize(
++    "opcode",
++    (0x3, 0x4, 0x5, 0x6, 0x7, 0xB, 0xC, 0xD, 0xE, 0xF),
++    ids=lambda v: "0x{:x}".format(v),
++)
++def test_reserved_opcode_rejected_at_header(out, opcode) -> None:
++    # RFC 6455 reserves opcodes 0x3-0x7 (non-control) and 0xB-0xF (control).
++    parser = WebSocketReader(out, max_msg_size=256, compress=False)
++
++    header = PACK_LEN3(0x80 | opcode, 127, 1024 * 1024)
++    with pytest.raises(
++        WebSocketError, match=r"^Unexpected opcode={}$".format(opcode)
++    ) as ctx:
++        parser._feed_data(header)
++    assert ctx.value.code == WSCloseCode.PROTOCOL_ERROR
++
++
+ class TestWebSocketError:
+     def test_ctor(self) -> None:
+         err = WebSocketError(WSCloseCode.PROTOCOL_ERROR, "Something invalid")
+
 --- /dev/null
 +++ b/CHANGES/12835.bugfix.rst
 @@ -0,0 +1 @@
@@ -85,6 +548,387 @@
  def test_request_info_back_compat() -> None:
      """Test RequestInfo can be created without real_url."""
      url = URL("http://example.com")
+
+--- a/aiohttp/client_middleware_digest_auth.py
++++ b/aiohttp/client_middleware_digest_auth.py
+@@ -162,6 +162,15 @@
+     - Includes replay attack protection with client nonce count tracking
+     - Supports preemptive authentication per RFC 7616 Section 3.6
+ 
++    Origin scoping:
++    The credentials are scoped to the origin of the first request the
++    middleware handles. A request to a different origin is passed through
++    untouched, so it never receives a digest response computed from those
++    credentials, unless that origin falls within a protection space the
++    anchor origin advertised through the RFC 7616 ``domain`` directive. Make
++    the first request through the middleware against the intended origin, as
++    the anchor is pinned to it and not reset for the life of the instance.
++
+     Standards compliance:
+     - RFC 7616: HTTP Digest Access Authentication (primary reference)
+     - RFC 2617: HTTP Authentication (deprecated by RFC 7616)
+@@ -198,6 +207,8 @@
+         self._preemptive: bool = preemptive
+         # Set of URLs defining the protection space
+         self._protection_space: list[str] = []
++        # Origin the credentials are scoped to; set on the first request.
++        self._origin: URL | None = None
+ 
+     async def _encode(self, method: str, url: URL, body: Payload | Literal[b""]) -> str:
+         """
+@@ -447,6 +458,16 @@
+         self, request: ClientRequest, handler: ClientHandlerType
+     ) -> ClientResponse:
+         """Run the digest auth middleware."""
++        # Credentials are scoped to the first request's origin. Other origins
++        # pass through untouched unless a challenge from the anchor origin
++        # advertised them via RFC 7616 domain; mirrors aiohttp stripping
++        # Authorization on cross-origin redirects.
++        origin = request.url.origin()
++        if self._origin is None:
++            self._origin = origin
++        elif origin != self._origin and not self._in_protection_space(request.url):
++            return await handler(request)
++
+         response = None
+         for retry_count in range(2):
+             # Apply authorization header if:
+--- a/docs/client_reference.rst
++++ b/docs/client_reference.rst
+@@ -2447,6 +2447,16 @@
+    The server may still respond with a 401 status and ``stale=true`` if the nonce
+    has expired, in which case the middleware will automatically retry with the new nonce.
+ 
++   **Origin scoping**
++
++   The credentials are scoped to the origin of the first request the middleware
++   handles. A request to a different origin is passed through untouched, so it
++   never receives a digest response computed from those credentials, unless that
++   origin falls within a protection space the anchor origin advertised through
++   the RFC 7616 ``domain`` directive. Make the first request through the
++   middleware against the intended origin, as the anchor is pinned to it and not
++   reset for the life of the instance.
++
+    To disable preemptive authentication and require a 401 challenge for every request,
+    set ``preemptive=False``::
+ 
+@@ -2472,6 +2482,10 @@
+    .. versionadded:: 3.12
+    .. versionchanged:: 3.12.8
+       Added ``preemptive`` parameter to enable/disable preemptive authentication.
++   .. versionchanged:: 3.14.1
++      Credentials are scoped to the origin of the first request the middleware
++      handles; other origins are passed through untouched unless covered by an
++      RFC 7616 ``domain`` directive from the anchor origin.
+ 
+ 
+ .. class:: CookieJar(*, unsafe=False, quote_cookie=True, treat_as_secure_origin = [])
+--- a/tests/test_client_middleware_digest_auth.py
++++ b/tests/test_client_middleware_digest_auth.py
+@@ -1198,6 +1198,176 @@
+     )  # Second request - preemptive auth (entire origin)
+ 
+ 
++async def test_does_not_answer_cross_origin_redirect_challenge(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A cross-origin redirect target must not receive a digest response.
++
++    aiohttp strips the Authorization header on cross-origin redirects; the
++    digest middleware must not re-add one for the redirect target, otherwise
++    the configured credentials leak to an origin the caller never targeted.
++    """
++    target_auth_headers: list[str | None] = []
++
++    async def target_handler(request: Request) -> Response:
++        auth_header = request.headers.get(hdrs.AUTHORIZATION)
++        target_auth_headers.append(auth_header)
++        assert auth_header is None
++        return Response(
++            status=401,
++            headers={
++                hdrs.WWW_AUTHENTICATE: 'Digest realm="evil", nonce="cross-origin"'
++            },
++        )
++
++    target_app = Application()
++    target_app.router.add_get("/", target_handler)
++    target_server = await aiohttp_server(target_app)
++
++    async def source_handler(request: Request) -> Response:
++        return Response(
++            status=302, headers={hdrs.LOCATION: str(target_server.make_url("/"))}
++        )
++
++    source_app = Application()
++    source_app.router.add_get("/", source_handler)
++    source_server = await aiohttp_server(source_app)
++
++    digest_auth = DigestAuthMiddleware("victim", "secret")
++    async with (
++        ClientSession(middlewares=(digest_auth,)) as session,
++        session.get(source_server.make_url("/")) as response,
++    ):
++        await response.text()
++
++    assert target_auth_headers == [None]
++
++
++async def test_answers_same_origin_redirect_challenge(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A same-origin redirect that issues a challenge must still authenticate."""
++    auth_headers: list[str | None] = []
++
++    async def handler(request: Request) -> Response:
++        if request.path == "/start":
++            return Response(status=302, headers={hdrs.LOCATION: "/protected"})
++        auth_header = request.headers.get(hdrs.AUTHORIZATION)
++        auth_headers.append(auth_header)
++        if auth_header is None:
++            return Response(
++                status=401,
++                headers={hdrs.WWW_AUTHENTICATE: 'Digest realm="good", nonce="abc"'},
++            )
++        return Response(text="OK")
++
++    app = Application()
++    app.router.add_get("/start", handler)
++    app.router.add_get("/protected", handler)
++    server = await aiohttp_server(app)
++
++    digest_auth = DigestAuthMiddleware("user", "pass")
++    async with (
++        ClientSession(middlewares=(digest_auth,)) as session,
++        session.get(server.make_url("/start")) as response,
++    ):
++        assert response.status == 200
++        assert await response.text() == "OK"
++
++    assert auth_headers[0] is None
++    assert auth_headers[1] is not None
++    assert auth_headers[1].startswith("Digest")
++
++
++async def test_answers_cross_origin_within_domain_protection_space(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A different origin advertised via the ``domain`` directive is honored.
++
++    RFC 7616 allows a challenge to define a protection space spanning other
++    servers through the ``domain`` directive. The anchor origin vouches for
++    those URIs, so preemptive auth to them is expected.
++    """
++    other_auth_headers: list[str | None] = []
++
++    async def other_handler(request: Request) -> Response:
++        other_auth_headers.append(request.headers.get(hdrs.AUTHORIZATION))
++        return Response(text="other")
++
++    other_app = Application()
++    other_app.router.add_get("/", other_handler)
++    other_server = await aiohttp_server(other_app)
++    other_origin = str(other_server.make_url("/").origin())
++
++    async def anchor_handler(request: Request) -> Response:
++        if request.headers.get(hdrs.AUTHORIZATION) is None:
++            challenge = f'Digest realm="anchor", nonce="n1", domain="{other_origin}/"'
++            return Response(status=401, headers={hdrs.WWW_AUTHENTICATE: challenge})
++        return Response(text="anchor")
++
++    anchor_app = Application()
++    anchor_app.router.add_get("/", anchor_handler)
++    anchor_server = await aiohttp_server(anchor_app)
++
++    digest_auth = DigestAuthMiddleware("user", "pass")
++    async with ClientSession(middlewares=(digest_auth,)) as session:
++        async with session.get(anchor_server.make_url("/")) as response:
++            assert response.status == 200
++        async with session.get(other_server.make_url("/")) as response:
++            assert response.status == 200
++
++    assert other_auth_headers[0] is not None
++    assert other_auth_headers[0].startswith("Digest")
++
++
++async def test_does_not_answer_cross_origin_challenge_without_redirect(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """Origin scoping applies to any cross-origin request, not just redirects.
++
++    After authenticating against the anchor origin, a direct request to a
++    different origin that issues its own challenge must not be answered with a
++    digest response computed from the configured credentials.
++    """
++    other_auth_headers: list[str | None] = []
++
++    async def other_handler(request: Request) -> Response:
++        auth_header = request.headers.get(hdrs.AUTHORIZATION)
++        other_auth_headers.append(auth_header)
++        assert auth_header is None
++        return Response(
++            status=401,
++            headers={hdrs.WWW_AUTHENTICATE: 'Digest realm="evil", nonce="x"'},
++        )
++
++    other_app = Application()
++    other_app.router.add_get("/", other_handler)
++    other_server = await aiohttp_server(other_app)
++
++    async def anchor_handler(request: Request) -> Response:
++        if request.headers.get(hdrs.AUTHORIZATION) is None:
++            return Response(
++                status=401,
++                headers={hdrs.WWW_AUTHENTICATE: 'Digest realm="anchor", nonce="n1"'},
++            )
++        return Response(text="anchor")
++
++    anchor_app = Application()
++    anchor_app.router.add_get("/", anchor_handler)
++    anchor_server = await aiohttp_server(anchor_app)
++
++    digest_auth = DigestAuthMiddleware("user", "pass")
++    async with ClientSession(middlewares=(digest_auth,)) as session:
++        async with session.get(anchor_server.make_url("/")) as response:
++            assert response.status == 200
++        async with session.get(other_server.make_url("/")) as response:
++            assert response.status == 401
++
++    # The other origin only ever saw the unauthenticated request; the
++    # middleware never answered its challenge.
++    assert other_auth_headers == [None]
++
++
+ @pytest.mark.parametrize(
+     ("status", "headers", "expected"),
+     [
+
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -779,7 +779,7 @@ cdef int cb_on_url(cparser.llhttp_t* parser,
+                    const char *at, size_t length) except -1:
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             status = pyparser._buf + at[:length]
+             raise LineTooLong(status[:100] + b"...", pyparser._max_line_size)
+         extend(pyparser._buf, at, length)
+@@ -794,7 +794,7 @@ cdef int cb_on_status(cparser.llhttp_t* parser,
+                       const char *at, size_t length) except -1:
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             reason = pyparser._buf + at[:length]
+             raise LineTooLong(reason[:100] + b"...", pyparser._max_line_size)
+         extend(pyparser._buf, at, length)
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -1574,6 +1574,17 @@ def test_http_request_max_status_line_under_limit(parser: HttpRequestParser) ->
+     assert msg.url == URL("/path" + path.decode())
+ 
+ 
++def test_http_request_max_status_line_fragmented(
++    parser: HttpRequestParser,
++) -> None:
++    # Split an overlong request target across reads so that each callback
++    # fragment is under the limit but the accumulated target is not.
++    match = "400, message:\n  Got more than 8190 bytes when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        parser.feed_data(b"GET /" + b"a" * 8000)
++        parser.feed_data(b"a" * 8000 + b" HTTP/1.1\r\nHost: a\r\n\r\n")
++
++
+ def test_http_response_parser_utf8(response) -> None:
+     text = "HTTP/1.1 200 Ok\r\nx-test:тест\r\n\r\n".encode()
+ 
+@@ -1651,6 +1662,17 @@ def test_http_response_parser_status_line_under_limit(
+     assert msg.reason == reason.decode()
+ 
+ 
++def test_http_response_parser_status_line_too_long_fragmented(
++    response: HttpResponseParser,
++) -> None:
++    # Split an overlong reason phrase across reads so that each callback
++    # fragment is under the limit but the accumulated reason is not.
++    match = "400, message:\n  Got more than 8190 bytes when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        response.feed_data(b"HTTP/1.1 200 " + b"a" * 8000)
++        response.feed_data(b"a" * 8000 + b"\r\n\r\n")
++
++
+ def test_http_response_parser_bad_version(response) -> None:
+     with pytest.raises(http_exceptions.BadHttpMessage):
+         response.feed_data(b"HT/11 200 Ok\r\n\r\n")
+
+--- a/aiohttp/streams.py
++++ b/aiohttp/streams.py
+@@ -559,15 +559,21 @@
+     def _read_nowait(self, n: int) -> bytes:
+         """Read not more than n bytes, or whole buffer if n == -1"""
+         self._timer.assert_timeout()
++        if n == -1:
++            # Drain only chunks present now; _read_nowait_chunk() can
++            # re-entrantly resume_reading() and refill the buffer.
++            count = len(self._buffer)
++            if count == 1:
++                return self._read_nowait_chunk(-1)
++            return b"".join([self._read_nowait_chunk(-1) for _ in range(count)])
+ 
+-        chunks = []
++        chunks: list[bytes] = []
+         while self._buffer:
+             chunk = self._read_nowait_chunk(n)
+             chunks.append(chunk)
+-            if n != -1:
+-                n -= len(chunk)
+-                if n == 0:
+-                    break
++            n -= len(chunk)
++            if n == 0:
++                break
+ 
+         return b"".join(chunks) if chunks else b""
+ 
+--- a/tests/test_streams.py
++++ b/tests/test_streams.py
+@@ -1555,6 +1555,35 @@
+     assert isinstance(streams.EMPTY_PAYLOAD, streams.StreamReader)
+ 
+ 
++async def test_read_nowait_n_minus_one_drains_buffer(
++    protocol: mock.Mock,
++) -> None:
++    stream = streams.StreamReader(protocol, 2**16, loop=asyncio.get_event_loop())
++    stream.feed_data(b"hello")
++    stream.feed_data(b" world")
++    result = stream._read_nowait(-1)
++    assert result == b"hello world"
++
++
++async def test_read_nowait_respects_n(
++    protocol: mock.Mock,
++) -> None:
++    stream = streams.StreamReader(protocol, 2**16, loop=asyncio.get_event_loop())
++    stream.feed_data(b"hello world")
++    result = stream._read_nowait(5)
++    assert result == b"hello"
++    result2 = stream._read_nowait(-1)
++    assert result2 == b" world"
++
++
++async def test_read_nowait_empty(
++    protocol: mock.Mock,
++) -> None:
++    stream = streams.StreamReader(protocol, 2**16, loop=asyncio.get_event_loop())
++    result = stream._read_nowait(-1)
++    assert result == b""
++
++
+ async def test_stream_reader_pause_on_high_water_chunks(
+     protocol: mock.Mock,
+ ) -> None:
 
 --- /dev/null
 +++ b/CHANGES/12824.bugfix.rst
