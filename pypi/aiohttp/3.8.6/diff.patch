@@ -2940,6 +2940,683 @@ Files in the upstream commit deliberately NOT included (do not exist in 3.8.6):
      p = payload.BytesPayload(b"data")
      assert p.content_type == "application/octet-stream"
 
+--- a/aiohttp/base_protocol.py
++++ b/aiohttp/base_protocol.py
+@@ -3,6 +3,10 @@
+ 
+ from .tcp_helpers import tcp_nodelay
+ 
++# Raised by transport.pause_reading()/resume_reading() when the transport
++# does not support flow control; safe to ignore.
++PAUSE_RESUME_READING_ERRORS = (AttributeError, NotImplementedError, RuntimeError)
++
+ 
+ class BaseProtocol(asyncio.Protocol):
+     __slots__ = (
+@@ -45,15 +49,23 @@
+         if not self._reading_paused and self.transport is not None:
+             try:
+                 self.transport.pause_reading()
+-            except (AttributeError, NotImplementedError, RuntimeError):
++            except PAUSE_RESUME_READING_ERRORS:
+                 pass
+             self._reading_paused = True
+ 
++    def _reading_paused_for_msg_queue(self) -> bool:
++        """Keep the transport paused for protocol-specific reasons (overridden)."""
++        return False
++
+     def resume_reading(self) -> None:
+-        if self._reading_paused and self.transport is not None:
++        if (
++            self._reading_paused
++            and not self._reading_paused_for_msg_queue()
++            and self.transport is not None
++        ):
+             try:
+                 self.transport.resume_reading()
+-            except (AttributeError, NotImplementedError, RuntimeError):
++            except PAUSE_RESUME_READING_ERRORS:
+                 pass
+             self._reading_paused = False
+ 
+--- a/aiohttp/http_parser.py
++++ b/aiohttp/http_parser.py
+@@ -284,6 +284,7 @@
+         response_with_body: bool = True,
+         read_until_eof: bool = False,
+         auto_decompress: bool = True,
++        max_msg_queue_size: int = 0,
+     ) -> None:
+         self.protocol = protocol
+         self.loop = loop
+@@ -308,11 +309,19 @@
+         self._headers_parser = HeadersParser(
+             max_line_size, max_headers, max_field_size, lax=self.lax
+         )
++        # Stop emitting messages once this many are queued unconsumed (0 = off).
++        self._max_msg_queue_size = max_msg_queue_size
++        self._msg_in_flight = 0
+ 
+     @abc.abstractmethod
+     def parse_message(self, lines: List[bytes]) -> _MsgT:
+         pass
+ 
++    def message_consumed(self) -> None:
++        """Protocol drained a queued message; free a slot for parsing."""
++        if self._msg_in_flight > 0:
++            self._msg_in_flight -= 1
++
+     def feed_eof(self) -> Optional[_MsgT]:
+         if self._payload_parser is not None:
+             self._payload_parser.feed_eof()
+@@ -353,6 +362,12 @@
+             # read HTTP message (request/response line + headers), \r\n\r\n
+             # and split by lines
+             if self._payload_parser is None and not self._upgraded:
++                if (
++                    self._max_msg_queue_size
++                    and self._msg_in_flight >= self._max_msg_queue_size
++                ):
++                    self._tail = data[start_pos:]
++                    break
+                 pos = data.find(SEP, start_pos)
+                 # consume \r\n
+                 if pos == start_pos and not self._lines:
+@@ -474,6 +489,8 @@
+                                 payload = EMPTY_PAYLOAD
+ 
+                         messages.append((msg, payload))
++                        if self._max_msg_queue_size:
++                            self._msg_in_flight += 1
+                 else:
+                     self._tail = data[start_pos:]
+                     data = EMPTY
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -318,6 +318,9 @@
+         list    _raw_headers
+         bint    _upgraded
+         list    _messages
++        Py_ssize_t _msg_in_flight
++        Py_ssize_t _max_msg_queue_size
++        bytes   _tail
+         object  _payload
+         bint    _payload_error
+         object  _payload_exception
+@@ -352,6 +355,7 @@
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+         bint auto_decompress=True,
++        Py_ssize_t max_msg_queue_size=0,
+     ):
+         cparser.llhttp_settings_init(self._csettings)
+         cparser.llhttp_init(self._cparser, mode, self._csettings)
+@@ -366,6 +370,9 @@
+         self._payload = None
+         self._payload_error = 0
+         self._payload_exception = payload_exception
++        self._msg_in_flight = 0
++        self._max_msg_queue_size = max_msg_queue_size
++        self._tail = b''
+         self._messages = []
+ 
+         self._raw_name = bytearray()
+@@ -527,6 +534,11 @@
+ 
+     ### Public API ###
+ 
++    def message_consumed(self):
++        # Protocol drained a queued message; free a slot for parsing.
++        if self._msg_in_flight > 0:
++            self._msg_in_flight -= 1
++
+     def feed_eof(self):
+         cdef bytes desc
+ 
+@@ -553,6 +565,9 @@
+             size_t nb
+             cdef cparser.llhttp_errno_t errno
+ 
++        if self._tail:
++            data, self._tail = self._tail + data, b''
++
+         PyObject_GetBuffer(data, &self.py_buf, PyBUF_SIMPLE)
+         data_len = <size_t>self.py_buf.len
+ 
+@@ -565,6 +580,10 @@
+             cparser.llhttp_resume_after_upgrade(self._cparser)
+ 
+             nb = cparser.llhttp_get_error_pos(self._cparser) - <char*>self.py_buf.buf
++        elif errno is cparser.HPE_PAUSED:
++            cparser.llhttp_resume(self._cparser)
++            pos = cparser.llhttp_get_error_pos(self._cparser) - <char*>self.py_buf.buf
++            self._tail = data[pos:]
+ 
+         PyBuffer_Release(&self.py_buf)
+ 
+@@ -607,11 +626,12 @@
+         size_t max_field_size=8190, payload_exception=None,
+         bint response_with_body=True, bint read_until_eof=False,
+         bint auto_decompress=True,
++        Py_ssize_t max_msg_queue_size=0,
+     ):
+         self._init(cparser.HTTP_REQUEST, protocol, loop, limit, timer,
+                    max_line_size, max_headers, max_field_size,
+                    payload_exception, response_with_body, read_until_eof,
+-                   auto_decompress)
++                   auto_decompress, max_msg_queue_size)
+ 
+     cdef object _on_status_complete(self):
+         cdef int idx1, idx2
+--- a/aiohttp/web_protocol.py
++++ b/aiohttp/web_protocol.py
+@@ -25,7 +25,7 @@
+ import yarl
+ 
+ from .abc import AbstractAccessLogger, AbstractStreamWriter
+-from .base_protocol import BaseProtocol
++from .base_protocol import PAUSE_RESUME_READING_ERRORS, BaseProtocol
+ from .helpers import ceil_timeout
+ from .http import (
+     HttpProcessingError,
+@@ -44,6 +44,10 @@
+ 
+ __all__ = ("RequestHandler", "RequestPayloadError", "PayloadAccessError")
+ 
++# Max parsed-but-unhandled pipelined requests buffered per connection before
++# reading is paused.
++MAX_MSG_QUEUE_SIZE = 32
++
+ if TYPE_CHECKING:  # pragma: no cover
+     from .web_server import Server
+ 
+@@ -143,6 +147,9 @@
+         "_keepalive_timeout",
+         "_lingering_time",
+         "_messages",
++        "_max_msg_queue_size",
++        "_msg_queue_resume_size",
++        "_msg_queue_paused",
+         "_message_tail",
+         "_waiter",
+         "_task_handler",
+@@ -178,6 +185,9 @@
+         read_bufsize: int = 2**16,
+         auto_decompress: bool = True,
+     ):
++        self._max_msg_queue_size = MAX_MSG_QUEUE_SIZE
++        self._msg_queue_resume_size = MAX_MSG_QUEUE_SIZE // 2
++        self._msg_queue_paused = False
+         super().__init__(loop)
+ 
+         self._request_count = 0
+@@ -211,6 +221,7 @@
+             max_headers=max_headers,
+             payload_exception=RequestPayloadError,
+             auto_decompress=auto_decompress,
++            max_msg_queue_size=MAX_MSG_QUEUE_SIZE,
+         )
+ 
+         self.logger = logger
+@@ -346,6 +357,12 @@
+                 # don't set result twice
+                 waiter.set_result(None)
+ 
++            if (
++                not self._msg_queue_paused
++                and len(self._messages) >= self._max_msg_queue_size
++            ):
++                self._pause_msg_queue_reading()
++
+             self._upgrade = upgraded
+             if upgraded and tail:
+                 self._message_tail = tail
+@@ -360,6 +377,29 @@
+             if eof:
+                 self.close()
+ 
++    def _reading_paused_for_msg_queue(self) -> bool:
++        return self._msg_queue_paused
++
++    def _pause_msg_queue_reading(self) -> None:
++        self._msg_queue_paused = True
++        if self.transport is not None:
++            try:
++                self.transport.pause_reading()
++            except PAUSE_RESUME_READING_ERRORS:
++                pass
++
++    def _resume_msg_queue_reading(self) -> None:
++        if not self._upgrade:
++            self.data_received(b"")
++            if len(self._messages) >= self._max_msg_queue_size:
++                return
++        self._msg_queue_paused = False
++        if not self._reading_paused and self.transport is not None:
++            try:
++                self.transport.resume_reading()
++            except PAUSE_RESUME_READING_ERRORS:
++                pass
++
+     def keep_alive(self, val: bool) -> None:
+         """Set keep-alive connection mode.
+ 
+@@ -491,6 +531,14 @@
+ 
+             message, payload = self._messages.popleft()
+ 
++            if self._parser is not None:
++                self._parser.message_consumed()
++            if (
++                self._msg_queue_paused
++                and len(self._messages) <= self._msg_queue_resume_size
++            ):
++                self._resume_msg_queue_reading()
++
+             start = loop.time()
+ 
+             manager.requests_count += 1
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -103,6 +103,74 @@
+     assert "RawResponseMessageC" in dir(aiohttp.http_parser)
+ 
+ 
++_PIPELINED_GET = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
++
++
++def _build_py_request_parser(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++    max_msg_queue_size: int,
++) -> Any:
++    from aiohttp.http_parser import HttpRequestParserPy
++
++    return HttpRequestParserPy(
++        protocol,
++        loop,
++        2**16,
++        max_line_size=8190,
++        max_headers=128,
++        max_field_size=8190,
++        max_msg_queue_size=max_msg_queue_size,
++    )
++
++
++def test_max_msg_queue_size_caps_emitted_messages(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 4)
++    messages, upgraded, _tail = parser.feed_data(_PIPELINED_GET * 10)
++    assert len(messages) == 4
++    assert not upgraded
++
++
++def test_max_msg_queue_size_resumes_after_consume(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    limit = 4
++    total = 10
++    parser = _build_py_request_parser(protocol, loop, limit)
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * total)
++    seen = 0
++    while messages:
++        assert len(messages) <= limit
++        seen += len(messages)
++        for _msg, _payload in messages:
++            parser.message_consumed()
++        messages, _upgraded, _tail = parser.feed_data(b"")
++    assert seen == total
++
++
++def test_max_msg_queue_size_zero_is_unbounded(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 0)
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 50)
++    assert len(messages) == 50
++
++
++def test_message_consumed_underflow_is_ignored(
++    protocol: Any,
++    loop: asyncio.AbstractEventLoop,
++) -> None:
++    parser = _build_py_request_parser(protocol, loop, 4)
++    parser.message_consumed()
++    messages, _upgraded, _tail = parser.feed_data(_PIPELINED_GET * 4)
++    assert len(messages) == 4
++
++
+ def test_parse_headers(parser: Any) -> None:
+     text = b"""GET /test HTTP/1.1\r
+ test: line\r
+
+--- a/aiohttp/http_websocket.py
++++ b/aiohttp/http_websocket.py
+@@ -344,13 +344,6 @@
+                     if opcode != WSMsgType.CONTINUATION:
+                         self._opcode = opcode
+                     self._partial.extend(payload)
+-                    if self._max_msg_size and len(self._partial) >= self._max_msg_size:
+-                        raise WebSocketError(
+-                            WSCloseCode.MESSAGE_TOO_BIG,
+-                            "Message size {} exceeds limit {}".format(
+-                                len(self._partial), self._max_msg_size
+-                            ),
+-                        )
+                 else:
+                     # previous frame was non finished
+                     # we should get continuation opcode
+@@ -368,13 +361,6 @@
+                         self._opcode = None
+ 
+                     self._partial.extend(payload)
+-                    if self._max_msg_size and len(self._partial) >= self._max_msg_size:
+-                        raise WebSocketError(
+-                            WSCloseCode.MESSAGE_TOO_BIG,
+-                            "Message size {} exceeds limit {}".format(
+-                                len(self._partial), self._max_msg_size
+-                            ),
+-                        )
+ 
+                     # Decompress process must to be done after all packets
+                     # received.
+@@ -455,6 +441,19 @@
+                             "Received frame with non-zero reserved bits",
+                         )
+ 
++                    if opcode not in {
++                        WSMsgType.CONTINUATION,
++                        WSMsgType.TEXT,
++                        WSMsgType.BINARY,
++                        WSMsgType.CLOSE,
++                        WSMsgType.PING,
++                        WSMsgType.PONG,
++                    }:
++                        raise WebSocketError(
++                            WSCloseCode.PROTOCOL_ERROR,
++                            "Unexpected opcode={!r}".format(opcode),
++                        )
++
+                     if opcode > 0x7 and fin == 0:
+                         raise WebSocketError(
+                             WSCloseCode.PROTOCOL_ERROR,
+@@ -493,40 +492,46 @@
+ 
+             # read payload length
+             if self._state == WSParserState.READ_PAYLOAD_LENGTH:
+-                length = self._payload_length_flag
+-                if length == 126:
++                length_flag = self._payload_length_flag
++                if length_flag == 126:
+                     if buf_length - start_pos >= 2:
+                         data = buf[start_pos : start_pos + 2]
+                         start_pos += 2
+-                        length = UNPACK_LEN2(data)[0]
+-                        self._payload_length = length
+-                        self._state = (
+-                            WSParserState.READ_PAYLOAD_MASK
+-                            if self._has_mask
+-                            else WSParserState.READ_PAYLOAD
+-                        )
++                        self._payload_length = UNPACK_LEN2(data)[0]
+                     else:
+                         break
+-                elif length > 126:
++                elif length_flag > 126:
+                     if buf_length - start_pos >= 8:
+                         data = buf[start_pos : start_pos + 8]
+                         start_pos += 8
+-                        length = UNPACK_LEN3(data)[0]
+-                        self._payload_length = length
+-                        self._state = (
+-                            WSParserState.READ_PAYLOAD_MASK
+-                            if self._has_mask
+-                            else WSParserState.READ_PAYLOAD
+-                        )
++                        self._payload_length = UNPACK_LEN3(data)[0]
+                     else:
+                         break
+                 else:
+-                    self._payload_length = length
+-                    self._state = (
+-                        WSParserState.READ_PAYLOAD_MASK
+-                        if self._has_mask
+-                        else WSParserState.READ_PAYLOAD
+-                    )
++                    self._payload_length = length_flag
++
++                # Reject oversized data frames before buffering any payload
++                # bytes. Control frames are capped at 125 bytes (checked in
++                # READ_HEADER) so only text/binary/continuation need this.
++                if self._max_msg_size and self._frame_opcode in (
++                    WSMsgType.TEXT,
++                    WSMsgType.BINARY,
++                    WSMsgType.CONTINUATION,
++                ):
++                    projected_size = self._payload_length + len(self._partial)
++                    if projected_size >= self._max_msg_size:
++                        raise WebSocketError(
++                            WSCloseCode.MESSAGE_TOO_BIG,
++                            "Message size {} exceeds limit {}".format(
++                                projected_size, self._max_msg_size
++                            ),
++                        )
++
++                self._state = (
++                    WSParserState.READ_PAYLOAD_MASK
++                    if self._has_mask
++                    else WSParserState.READ_PAYLOAD
++                )
+ 
+             # read payload mask
+             if self._state == WSParserState.READ_PAYLOAD_MASK:
+--- a/tests/test_websocket_parser.py
++++ b/tests/test_websocket_parser.py
+@@ -498,6 +498,74 @@
+     assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
+ 
+ 
++@pytest.mark.parametrize("fin", (0x80, 0x00), ids=("fin", "non-fin"))
++def test_msg_too_large_at_header(out, fin) -> None:
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    # Header alone: TEXT, 64-bit length, declares 1 MiB of payload.
++    header = PACK_LEN3(fin | WSMsgType.TEXT, 127, 1024 * 1024)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 1048576 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(header)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++def test_msg_too_large_across_fragments(out) -> None:
++    # Individual fragments fit under max_msg_size but accumulate past it.
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    first = build_frame(b"a" * 100, WSMsgType.TEXT, is_fin=False)
++    parser._feed_data(first)
++    middle = build_frame(b"b" * 100, WSMsgType.CONTINUATION, is_fin=False)
++    parser._feed_data(middle)
++
++    # Third 100-byte fragment would push the accumulated total to 300.
++    last = build_frame(b"c" * 100, WSMsgType.CONTINUATION, is_fin=False)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 300 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(last)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++def test_msg_too_large_text_after_non_fin_text(out) -> None:
++    # Protocol-violating sequence: a fresh TEXT arrives while a fragmented
++    # message is still open.
++    max_msg_size = 256
++    parser = WebSocketReader(out, max_msg_size, compress=False)
++
++    first = build_frame(b"a" * 200, WSMsgType.TEXT, is_fin=False)
++    parser._feed_data(first)
++
++    # Second TEXT header alone announces 100 bytes; 100 + 200 partial = 300.
++    second_header = PACK_LEN1(WSMsgType.TEXT, 100)
++    with pytest.raises(
++        WebSocketError, match=r"^Message size 300 exceeds limit 256$"
++    ) as ctx:
++        parser._feed_data(second_header)
++    assert ctx.value.code == WSCloseCode.MESSAGE_TOO_BIG
++
++
++@pytest.mark.parametrize(
++    "opcode",
++    (0x3, 0x4, 0x5, 0x6, 0x7, 0xB, 0xC, 0xD, 0xE, 0xF),
++    ids=lambda v: "0x{:x}".format(v),
++)
++def test_reserved_opcode_rejected_at_header(out, opcode) -> None:
++    # RFC 6455 reserves opcodes 0x3-0x7 (non-control) and 0xB-0xF (control).
++    parser = WebSocketReader(out, max_msg_size=256, compress=False)
++
++    header = PACK_LEN3(0x80 | opcode, 127, 1024 * 1024)
++    with pytest.raises(
++        WebSocketError, match=r"^Unexpected opcode={}$".format(opcode)
++    ) as ctx:
++        parser._feed_data(header)
++    assert ctx.value.code == WSCloseCode.PROTOCOL_ERROR
++
++
+ class TestWebSocketError:
+     def test_ctor(self) -> None:
+         err = WebSocketError(WSCloseCode.PROTOCOL_ERROR, "Something invalid")
+
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -727,7 +727,7 @@
+                    const char *at, size_t length) except -1:
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             raise LineTooLong(
+                 'Status line is too long', pyparser._max_line_size, length)
+         extend(pyparser._buf, at, length)
+@@ -743,7 +743,7 @@
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     cdef str reason
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             raise LineTooLong(
+                 'Status line is too long', pyparser._max_line_size, length)
+         extend(pyparser._buf, at, length)
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -1077,6 +1077,17 @@
+     assert msg.url == URL("/path" + path.decode())
+ 
+ 
++def test_http_request_max_status_line_fragmented(
++    parser,
++) -> None:
++    # Split an overlong request target across reads so that each callback
++    # fragment is under the limit but the accumulated target is not.
++    match = "400, message:\n  Got more than 8190 bytes when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        parser.feed_data(b"GET /" + b"a" * 8000)
++        parser.feed_data(b"a" * 8000 + b" HTTP/1.1\r\nHost: a\r\n\r\n")
++
++
+ def test_http_response_parser_utf8(response) -> None:
+     text = "HTTP/1.1 200 Ok\r\nx-test:тест\r\n\r\n".encode()
+ 
+@@ -1112,6 +1123,17 @@
+     assert msg.reason == reason.decode()
+ 
+ 
++def test_http_response_parser_status_line_too_long_fragmented(
++    response,
++) -> None:
++    # Split an overlong reason phrase across reads so that each callback
++    # fragment is under the limit but the accumulated reason is not.
++    match = "400, message:\n  Got more than 8190 bytes when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        response.feed_data(b"HTTP/1.1 200 " + b"a" * 8000)
++        response.feed_data(b"a" * 8000 + b"\r\n\r\n")
++
++
+ def test_http_response_parser_bad_version(response) -> None:
+     with pytest.raises(http_exceptions.BadHttpMessage):
+         response.feed_data(b"HT/11 200 Ok\r\n\r\n")
+
+--- a/aiohttp/streams.py
++++ b/aiohttp/streams.py
+@@ -491,15 +491,21 @@
+ 
+     def _read_nowait(self, n: int) -> bytes:
+         """Read not more than n bytes, or whole buffer if n == -1"""
+-        chunks = []
++        if n == -1:
++            # Drain only chunks present now; _read_nowait_chunk() can
++            # re-entrantly resume_reading() and refill the buffer.
++            count = len(self._buffer)
++            if count == 1:
++                return self._read_nowait_chunk(-1)
++            return b"".join([self._read_nowait_chunk(-1) for _ in range(count)])
+ 
++        chunks: List[bytes] = []
+         while self._buffer:
+             chunk = self._read_nowait_chunk(n)
+             chunks.append(chunk)
+-            if n != -1:
+-                n -= len(chunk)
+-                if n == 0:
+-                    break
++            n -= len(chunk)
++            if n == 0:
++                break
+ 
+         return b"".join(chunks) if chunks else b""
+ 
+--- a/tests/test_streams.py
++++ b/tests/test_streams.py
+@@ -1509,3 +1509,32 @@
+ 
+ def test_isinstance_check() -> None:
+     assert isinstance(streams.EMPTY_PAYLOAD, streams.StreamReader)
++
++
++
++async def test_readany_does_not_drain_reentrant_refill(
++    protocol: mock.Mock,
++) -> None:
++    """A single readany() must not reassemble data fed re-entrantly.
++
++    Draining below the low water mark resumes reading, which can synchronously
++    refill the buffer (e.g. decompressing another chunk). Joining that refill in
++    one call would reassemble an unbounded body.
++    """
++    loop = asyncio.get_event_loop()
++    stream = streams.StreamReader(protocol, limit=4, loop=loop)
++
++    refills = [b"second", b"third"]
++
++    def resume_reading() -> None:
++        if refills:
++            stream.feed_data(refills.pop(0))
++
++    protocol.resume_reading.side_effect = resume_reading
++
++    stream.feed_data(b"first")
++
++    # Popping "first" refills "second", but this readany() returns only "first".
++    assert await stream.readany() == b"first"
++    assert await stream.readany() == b"second"
++    assert await stream.readany() == b"third"
+
 --- a/aiohttp/cookiejar.py
 +++ b/aiohttp/cookiejar.py
 @@ -34,6 +34,9 @@ __all__ = ("CookieJar", "DummyCookieJar")
