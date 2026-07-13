@@ -8,6 +8,7 @@ unknown
 - CVE-2023-30798
 - CVE-2025-54121
 - CVE-2026-48710
+- CVE-2026-48818
 
 ## How to Apply:
 1. Clone or download the source code for starlette
