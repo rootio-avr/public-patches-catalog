@@ -1,3 +1,46 @@
+--- a/starlette/datastructures.py
++++ b/starlette/datastructures.py
+@@ -424,6 +424,10 @@ class UploadFile:
+         self.size = size
+         self.headers = headers or Headers()
+
++        # Capture max size from SpooledTemporaryFile if one is provided. This slightly speeds up future checks.
++        # Note 0 means unlimited mirroring SpooledTemporaryFile's __init__
++        self._max_mem_size = getattr(self.file, "_max_size", 0)
++
+     @property
+     def content_type(self) -> str | None:
+         return self.headers.get("content-type", None)
+@@ -434,14 +438,24 @@ class UploadFile:
+         rolled_to_disk = getattr(self.file, "_rolled", True)
+         return not rolled_to_disk
+
++    def _will_roll(self, size_to_add: int) -> bool:
++        # If we're not in_memory then we will always roll
++        if not self._in_memory:
++            return True
++
++        # Check for SpooledTemporaryFile._max_size
++        future_size = self.file.tell() + size_to_add
++        return bool(future_size > self._max_mem_size) if self._max_mem_size else False
++
+     async def write(self, data: bytes) -> None:
++        new_data_len = len(data)
+         if self.size is not None:
+-            self.size += len(data)
++            self.size += new_data_len
+
+-        if self._in_memory:
+-            self.file.write(data)
+-        else:
++        if self._will_roll(new_data_len):
+             await run_in_threadpool(self.file.write, data)
++        else:
++            self.file.write(data)
+
+     async def read(self, size: int = -1) -> bytes:
+         if self._in_memory:
+
 From 54f60fcbf2c8e2d6d3f40cfba0c5874946e55153 Mon Sep 17 00:00:00 2001
 From: Marcelo Trylesinski <marcelotryle@gmail.com>
 Date: Tue, 28 Oct 2025 18:14:01 +0100
@@ -199,3 +242,378 @@ index d5ed834..76c13ac 100644
  def test_headers() -> None:
      h = Headers(raw=[(b"a", b"123"), (b"a", b"456"), (b"b", b"789")])
      assert "a" in h
+
+--- a/starlette/endpoints.py
++++ b/starlette/endpoints.py
+@@ -32,7 +32,11 @@ class HTTPEndpoint:
+         request = Request(self.scope, receive=self.receive)
+         handler_name = "get" if request.method == "HEAD" and not hasattr(self, "head") else request.method.lower()
+
+-        handler: typing.Callable[[Request], typing.Any] = getattr(self, handler_name, self.method_not_allowed)
++        handler: typing.Callable[[Request], typing.Any]
++        if request.method in self._allowed_methods or (request.method == "HEAD" and "GET" in self._allowed_methods):
++            handler = getattr(self, handler_name)
++        else:
++            handler = self.method_not_allowed
+         is_async = is_async_callable(handler)
+         if is_async:
+             response = await handler(request)
+--- a/tests/test_endpoints.py
++++ b/tests/test_endpoints.py
+@@ -47,6 +47,23 @@ def test_http_endpoint_route_method(client: TestClient) -> None:
+     assert response.headers["allow"] == "GET"
+
+
++def test_http_endpoint_does_not_dispatch_non_verb_method(test_client_factory: TestClientFactory) -> None:
++    class Endpoint(HTTPEndpoint):
++        async def get(self, request: Request) -> PlainTextResponse:
++            return PlainTextResponse("Hello, world!")  # pragma: no cover
++
++        async def _do_delete(self, request: Request) -> PlainTextResponse:
++            return PlainTextResponse("Privileged helper")  # pragma: no cover
++
++    app = Router(routes=[Route("/", endpoint=Endpoint)])
++    client = test_client_factory(app)
++
++    response = client.request("_DO_DELETE", "/")
++    assert response.status_code == 405
++    assert response.text == "Method Not Allowed"
++    assert response.headers["allow"] == "GET"
++
++
+ def test_websocket_endpoint_on_connect(test_client_factory: TestClientFactory) -> None:
+     class WebSocketApp(WebSocketEndpoint):
+         async def on_connect(self, websocket: WebSocket) -> None:
+
+--- a/starlette/staticfiles.py
++++ b/starlette/staticfiles.py
+@@ -149,6 +149,9 @@
+         raise HTTPException(status_code=404)
+
+     def lookup_path(self, path: str) -> tuple[str, os.stat_result | None]:
++        # Reject absolute paths so they cannot escape the served directory.
++        if path.startswith(("/", "\\")):
++            return "", None
+         for directory in self.all_directories:
+             joined_path = os.path.join(directory, path)
+             if self.follow_symlink:
+--- a/tests/test_staticfiles.py
++++ b/tests/test_staticfiles.py
+@@ -559,3 +559,23 @@
+
+     assert exc_info.value.status_code == 404
+     assert exc_info.value.detail == "Not Found"
++
++
++def test_staticfiles_rejects_absolute_paths(tmp_path: Path) -> None:
++    statics_path = tmp_path / "static"
++    statics_path.mkdir()
++    app = StaticFiles(directory=statics_path)
++
++    full_path, stat_result = app.lookup_path("/etc/passwd")
++    assert full_path == ""
++    assert stat_result is None
++
++
++def test_staticfiles_rejects_absolute_windows_paths(tmp_path: Path) -> None:
++    statics_path = tmp_path / "static"
++    statics_path.mkdir()
++    app = StaticFiles(directory=statics_path)
++
++    full_path, stat_result = app.lookup_path("\\\\server\\share")
++    assert full_path == ""
++    assert stat_result is None
+
+--- a/starlette/formparsers.py
++++ b/starlette/formparsers.py
+@@ -54,25 +54,46 @@
+ 
+ 
+ class FormParser:
+-    def __init__(self, headers: Headers, stream: typing.AsyncGenerator[bytes, None]) -> None:
++    def __init__(
++        self,
++        headers: Headers,
++        stream: typing.AsyncGenerator[bytes, None],
++        *,
++        max_fields: int | float = 1000,
++        max_part_size: int = 1024 * 1024,  # 1MB
++    ) -> None:
+         assert multipart is not None, "The `python-multipart` library must be installed to use form parsing."
+         self.headers = headers
+         self.stream = stream
++        self.max_fields = max_fields
++        self.max_part_size = max_part_size
+         self.messages: list[tuple[FormMessage, bytes]] = []
++        self._current_field_size = 0
++        self._current_fields = 0
+ 
+     def on_field_start(self) -> None:
++        self._current_field_size = 0
+         message = (FormMessage.FIELD_START, b"")
+         self.messages.append(message)
+ 
+     def on_field_name(self, data: bytes, start: int, end: int) -> None:
++        self._current_field_size += end - start
++        if self._current_field_size > self.max_part_size:
++            raise MultiPartException(f"Field exceeded maximum size of {int(self.max_part_size / 1024)}KB.")
+         message = (FormMessage.FIELD_NAME, data[start:end])
+         self.messages.append(message)
+ 
+     def on_field_data(self, data: bytes, start: int, end: int) -> None:
++        self._current_field_size += end - start
++        if self._current_field_size > self.max_part_size:
++            raise MultiPartException(f"Field exceeded maximum size of {int(self.max_part_size / 1024)}KB.")
+         message = (FormMessage.FIELD_DATA, data[start:end])
+         self.messages.append(message)
+ 
+     def on_field_end(self) -> None:
++        self._current_fields += 1
++        if self._current_fields > self.max_fields:
++            raise MultiPartException(f"Too many fields. Maximum number of fields is {self.max_fields}.")
+         message = (FormMessage.FIELD_END, b"")
+         self.messages.append(message)
+ 
+--- a/starlette/requests.py
++++ b/starlette/requests.py
+@@ -249,7 +249,13 @@
+             self._json = json.loads(body)
+         return self._json
+ 
+-    async def _get_form(self, *, max_files: int | float = 1000, max_fields: int | float = 1000) -> FormData:
++    async def _get_form(
++        self,
++        *,
++        max_files: int | float = 1000,
++        max_fields: int | float = 1000,
++        max_part_size: int = 1024 * 1024,
++    ) -> FormData:
+         if self._form is None:
+             assert (
+                 parse_options_header is not None
+@@ -271,16 +277,32 @@
+                         raise HTTPException(status_code=400, detail=exc.message)
+                     raise exc
+             elif content_type == b"application/x-www-form-urlencoded":
+-                form_parser = FormParser(self.headers, self.stream())
+-                self._form = await form_parser.parse()
++                try:
++                    form_parser = FormParser(
++                        self.headers,
++                        self.stream(),
++                        max_fields=max_fields,
++                        max_part_size=max_part_size,
++                    )
++                    self._form = await form_parser.parse()
++                except MultiPartException as exc:
++                    if "app" in self.scope:
++                        raise HTTPException(status_code=400, detail=exc.message)
++                    raise exc
+             else:
+                 self._form = FormData()
+         return self._form
+ 
+     def form(
+-        self, *, max_files: int | float = 1000, max_fields: int | float = 1000
++        self,
++        *,
++        max_files: int | float = 1000,
++        max_fields: int | float = 1000,
++        max_part_size: int = 1024 * 1024,
+     ) -> AwaitableOrContextManager[FormData]:
+-        return AwaitableOrContextManagerWrapper(self._get_form(max_files=max_files, max_fields=max_fields))
++        return AwaitableOrContextManagerWrapper(
++            self._get_form(max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
++        )
+ 
+     async def close(self) -> None:
+         if self._form is not None:  # pragma: no branch
+--- a/tests/test_formparsers.py
++++ b/tests/test_formparsers.py
+@@ -2,14 +2,15 @@
+ 
+ import os
+ import typing
+-from contextlib import nullcontext as does_not_raise
++from collections.abc import AsyncGenerator
++from contextlib import AbstractContextManager, nullcontext as does_not_raise
+ from pathlib import Path
+ 
+ import pytest
+ 
+ from starlette.applications import Starlette
+-from starlette.datastructures import UploadFile
+-from starlette.formparsers import MultiPartException, _user_safe_decode
++from starlette.datastructures import Headers, UploadFile
++from starlette.formparsers import FormParser, MultiPartException, _user_safe_decode
+ from starlette.requests import Request
+ from starlette.responses import JSONResponse
+ from starlette.routing import Mount
+@@ -104,10 +105,10 @@
+     await response(scope, receive, send)
+ 
+ 
+-def make_app_max_parts(max_files: int = 1000, max_fields: int = 1000) -> ASGIApp:
++def make_app_max_parts(max_files: int = 1000, max_fields: int = 1000, max_part_size: int = 1024 * 1024) -> ASGIApp:
+     async def app(scope: Scope, receive: Receive, send: Send) -> None:
+         request = Request(scope, receive)
+-        data = await request.form(max_files=max_files, max_fields=max_fields)
++        data = await request.form(max_files=max_files, max_fields=max_fields, max_part_size=max_part_size)
+         output: dict[str, typing.Any] = {}
+         for key, value in data.items():
+             if isinstance(value, UploadFile):
+@@ -401,6 +402,154 @@
+     client = test_client_factory(app_read_body)
+     response = client.post("/", data={"some": "data", "second": "key pair"}, files=FORCE_MULTIPART)
+     assert response.json() == {"some": "data", "second": "key pair"}
++
++
++@pytest.mark.parametrize(
++    "app,expectation",
++    [
++        (app, pytest.raises(MultiPartException)),
++        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
++    ],
++)
++def test_urlencoded_too_many_fields_raise(
++    app: ASGIApp,
++    expectation: AbstractContextManager[Exception],
++    test_client_factory: TestClientFactory,
++) -> None:
++    client = test_client_factory(app)
++    data = "&".join(f"N{i}=" for i in range(1001))
++    with expectation:
++        res = client.post(
++            "/",
++            content=data,
++            headers={"Content-Type": "application/x-www-form-urlencoded"},
++        )
++        assert res.status_code == 400
++        assert res.text == "Too many fields. Maximum number of fields is 1000."
++
++
++@pytest.mark.parametrize(
++    "app,expectation",
++    [
++        (app, pytest.raises(MultiPartException)),
++        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
++    ],
++)
++def test_urlencoded_field_exceeds_max_part_size_raise(
++    app: ASGIApp,
++    expectation: AbstractContextManager[Exception],
++    test_client_factory: TestClientFactory,
++) -> None:
++    client = test_client_factory(app)
++    data = "field=" + "x" * (1024 * 1024 + 1)
++    with expectation:
++        res = client.post(
++            "/",
++            content=data,
++            headers={"Content-Type": "application/x-www-form-urlencoded"},
++        )
++        assert res.status_code == 400
++        assert res.text == "Field exceeded maximum size of 1024KB."
++
++
++@pytest.mark.parametrize(
++    "app,expectation",
++    [
++        (app, pytest.raises(MultiPartException)),
++        (Starlette(routes=[Mount("/", app=app)]), does_not_raise()),
++    ],
++)
++def test_urlencoded_field_name_exceeds_max_part_size_raise(
++    app: ASGIApp,
++    expectation: AbstractContextManager[Exception],
++    test_client_factory: TestClientFactory,
++) -> None:
++    client = test_client_factory(app)
++    data = "x" * (1024 * 1024 + 1) + "=value"
++    with expectation:
++        res = client.post(
++            "/",
++            content=data,
++            headers={"Content-Type": "application/x-www-form-urlencoded"},
++        )
++        assert res.status_code == 400
++        assert res.text == "Field exceeded maximum size of 1024KB."
++
++
++@pytest.mark.parametrize(
++    "app,expectation",
++    [
++        (make_app_max_parts(max_fields=1), pytest.raises(MultiPartException)),
++        (
++            Starlette(routes=[Mount("/", app=make_app_max_parts(max_fields=1))]),
++            does_not_raise(),
++        ),
++    ],
++)
++def test_urlencoded_max_fields_is_customizable(
++    app: ASGIApp,
++    expectation: AbstractContextManager[Exception],
++    test_client_factory: TestClientFactory,
++) -> None:
++    client = test_client_factory(app)
++    with expectation:
++        res = client.post(
++            "/",
++            content="a=1&b=2",
++            headers={"Content-Type": "application/x-www-form-urlencoded"},
++        )
++        assert res.status_code == 400
++        assert res.text == "Too many fields. Maximum number of fields is 1."
++
++
++@pytest.mark.parametrize(
++    "app,expectation",
++    [
++        (make_app_max_parts(max_part_size=1024 * 10), pytest.raises(MultiPartException)),
++        (
++            Starlette(routes=[Mount("/", app=make_app_max_parts(max_part_size=1024 * 10))]),
++            does_not_raise(),
++        ),
++    ],
++)
++def test_urlencoded_max_part_size_is_customizable(
++    app: ASGIApp,
++    expectation: AbstractContextManager[Exception],
++    test_client_factory: TestClientFactory,
++) -> None:
++    client = test_client_factory(app)
++    with expectation:
++        res = client.post(
++            "/",
++            content="field=" + "x" * (1024 * 10 + 1),
++            headers={"Content-Type": "application/x-www-form-urlencoded"},
++        )
++        assert res.status_code == 400
++        assert res.text == "Field exceeded maximum size of 10KB."
++
++
++@pytest.mark.anyio
++async def test_urlencoded_limits_stop_parsing_within_a_single_chunk() -> None:
++    async def single_chunk(body: bytes) -> AsyncGenerator[bytes, None]:
++        yield body
++
++    headers = Headers({"content-type": "application/x-www-form-urlencoded"})
++
++    too_many = "&".join(f"f{i}=" for i in range(100_000)).encode()
++    stream = single_chunk(too_many)
++    parser = FormParser(headers, stream, max_fields=10)
++    with pytest.raises(MultiPartException, match="Too many fields"):
++        await parser.parse()
++    await stream.aclose()
++    assert parser._current_fields == 11
++
++    too_big = ("field=" + "x" * (1024 * 1024 * 50)).encode()
++    stream = single_chunk(too_big)
++    parser = FormParser(headers, stream, max_part_size=1024)
++    with pytest.raises(MultiPartException, match="Field exceeded maximum size"):
++        await parser.parse()
++    await stream.aclose()
++    assert sum(len(data) for _, data in parser.messages) <= 1024
+ 
+ 
+ def test_user_safe_decode_helper() -> None:
