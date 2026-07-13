@@ -4,7 +4,7 @@ This patch is based on starlette version 1.2.0, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-54283
+- CVE-2026-54282
 
 ## How to Apply:
 1. Clone or download the source code for starlette
