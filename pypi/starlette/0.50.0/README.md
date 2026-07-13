@@ -4,8 +4,10 @@ This patch is based on starlette version 0.50.0, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-54283
+- CVE-2026-48817
 - CVE-2026-48818
+- CVE-2026-54282
+- CVE-2026-54283
 
 ## How to Apply:
 1. Clone or download the source code for starlette
