@@ -653,3 +653,147 @@ index 00000000..e9fd6b1b
 +- [GHSA-v9p9-hfj2-hcw8 (CVE-2026-2229)](https://github.com/nodejs/undici/security/advisories/GHSA-v9p9-hfj2-hcw8)
 +- [Fix commit cb79c570](https://github.com/nodejs/undici/commit/cb79c5704ac47e42ce01a72269994fc70e377536)
 +- [RFC 7692 — Compression Extensions for WebSocket](https://datatracker.ietf.org/doc/html/rfc7692)
+
+--- a/lib/fetch/request.js
++++ b/lib/fetch/request.js
+@@ -40,6 +40,29 @@
+   signal.removeEventListener('abort', abort)
+ })
+ 
++function buildAbort (acRef) {
++  return abort
++
++  function abort () {
++    const ac = acRef.deref()
++    if (ac !== undefined) {
++      // Currently, there is a problem with FinalizationRegistry.
++      // https://github.com/nodejs/node/issues/49344
++      // https://github.com/nodejs/node/issues/47748
++      // In the case of abort, the first step is to unregister from it.
++      // If the controller can refer to it, it is still registered.
++      // It will be removed in the future.
++      requestFinalizer.unregister(abort)
++
++      // Unsubscribe a listener.
++      // FinalizationRegistry will no longer be called, so this must be done.
++      this.removeEventListener('abort', abort)
++
++      ac.abort(this.reason)
++    }
++  }
++}
++
+ // https://fetch.spec.whatwg.org/#request-class
+ class Request {
+   // https://fetch.spec.whatwg.org/#dom-request
+@@ -370,12 +393,7 @@
+         this[kAbortController] = ac
+ 
+         const acRef = new WeakRef(ac)
+-        const abort = function () {
+-          const ac = acRef.deref()
+-          if (ac !== undefined) {
+-            ac.abort(this.reason)
+-          }
+-        }
++        const abort = buildAbort(acRef)
+ 
+         // Third-party AbortControllers may not work with these.
+         // See, https://github.com/nodejs/undici/pull/1910#issuecomment-1464495619.
+@@ -383,9 +401,9 @@
+           // If the max amount of listeners is equal to the default, increase it
+           // This is only available in node >= v19.9.0
+           if (typeof getMaxListeners === 'function' && getMaxListeners(signal) === defaultMaxListeners) {
+-            setMaxListeners(100, signal)
++            setMaxListeners(1500, signal)
+           } else if (getEventListeners(signal, 'abort').length >= defaultMaxListeners) {
+-            setMaxListeners(100, signal)
++            setMaxListeners(1500, signal)
+           }
+         } catch {}
+ 
+--- a/lib/compat/dispatcher-weakref.js
++++ b/lib/compat/dispatcher-weakref.js
+@@ -33,9 +33,10 @@
+ }
+ 
+ module.exports = function () {
+-  // FIXME: remove workaround when the Node bug is fixed
++  // FIXME: remove workaround when the Node bug is backported to v18
+   // https://github.com/nodejs/node/issues/49344#issuecomment-1741776308
+-  if (process.env.NODE_V8_COVERAGE) {
++  if (process.env.NODE_V8_COVERAGE && process.version.startsWith('v18')) {
++    process._rawDebug('Using compatibility WeakRef and FinalizationRegistry')
+     return {
+       WeakRef: CompatWeakRef,
+       FinalizationRegistry: CompatFinalizer
+--- /dev/null
++++ b/test/fetch/long-lived-abort-controller.js
+@@ -0,0 +1,67 @@
++'use strict'
++
++const { test } = require('tap')
++const { fetch } = require('../..')
++const { createServer } = require('http')
++const { once, getEventListeners } = require('events')
++
++// Regression test for AIKIDO-2024-10065 (CWE-401).
++//
++// undici's fetch() attaches an 'abort' listener to the caller-provided
++// AbortSignal on every call. Before the fix it was never released on normal
++// completion, so reusing one long-lived AbortController/AbortSignal across many
++// fetch() calls let the signal's 'abort' listeners accumulate unbounded, which
++// tripped a MaxListenersExceededWarning (old cap: 100) and leaked memory.
++//
++// The fix raises the per-signal listener cap (100 -> 1500) and releases the
++// listener through buildAbort()/the finalizer, keeping the count bounded.
++//
++// Grounded in upstream test/fetch/long-lived-abort-controller.js
++// @ c0a0bb5b8ba50d921a7903870ba86af5200f8be2 (nodejs/undici PR #3158), which
++// fires 2000 requests against one shared signal and asserts no warning is
++// emitted. Trimmed to a smaller request count here (still above the old cap of
++// 100, well under the raised cap of 1500) to keep the regression cheap while
++// preserving the same signal.
++test('fetch does not leak abort listeners on a long-lived AbortController', async (t) => {
++  t.plan(2)
++
++  const server = createServer((req, res) => {
++    res.writeHead(200, { 'content-type': 'text/plain' })
++    res.end('Hello World!')
++  }).listen(0)
++
++  t.teardown(server.close.bind(server))
++  await once(server, 'listening')
++
++  // Capture any MaxListenersExceededWarning produced while hammering the signal.
++  let maxListenersWarning = null
++  const onWarning = (warning) => {
++    if (warning.name === 'MaxListenersExceededWarning') {
++      maxListenersWarning = warning
++    }
++  }
++  process.on('warning', onWarning)
++  t.teardown(() => process.off('warning', onWarning))
++
++  // A single controller / signal shared across every request: the leak scenario.
++  const controller = new AbortController()
++  const { signal } = controller
++
++  const requestCount = 200
++  for (let i = 0; i < requestCount; i++) {
++    const res = await fetch(`http://localhost:${server.address().port}`, { signal })
++    await res.text() // drain the body so the request settles
++  }
++
++  // Post-fix the raised cap absorbs the shared signal's listeners; pre-fix the
++  // old cap of 100 would have been breached and a warning emitted.
++  t.equal(maxListenersWarning, null, 'no MaxListenersExceededWarning was emitted')
++
++  // The signal's live 'abort' listener count stays bounded (at most one per
++  // outstanding request) rather than growing without limit.
++  const abortListeners = getEventListeners(signal, 'abort').length
++  t.ok(
++    abortListeners <= requestCount,
++    `abort listener count stayed bounded (${abortListeners} <= ${requestCount})`
++  )
++})
