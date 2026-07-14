@@ -5,14 +5,18 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-15599
-- GHSA-cj63-jhhr-wcxv
 - CVE-2026-0540
-- GHSA-39q2-94rc-95cp
-- CVE-2026-41239
-- GHSA-h8r8-wccr-v5f2
 - CVE-2026-41238
+- CVE-2026-41239
 - CVE-2026-41240
+- CVE-2026-49458
+- CVE-2026-49459
+- CVE-2026-49978
+- GHSA-39q2-94rc-95cp
+- GHSA-76mc-f452-cxcm
+- GHSA-cj63-jhhr-wcxv
 - GHSA-cjmm-f4jc-qw8r
+- GHSA-h8r8-wccr-v5f2
 
 ## How to Apply:
 1. Clone or download the source code for dompurify
