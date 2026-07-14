@@ -1,11 +1,10 @@
-# krb5 : 1.21.3-5.root.io.1
+# krb5 : 1.21.3-5+deb13u1.root.io.2
 
-This patch is based on krb5 version 1.21.3-5.root.io.1, which is available at:
-https://sources.debian.org/src/krb5/1.21.3-5/
+This patch is based on krb5 version 1.21.3-5+deb13u1.root.io.2, which is available at:
+https://sources.debian.org/src/krb5/1.21.3-5+deb13u1/
 
 ## Affected CVEs:
-- CVE-2026-40355
-- CVE-2026-40356
+- CVE-2026-11850
 
 ## How to Apply:
 1. Obtain the source package: `apt source krb5`
