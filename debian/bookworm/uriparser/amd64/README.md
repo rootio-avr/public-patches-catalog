@@ -1,6 +1,6 @@
-# uriparser : 0.9.7+dfsg-2.root.io.3
+# uriparser : 0.9.7+dfsg-2.root.io.4
 
-This patch is based on uriparser version 0.9.7+dfsg-2.root.io.3, which is available at:
+This patch is based on uriparser version 0.9.7+dfsg-2.root.io.4, which is available at:
 https://sources.debian.org/src/uriparser/0.9.7+dfsg-2/
 
 ## Affected CVEs:
@@ -8,6 +8,7 @@ https://sources.debian.org/src/uriparser/0.9.7+dfsg-2/
 - CVE-2024-34402
 - CVE-2026-44928
 - CVE-2026-42371
+- CVE-2026-44927
 
 ## How to Apply:
 1. Obtain the source package: `apt source uriparser`
