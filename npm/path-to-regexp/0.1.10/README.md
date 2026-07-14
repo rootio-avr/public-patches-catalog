@@ -4,6 +4,7 @@ This patch is based on path-to-regexp version 0.1.10, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2024-10181
 - CVE-2024-52798
 - CVE-2026-4867
 
