@@ -4,6 +4,7 @@ This patch is based on starlette version 0.45.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-10923
 - CVE-2025-54121
 - CVE-2025-62727
 - CVE-2026-48710
