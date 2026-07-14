@@ -1,0 +1,182 @@
+--- a/google/protobuf/internal/decoder.py
++++ b/google/protobuf/internal/decoder.py
+@@ -59,6 +59,7 @@
+ 
+ import math
+ import struct
++import threading
+ 
+ from google.protobuf.internal import containers
+ from google.protobuf.internal import encoder
+@@ -71,6 +72,38 @@
+ _DecodeError = message.DecodeError
+ 
+ 
++# Recursion limit for parsing nested messages and groups in the pure-Python
++# protobuf backend.  Protects against unbounded recursion (CVE-2025-4565).
++DEFAULT_RECURSION_LIMIT = 100
++_recursion_limit = DEFAULT_RECURSION_LIMIT
++
++
++def SetRecursionLimit(new_limit):
++  """Set the maximum recursion depth allowed when parsing messages."""
++  global _recursion_limit
++  _recursion_limit = new_limit
++
++
++# Thread-local depth counter used to bound recursion inside the Group/Message
++# decoders without changing the public _InternalParse signature.
++_thread_local = threading.local()
++
++
++def _CheckAndIncrementDepth():
++  depth = getattr(_thread_local, 'current_depth', 0) + 1
++  if depth > _recursion_limit:
++    raise _DecodeError(
++        'Error parsing message: too many levels of nesting.'
++    )
++  _thread_local.current_depth = depth
++
++
++def _DecrementDepth():
++  _thread_local.current_depth = (
++      getattr(_thread_local, 'current_depth', 1) - 1
++  )
++
++
+ def _VarintDecoder(mask, result_type):
+   """Return an encoder for a basic varint value (does not include tag).
+ 
+@@ -632,7 +665,11 @@
+         if value is None:
+           value = field_dict.setdefault(key, new_default(message))
+         # Read sub-message.
+-        pos = value.add()._InternalParse(buffer, pos, end)
++        _CheckAndIncrementDepth()
++        try:
++          pos = value.add()._InternalParse(buffer, pos, end)
++        finally:
++          _DecrementDepth()
+         # Read end tag.
+         new_pos = pos+end_tag_len
+         if buffer[pos:new_pos] != end_tag_bytes or new_pos > end:
+@@ -649,7 +686,11 @@
+       if value is None:
+         value = field_dict.setdefault(key, new_default(message))
+       # Read sub-message.
+-      pos = value._InternalParse(buffer, pos, end)
++      _CheckAndIncrementDepth()
++      try:
++        pos = value._InternalParse(buffer, pos, end)
++      finally:
++        _DecrementDepth()
+       # Read end tag.
+       new_pos = pos+end_tag_len
+       if buffer[pos:new_pos] != end_tag_bytes or new_pos > end:
+@@ -679,10 +720,14 @@
+         if new_pos > end:
+           raise _DecodeError('Truncated message.')
+         # Read sub-message.
+-        if value.add()._InternalParse(buffer, pos, new_pos) != new_pos:
+-          # The only reason _InternalParse would return early is if it
+-          # encountered an end-group tag.
+-          raise _DecodeError('Unexpected end-group tag.')
++        _CheckAndIncrementDepth()
++        try:
++          if value.add()._InternalParse(buffer, pos, new_pos) != new_pos:
++            # The only reason _InternalParse would return early is if it
++            # encountered an end-group tag.
++            raise _DecodeError('Unexpected end-group tag.')
++        finally:
++          _DecrementDepth()
+         # Predict that the next tag is another copy of the same repeated field.
+         pos = new_pos + tag_len
+         if buffer[new_pos:pos] != tag_bytes or new_pos == end:
+@@ -700,10 +745,14 @@
+       if new_pos > end:
+         raise _DecodeError('Truncated message.')
+       # Read sub-message.
+-      if value._InternalParse(buffer, pos, new_pos) != new_pos:
+-        # The only reason _InternalParse would return early is if it encountered
+-        # an end-group tag.
+-        raise _DecodeError('Unexpected end-group tag.')
++      _CheckAndIncrementDepth()
++      try:
++        if value._InternalParse(buffer, pos, new_pos) != new_pos:
++          # The only reason _InternalParse would return early is if it
++          # encountered an end-group tag.
++          raise _DecodeError('Unexpected end-group tag.')
++      finally:
++        _DecrementDepth()
+       return new_pos
+     return DecodeField
+ 
+@@ -942,7 +991,7 @@
+     pos = new_pos
+ 
+ 
+-def _DecodeUnknownFieldSet(buffer, pos, end_pos=None):
++def _DecodeUnknownFieldSet(buffer, pos, end_pos=None, current_depth=0):
+   """Decode UnknownFieldSet.  Returns the UnknownFieldSet and new position."""
+ 
+   unknown_field_set = containers.UnknownFieldSet()
+@@ -952,14 +1001,14 @@
+     field_number, wire_type = wire_format.UnpackTag(tag)
+     if wire_type == wire_format.WIRETYPE_END_GROUP:
+       break
+-    (data, pos) = _DecodeUnknownField(buffer, pos, wire_type)
++    (data, pos) = _DecodeUnknownField(buffer, pos, wire_type, current_depth)
+     # pylint: disable=protected-access
+     unknown_field_set._add(field_number, wire_type, data)
+ 
+   return (unknown_field_set, pos)
+ 
+ 
+-def _DecodeUnknownField(buffer, pos, wire_type):
++def _DecodeUnknownField(buffer, pos, wire_type, current_depth=0):
+   """Decode a unknown field.  Returns the UnknownField and new position."""
+ 
+   if wire_type == wire_format.WIRETYPE_VARINT:
+@@ -973,7 +1022,12 @@
+     data = buffer[pos:pos+size].tobytes()
+     pos += size
+   elif wire_type == wire_format.WIRETYPE_START_GROUP:
+-    (data, pos) = _DecodeUnknownFieldSet(buffer, pos)
++    current_depth += 1
++    if current_depth >= _recursion_limit:
++      raise _DecodeError(
++          'Error parsing message: too many levels of nesting.'
++      )
++    (data, pos) = _DecodeUnknownFieldSet(buffer, pos, None, current_depth)
+   elif wire_type == wire_format.WIRETYPE_END_GROUP:
+     return (0, -1)
+   else:
+
+--- a/google/protobuf/json_format.py
++++ b/google/protobuf/json_format.py
+@@ -471,6 +471,10 @@
+     Raises:
+       ParseError: In case of convert problems.
+     """
++    # Increment recursion depth at message entry. The max_recursion_depth limit
++    # is exclusive: a depth value equal to max_recursion_depth will trigger an
++    # error. For example, with max_recursion_depth=5, nesting up to depth 4 is
++    # allowed, but attempting depth 5 raises ParseError.
+     self.recursion_depth += 1
+     if self.recursion_depth > self.max_recursion_depth:
+       raise ParseError('Message too deep. Max recursion depth is {0}'.format(
+@@ -644,9 +648,11 @@
+       self._ConvertWrapperMessage(value['value'], sub_message,
+                                   '{0}.value'.format(path))
+     elif full_name in _WKTJSONMETHODS:
+-      methodcaller(_WKTJSONMETHODS[full_name][1], value['value'], sub_message,
+-                   '{0}.value'.format(path))(
+-                       self)
++      # For well-known types (including nested Any), use ConvertMessage
++      # to ensure recursion depth is properly tracked
++      self.ConvertMessage(
++          value['value'], sub_message, '{0}.value'.format(path)
++      )
+     else:
+       del value['@type']
+       self._ConvertFieldValuePair(value, sub_message, path)
