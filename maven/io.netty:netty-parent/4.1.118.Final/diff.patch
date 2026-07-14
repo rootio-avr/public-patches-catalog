@@ -5351,6 +5351,160 @@ index 5b6406a..46eee95 100644
 +    }
 +}
 
+--- a/codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java
++++ b/codec-http/src/main/java/io/netty/handler/codec/http/HttpObjectDecoder.java
+@@ -1314,16 +1314,24 @@
+         private boolean skipControlChars(ByteBuf buffer, int readableBytes, int readerIndex) {
+             assert currentState == State.SKIP_CONTROL_CHARS;
+             final int maxToSkip = Math.min(maxLength, readableBytes);
+-            final int firstNonControlIndex = buffer.forEachByte(readerIndex, maxToSkip, SKIP_CONTROL_CHARS_BYTES);
+-            if (firstNonControlIndex == -1) {
++            // CVE-2026-50020: only CR/LF are permitted before the initial line per RFC 9112 §2.2.
++            // Reject any non-CRLF ISO control bytes that previously were silently skipped.
++            final int firstNonLineIndex = buffer.forEachByte(readerIndex, maxToSkip, ByteProcessor.FIND_NON_CRLF);
++            if (firstNonLineIndex == -1) {
+                 buffer.skipBytes(maxToSkip);
+                 if (readableBytes > maxLength) {
+                     throw newException(maxLength);
+                 }
+                 return true;
+             }
++            final int b = buffer.getByte(firstNonLineIndex) & 0xFF;
++            if (Character.isISOControl(b)) {
++                throw new IllegalArgumentException(
++                        "Only CR/LF characters are permitted before the initial line, but got: 0x"
++                                + Integer.toHexString(b));
++            }
+             // from now on we don't care about control chars
+-            buffer.readerIndex(firstNonControlIndex);
++            buffer.readerIndex(firstNonLineIndex);
+             currentState = State.READ_INITIAL;
+             return false;
+         }
+--- a/codec-http/src/test/java/io/netty/handler/codec/http/HttpRequestDecoderTest.java
++++ b/codec-http/src/test/java/io/netty/handler/codec/http/HttpRequestDecoderTest.java
+@@ -1058,4 +1058,29 @@
+         assertTrue(request.decoderResult().isFailure());
+         assertFalse(channel.finish());
+     }
++
++    @Test
++    public void testNonCrlfControlBytesPrecedingRequestLineAreRejected() {
++        // CVE-2026-50020 / RFC 9112 §2.2: servers SHOULD ignore "at least one empty line (CRLF)"
++        // before the request-line.  Non-CRLF control bytes are not part of this robustness
++        // allowance and must not be silently swallowed.
++        EmbeddedChannel channel = new EmbeddedChannel(new HttpRequestDecoder());
++
++        ByteBuf buf = Unpooled.buffer();
++        buf.writeByte(0x00);   // NUL  - not an empty CRLF line
++        buf.writeByte(0x01);   // SOH  - not an empty CRLF line
++        buf.writeCharSequence(
++                "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n",
++                CharsetUtil.US_ASCII);
++
++        channel.writeInbound(buf);
++        HttpRequest req = channel.readInbound();
++
++        DecoderResult decoderResult = req.decoderResult();
++        assertTrue(decoderResult.isFailure(),
++                "Non-CRLF control bytes before the request-line must not be silently skipped");
++        assertThat(decoderResult.cause(), instanceOf(IllegalArgumentException.class));
++
++        assertFalse(channel.finish());
++    }
+ }
+
+--- a/codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2ConnectionEncoder.java
++++ b/codec-http2/src/main/java/io/netty/handler/codec/http2/DefaultHttp2ConnectionEncoder.java
+@@ -100,7 +100,9 @@ public class DefaultHttp2ConnectionEncoder implements Http2ConnectionEncoder, Ht
+         }
+ 
+         Long maxHeaderListSize = settings.maxHeaderListSize();
+-        if (maxHeaderListSize != null) {
++        if (maxHeaderListSize != null && !connection.isServer()) {
++            // Servers ignore the MAX_HEADER_LIST_SIZE setting from clients.
++            // It's advisory in spec (RFC 9113 §6.5.2) and best praxis is to ignore it.
+             outboundHeaderConfig.maxHeaderListSize(maxHeaderListSize);
+         }
+ 
+--- a/codec-http2/src/test/java/io/netty/handler/codec/http2/Http2ConnectionRoundtripTest.java
++++ b/codec-http2/src/test/java/io/netty/handler/codec/http2/Http2ConnectionRoundtripTest.java
+@@ -1179,6 +1179,74 @@ public class Http2ConnectionRoundtripTest {
+         }
+     }
+ 
++    @Test
++    public void serverShouldNotEnforceClientAdvertisedMaxHeaderListSize() throws Exception {
++        // Verifies that SETTINGS_MAX_HEADER_LIST_SIZE sent by a client is treated as advisory
++        // (per RFC 9113 §6.5.2) and does not prevent the server from encoding response headers.
++        final CountDownLatch clientSettingsAckLatch = new CountDownLatch(2);
++        final CountDownLatch responseLatch = new CountDownLatch(1);
++        final AtomicReference<Throwable> serverWriteError = new AtomicReference<Throwable>();
++
++        doAnswer(new Answer<Void>() {
++            @Override
++            public Void answer(InvocationOnMock invocationOnMock) throws Throwable {
++                final ChannelHandlerContext sCtx = serverCtx();
++                final int streamId = (Integer) invocationOnMock.getArgument(1);
++                Http2Headers responseHeaders = new DefaultHttp2Headers().status("200");
++                http2Server.encoder().writeHeaders(sCtx, streamId, responseHeaders, 0, true, sCtx.newPromise())
++                        .addListener(new ChannelFutureListener() {
++                    @Override
++                    public void operationComplete(ChannelFuture future) throws Exception {
++                        serverWriteError.set(future.cause());
++                        responseLatch.countDown();
++                    }
++                });
++                http2Server.flush(sCtx);
++                return null;
++            }
++        }).when(serverListener).onHeadersRead(any(ChannelHandlerContext.class), anyInt(), any(Http2Headers.class),
++                anyInt(), anyShort(), anyBoolean(), anyInt(), anyBoolean());
++
++        doAnswer(new Answer<Void>() {
++            @Override
++            public Void answer(InvocationOnMock invocationOnMock) throws Throwable {
++                clientSettingsAckLatch.countDown();
++                return null;
++            }
++        }).when(clientListener).onSettingsAckRead(any(ChannelHandlerContext.class));
++
++        bootstrapEnv(0, 1, 2, 0);
++
++        // Client advertises a tiny MAX_HEADER_LIST_SIZE (2 bytes) to the server.
++        runInChannel(clientChannel, new Http2Runnable() {
++            @Override
++            public void run() throws Http2Exception {
++                http2Client.encoder().writeSettings(ctx(),
++                        new Http2Settings().maxHeaderListSize(2),
++                        newPromise());
++                http2Client.flush(ctx());
++            }
++        });
++
++        // Wait for the server to acknowledge both the initial settings and our custom settings.
++        assertTrue(clientSettingsAckLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS, SECONDS));
++
++        // Send a request; the server will attempt to respond with headers far exceeding 2 bytes.
++        final short weight = 16;
++        runInChannel(clientChannel, new Http2Runnable() {
++            @Override
++            public void run() throws Http2Exception {
++                http2Client.encoder().writeHeaders(ctx(), 3, dummyHeaders(), 0, weight, false, 0, true,
++                        newPromise());
++                http2Client.flush(ctx());
++            }
++        });
++
++        assertTrue(responseLatch.await(DEFAULT_AWAIT_TIMEOUT_SECONDS, SECONDS));
++        assertNull(serverWriteError.get(),
++                "Server must succeed writing response headers regardless of client's SETTINGS_MAX_HEADER_LIST_SIZE");
++    }
++
+     private void bootstrapEnv(int dataCountDown, int settingsAckCount,
+             int requestCountDown, int trailersCountDown) throws Exception {
+         bootstrapEnv(dataCountDown, settingsAckCount, requestCountDown, trailersCountDown, -1);
+
 diff --git a/transport-native-unix-common/pom.xml b/transport-native-unix-common/pom.xml
 --- a/transport-native-unix-common/pom.xml
 +++ b/transport-native-unix-common/pom.xml
@@ -5392,6 +5546,22 @@ diff --git a/transport-native-unix-common/pom.xml b/transport-native-unix-common
              </configuration>
            </execution>
          </executions>
+
+--- a/pom.xml
++++ b/pom.xml
+@@ -17,12 +17,6 @@
+ <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/maven-v4_0_0.xsd">
+ 
+   <modelVersion>4.0.0</modelVersion>
+-  <parent>
+-    <groupId>org.sonatype.oss</groupId>
+-    <artifactId>oss-parent</artifactId>
+-    <version>9</version>
+-  </parent>
+-
+   <groupId>io.netty</groupId>
+   <artifactId>netty-parent</artifactId>
+   <packaging>pom</packaging>
 
 --- a/pom.xml
 +++ b/pom.xml
