@@ -1,6 +1,6 @@
-# expat : 2.2.10-2+deb11u7.root.io.14
+# expat : 2.2.10-2+deb11u7.root.io.15
 
-This patch is based on expat version 2.2.10-2+deb11u7.root.io.14, which is available at:
+This patch is based on expat version 2.2.10-2+deb11u7.root.io.15, which is available at:
 https://sources.debian.org/src/expat/2.2.10-2+deb11u7/
 
 ## Affected CVEs:
@@ -13,6 +13,9 @@ https://sources.debian.org/src/expat/2.2.10-2+deb11u7/
 - CVE-2026-32776
 - CVE-2026-45186
 - CVE-2026-56408
+- CVE-2026-50219
+- CVE-2026-56131
+- CVE-2026-56407
 
 ## How to Apply:
 1. Obtain the source package: `apt source expat`
