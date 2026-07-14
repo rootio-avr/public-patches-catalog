@@ -10,6 +10,8 @@ unknown
 - GHSA-537c-gmf6-5ccf
 - CVE-2023-23931
 - CVE-2026-26007
+- CVE-2024-0727
+- CVE-2026-34073
 
 ## How to Apply:
 1. Clone or download the source code for cryptography
