@@ -1,3 +1,180 @@
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -16,6 +16,18 @@
+ 
+ var isHttps = /https:?/;
+ 
++// Delete any case variant of the Proxy-Authorization header. Used to clear a
++// stale proxy credential that a previous request or redirect hop may have set
++// on the shared headers object before we (re)evaluate proxy auth for this hop.
++// (CVE-2026-44486 / GHSA-j5f8-grm9-p9fc)
++function removeProxyAuthorization(headers) {
++  Object.keys(headers).forEach(function removeHeader(header) {
++    if (header.toLowerCase() === 'proxy-authorization') {
++      delete headers[header];
++    }
++  });
++}
++
+ /**
+  *
+  * @param {http.ClientRequestArgs} options
+@@ -27,6 +39,22 @@
+   options.host = proxy.host;
+   options.port = proxy.port;
+   options.path = location;
++
++  // Always strip any Proxy-Authorization header carried over from a prior
++  // request or redirect hop before deciding what (if any) proxy auth applies
++  // here. follow-redirects reuses the same headers object across hops, and in
++  // 0.21.1 beforeRedirect re-invokes setProxy for every redirect target; without
++  // this, a proxy credential set on an earlier hop would leak to a redirect
++  // target that uses different (or no) proxy auth.
++  // NOTE: 0.21.1 resolves the proxy once (before the request) and beforeRedirect
++  // reuses that same proxy object on every hop -- it never re-checks no_proxy per
++  // redirect target -- so a full "redirect target becomes direct" re-resolution
++  // is out of scope for this backport (that would require the upstream
++  // shouldBypassProxy module / proxy-from-env, neither of which exists in 0.21.1).
++  // This strip-then-reapply is the minimal, self-contained defense that clears a
++  // stale credential before any new proxy auth is written on each hop.
++  // (CVE-2026-44486 / GHSA-j5f8-grm9-p9fc)
++  removeProxyAuthorization(options.headers);
+ 
+   // Basic proxy authorization
+   if (proxy.auth) {
+--- a/test/unit/adapters/http.js
++++ b/test/unit/adapters/http.js
+@@ -879,5 +879,129 @@
+       });
+     });
+   });
++
++  it('should not leak a stale Proxy-Authorization header to a redirect target (CVE-2026-44486)', function (done) {
++    // Regression test for GHSA-j5f8-grm9-p9fc: a Proxy-Authorization header
++    // present on the request must not persist across a redirect when the proxy
++    // in effect carries no credentials of its own. The proxy here has NO auth,
++    // yet the client pre-sets a (stale/foreign) Proxy-Authorization header.
++    // Before the fix that header leaked to the proxy on every hop; after the
++    // fix removeProxyAuthorization() strips it before proxy auth is (re)applied.
++    var seenProxyAuth = [];
++
++    server = http.createServer(function (req, res) {
++      var parsed = url.parse(req.url);
++      if (parsed.pathname === '/one') {
++        res.setHeader('Location', 'http://localhost:4444/two');
++        res.statusCode = 302;
++        res.end();
++      } else {
++        res.end('done');
++      }
++    }).listen(4444, function () {
++      proxy = http.createServer(function (request, response) {
++        // Record the proxy-authorization header seen on each hop through the proxy.
++        seenProxyAuth.push(request.headers['proxy-authorization']);
++
++        var parsed = url.parse(request.url);
++        var opts = {
++          host: parsed.hostname,
++          port: parsed.port,
++          path: parsed.path
++        };
++
++        http.get(opts, function (res) {
++          var body = '';
++          res.on('data', function (data) {
++            body += data;
++          });
++          res.on('end', function () {
++            // Propagate status + Location so follow-redirects performs the
++            // redirect (which routes back through this proxy for a 2nd hop).
++            response.statusCode = res.statusCode;
++            if (res.headers['location']) {
++              response.setHeader('Location', res.headers['location']);
++            }
++            response.end(body);
++          });
++        });
++
++      }).listen(4000, function () {
++        axios.get('http://localhost:4444/one', {
++          proxy: {
++            host: 'localhost',
++            port: 4000
++          },
++          headers: {
++            'Proxy-Authorization': 'Basic c3RhbGU6Y3JlZA=='
++          }
++        }).then(function (res) {
++          assert.equal(res.data, 'done');
++          assert.ok(seenProxyAuth.length >= 1, 'proxy should have been reached');
++          seenProxyAuth.forEach(function (value) {
++            assert.equal(value, undefined,
++              'stale Proxy-Authorization header must not be forwarded to the proxy');
++          });
++          done();
++        }).catch(function (err) {
++          done(err);
++        });
++      });
++    });
++  });
++
++  it('should strip a stale case-variant Proxy-Authorization header before applying proxy auth (CVE-2026-44486)', function (done) {
++    // Regression test for GHSA-j5f8-grm9-p9fc case-insensitive stripping: a
++    // lower-cased 'proxy-authorization' header pre-set by the caller must be
++    // removed before the configured proxy credentials are written, so only the
++    // proxy's own credentials reach the proxy (no duplicate/stale header leak).
++    server = http.createServer(function (req, res) {
++      res.end();
++    }).listen(4444, function () {
++      proxy = http.createServer(function (request, response) {
++        var parsed = url.parse(request.url);
++        var opts = {
++          host: parsed.hostname,
++          port: parsed.port,
++          path: parsed.path
++        };
++        var proxyAuth = request.headers['proxy-authorization'];
++
++        http.get(opts, function (res) {
++          var body = '';
++          res.on('data', function (data) {
++            body += data;
++          });
++          res.on('end', function () {
++            response.setHeader('Content-Type', 'text/html; charset=UTF-8');
++            response.end(proxyAuth);
++          });
++        });
++
++      }).listen(4000, function () {
++        axios.get('http://localhost:4444/', {
++          proxy: {
++            host: 'localhost',
++            port: 4000,
++            auth: {
++              username: 'user',
++              password: 'pass'
++            }
++          },
++          headers: {
++            'proxy-authorization': 'Basic c3RhbGU6Y3JlZA=='
++          }
++        }).then(function (res) {
++          var base64 = Buffer.from('user:pass', 'utf8').toString('base64');
++          assert.equal(res.data, 'Basic ' + base64,
++            'proxy must receive only the configured credentials, not the stale header');
++          done();
++        }).catch(function (err) {
++          done(err);
++        });
++      });
++    });
++  });
++
+ });
+ 
+
 --- /dev/null
 +++ b/lib/helpers/sanitizeHeaderValue.js
 @@ -0,0 +1,22 @@

@@ -4,6 +4,7 @@ This patch is based on axios version 0.21.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-10741
 - CVE-2025-62718
 - CVE-2026-42033
 - CVE-2026-42039
