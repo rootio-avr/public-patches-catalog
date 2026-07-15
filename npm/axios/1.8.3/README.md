@@ -4,6 +4,9 @@ This patch is based on axios version 1.8.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-10509
+- AIKIDO-2026-10819
+- AIKIDO-2026-10820
 - AIKIDO-2026-10823
 - CVE-2025-62718
 - CVE-2026-25639
