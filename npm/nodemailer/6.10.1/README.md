@@ -4,6 +4,8 @@ This patch is based on nodemailer version 6.10.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-10941
+- AIKIDO-2026-10942
 - CVE-2025-13033
 - CVE-2025-14874
 - GHSA-p6gq-j5cr-w38f
