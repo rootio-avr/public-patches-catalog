@@ -1,6 +1,6 @@
-# xorg-server : 2:21.1.7-3+deb12u12.root.io.6
+# xorg-server : 2:21.1.7-3+deb12u12.root.io.7
 
-This patch is based on xorg-server version 2:21.1.7-3+deb12u12.root.io.6, which is available at:
+This patch is based on xorg-server version 2:21.1.7-3+deb12u12.root.io.7, which is available at:
 https://sources.debian.org/src/xorg-server/2:21.1.7-3+deb12u12/
 
 ## Affected CVEs:
@@ -13,6 +13,8 @@ https://sources.debian.org/src/xorg-server/2:21.1.7-3+deb12u12/
 - CVE-2026-50257
 - CVE-2026-50258
 - CVE-2026-50260
+- CVE-2026-55999
+- CVE-2026-56000
 
 ## How to Apply:
 1. Obtain the source package: `apt source xorg-server`
