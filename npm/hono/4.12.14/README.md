@@ -16,6 +16,7 @@ unknown
 - CVE-2026-54287
 - CVE-2026-54288
 - CVE-2026-54290
+- CVE-2026-54289
 
 ## How to Apply:
 1. Clone or download the source code for hono
