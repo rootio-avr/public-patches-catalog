@@ -7,6 +7,8 @@ unknown
 - CVE-2024-21508
 - CVE-2024-21511
 - CVE-2024-21512
+- CVE-2024-21507
+- CVE-2024-21509
 
 ## How to Apply:
 1. Clone or download the source code for mysql2
