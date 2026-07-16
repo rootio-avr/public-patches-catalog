@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2024-10105
+- CVE-2021-21353
+- CVE-2024-36361
 
 ## How to Apply:
 1. Clone or download the source code for pug
