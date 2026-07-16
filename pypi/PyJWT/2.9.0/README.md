@@ -5,6 +5,10 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-32597
+- CVE-2026-48522
+- CVE-2026-48523
+- CVE-2026-48524
+- CVE-2026-48525
 - CVE-2026-48526
 
 ## How to Apply:

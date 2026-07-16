@@ -55,6 +55,363 @@
  
  _jws_global_obj = PyJWS()
 
+--- a/jwt/jwks_client.py
++++ b/jwt/jwks_client.py
+@@ -4,6 +4,7 @@
+ from ssl import SSLContext
+ from typing import Any, Dict, List, Optional
+ from urllib.error import URLError
++from urllib.parse import urlparse
+ 
+ from .api_jwk import PyJWK, PyJWKSet
+ from .api_jwt import decode_complete as decode_token
+@@ -25,6 +26,16 @@
+     ):
+         if headers is None:
+             headers = {}
++        # urllib's default OpenerDirector also handles file://, ftp://, and
++        # data: URIs. Reject anything that isn't http(s) eagerly so a caller
++        # passing an attacker-influenced URL (e.g. taken from a `jku` token
++        # header) can't read local files or reach other unintended schemes.
++        scheme = urlparse(uri).scheme.lower()
++        if scheme not in ("http", "https"):
++            raise PyJWKClientError(
++                f"Invalid JWKS URI scheme {scheme!r}: only 'http' and 'https' "
++                f"are supported."
++            )
+         self.uri = uri
+         self.jwk_set_cache: Optional[JWKSetCache] = None
+         self.headers = headers
+@@ -48,7 +59,6 @@
+             self.get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)  # type: ignore
+ 
+     def fetch_data(self) -> Any:
+-        jwk_set: Any = None
+         try:
+             r = urllib.request.Request(url=self.uri, headers=self.headers)
+             with urllib.request.urlopen(
+@@ -59,11 +69,14 @@
+             raise PyJWKClientConnectionError(
+                 f'Fail to fetch data from the url, err: "{e}"'
+             )
+-        else:
+-            return jwk_set
+-        finally:
+-            if self.jwk_set_cache is not None:
+-                self.jwk_set_cache.put(jwk_set)
++
++        # Only update the cache on a successful fetch. Writing in a
++        # `finally` block with `jwk_set=None` on error clears any
++        # previously-cached JWKS, turning a transient outage into a cache
++        # wipe that breaks legitimate auth.
++        if self.jwk_set_cache is not None:
++            self.jwk_set_cache.put(jwk_set)
++        return jwk_set
+ 
+     def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
+         data = None
+--- a/tests/test_jwks_client.py
++++ b/tests/test_jwks_client.py
+@@ -271,18 +271,30 @@
+ 
+         assert repeated_call.call_count == 1
+ 
+-    def test_get_jwt_set_failed_request_should_clear_cache(self):
++    def test_get_jwt_set_failed_refresh_preserves_cached_jwks(self):
++        # Regression: a transient fetch failure used to clear the cache via
++        # the previous `finally: put(jwk_set=None)` pattern, turning one bad
++        # request from the JWKS endpoint into application-wide auth failure.
++        # The cache must survive.
+         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+ 
+         jwks_client = PyJWKClient(url)
+         with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+             jwks_client.get_jwk_set()
+ 
++        assert jwks_client.jwk_set_cache is not None
++        assert jwks_client.jwk_set_cache.get() is not None
++
+         with pytest.raises(PyJWKClientError):
+             with mocked_failed_response():
+                 jwks_client.get_jwk_set(refresh=True)
+ 
+-            assert jwks_client.jwk_set_cache is None
++        cached = jwks_client.jwk_set_cache.get()
++        assert cached is not None
++        # Subsequent reads still serve from cache without another fetch.
++        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as call:
++            jwks_client.get_jwk_set()
++        assert call.call_count == 0
+ 
+     def test_failed_request_should_raise_connection_error(self):
+         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6Ik5FRTFRVVJCT1RNNE16STVSa0ZETlRZeE9UVTFNRGcyT0Rnd1EwVXpNVGsxUWpZeVJrUkZRdyJ9.eyJpc3MiOiJodHRwczovL2Rldi04N2V2eDlydS5hdXRoMC5jb20vIiwic3ViIjoiYVc0Q2NhNzl4UmVMV1V6MGFFMkg2a0QwTzNjWEJWdENAY2xpZW50cyIsImF1ZCI6Imh0dHBzOi8vZXhwZW5zZXMtYXBpIiwiaWF0IjoxNTcyMDA2OTU0LCJleHAiOjE1NzIwMDY5NjQsImF6cCI6ImFXNENjYTc5eFJlTFdVejBhRTJINmtEME8zY1hCVnRDIiwiZ3R5IjoiY2xpZW50LWNyZWRlbnRpYWxzIn0.PUxE7xn52aTCohGiWoSdMBZGiYAHwE5FYie0Y1qUT68IHSTXwXVd6hn02HTah6epvHHVKA2FqcFZ4GGv5VTHEvYpeggiiZMgbxFrmTEY0csL6VNkX1eaJGcuehwQCRBKRLL3zKmA5IKGy5GeUnIbpPHLHDxr-GXvgFzsdsyWlVQvPX2xjeaQ217r2PtxDeqjlf66UYl6oY6AqNS8DH3iryCvIfCcybRZkc_hdy-6ZMoKT6Piijvk_aXdm7-QQqKJFHLuEqrVSOuBqqiNfVrG27QzAPuPOxvfXTVLXL2jek5meH6n-VWgrBdoMFH93QEszEDowDAEhQPHVs0xj7SIzA"
+@@ -326,6 +338,36 @@
+         with pytest.raises(PyJWKClientError):
+             jwks_client = PyJWKClient(url, lifespan=-1)
+             assert jwks_client is None
++
++    @pytest.mark.parametrize(
++        "uri",
++        [
++            "file:///etc/passwd",
++            "ftp://example.org/keys.json",
++            'data:application/json,{"keys":[]}',
++            "/etc/passwd",  # urlparse gives scheme="" — also rejected
++            "ldap://internal.test/jwks",
++        ],
++    )
++    def test_pyjwkclient_rejects_non_http_schemes(self, uri):
++        # urllib's default OpenerDirector handles file://, ftp://, and data:
++        # URIs. PyJWKClient must reject these so callers can't be tricked
++        # into reading attacker-controlled local files or other unintended
++        # schemes via a manipulated URI.
++        with pytest.raises(PyJWKClientError, match="Invalid JWKS URI scheme"):
++            PyJWKClient(uri)
++
++    @pytest.mark.parametrize(
++        "uri",
++        [
++            "http://localhost/jwks.json",
++            "https://example.test/jwks.json",
++            "HTTPS://Example.Test/jwks.json",  # case-insensitive
++        ],
++    )
++    def test_pyjwkclient_accepts_http_https_schemes(self, uri):
++        # Construction succeeds; no fetch is made until get_jwk_set().
++        PyJWKClient(uri)
+ 
+     def test_get_jwt_set_timeout(self):
+         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
+--- a/jwt/api_jws.py
++++ b/jwt/api_jws.py
+@@ -304,6 +304,16 @@
+             raise InvalidAlgorithmError("The specified alg value is not allowed")
+ 
+         if isinstance(key, PyJWK):
++            # The PyJWK has a fixed algorithm bound at construction time.
++            # Verification must use that algorithm, not whatever the token
++            # header advertises, otherwise the caller's allow-list check
++            # above degenerates into a string compare with no behavioural
++            # effect on which algorithm actually verifies the signature.
++            if alg != key.algorithm_name:
++                raise InvalidAlgorithmError(
++                    f"Token algorithm {alg!r} does not match the key's "
++                    f"algorithm {key.algorithm_name!r}"
++                )
+             alg_obj = key.Algorithm
+             prepared_key = key.key
+         else:
+--- a/tests/test_api_jws.py
++++ b/tests/test_api_jws.py
+@@ -304,6 +304,31 @@
+         with pytest.raises(InvalidAlgorithmError):
+             jws.decode(example_jws, jwk)
+ 
++    def test_decodes_with_jwk_rejects_header_alg_outside_jwk_alg(self, jws):
++        # Token header says HS256 and the caller's allow-list also accepts
++        # HS256, but the PyJWK is bound to HS512. Even though the allow-list
++        # would pass, verification must be locked to the PyJWK's algorithm
++        # rather than the header's — otherwise an attacker who controls a
++        # registered key can advertise a disallowed algorithm in the header
++        # and have it accepted.
++        jwk = PyJWK(
++            {
++                "kty": "oct",
++                "alg": "HS512",
++                "k": "c2VjcmV0",  # "secret"
++            }
++        )
++        example_jws = (
++            b"eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9."
++            b"aGVsbG8gd29ybGQ."
++            b"gEW0pdU4kxPthjtehYdhxB9mMOGajt1xCKlGGXDJ8PM"
++        )
++
++        with pytest.raises(
++            InvalidAlgorithmError, match="does not match the key's algorithm"
++        ):
++            jws.decode(example_jws, jwk, algorithms=["HS256", "HS512"])
++
+     # 'Control' Elliptic Curve jws created by another library.
+     # Used to test for regressions that could affect both
+     # encoding / decoding operations equally (causing tests
+
+--- a/jwt/api_jws.py
++++ b/jwt/api_jws.py
+@@ -138,6 +138,17 @@
+ 
+         if is_payload_detached:
+             header["b64"] = False
++            # RFC 7797 §3: producers MUST list "b64" in "crit" whenever
++            # "b64" appears in the protected header, so b64-unaware
++            # verifiers don't silently treat an unencoded payload as
++            # base64-encoded.
++            existing_crit = header.get("crit", [])
++            if not isinstance(existing_crit, list):
++                raise InvalidTokenError(
++                    "Invalid 'crit' header: must be a list"
++                )
++            if "b64" not in existing_crit:
++                header["crit"] = [*existing_crit, "b64"]
+         elif "b64" in header:
+             # True is the standard value for b64, so no need for it
+             del header["b64"]
+@@ -199,6 +210,15 @@
+         payload, signing_input, header, signature = self._load(jwt)
+ 
+         if header.get("b64", True) is False:
++            # RFC 7797 §3: when "b64" is present in the protected header,
++            # it MUST also appear in "crit". A token that sets b64=false
++            # without declaring it critical is malformed.
++            crit = header.get("crit") or []
++            if not isinstance(crit, list) or "b64" not in crit:
++                raise InvalidTokenError(
++                    "The 'b64' header parameter requires 'b64' to be "
++                    "listed in 'crit'."
++                )
+             if detached_payload is None:
+                 raise DecodeError(
+                     'It is required that you pass in a value for the "detached_payload" argument to decode a message having the b64 header set to false.'
+@@ -273,10 +293,24 @@
+         if not isinstance(header, dict):
+             raise DecodeError("Invalid header string: must be a json object")
+ 
+-        try:
+-            payload = base64url_decode(payload_segment)
+-        except (TypeError, binascii.Error) as err:
+-            raise DecodeError("Invalid payload padding") from err
++        if header.get("b64", True) is False:
++            # Detached payload form (RFC 7515 Appendix F): the compact-form
++            # payload segment must be empty; the caller supplies the actual
++            # payload via the `detached_payload` argument in decode_complete.
++            # Skipping the base64 decode here removes an unauthenticated work
++            # amplifier — otherwise an attacker can inflate the unused
++            # segment to force CPU + memory cost before the signature is
++            # even checked.
++            if payload_segment:
++                raise DecodeError(
++                    "Payload segment must be empty when 'b64' is false."
++                )
++            payload = b""
++        else:
++            try:
++                payload = base64url_decode(payload_segment)
++            except (TypeError, binascii.Error) as err:
++                raise DecodeError("Invalid payload padding") from err
+ 
+         try:
+             signature = base64url_decode(crypto_segment)
+--- a/tests/test_api_jws.py
++++ b/tests/test_api_jws.py
+@@ -12,7 +12,7 @@
+     InvalidSignatureError,
+     InvalidTokenError,
+ )
+-from jwt.utils import base64url_decode
++from jwt.utils import base64url_decode, base64url_encode
+ from jwt.warnings import RemovedInPyjwt3Warning
+ 
+ from .utils import crypto_required, key_path, no_crypto_required
+@@ -820,13 +820,92 @@
+         assert "b64" not in msg_header_obj
+         assert msg_payload
+ 
+-    def test_decode_detached_content_without_proper_argument(self, jws):
+-        example_jws = (
+-            "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiIsImI2NCI6ZmFsc2V9"
+-            "."
+-            ".65yNkX_ZH4A_6pHaTL_eI84OXOHtfl4K0k5UnlXZ8f4"
++    def test_encode_b64_false_auto_adds_b64_to_crit(self, jws, payload):
++        # RFC 7797 §3: producers MUST list "b64" in "crit" whenever "b64"
++        # appears in the protected header.
++        secret = "secret"
++        token = jws.encode(
++            payload, secret, algorithm="HS256", is_payload_detached=True
+         )
++
++        msg_header, _, _ = token.split(".")
++        header_obj = json.loads(base64url_decode(msg_header.encode()))
++
++        assert header_obj["b64"] is False
++        assert "b64" in header_obj.get("crit", [])
++
++    def test_encode_b64_false_preserves_existing_crit_entries(self, jws, payload):
++        secret = "secret"
++        # Caller-supplied crit (already containing "b64") should be
++        # preserved as-is.
++        token = jws.encode(
++            payload,
++            secret,
++            algorithm="HS256",
++            headers={"b64": False, "crit": ["b64"]},
++        )
++
++        header_obj = json.loads(base64url_decode(token.split(".")[0].encode()))
++        assert header_obj["crit"] == ["b64"]
++
++    def test_decode_b64_false_rejects_non_empty_payload_segment(self, jws, payload):
++        # RFC 7515 Appendix F detached form: when b64=false, the compact-
++        # serialization payload segment must be empty. PyJWT must reject a
++        # non-empty middle segment without doing any base64-decoding work
++        # on it -- that decode used to be the unauthenticated DoS amplifier.
++        secret = "secret"
++        import hmac as _hmac
++        import hashlib as _hashlib
++
++        header_obj = {
++            "typ": "JWT",
++            "alg": "HS256",
++            "b64": False,
++            "crit": ["b64"],
++        }
++        header_b64 = base64url_encode(
++            json.dumps(header_obj, separators=(",", ":")).encode()
++        )
++        # Stuff the middle segment with arbitrary attacker-controlled bytes.
++        # This should be rejected without being base64-decoded.
++        attacker_segment = b"A" * 1024
++        signing_input = b".".join([header_b64, payload])
++        sig = _hmac.new(secret.encode(), signing_input, _hashlib.sha256).digest()
++        token = b".".join(
++            [header_b64, attacker_segment, base64url_encode(sig)]
++        ).decode()
++
++        with pytest.raises(DecodeError, match="Payload segment must be empty"):
++            jws.decode(
++                token, secret, algorithms=["HS256"], detached_payload=payload
++            )
++
++    def test_decode_b64_false_without_crit_b64_is_rejected(self, jws, payload):
++        # Hand-craft a non-compliant token: header has b64=false but no
++        # crit:["b64"]. Per RFC 7797 §3, such tokens are malformed and must
++        # be rejected even though PyJWT understands b64.
++        secret = "secret"
++        import hmac as _hmac
++        import hashlib as _hashlib
++
++        header_obj = {"typ": "JWT", "alg": "HS256", "b64": False}
++        header_b64 = base64url_encode(
++            json.dumps(header_obj, separators=(",", ":")).encode()
++        )
++        signing_input = b".".join([header_b64, payload])
++        sig = _hmac.new(secret.encode(), signing_input, _hashlib.sha256).digest()
++        token = b".".join([header_b64, b"", base64url_encode(sig)]).decode()
++
++        with pytest.raises(InvalidTokenError, match="b64.*crit"):
++            jws.decode(
++                token, secret, algorithms=["HS256"], detached_payload=payload
++            )
++
++    def test_decode_detached_content_without_proper_argument(self, jws, payload):
+         example_secret = "secret"
++        example_jws = jws.encode(
++            payload, example_secret, algorithm="HS256", is_payload_detached=True
++        )
+ 
+         with pytest.raises(DecodeError) as exc:
+             jws.decode(example_jws, example_secret, algorithms=["HS256"])
+
 --- a/jwt/algorithms.py
 +++ b/jwt/algorithms.py
 @@ -255,12 +255,35 @@ class HMACAlgorithm(Algorithm):
