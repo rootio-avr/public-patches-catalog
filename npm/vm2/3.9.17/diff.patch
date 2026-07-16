@@ -5826,6 +5826,351 @@ new file mode 100644
 +	});
 +});
 
+--- a/lib/transformer.js
++++ b/lib/transformer.js
+@@ -51,8 +51,28 @@
+ 	let argsOffset;
+ 	if (args === null) {
+ 		code = body;
+-		// Note: Keywords are not allows to contain u escapes
+-		if (!/\b(?:catch|import|async)\b/.test(code)) {
++		// SECURITY (CVE-2026-44003 / GHSA-wp5r-2gw5-m7q7): this fast-path skips the
++		// AST walk (below) entirely for source matching neither branch of this
++		// check -- but the AST walk is also what instruments `with` statements
++		// (wraps the object in `wrapWith()`, see the WithStatement branch below)
++		// and rejects any direct reference to the `INTERNAL_STATE_NAME` identifier
++		// (the "Use of internal vm2 state variable" check below). Pre-fix, this
++		// regex tested only `catch`/`import`/`async`, so source containing neither
++		// of those three keywords -- e.g. a bare
++		// `VM2_INTERNAL_STATE_DO_NOT_USE_OR_PROGRAM_WILL_FAIL` reference, or a raw
++		// `with (obj) { ... }` -- reached this early return unchanged, completely
++		// bypassing both protections. Add `with` to the keyword regex, and
++		// substring-check the whole source for the internal-state identifier
++		// directly (keywords/identifiers cannot contain `u`-escape sequences in
++		// JavaScript source, so a plain substring/regex test over `code` is
++		// sufficient without parsing).
++		// Defensive: `typeof code === 'string'` guards the existing "custom
++		// compiler function" path (a custom compiler may legitimately return
++		// `undefined`; pre-fix, `regex.test(undefined)` silently coerced to the
++		// string `"undefined"` and evaluated false -- the new `.indexOf` call
++		// would otherwise throw on a non-string).
++		const codeStr = typeof code === 'string' ? code : '';
++		if (!/\b(?:catch|import|async|with)\b/.test(codeStr) && codeStr.indexOf(INTERNAL_STATE_NAME) === -1) {
+ 			return {__proto__: null, code, hasAsync: false};
+ 		}
+ 	} else {
+
+--- a/lib/vm.js
++++ b/lib/vm.js
+@@ -142,7 +142,10 @@
+ const bridgeScript = compileScript(`${__dirname}/bridge.js`,
+ 	`(function(global) {"use strict"; const exports = {};${fs.readFileSync(`${__dirname}/bridge.js`, 'utf8')}\nreturn exports;})`);
+ const setupSandboxScript = compileScript(`${__dirname}/setup-sandbox.js`,
+-	`(function(global, host, bridge, data, context) { ${fs.readFileSync(`${__dirname}/setup-sandbox.js`, 'utf8')}\n})`);
++	// SECURITY (GHSA-2cm2-m3w5-gp2f): pre-declare the internal-state binding as a
++	// closure-scoped `let` in the wrapping IIFE (see setup-sandbox.js, which now
++	// assigns to it directly instead of Reflect.defineProperty-ing it onto `global`).
++	`let ${INTERNAL_STATE_NAME};(function(global, host, bridge, data, context) { ${fs.readFileSync(`${__dirname}/setup-sandbox.js`, 'utf8')}\n})`);
+ const getGlobalScript = compileScript('get_global.js', 'this');
+ 
+ let getGeneratorFunctionScript = null;
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -508,13 +508,23 @@
+ 	}
+ });
+ 
+-if (!localReflectDefineProperty(global, host.INTERNAL_STATE_NAME, {
+-	__proto__: null,
+-	configurable: false,
+-	enumerable: false,
+-	writable: false,
+-	value: interanState
+-})) throw localUnexpected();
++// SECURITY (GHSA-2cm2-m3w5-gp2f): assign the internal state directly to the
++// closure-scoped `let VM2_INTERNAL_STATE_DO_NOT_USE_OR_PROGRAM_WILL_FAIL`
++// pre-declared by lib/vm.js in the IIFE wrapping this whole script, instead of
++// installing it as a property on `global` via Reflect.defineProperty. A
++// same-named property on `global` is reachable by ANY code running in this
++// context that can enumerate/guess the identifier -- including a transformer
++// fast-path bypass that lets unsanitized source reach the raw identifier
++// without going through the `with`-wrapping/`wrapWith` unscopable guard at
++// all. A closure-scoped lexical binding has no such reflection surface: it is
++// not a property of anything, so it cannot be read via `global[name]`,
++// `Object.keys(global)`, a `with` statement over an unrelated object, or any
++// other property-access primitive -- only a direct, lexically-scoped
++// identifier reference resolves to it, which is exactly what the transformer
++// is responsible for injecting only into instrumented code.
++if (typeof host.INTERNAL_STATE_NAME !== 'string') throw localUnexpected();
++// eslint-disable-next-line no-undef
++VM2_INTERNAL_STATE_DO_NOT_USE_OR_PROGRAM_WILL_FAIL = interanState;
+ 
+ /*
+  * Eval sanitization
+
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -230,6 +230,98 @@
+ 
+ const oldPrepareStackTraceDesc = localReflectGetOwnPropertyDescriptor(LocalError, 'prepareStackTrace');
+ 
++/*
++ * SECURITY (CVE-2026-44002 / GHSA-v27g-jcqj-v8rw): host path/frame disclosure
++ * via Error.prepareStackTrace.
++ *
++ * Two related leaks:
++ *  1. If sandbox code sets `Error.prepareStackTrace` to a non-function value
++ *     (including `undefined`), V8 falls through to Node's own internal
++ *     default stack formatter (node:internal/errors), which is a host-level
++ *     customization -- not a plain per-realm V8 default -- and it emits
++ *     absolute host file paths and host function names into `.stack`.
++ *  2. Even with a sandbox-installed custom `prepareStackTrace`, the
++ *     CallSite wrapper below (`applyCallSiteGetters`) applied every getter
++ *     unconditionally, including `getFileName()`, `getFunctionName()`, etc.,
++ *     on every frame -- including frames belonging to vm2's own internals or
++ *     the embedder's host-realm code that happen to appear on the captured
++ *     stack, leaking their real absolute paths and names to sandbox code.
++ *
++ * Fix: (1) always install a safe, sandbox-realm default formatter -- never
++ * leave `prepareStackTrace` truly unset -- so V8 never fall back to Node's
++ * host formatter; (2) classify each frame as host or sandbox by inspecting
++ * its real (unwrapped) filename, and return `null` from every getter for a
++ * host frame instead of the real value.
++ */
++function defaultSandboxPrepareStackTrace(error, callSites) {
++	// Safely convert error to a header string -- handles Symbol names, Proxy
++	// objects, and other exotic types that would throw during coercion.
++	let header;
++	try {
++		let name;
++		try {
++			name = error.name;
++		} catch (e) {
++			name = 'Error';
++		}
++		if (typeof name === 'symbol') {
++			try {
++				name = name.toString();
++			} catch (e) {
++				name = 'Error';
++			}
++		} else if (typeof name !== 'string') {
++			try {
++				name = '' + name;
++			} catch (e) {
++				name = 'Error';
++			}
++		}
++		let message;
++		try {
++			message = error.message;
++		} catch (e) {
++			message = '';
++		}
++		if (typeof message !== 'string') {
++			try {
++				message = '' + message;
++			} catch (e) {
++				message = '';
++			}
++		}
++		header = message ? name + ': ' + message : name;
++	} catch (e) {
++		header = 'Error';
++	}
++	const lines = [header];
++	for (let i = 0; i < callSites.length; i++) {
++		try {
++			lines[lines.length] = '    at ' + callSites[i];
++		} catch (e) {
++			lines[lines.length] = '    at <error formatting frame>';
++		}
++	}
++	return lines.join('\n');
++}
++
++// SECURITY (CVE-2026-44002 / GHSA-v27g-jcqj-v8rw): a "host frame" is any frame
++// whose real filename indicates host-realm code: an absolute POSIX path
++// (starts with `/`), a Windows-style absolute path (`<letter>:\`), a Node
++// internals pseudo-path (`node:...` / `internal/...`), or anything else that
++// isn't a clean sandbox-relative filename. Clean sandbox filenames (the
++// default `vm.js`, or a user-supplied VMScript filename without a leading
++// separator) do not match -- sandbox developers can still see their own line
++// numbers and function names.
++function isHostFrameFileName(name) {
++	if (typeof name !== 'string' || name.length === 0) return false;
++	if (name.charCodeAt(0) === 0x2F /* '/' */) return true;
++	if (name.length >= 2 && name.charCodeAt(1) === 0x3A /* ':' */) return true;
++	if (name.length >= 5 && name.slice(0, 5) === 'node:') return true;
++	if (name.length >= 9 && name.slice(0, 9) === 'internal/') return true;
++	return false;
++}
++
+ let currentPrepareStackTrace = LocalError.prepareStackTrace;
+ const wrappedPrepareStackTrace = new LocalWeakMap();
+ if (typeof currentPrepareStackTrace === 'function') {
+@@ -261,11 +353,23 @@
+ 	}
+ 
+ 	function applyCallSiteGetters(thiz, callSite, getters) {
++		// SECURITY (CVE-2026-44002 / GHSA-v27g-jcqj-v8rw): classify the frame once
++		// (host vs sandbox) via the real, unwrapped getFileName() before applying
++		// any getter. A host frame gets `null` from every getter -- closes the
++		// path/line/function-name leak this class of frame would otherwise carry
++		// through a sandbox-installed custom `Error.prepareStackTrace`.
++		let fileName;
++		try {
++			fileName = localReflectApply(OriginalCallSite.prototype.getFileName, callSite, []);
++		} catch (e) {
++			fileName = null;
++		}
++		const isHostFrame = isHostFrameFileName(fileName);
+ 		for (let i=0; i<getters.length; i++) {
+ 			const getter = getters[i];
+ 			localReflectDefineProperty(thiz, getter.propName, {
+ 				__proto__: null,
+-				value: getter.func(callSite)
++				value: isHostFrame ? null : getter.func(callSite)
+ 			});
+ 		}
+ 	}
+@@ -319,6 +423,78 @@
+ 		if (!localReflectDefineProperty(CallSite.prototype, name, funcProp)) throw localUnexpected();
+ 	}
+ 
++	// SECURITY (CVE-2026-44002 / GHSA-v27g-jcqj-v8rw): shared by the setter below
++	// and by the initial-value fixup that follows it. Wraps `value` (assumed
++	// already a function) so the raw structured-stack-trace array it receives
++	// is replaced with sandbox `CallSite` instances (host-frame-scrubbed by
++	// `applyCallSiteGetters`) before `value` ever sees it.
++	// SECURITY (CVE-2026-44002 / GHSA-v27g-jcqj-v8rw): pure wrapping logic, no
++	// WeakMap cache interaction -- `localReflectApply` (used throughout this
++	// file, including by the cache get/set below) unconditionally runs
++	// `resetPromiseSpecies` on whatever `thisArg` it's given. That's normally a
++	// harmless no-op for a non-Promise `thisArg`, but calling it this early --
++	// during this setup script's own initial evaluation, before `localPromise`
++	// exists yet -- makes `resetPromiseSpecies` throw (it treats the resulting
++	// ReferenceError as "species pin failed"). Keep this helper itself free of
++	// `localReflectApply`/WeakMap use so it's safe to call before that point;
++	// the WeakMap caching stays in `wrapPrepareStackTraceValue` below, which is
++	// only ever reached from the setter, always well after full setup.
++	function buildWrappedPrepareStackTrace(value) {
++		return (error, sst) => {
++			const sandboxSst = ensureThis(sst);
++			if (localArrayIsArray(sst)) {
++				if (sst === sandboxSst) {
++					for (let i=0; i < sst.length; i++) {
++						const cs = sst[i];
++						if (typeof cs === 'object' && localReflectGetPrototypeOf(cs) === OriginalCallSite.prototype) {
++							sst[i] = new CallSite(cs);
++						}
++					}
++				} else {
++					sst = [];
++					for (let i=0; i < sandboxSst.length; i++) {
++						const cs = sandboxSst[i];
++						localReflectDefineProperty(sst, i, {
++							__proto__: null,
++							value: new CallSite(cs),
++							enumerable: true,
++							configurable: true,
++							writable: true
++						});
++					}
++				}
++			} else {
++				sst = sandboxSst;
++			}
++			return value(error, sst);
++		};
++	}
++
++	function wrapPrepareStackTraceValue(value) {
++		const wrapped = localReflectApply(localWeakMapGet, wrappedPrepareStackTrace, [value]);
++		if (wrapped) return wrapped;
++		const newWrapped = buildWrappedPrepareStackTrace(value);
++		localReflectApply(localWeakMapSet, wrappedPrepareStackTrace, [value, newWrapped]);
++		localReflectApply(localWeakMapSet, wrappedPrepareStackTrace, [newWrapped, newWrapped]);
++		return newWrapped;
++	}
++
++	// SECURITY (CVE-2026-44002 / GHSA-v27g-jcqj-v8rw): if nothing had set
++	// `Error.prepareStackTrace` before this setup script ran (the common case:
++	// a fresh sandbox that never touches it), `currentPrepareStackTrace` was
++	// captured non-function above, and V8 would fall back to Node's host-realm
++	// default formatter the first time any error's `.stack` is read -- leaking
++	// absolute host paths with no sandbox action required at all. Fix it up to
++	// the safe sandbox-local default. Built directly via
++	// `buildWrappedPrepareStackTrace` (not the cached `wrapPrepareStackTraceValue`
++	// -- see that function's comment for why the WeakMap cache path can't run
++	// this early). Not caching this one-off wrapper costs nothing: nothing has
++	// run yet that could have obtained a reference to `defaultSandboxPrepareStackTrace`
++	// to look up in the cache later.
++	if (typeof currentPrepareStackTrace !== 'function') {
++		currentPrepareStackTrace = buildWrappedPrepareStackTrace(defaultSandboxPrepareStackTrace);
++	}
++
+ 	if (!localReflectDefineProperty(LocalError, 'prepareStackTrace', {
+ 		configurable: false,
+ 		enumerable: false,
+@@ -326,46 +502,18 @@
+ 			return currentPrepareStackTrace;
+ 		},
+ 		set(value) {
++			// SECURITY (CVE-2026-44002 / GHSA-v27g-jcqj-v8rw): never let
++			// `prepareStackTrace` become a non-function. Leaving it `undefined`
++			// (or any other non-function) makes V8 fall through to Node's own
++			// host-realm default stack formatter, which leaks absolute host paths
++			// and function names into every `.stack` access. Substitute the safe
++			// sandbox-local default instead, routed through the same wrapping path
++			// as a user-supplied function so its callsite `toString()` calls still
++			// go through the sandbox `CallSite` class below.
+ 			if (typeof(value) !== 'function') {
+-				currentPrepareStackTrace = value;
+-				return;
+-			}
+-			const wrapped = localReflectApply(localWeakMapGet, wrappedPrepareStackTrace, [value]);
+-			if (wrapped) {
+-				currentPrepareStackTrace = wrapped;
+-				return;
++				value = defaultSandboxPrepareStackTrace;
+ 			}
+-			const newWrapped = (error, sst) => {
+-				const sandboxSst = ensureThis(sst);
+-				if (localArrayIsArray(sst)) {
+-					if (sst === sandboxSst) {
+-						for (let i=0; i < sst.length; i++) {
+-							const cs = sst[i];
+-							if (typeof cs === 'object' && localReflectGetPrototypeOf(cs) === OriginalCallSite.prototype) {
+-								sst[i] = new CallSite(cs);
+-							}
+-						}
+-					} else {
+-						sst = [];
+-						for (let i=0; i < sandboxSst.length; i++) {
+-							const cs = sandboxSst[i];
+-							localReflectDefineProperty(sst, i, {
+-								__proto__: null,
+-								value: new CallSite(cs),
+-								enumerable: true,
+-								configurable: true,
+-								writable: true
+-							});
+-						}
+-					}
+-				} else {
+-					sst = sandboxSst;
+-				}
+-				return value(error, sst);
+-			};
+-			localReflectApply(localWeakMapSet, wrappedPrepareStackTrace, [value, newWrapped]);
+-			localReflectApply(localWeakMapSet, wrappedPrepareStackTrace, [newWrapped, newWrapped]);
+-			currentPrepareStackTrace = newWrapped;
++			currentPrepareStackTrace = wrapPrepareStackTraceValue(value);
+ 		}
+ 	})) throw localUnexpected();
+ } else if (oldPrepareStackTraceDesc) {
+
 --- a/lib/bridge.js
 +++ b/lib/bridge.js
 @@ -1378,6 +1378,15 @@
@@ -7301,6 +7646,54 @@ Advisory:        https://github.com/patriksimek/vm2/security/advisories/GHSA-76w
  let EventEmitterReferencingAsyncResourceClass = null;
  if (EventEmitter.EventEmitterAsyncResource) {
 
+--- a/lib/resolver-compat.js
++++ b/lib/resolver-compat.js
+@@ -219,7 +219,43 @@
+ 	'inspector',
+ 	'process',
+ 	'trace_events',
+-	'wasi'
++	'wasi',
++	// SECURITY (CVE-2026-47141 / GHSA-9g8x-92q2-p28f): process-wide
++	// observability builtins. Unlike most Node builtins, these expose state
++	// of the *entire host process* rather than sandbox-local state -- the
++	// vm2 boundary cannot usefully contain them because the data they
++	// surface (HTTP requests, async-context, perf marks, heap contents)
++	// belongs to the embedder. Even a readonly proxy that forwards every
++	// call to the host module is a working host-data exfiltration primitive:
++	//
++	//   - diagnostics_channel : `dc.channel('http.server.request.start').subscribe(cb)`
++	//                           hands the sandbox raw host IncomingMessage
++	//                           objects -- including Authorization /
++	//                           session-token headers -- for every request the
++	//                           embedder receives.
++	//   - async_hooks         : `executionAsyncResource()` returns the host's
++	//                           current AsyncResource; embedders routinely
++	//                           pin per-request user/auth state on it via
++	//                           AsyncLocalStorage.
++	//   - perf_hooks          : `performance.getEntriesByType('mark')` reads
++	//                           every host-side `performance.mark(name)`,
++	//                           which embedders often label with request IDs,
++	//                           user IDs, or query strings.
++	//   - v8                  : `v8.getHeapSnapshot()` / `v8.writeHeapSnapshot()`
++	//                           serialize the *entire* host V8 heap (every
++	//                           string, every Buffer, every closure capture)
++	//                           and `v8.queryObjects(Ctor)` (Node 20+) returns
++	//                           every host-realm instance of a constructor.
++	//                           Strictly worse than perf_hooks for the same
++	//                           reason -- host process state, not sandbox state.
++	//
++	// Embedders who genuinely need a sandbox-local replacement can register a
++	// controlled wrapper under the same name via `mock` / `override`; the
++	// denylist only rejects the default host-passthrough loader.
++	'diagnostics_channel',
++	'async_hooks',
++	'perf_hooks',
++	'v8'
+ ]);
+ 
+ // SECURITY (GHSA-rp36-8xq3-r6c4): Family-prefix denylist check. `inspector`
+
 --- a/lib/vm.js
 +++ b/lib/vm.js
 @@ -44,6 +44,9 @@
@@ -7564,6 +7957,62 @@ index ec2fcda..db1fa11 100644
  function readonly(other, mock) {
  	// Note: other@other(unsafe) mock@other(unsafe) returns@this(unsafe) throws@this(unsafe)
  	if (!mock) return fromWithFactory(readonlyFactory, other);
+
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -884,6 +884,52 @@
+ 	}
+ }
+ 
++/*
++ * WebAssembly streaming custom-inspect sandbox escape (CVE-2023-37903 /
++ * GHSA-g644-9gfx-q4q4)
++ *
++ * `WebAssembly.compileStreaming` / `WebAssembly.instantiateStreaming` validate
++ * their `source` argument and, on anything other than a `Response` (or a thenable
++ * resolving to one), synchronously build a `TypeError` whose message embeds the
++ * rejected value via Node's internal `inspect()` formatting. That formatting
++ * honors `Symbol.for('nodejs.util.inspect.custom')` on the value and invokes it
++ * with the HOST realm's own `inspect` function as the third argument.
++ *
++ * `Symbol.for`'s registry is agent-wide, not per-realm, so sandbox code needs no
++ * gadget or leak to obtain the exact symbol Node's internals key on -- it just
++ * calls `Symbol.for('nodejs.util.inspect.custom')` directly inside the sandbox.
++ * Handing an object with that key set to `WebAssembly.compileStreaming(obj)`
++ * (neither `fetch` nor `Response` exist in this sandbox, so it can never resolve
++ * successfully) reliably reaches this path:
++ *
++ *   const s = Symbol.for('nodejs.util.inspect.custom');
++ *   const obj = { [s]: (depth, opts, inspect) => {
++ *     inspect.constructor('return process')(); // real host Function -> RCE
++ *   }, valueOf: undefined, constructor: undefined };
++ *   WebAssembly.compileStreaming(obj).catch(() => {});
++ *
++ * The attacker's callback receives the live host-realm `inspect` function;
++ * `inspect.constructor` is the host `Function` constructor, which compiles and
++ * runs arbitrary code outside the sandbox.
++ *
++ * Fix: remove `WebAssembly.compileStreaming` and `WebAssembly.instantiateStreaming`
++ * from the sandbox. Both require a Fetch API `Response` (directly or via a
++ * resolved thenable) to ever succeed, and this sandbox exposes neither `fetch`
++ * nor `Response` -- so removing them costs no legitimate functionality. The
++ * synchronous `WebAssembly.compile`/`instantiate`/`new Module()` counterparts are
++ * unaffected: their argument-validation error path only reports the expected
++ * type, and does not format the received value through `inspect`, so they do not
++ * carry this gadget.
++ */
++if (typeof WebAssembly !== 'undefined') {
++	if (typeof WebAssembly.compileStreaming !== 'undefined') {
++		localReflectDeleteProperty(WebAssembly, 'compileStreaming');
++	}
++	if (typeof WebAssembly.instantiateStreaming !== 'undefined') {
++		localReflectDeleteProperty(WebAssembly, 'instantiateStreaming');
++	}
++}
++
+ localObject.defineProperty(localObject, 'setPrototypeOf', {
+ 	value: () => {
+ 		throw new VMError('Operation not allowed on contextified object.');
 
 diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
 index 6d82c39..cd1814f 100644
