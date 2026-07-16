@@ -1,11 +1,12 @@
-# wget : 1.21-1+deb11u2.root.io.11
+# wget : 1.21-1+deb11u2.root.io.12
 
-This patch is based on wget version 1.21-1+deb11u2.root.io.11, which is available at:
+This patch is based on wget version 1.21-1+deb11u2.root.io.12, which is available at:
 https://sources.debian.org/src/wget/1.21-1+deb11u2/
 
 ## Affected CVEs:
 - CVE-2021-31879
 - CVE-2024-10524
+- CVE-2026-58472
 
 ## How to Apply:
 1. Obtain the source package: `apt source wget`
