@@ -7,6 +7,7 @@ unknown
 - CVE-2020-8203
 - CVE-2021-23337
 - CVE-2026-4800
+- NSWG-ECO-516
 
 ## How to Apply:
 1. Clone or download the source code for lodash
