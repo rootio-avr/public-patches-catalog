@@ -14,6 +14,7 @@ unknown
 - GHSA-76mc-f452-cxcm
 - GHSA-cj63-jhhr-wcxv
 - GHSA-cjmm-f4jc-qw8r
+- GHSA-cmwh-pvxp-8882
 - GHSA-h8r8-wccr-v5f2
 
 ## How to Apply:
