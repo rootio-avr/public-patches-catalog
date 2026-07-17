@@ -7,6 +7,7 @@ unknown
 - CVE-2025-30359
 - CVE-2025-30360
 - CVE-2026-6402
+- CVE-2026-9595
 
 ## How to Apply:
 1. Clone or download the source code for webpack-dev-server
