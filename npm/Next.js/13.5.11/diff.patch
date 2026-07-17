@@ -1,0 +1,603 @@
+--- a/packages/next/src/server/image-optimizer.ts
++++ b/packages/next/src/server/image-optimizer.ts
+@@ -174,6 +174,12 @@
+     } else if (Array.isArray(url)) {
+       return { errorMessage: '"url" parameter cannot be an array' }
+     }
++
++    if (url.startsWith('//')) {
++      return {
++        errorMessage: '"url" parameter cannot be a protocol-relative URL (//)',
++      }
++    }
+
+     let isAbsolute: boolean
+
+--- a/test/integration/image-optimizer/test/util.ts
++++ b/test/integration/image-optimizer/test/util.ts
+@@ -858,8 +858,17 @@
+     expect(await res.text()).toBe(`"url" parameter is invalid`)
+   })
+
++  it('should fail when url is protocol relative', async () => {
++    const query = { url: `//example.com`, w: ctx.w, q: 1 }
++    const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, {})
++    expect(res.status).toBe(400)
++    expect(await res.text()).toBe(
++      `"url" parameter cannot be a protocol-relative URL (//)`
++    )
++  })
++
+   it('should fail when internal url is not an image', async () => {
+-    const url = `//<h1>not-an-image</h1>`
++    const url = `/api/no-header`
+     const query = { url, w: ctx.w, q: 39 }
+     const opts = { headers: { accept: 'image/webp' } }
+     const res = await fetchViaHTTP(ctx.appPort, '/_next/image', query, opts)
+--- /dev/null
++++ b/test/integration/image-optimizer/app/pages/api/no-header.js
+@@ -0,0 +1,5 @@
++export default function handler(_req, res) {
++  // Intentionally missing Content-Type header so that
++  // the fallback is not served when optimization fails
++  res.end('foo')
++}
+
+diff --git a/packages/next/src/server/image-optimizer.ts b/packages/next/src/server/image-optimizer.ts
+index 64d1baaa..ab677cd6 100644
+--- a/packages/next/src/server/image-optimizer.ts
++++ b/packages/next/src/server/image-optimizer.ts
+@@ -556,6 +556,7 @@ export async function imageOptimizer(
+         method: _req.method || 'GET',
+         headers: _req.headers,
+         socket: _req.socket,
++        maximumResponseBody: 300_000_000,
+       })
+ 
+       await handleRequest(mocked.req, mocked.res, nodeUrl.parse(href, true))
+@@ -569,6 +570,14 @@ export async function imageOptimizer(
+         )
+       }
+ 
++      if (mocked.res.buffers.length === 0) {
++        console.error('internal image response is empty for', href)
++        throw new ImageError(
++          400,
++          '"url" parameter is valid but internal response is invalid'
++        )
++      }
++
+       upstreamBuffer = Buffer.concat(mocked.res.buffers)
+       upstreamType =
+         detectContentType(upstreamBuffer) ||
+@@ -576,6 +585,23 @@ export async function imageOptimizer(
+       const cacheControl = mocked.res.getHeader('Cache-Control')
+       maxAge = cacheControl ? getMaxAge(cacheControl) : 0
+     } catch (err) {
++      if (err instanceof ImageError) {
++        throw err
++      }
++
++      if (
++        err &&
++        typeof err === 'object' &&
++        'code' in err &&
++        (err as NodeJS.ErrnoException).code === 'ERR_MAX_BODY_SIZE_EXCEEDED'
++      ) {
++        console.error('internal image response exceeded maximum size for', href)
++        throw new ImageError(
++          413,
++          '"url" parameter is valid but internal response is invalid'
++        )
++      }
++
+       console.error('upstream image response failed for', href, err)
+       throw new ImageError(
+         500,
+diff --git a/packages/next/src/server/lib/mock-request.ts b/packages/next/src/server/lib/mock-request.ts
+index 6837599c..74e8e2b3 100644
+--- a/packages/next/src/server/lib/mock-request.ts
++++ b/packages/next/src/server/lib/mock-request.ts
+@@ -140,6 +140,7 @@ export interface MockedResponseOptions {
+   socket?: Socket | null
+   headers?: OutgoingHttpHeaders
+   resWriter?: (chunk: Uint8Array | Buffer | string) => boolean
++  maximumResponseBody?: number
+ }
+ 
+ export class MockedResponse extends Stream.Writable implements ServerResponse {
+@@ -172,6 +173,9 @@ export class MockedResponse extends Stream.Writable implements ServerResponse {
+   public readonly headers: Headers
+ 
+   private resWriter: MockedResponseOptions['resWriter']
++  private maximumResponseBody?: number
++  private totalSize = 0
++  private writeError: Error | null = null
+ 
+   public readonly headPromise: Promise<void>
+   private headPromiseResolve?: () => void
+@@ -200,6 +204,8 @@ export class MockedResponse extends Stream.Writable implements ServerResponse {
+       return val
+     })
+ 
++    this.maximumResponseBody = res.maximumResponseBody
++
+     if (res.resWriter) {
+       this.resWriter = res.resWriter
+     }
+@@ -236,12 +242,30 @@ export class MockedResponse extends Stream.Writable implements ServerResponse {
+     if (this.resWriter) {
+       return this.resWriter(chunk)
+     }
+-    this.buffers.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
++    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
++
++    if (this.maximumResponseBody !== undefined) {
++      this.totalSize += buffer.byteLength
++      if (this.totalSize > this.maximumResponseBody) {
++        const error = new Error(
++          `Response body exceeded maximum size of ${this.maximumResponseBody} bytes`
++        )
++        ;(error as NodeJS.ErrnoException).code = 'ERR_MAX_BODY_SIZE_EXCEEDED'
++        this.writeError = error
++        this.destroy(error)
++        return true
++      }
++    }
++
++    this.buffers.push(buffer)
+ 
+     return true
+   }
+ 
+   public end() {
++    if (this.destroyed) {
++      return this
++    }
+     this.finished = true
+     return super.end(...arguments)
+   }
+@@ -258,7 +282,7 @@ export class MockedResponse extends Stream.Writable implements ServerResponse {
+   public _write(
+     chunk: Buffer | string,
+     _encoding: string,
+-    callback: () => void
++    callback: (error?: Error | null) => void
+   ) {
+     this.write(chunk)
+ 
+@@ -267,7 +291,11 @@ export class MockedResponse extends Stream.Writable implements ServerResponse {
+     // invoked, the 'finish' event will not be emitted.
+     //
+     // https://nodejs.org/docs/latest-v16.x/api/stream.html#writable_writechunk-encoding-callback
+-    callback()
++    if (this.writeError) {
++      callback(this.writeError)
++    } else {
++      callback()
++    }
+   }
+ 
+   public writeHead(
+@@ -438,6 +466,7 @@ interface RequestResponseMockerOptions {
+   bodyReadable?: Stream.Readable
+   resWriter?: (chunk: Uint8Array | Buffer | string) => boolean
+   socket?: Socket | null
++  maximumResponseBody?: number
+ }
+ 
+ export function createRequestResponseMocks({
+@@ -447,6 +476,7 @@ export function createRequestResponseMocks({
+   bodyReadable,
+   resWriter,
+   socket = null,
++  maximumResponseBody,
+ }: RequestResponseMockerOptions) {
+   return {
+     req: new MockedRequest({
+@@ -456,6 +486,6 @@ export function createRequestResponseMocks({
+       socket,
+       readable: bodyReadable,
+     }),
+-    res: new MockedResponse({ socket, resWriter }),
++    res: new MockedResponse({ socket, resWriter, maximumResponseBody }),
+   }
+ }
+
+diff --git a/packages/next/src/server/app-render/get-script-nonce-from-header.tsx b/packages/next/src/server/app-render/get-script-nonce-from-header.tsx
+index 63b20a00..45ce83c0 100644
+--- a/packages/next/src/server/app-render/get-script-nonce-from-header.tsx
++++ b/packages/next/src/server/app-render/get-script-nonce-from-header.tsx
+@@ -1,4 +1,4 @@
+-import { ESCAPE_REGEX } from '../htmlescape'
++const CSP_NONCE_SOURCE_REGEX = /^'nonce-([A-Za-z0-9+/_-]+={0,2})'$/
+ 
+ export function getScriptNonceFromHeader(
+   cspHeaderValue: string
+@@ -19,35 +19,13 @@ export function getScriptNonceFromHeader(
+     return
+   }
+ 
+-  // Extract the nonce from the directive
+-  const nonce = directive
+-    .split(' ')
+-    // Remove the 'strict-src'/'default-src' string, this can't be the nonce.
+-    .slice(1)
+-    .map((source) => source.trim())
+-    // Find the first source with the 'nonce-' prefix.
+-    .find(
+-      (source) =>
+-        source.startsWith("'nonce-") &&
+-        source.length > 8 &&
+-        source.endsWith("'")
+-    )
+-    // Grab the nonce by trimming the 'nonce-' prefix.
+-    ?.slice(7, -1)
++  // Extract the first valid nonce from the directive. Malformed nonces are
++  // ignored so the request can continue without a nonce instead of failing.
++  for (const source of directive.split(/\s+/).slice(1)) {
++    const match = source.trim().match(CSP_NONCE_SOURCE_REGEX)
+ 
+-  // If we could't find the nonce, then we're done.
+-  if (!nonce) {
+-    return
+-  }
+-
+-  // Don't accept the nonce value if it contains HTML escape characters.
+-  // Technically, the spec requires a base64'd value, but this is just an
+-  // extra layer.
+-  if (ESCAPE_REGEX.test(nonce)) {
+-    throw new Error(
+-      'Nonce value from Content-Security-Policy contained HTML escape characters.\nLearn more: https://nextjs.org/docs/messages/nonce-contained-invalid-characters'
+-    )
++    if (match) {
++      return match[1]
++    }
+   }
+-
+-  return nonce
+ }
+diff --git a/packages/next/src/server/app-render/use-flight-response.tsx b/packages/next/src/server/app-render/use-flight-response.tsx
+index e20c9b86..75377d6f 100644
+--- a/packages/next/src/server/app-render/use-flight-response.tsx
++++ b/packages/next/src/server/app-render/use-flight-response.tsx
+@@ -1,7 +1,10 @@
+ import type { ClientReferenceManifest } from '../../build/webpack/plugins/flight-manifest-plugin'
+ import type { FlightResponseRef } from './flight-response-ref'
+ import { encodeText, decodeText } from '../stream-utils/encode-decode'
+-import { htmlEscapeJsonString } from '../htmlescape'
++import {
++  htmlEscapeAttributeString,
++  htmlEscapeJsonString,
++} from '../htmlescape'
+ 
+ const isEdgeRuntime = process.env.NEXT_RUNTIME === 'edge'
+ 
+@@ -54,7 +57,7 @@ export function useFlightResponse(
+   const forwardReader = forwardStream.getReader()
+   const writer = writable.getWriter()
+   const startScriptTag = nonce
+-    ? `<script nonce=${JSON.stringify(nonce)}>`
++    ? `<script nonce="${htmlEscapeAttributeString(nonce)}">`
+     : '<script>'
+   const textDecoder = new TextDecoder()
+ 
+diff --git a/packages/next/src/server/htmlescape.ts b/packages/next/src/server/htmlescape.ts
+index fa06e75d..e8272bee 100644
+--- a/packages/next/src/server/htmlescape.ts
++++ b/packages/next/src/server/htmlescape.ts
+@@ -14,3 +14,20 @@ export const ESCAPE_REGEX = /[&><\u2028\u2029]/g
+ export function htmlEscapeJsonString(str: string): string {
+   return str.replace(ESCAPE_REGEX, (match) => ESCAPE_LOOKUP[match])
+ }
++
++const ATTRIBUTE_ESCAPE_LOOKUP: { [match: string]: string } = {
++  '&': '&amp;',
++  '"': '&quot;',
++  "'": '&#39;',
++  '<': '&lt;',
++  '>': '&gt;',
++}
++
++const ATTRIBUTE_ESCAPE_REGEX = /[&"'<>]/g
++
++export function htmlEscapeAttributeString(str: string): string {
++  return str.replace(
++    ATTRIBUTE_ESCAPE_REGEX,
++    (match) => ATTRIBUTE_ESCAPE_LOOKUP[match]
++  )
++}
+
+diff --git a/packages/next/src/client/script.tsx b/packages/next/src/client/script.tsx
+index 9fe128ab..401cf325 100644
+--- a/packages/next/src/client/script.tsx
++++ b/packages/next/src/client/script.tsx
+@@ -6,6 +6,7 @@ import type { ScriptHTMLAttributes } from 'react'
+ import { HeadManagerContext } from '../shared/lib/head-manager-context.shared-runtime'
+ import { DOMAttributeNames } from './head-manager'
+ import { requestIdleCallback } from './request-idle-callback'
++import { htmlEscapeJsonString } from '../shared/lib/htmlescape'
+ 
+ const ScriptCache = new Map()
+ const LoadCache = new Set()
+@@ -332,10 +333,9 @@ function Script(props: ScriptProps): JSX.Element | null {
+           <script
+             nonce={nonce}
+             dangerouslySetInnerHTML={{
+-              __html: `(self.__next_s=self.__next_s||[]).push(${JSON.stringify([
+-                0,
+-                { ...restProps },
+-              ])})`,
++              __html: `(self.__next_s=self.__next_s||[]).push(${htmlEscapeJsonString(
++                JSON.stringify([0, { ...restProps }])
++              )})`,
+             }}
+           />
+         )
+@@ -351,9 +351,9 @@ function Script(props: ScriptProps): JSX.Element | null {
+           <script
+             nonce={nonce}
+             dangerouslySetInnerHTML={{
+-              __html: `(self.__next_s=self.__next_s||[]).push(${JSON.stringify([
+-                src,
+-              ])})`,
++              __html: `(self.__next_s=self.__next_s||[]).push(${htmlEscapeJsonString(
++                JSON.stringify([src])
++              )})`,
+             }}
+           />
+         )
+diff --git a/packages/next/src/shared/lib/htmlescape.ts b/packages/next/src/shared/lib/htmlescape.ts
+new file mode 100644
+index 00000000..e8272bee
+--- /dev/null
++++ b/packages/next/src/shared/lib/htmlescape.ts
+@@ -0,0 +1,33 @@
++// This utility is based on https://github.com/zertosh/htmlescape
++// License: https://github.com/zertosh/htmlescape/blob/0527ca7156a524d256101bb310a9f970f63078ad/LICENSE
++
++const ESCAPE_LOOKUP: { [match: string]: string } = {
++  '&': '\\u0026',
++  '>': '\\u003e',
++  '<': '\\u003c',
++  '\u2028': '\\u2028',
++  '\u2029': '\\u2029',
++}
++
++export const ESCAPE_REGEX = /[&><\u2028\u2029]/g
++
++export function htmlEscapeJsonString(str: string): string {
++  return str.replace(ESCAPE_REGEX, (match) => ESCAPE_LOOKUP[match])
++}
++
++const ATTRIBUTE_ESCAPE_LOOKUP: { [match: string]: string } = {
++  '&': '&amp;',
++  '"': '&quot;',
++  "'": '&#39;',
++  '<': '&lt;',
++  '>': '&gt;',
++}
++
++const ATTRIBUTE_ESCAPE_REGEX = /[&"'<>]/g
++
++export function htmlEscapeAttributeString(str: string): string {
++  return str.replace(
++    ATTRIBUTE_ESCAPE_REGEX,
++    (match) => ATTRIBUTE_ESCAPE_LOOKUP[match]
++  )
++}
+
+diff --git a/packages/next/src/server/image-optimizer.ts b/packages/next/src/server/image-optimizer.ts
+index ab677cd6..1dcae91b 100644
+--- a/packages/next/src/server/image-optimizer.ts
++++ b/packages/next/src/server/image-optimizer.ts
+@@ -31,6 +31,16 @@ import { getContentType, getExtension } from './serve-static'
+ 
+ type XCacheHeader = 'MISS' | 'HIT' | 'STALE'
+ 
++const DUMMY_ORIGIN = 'http://n'
++
++function parseImageOptimizerUrl(url: string): URL | undefined {
++  try {
++    return new URL(url, DUMMY_ORIGIN)
++  } catch {
++    return undefined
++  }
++}
++
+ const AVIF = 'image/avif'
+ const WEBP = 'image/webp'
+ const PNG = 'image/png'
+@@ -200,6 +210,20 @@ export class ImageOptimizerCache {
+       }
+     }
+ 
++    const parsedUrl = parseImageOptimizerUrl(url)
++    if (parsedUrl) {
++      try {
++        const decodedPathname = decodeURIComponent(parsedUrl.pathname)
++        if (/\/_next\/image($|\/)/.test(decodedPathname)) {
++          return {
++            errorMessage: '"url" parameter cannot be recursive',
++          }
++        }
++      } catch {
++        return { errorMessage: '"url" parameter is invalid' }
++      }
++    }
++
+     if (!w) {
+       return { errorMessage: '"w" parameter (width) is required' }
+     } else if (Array.isArray(w)) {
+
+diff --git a/packages/next/src/server/image-optimizer.ts b/packages/next/src/server/image-optimizer.ts
+index 1dcae91b..776bdb56 100644
+--- a/packages/next/src/server/image-optimizer.ts
++++ b/packages/next/src/server/image-optimizer.ts
+@@ -569,9 +569,8 @@ export async function imageOptimizer(
+     }
+ 
+     upstreamBuffer = Buffer.from(await upstreamRes.arrayBuffer())
+-    upstreamType =
+-      detectContentType(upstreamBuffer) ||
+-      upstreamRes.headers.get('Content-Type')
++    // Do not fall back to untrusted upstream Content-Type (CVE-2025-55173)
++    upstreamType = detectContentType(upstreamBuffer)
+     maxAge = getMaxAge(upstreamRes.headers.get('Cache-Control'))
+   } else {
+     try {
+@@ -603,9 +602,8 @@ export async function imageOptimizer(
+       }
+ 
+       upstreamBuffer = Buffer.concat(mocked.res.buffers)
+-      upstreamType =
+-        detectContentType(upstreamBuffer) ||
+-        mocked.res.getHeader('Content-Type')
++      // Do not fall back to untrusted upstream Content-Type (CVE-2025-55173)
++      upstreamType = detectContentType(upstreamBuffer)
+       const cacheControl = mocked.res.getHeader('Cache-Control')
+       maxAge = cacheControl ? getMaxAge(cacheControl) : 0
+     } catch (err) {
+@@ -634,37 +632,41 @@ export async function imageOptimizer(
+     }
+   }
+ 
+-  if (upstreamType) {
+-    upstreamType = upstreamType.toLowerCase().trim()
++  // Require magic-byte detection; never trust Content-Type alone (CVE-2025-55173)
++  if (
++    !upstreamType ||
++    !String(upstreamType).toLowerCase().trim().startsWith('image/') ||
++    String(upstreamType).includes(',')
++  ) {
++    console.error(
++      "The requested resource isn't a valid image for",
++      href,
++      'received',
++      upstreamType
++    )
++    throw new ImageError(400, "The requested resource isn't a valid image.")
++  }
+ 
+-    if (
+-      upstreamType.startsWith('image/svg') &&
+-      !nextConfig.images.dangerouslyAllowSVG
+-    ) {
+-      console.error(
+-        `The requested resource "${href}" has type "${upstreamType}" but dangerouslyAllowSVG is disabled`
+-      )
+-      throw new ImageError(
+-        400,
+-        '"url" parameter is valid but image type is not allowed'
+-      )
+-    }
+-    const vector = VECTOR_TYPES.includes(upstreamType)
+-    const animate =
+-      ANIMATABLE_TYPES.includes(upstreamType) && isAnimated(upstreamBuffer)
++  upstreamType = upstreamType.toLowerCase().trim()
+ 
+-    if (vector || animate) {
+-      return { buffer: upstreamBuffer, contentType: upstreamType, maxAge }
+-    }
+-    if (!upstreamType.startsWith('image/') || upstreamType.includes(',')) {
+-      console.error(
+-        "The requested resource isn't a valid image for",
+-        href,
+-        'received',
+-        upstreamType
+-      )
+-      throw new ImageError(400, "The requested resource isn't a valid image.")
+-    }
++  if (
++    upstreamType.startsWith('image/svg') &&
++    !nextConfig.images.dangerouslyAllowSVG
++  ) {
++    console.error(
++      `The requested resource "${href}" has type "${upstreamType}" but dangerouslyAllowSVG is disabled`
++    )
++    throw new ImageError(
++      400,
++      '"url" parameter is valid but image type is not allowed'
++    )
++  }
++  const vector = VECTOR_TYPES.includes(upstreamType)
++  const animate =
++    ANIMATABLE_TYPES.includes(upstreamType) && isAnimated(upstreamBuffer)
++
++  if (vector || animate) {
++    return { buffer: upstreamBuffer, contentType: upstreamType, maxAge }
+   }
+ 
+   let contentType: string
+
+diff --git a/packages/next/src/server/image-optimizer.ts b/packages/next/src/server/image-optimizer.ts
+index 776bdb56..6642d533 100644
+--- a/packages/next/src/server/image-optimizer.ts
++++ b/packages/next/src/server/image-optimizer.ts
+@@ -577,7 +577,6 @@ export async function imageOptimizer(
+       const mocked = createRequestResponseMocks({
+         url: href,
+         method: _req.method || 'GET',
+-        headers: _req.headers,
+         socket: _req.socket,
+         maximumResponseBody: 300_000_000,
+       })
+
+diff --git a/packages/next/src/server/lib/router-utils/resolve-routes.ts b/packages/next/src/server/lib/router-utils/resolve-routes.ts
+index 4e46664c..16e04c29 100644
+--- a/packages/next/src/server/lib/router-utils/resolve-routes.ts
++++ b/packages/next/src/server/lib/router-utils/resolve-routes.ts
+@@ -18,7 +18,10 @@ import { formatHostname } from '../format-hostname'
+ import { toNodeOutgoingHttpHeaders } from '../../web/utils'
+ import { isAbortError } from '../../pipe-readable'
+ import { getHostname } from '../../../shared/lib/get-hostname'
+-import { getRedirectStatus } from '../../../lib/redirect-status'
++import {
++  getRedirectStatus,
++  allowedStatusCodes,
++} from '../../../lib/redirect-status'
+ import { normalizeRepeatedSlashes } from '../../../shared/lib/utils'
+ import { relativizeURL } from '../../../shared/lib/router/utils/relativize-url'
+ import { addPathPrefix } from '../../../shared/lib/router/utils/add-path-prefix'
+@@ -624,15 +627,33 @@ export function getResolveRoutes(
+ 
+             if (middlewareHeaders['location']) {
+               const value = middlewareHeaders['location'] as string
+-              const rel = relativizeURL(value, initUrl)
+-              resHeaders['location'] = rel
+-              parsedUrl = url.parse(rel, true)
+ 
+-              return {
+-                parsedUrl,
+-                resHeaders,
+-                finished: true,
+-                statusCode: middlewareRes.status,
++              // Only treat Location as redirect when status is a redirect code
++              const isRedirectStatus = allowedStatusCodes.has(
++                middlewareRes.status
++              )
++
++              if (isRedirectStatus) {
++                const rel = relativizeURL(value, initUrl)
++                resHeaders['location'] = rel
++                parsedUrl = url.parse(rel, true)
++
++                return {
++                  parsedUrl,
++                  resHeaders,
++                  finished: true,
++                  statusCode: middlewareRes.status,
++                }
++              } else {
++                resHeaders['location'] = value
++
++                return {
++                  parsedUrl,
++                  resHeaders,
++                  finished: true,
++                  bodyStream,
++                  statusCode: middlewareRes.status,
++                }
+               }
+             }
+ 
