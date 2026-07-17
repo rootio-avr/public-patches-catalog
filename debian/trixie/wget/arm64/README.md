@@ -1,11 +1,12 @@
-# wget : 1.25.0-2.root.io.2
+# wget : 1.25.0-2.root.io.3
 
-This patch is based on wget version 1.25.0-2.root.io.2, which is available at:
+This patch is based on wget version 1.25.0-2.root.io.3, which is available at:
 https://sources.debian.org/src/wget/1.25.0-2/
 
 ## Affected CVEs:
 - CVE-2021-31879
 - CVE-2026-58472
+- CVE-2026-58471
 
 ## How to Apply:
 1. Obtain the source package: `apt source wget`
