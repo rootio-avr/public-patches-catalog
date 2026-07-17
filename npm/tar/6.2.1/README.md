@@ -10,6 +10,7 @@ unknown
 - CVE-2026-26960
 - CVE-2026-29786
 - CVE-2026-31802
+- CVE-2026-53655
 
 ## How to Apply:
 1. Clone or download the source code for tar
