@@ -1,3 +1,128 @@
+Description: Fix CVE-2025-49128 - misleading exception leaks unrelated buffer
+ content when JsonParser is created from a byte[]/char[] with non-zero start
+ offset. JsonLocation._appendSourceDesc reads from index 0 instead of the
+ supplied offset, exposing up to 500 bytes/chars of unrelated buffer data
+ in JsonParseException messages (CWE-209).
+ .
+ Backport for jackson-core 2.10.1: the upstream fix (jackson-core PR #652,
+ commit a6c297682737dde13337cb7c3020f299518609a8, released in 2.13.0) relies
+ on the ContentReference abstraction introduced in 2.13. ContentReference is
+ not present in 2.10.1, so this backport instead slices the input array at
+ the JsonFactory entry points (createParser(byte[],int,int) and
+ createParser(char[],int,int)) so that IOContext._sourceRef only references
+ the actual content range. JsonLocation then has nothing outside that range
+ to expose. The upstream regression test (testContentSnippetWithOffset) and
+ its a2q() helper are included verbatim and pass against this slice-based
+ fix.
+Origin: backport, https://github.com/FasterXML/jackson-core/commit/a6c297682737dde13337cb7c3020f299518609a8
+Bug: https://github.com/FasterXML/jackson-core/pull/652
+Bug-CVE: CVE-2025-49128
+Forwarded: not-needed
+Last-Update: 2026-06-18
+
+--- a/src/main/java/com/fasterxml/jackson/core/JsonFactory.java
++++ b/src/main/java/com/fasterxml/jackson/core/JsonFactory.java
+@@ -1023,6 +1023,14 @@
+      */
+     @Override
+     public JsonParser createParser(byte[] data, int offset, int len) throws IOException, JsonParseException {
++        // [CVE-2025-49128]: avoid retaining the caller's full buffer in IOContext;
++        // slice to the actual content range so JsonLocation cannot leak data outside it.
++        if (offset > 0 || len != data.length) {
++            byte[] slice = new byte[len];
++            System.arraycopy(data, offset, slice, 0, len);
++            data = slice;
++            offset = 0;
++        }
+         IOContext ctxt = _createContext(data, true);
+         // [JACKSON-512]: allow wrapping with InputDecorator
+         if (_inputDecorator != null) {
+@@ -1075,6 +1083,14 @@
+     public JsonParser createParser(char[] content, int offset, int len) throws IOException {
+         if (_inputDecorator != null) { // easier to just wrap in a Reader than extend InputDecorator
+             return createParser(new CharArrayReader(content, offset, len));
++        }
++        // [CVE-2025-49128]: avoid retaining the caller's full buffer in IOContext;
++        // slice to the actual content range so JsonLocation cannot leak data outside it.
++        if (offset > 0 || len != content.length) {
++            char[] slice = new char[len];
++            System.arraycopy(content, offset, slice, 0, len);
++            content = slice;
++            offset = 0;
+         }
+         return _createParser(content, offset, len, _createContext(content, true),
+                 // important: buffer is NOT recyclable, as it's from caller
+--- a/src/test/java/com/fasterxml/jackson/core/BaseTest.java
++++ b/src/test/java/com/fasterxml/jackson/core/BaseTest.java
+@@ -532,6 +532,10 @@
+     }
+ 
+     protected static String aposToQuotes(String json) {
++        return a2q(json);
++    }
++
++    protected static String a2q(String json) {
+         return json.replace("'", "\"");
+     }
+ 
+--- a/src/test/java/com/fasterxml/jackson/core/TestExceptions.java
++++ b/src/test/java/com/fasterxml/jackson/core/TestExceptions.java
+@@ -2,6 +2,7 @@
+ 
+ import java.io.StringWriter;
+ 
++import com.fasterxml.jackson.core.exc.StreamReadException;
+ import com.fasterxml.jackson.core.io.JsonEOFException;
+ 
+ public class TestExceptions extends BaseTest
+@@ -118,5 +119,46 @@
+         p.close();
+ 
+         // any other cases we'd like to test?
++    }
++
++    // [CVE-2025-49128] / jackson-core#652
++    public void testContentSnippetWithOffset() throws Exception
++    {
++        JsonParser p;
++        final String json = a2q("{'k1':'v1'}\n[broken]\n");
++        final byte[] jsonB = utf8Bytes(json);
++        final int lfIndex = json.indexOf("\n");
++        final int start = lfIndex+1;
++        final int len = json.length() - start;
++
++        p = JSON_F.createParser(jsonB, start, len);
++        // for byte-based, will be after character that follows token:
++        // (and alas cannot be easily fixed)
++        _testContentSnippetWithOffset(p, 9, "(byte[])\"[broken]\n\"");
++        p.close();
++
++        final char[] jsonC = json.toCharArray();
++        p = JSON_F.createParser(jsonC, start, len);
++        // for char-based we get true offset at end of token
++        _testContentSnippetWithOffset(p, 8, "(char[])\"[broken]\n\"");
++        p.close();
++    }
++
++    private void _testContentSnippetWithOffset(final JsonParser p,
++            int expColumn, String expContent) throws Exception
++    {
++        assertToken(JsonToken.START_ARRAY, p.nextToken());
++        try {
++            p.nextToken();
++            fail("Should not pass");
++        } catch (StreamReadException e) {
++            verifyException(e, "Unrecognized token 'broken'");
++            JsonLocation loc = e.getLocation();
++            assertEquals(1, loc.getLineNr());
++            assertEquals(expColumn, loc.getColumnNr());
++            final String srcDesc = loc.sourceDescription();
++
++            assertEquals(expContent, srcDesc);
++        }
+     }
+ }
+
 --- a/src/main/java/com/fasterxml/jackson/core/JsonStreamContext.java
 +++ b/src/main/java/com/fasterxml/jackson/core/JsonStreamContext.java
 @@ -36,6 +36,12 @@
@@ -453,3 +578,214 @@
 +        return sb.toString();
 +    }
 +}
+
+--- a/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParser.java
++++ b/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParser.java
+@@ -380,7 +380,7 @@ public class NonBlockingJsonParser
+                 if (_numberNegative) {
+                     --len;
+                 }
+-                _intLength = len;
++                _setIntLength(len);
+             }
+             return _valueComplete(JsonToken.VALUE_NUMBER_INT);
+
+@@ -1298,7 +1298,7 @@ public class NonBlockingJsonParser
+         while (true) {
+             if (ch < INT_0) {
+                 if (ch == INT_PERIOD) {
+-                    _intLength = outPtr;
++                    _setIntLength(outPtr);
+                     ++_inputPtr;
+                     return _startFloat(outBuf, outPtr, ch);
+                 }
+@@ -1306,7 +1306,7 @@ public class NonBlockingJsonParser
+             }
+             if (ch > INT_9) {
+                 if (ch == INT_e || ch == INT_E) {
+-                    _intLength = outPtr;
++                    _setIntLength(outPtr);
+                     ++_inputPtr;
+                     return _startFloat(outBuf, outPtr, ch);
+                 }
+@@ -1325,7 +1325,7 @@ public class NonBlockingJsonParser
+             }
+             ch = _inputBuffer[_inputPtr] & 0xFF;
+         }
+-        _intLength = outPtr;
++        _setIntLength(outPtr);
+         _textBuffer.setCurrentLength(outPtr);
+         return _valueComplete(JsonToken.VALUE_NUMBER_INT);
+     }
+@@ -1365,7 +1365,7 @@ public class NonBlockingJsonParser
+         while (true) {
+             if (ch < INT_0) {
+                 if (ch == INT_PERIOD) {
+-                    _intLength = outPtr-1;
++                    _setIntLength(outPtr-1);
+                     ++_inputPtr;
+                     return _startFloat(outBuf, outPtr, ch);
+                 }
+@@ -1373,7 +1373,7 @@ public class NonBlockingJsonParser
+             }
+             if (ch > INT_9) {
+                 if (ch == INT_e || ch == INT_E) {
+-                    _intLength = outPtr-1;
++                    _setIntLength(outPtr-1);
+                     ++_inputPtr;
+                     return _startFloat(outBuf, outPtr, ch);
+                 }
+@@ -1391,7 +1391,7 @@ public class NonBlockingJsonParser
+             }
+             ch = _inputBuffer[_inputPtr] & 0xFF;
+         }
+-        _intLength = outPtr-1;
++        _setIntLength(outPtr-1);
+         _textBuffer.setCurrentLength(outPtr);
+         return _valueComplete(JsonToken.VALUE_NUMBER_INT);
+     }
+@@ -1579,7 +1579,7 @@ public class NonBlockingJsonParser
+             int ch = _inputBuffer[_inputPtr] & 0xFF;
+             if (ch < INT_0) {
+                 if (ch == INT_PERIOD) {
+-                    _intLength = outPtr+negMod;
++                    _setIntLength(outPtr+negMod);
+                     ++_inputPtr;
+                     return _startFloat(outBuf, outPtr, ch);
+                 }
+@@ -1587,7 +1587,7 @@ public class NonBlockingJsonParser
+             }
+             if (ch > INT_9) {
+                 if (ch == INT_e || ch == INT_E) {
+-                    _intLength = outPtr+negMod;
++                    _setIntLength(outPtr+negMod);
+                     ++_inputPtr;
+                     return _startFloat(outBuf, outPtr, ch);
+                 }
+@@ -1601,7 +1601,7 @@ public class NonBlockingJsonParser
+             }
+             outBuf[outPtr++] = (char) ch;
+         }
+-        _intLength = outPtr+negMod;
++        _setIntLength(outPtr+negMod);
+         _textBuffer.setCurrentLength(outPtr);
+         return _valueComplete(JsonToken.VALUE_NUMBER_INT);
+     }
+@@ -1618,7 +1618,7 @@ public class NonBlockingJsonParser
+                 if (_inputPtr >= _inputEnd) {
+                     _textBuffer.setCurrentLength(outPtr);
+                     _minorState = MINOR_NUMBER_FRACTION_DIGITS;
+-                    _fractLength = fractLen;
++                    _setFractLength(fractLen);
+                     return (_currToken = JsonToken.NOT_AVAILABLE);
+                 }
+                 ch = _inputBuffer[_inputPtr++]; // ok to have sign extension for now
+@@ -1637,7 +1637,7 @@ public class NonBlockingJsonParser
+                 ++fractLen;
+             }
+         }
+-        _fractLength = fractLen;
++        _setFractLength(fractLen);
+         int expLen = 0;
+         if (ch == INT_e || ch == INT_E) { // exponent?
+             if (outPtr >= outBuf.length) {
+@@ -1673,7 +1673,7 @@ public class NonBlockingJsonParser
+                 if (_inputPtr >= _inputEnd) {
+                     _textBuffer.setCurrentLength(outPtr);
+                     _minorState = MINOR_NUMBER_EXPONENT_DIGITS;
+-                    _expLength = expLen;
++                    _setExpLength(expLen);
+                     return (_currToken = JsonToken.NOT_AVAILABLE);
+                 }
+                 ch = _inputBuffer[_inputPtr++];
+@@ -1688,7 +1688,7 @@ public class NonBlockingJsonParser
+         --_inputPtr;
+         _textBuffer.setCurrentLength(outPtr);
+         // negative, int-length, fract-length already set, so...
+-        _expLength = expLen;
++        _setExpLength(expLen);
+         return _valueComplete(JsonToken.VALUE_NUMBER_FLOAT);
+     }
+
+@@ -1708,7 +1708,7 @@ public class NonBlockingJsonParser
+             outBuf[outPtr++] = (char) ch;
+             if (_inputPtr >= _inputEnd) {
+                 _textBuffer.setCurrentLength(outPtr);
+-                _fractLength = fractLen;
++                _setFractLength(fractLen);
+                 return JsonToken.NOT_AVAILABLE;
+             }
+         }
+@@ -1718,7 +1718,7 @@ public class NonBlockingJsonParser
+         if (fractLen == 0) {
+             reportUnexpectedNumberChar(ch, "Decimal point not followed by a digit");
+         }
+-        _fractLength = fractLen;
++        _setFractLength(fractLen);
+         _textBuffer.setCurrentLength(outPtr);
+
+         // Ok: end of floating point number or exponent?
+@@ -1768,7 +1768,7 @@ public class NonBlockingJsonParser
+             outBuf[outPtr++] = (char) ch;
+             if (_inputPtr >= _inputEnd) {
+                 _textBuffer.setCurrentLength(outPtr);
+-                _expLength = expLen;
++                _setExpLength(expLen);
+                 return JsonToken.NOT_AVAILABLE;
+             }
+             ch = _inputBuffer[_inputPtr++];
+@@ -1782,7 +1782,7 @@ public class NonBlockingJsonParser
+         --_inputPtr;
+         _textBuffer.setCurrentLength(outPtr);
+         // negative, int-length, fract-length already set, so...
+-        _expLength = expLen;
++        _setExpLength(expLen);
+         return _valueComplete(JsonToken.VALUE_NUMBER_FLOAT);
+     }
+
+--- a/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParserBase.java
++++ b/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParserBase.java
+@@ -887,7 +887,43 @@ public abstract class NonBlockingJsonParserBase
+         _reportInvalidOther(mask);
+     }
+
+     protected void _reportInvalidOther(int mask) throws JsonParseException {
+         _reportError("Invalid UTF-8 middle byte 0x"+Integer.toHexString(mask));
+     }
++
++    /*
++    /**********************************************************************
++    /* Internal methods, number length validation (GHSA-72hv-8253-57qq)
++    /**********************************************************************
++     */
++
++    /**
++     * Hard-coded maximum number length, mirroring the default value of
++     * {@code StreamReadConstraints.maxNumberLength} introduced in 2.15.
++     */
++    private static final int MAX_NUMBER_LENGTH = 1000;
++
++    protected void _setIntLength(final int len) throws JsonParseException {
++        _validateNumberLength(len);
++        _intLength = len;
++    }
++
++    protected void _setFractLength(final int len) throws JsonParseException {
++        // assumes that the _intLength has been updated first
++        _validateNumberLength(_intLength + len);
++        _fractLength = len;
++    }
++
++    protected void _setExpLength(final int len) throws JsonParseException {
++        // assumes that the _intLength and _fractLength have been updated already
++        _validateNumberLength(_intLength + _fractLength + len);
++        _expLength = len;
++    }
++
++    protected void _validateNumberLength(final int len) throws JsonParseException {
++        if (len > MAX_NUMBER_LENGTH) {
++            throw _constructError("Number length (" + len
++                    + ") exceeds the maximum length (" + MAX_NUMBER_LENGTH + ")");
++        }
++    }
+ }
