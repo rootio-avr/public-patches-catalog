@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-21536
+- CVE-2026-55602
 
 ## How to Apply:
 1. Clone or download the source code for http-proxy-middleware
