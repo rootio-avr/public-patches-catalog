@@ -1,6 +1,6 @@
-# openexr : 2.5.4-2+deb11u1.root.io.14
+# openexr : 2.5.4-2+deb11u1.root.io.15
 
-This patch is based on openexr version 2.5.4-2+deb11u1.root.io.14, which is available at:
+This patch is based on openexr version 2.5.4-2+deb11u1.root.io.15, which is available at:
 https://sources.debian.org/src/openexr/2.5.4-2+deb11u1/
 
 ## Affected CVEs:
@@ -18,6 +18,10 @@ https://sources.debian.org/src/openexr/2.5.4-2+deb11u1/
 - CVE-2026-34588
 - CVE-2026-34379
 - CVE-2026-34545
+- CVE-2026-34380
+- CVE-2026-34589
+- CVE-2026-34543
+- CVE-2026-34544
 
 ## How to Apply:
 1. Obtain the source package: `apt source openexr`
