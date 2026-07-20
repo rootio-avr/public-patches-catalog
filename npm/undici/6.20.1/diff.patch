@@ -1,338 +1,29 @@
---- a/lib/core/errors.js
-+++ b/lib/core/errors.js
-@@ -217,6 +217,24 @@
-   }
- }
- 
-+const kMessageSizeExceededError = Symbol.for('undici.error.UND_ERR_WS_MESSAGE_SIZE_EXCEEDED')
-+class MessageSizeExceededError extends UndiciError {
-+  constructor (message) {
-+    super(message)
-+    this.name = 'MessageSizeExceededError'
-+    this.message = message || 'Max decompressed message size exceeded'
-+    this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
-+  }
+--- a/lib/web/fetch/body.js
++++ b/lib/web/fetch/body.js
+@@ -20,6 +20,14 @@ const { isErrored, isDisturbed } = require('node:stream')
+ const { isArrayBuffer } = require('node:util/types')
+ const { serializeAMimeType } = require('./data-url')
+ const { multipartFormDataParser } = require('./formdata-parser')
++let random
 +
-+  static [Symbol.hasInstance] (instance) {
-+    return instance && instance[kMessageSizeExceededError] === true
-+  }
-+
-+  get [kMessageSizeExceededError] () {
-+    return true
-+  }
++try {
++  const crypto = require('node:crypto')
++  random = (max) => crypto.randomInt(0, max)
++} catch {
++  random = (max) => Math.floor(Math.random(max))
 +}
-+
- module.exports = {
-   AbortError,
-   HTTPParserError,
-@@ -240,5 +258,6 @@
-   ResponseExceededMaxSizeError,
-   RequestRetryError,
-   ResponseError,
--  SecureProxyConnectionError
-+  SecureProxyConnectionError,
-+  MessageSizeExceededError
- }
---- a/lib/dispatcher/agent.js
-+++ b/lib/dispatcher/agent.js
-@@ -24,7 +24,7 @@
  
- class Agent extends DispatcherBase {
-   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
--    super()
-+    super(options)
+ const textEncoder = new TextEncoder()
+ function noop () {}
+@@ -113,7 +121,7 @@ function extractBody (object, keepalive = false) {
+     // Set source to a copy of the bytes held by object.
+     source = new Uint8Array(object.buffer.slice(object.byteOffset, object.byteOffset + object.byteLength))
+   } else if (util.isFormDataLike(object)) {
+-    const boundary = `----formdata-undici-0${`${Math.floor(Math.random() * 1e11)}`.padStart(11, '0')}`
++    const boundary = `----formdata-undici-0${`${random(1e11)}`.padStart(11, '0')}`
+     const prefix = `--${boundary}\r\nContent-Disposition: form-data`
  
-     if (typeof factory !== 'function') {
-       throw new InvalidArgumentError('factory must be a function.')
---- a/lib/dispatcher/client.js
-+++ b/lib/dispatcher/client.js
-@@ -106,9 +106,10 @@
-     autoSelectFamilyAttemptTimeout,
-     // h2
-     maxConcurrentStreams,
--    allowH2
-+    allowH2,
-+    webSocket
-   } = {}) {
--    super()
-+    super({ webSocket })
- 
-     if (keepAlive !== undefined) {
-       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
---- a/lib/dispatcher/dispatcher-base.js
-+++ b/lib/dispatcher/dispatcher-base.js
-@@ -11,15 +11,24 @@
- const kOnDestroyed = Symbol('onDestroyed')
- const kOnClosed = Symbol('onClosed')
- const kInterceptedDispatch = Symbol('Intercepted Dispatch')
-+const kWebSocketOptions = Symbol('webSocketOptions')
- 
- class DispatcherBase extends Dispatcher {
--  constructor () {
-+  constructor (opts) {
-     super()
- 
-     this[kDestroyed] = false
-     this[kOnDestroyed] = null
-     this[kClosed] = false
-     this[kOnClosed] = []
-+    this[kWebSocketOptions] = opts?.webSocket ?? {}
-+  }
-+
-+  get webSocketOptions () {
-+    return {
-+      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
-+      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
-+    }
-   }
- 
-   get destroyed () {
---- a/lib/dispatcher/pool-base.js
-+++ b/lib/dispatcher/pool-base.js
-@@ -19,8 +19,8 @@
- const kStats = Symbol('stats')
- 
- class PoolBase extends DispatcherBase {
--  constructor () {
--    super()
-+  constructor (opts) {
-+    super(opts)
- 
-     this[kQueue] = new FixedQueue()
-     this[kClients] = []
---- a/lib/dispatcher/pool.js
-+++ b/lib/dispatcher/pool.js
-@@ -37,7 +37,7 @@
-     allowH2,
-     ...options
-   } = {}) {
--    super()
-+    super(options)
- 
-     if (connections != null && (!Number.isFinite(connections) || connections < 0)) {
-       throw new InvalidArgumentError('invalid connections')
---- a/lib/web/websocket/receiver.js
-+++ b/lib/web/websocket/receiver.js
-@@ -18,7 +18,13 @@
- const { WebsocketFrameSend } = require('./frame')
- const { closeWebSocketConnection } = require('./connection')
- const { PerMessageDeflate } = require('./permessage-deflate')
-+const { MessageSizeExceededError } = require('../../core/errors')
- 
-+function failWebsocketConnectionWithCode (ws, code, reason) {
-+  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
-+  failWebsocketConnection(ws, reason)
-+}
-+
- // This code was influenced by ws released under the MIT license.
- // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
- // Copyright (c) 2013 Arnout Kazemier and contributors
-@@ -26,6 +32,7 @@
- 
- class ByteParser extends Writable {
-   #buffers = []
-+  #fragmentsBytes = 0
-   #byteOffset = 0
-   #loop = false
- 
-@@ -37,14 +44,27 @@
-   /** @type {Map<string, PerMessageDeflate>} */
-   #extensions
- 
--  constructor (ws, extensions) {
-+  /** @type {number} */
-+  #maxFragments
-+
-+  /** @type {number} */
-+  #maxPayloadSize
-+
-+  /**
-+   * @param {import('./websocket').WebSocket} ws
-+   * @param {Map<string, string>|null} extensions
-+   * @param {{ maxFragments?: number, maxPayloadSize?: number }} [options]
-+   */
-+  constructor (ws, extensions, options = {}) {
-     super()
- 
-     this.ws = ws
-     this.#extensions = extensions == null ? new Map() : extensions
-+    this.#maxFragments = options.maxFragments ?? 0
-+    this.#maxPayloadSize = options.maxPayloadSize ?? 0
- 
-     if (this.#extensions.has('permessage-deflate')) {
--      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
-+      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
-     }
-   }
- 
-@@ -60,6 +80,19 @@
-     this.run(callback)
-   }
- 
-+  #validatePayloadLength () {
-+    if (
-+      this.#maxPayloadSize > 0 &&
-+      !isControlFrame(this.#info.opcode) &&
-+      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
-+    ) {
-+      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
-+      return false
-+    }
-+
-+    return true
-+  }
-+
-   /**
-    * Runs whenever a new chunk is received.
-    * Callback is called whenever there are no more chunks buffering,
-@@ -163,6 +196,10 @@
-         this.#info.masked = masked
-         this.#info.fin = fin
-         this.#info.fragmented = fragmented
-+
-+        if (payloadLength <= 125 && !this.#validatePayloadLength()) {
-+          return
-+        }
-       } else if (this.#state === parserStates.PAYLOADLENGTH_16) {
-         if (this.#byteOffset < 2) {
-           return callback()
-@@ -172,6 +209,10 @@
- 
-         this.#info.payloadLength = buffer.readUInt16BE(0)
-         this.#state = parserStates.READ_DATA
-+
-+        if (!this.#validatePayloadLength()) {
-+          return
-+        }
-       } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
-         if (this.#byteOffset < 8) {
-           return callback()
-@@ -195,6 +236,10 @@
- 
-         this.#info.payloadLength = (upper << 8) + lower
-         this.#state = parserStates.READ_DATA
-+
-+        if (!this.#validatePayloadLength()) {
-+          return
-+        }
-       } else if (this.#state === parserStates.READ_DATA) {
-         if (this.#byteOffset < this.#info.payloadLength) {
-           return callback()
-@@ -207,28 +252,41 @@
-           this.#state = parserStates.INFO
-         } else {
-           if (!this.#info.compressed) {
--            this.#fragments.push(body)
-+            if (!this.writeFragments(body)) {
-+              return
-+            }
- 
-+            if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-+              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
-+              return
-+            }
-+
-             // If the frame is not fragmented, a message has been received.
-             // If the frame is fragmented, it will terminate with a fin bit set
-             // and an opcode of 0 (continuation), therefore we handle that when
-             // parsing continuation frames, not here.
-             if (!this.#info.fragmented && this.#info.fin) {
--              const fullMessage = Buffer.concat(this.#fragments)
--              websocketMessageReceived(this.ws, this.#info.binaryType, fullMessage)
--              this.#fragments.length = 0
-+              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
-             }
- 
-             this.#state = parserStates.INFO
-           } else {
-             this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
-               if (error) {
--                closeWebSocketConnection(this.ws, 1007, error.message, error.message.length)
-+                const code = error instanceof MessageSizeExceededError ? 1009 : 1007
-+                failWebsocketConnectionWithCode(this.ws, code, error.message)
-                 return
-               }
- 
--              this.#fragments.push(data)
-+              if (!this.writeFragments(data)) {
-+                return
-+              }
- 
-+              if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
-+                failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
-+                return
-+              }
-+
-               if (!this.#info.fin) {
-                 this.#state = parserStates.INFO
-                 this.#loop = true
-@@ -236,11 +294,10 @@
-                 return
-               }
- 
--              websocketMessageReceived(this.ws, this.#info.binaryType, Buffer.concat(this.#fragments))
-+              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
- 
-               this.#loop = true
-               this.#state = parserStates.INFO
--              this.#fragments.length = 0
-               this.run(callback)
-             })
- 
-@@ -292,6 +349,35 @@
-     this.#byteOffset -= n
- 
-     return buffer
-+  }
-+
-+  writeFragments (fragment) {
-+    if (
-+      this.#maxFragments > 0 &&
-+      this.#fragments.length === this.#maxFragments
-+    ) {
-+      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
-+      return false
-+    }
-+
-+    this.#fragmentsBytes += fragment.length
-+    this.#fragments.push(fragment)
-+    return true
-+  }
-+
-+  consumeFragments () {
-+    const fragments = this.#fragments
-+
-+    if (fragments.length === 1) {
-+      this.#fragmentsBytes = 0
-+      return fragments.shift()
-+    }
-+
-+    const output = Buffer.concat(fragments, this.#fragmentsBytes)
-+    this.#fragments = []
-+    this.#fragmentsBytes = 0
-+
-+    return output
-   }
- 
-   parseCloseBody (data) {
---- a/lib/web/websocket/websocket.js
-+++ b/lib/web/websocket/websocket.js
-@@ -433,7 +433,14 @@
-     // once this happens, the connection is open
-     this[kResponse] = response
- 
--    const parser = new ByteParser(this, parsedExtensions)
-+    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
-+    const maxFragments = webSocketOptions?.maxFragments
-+    const maxPayloadSize = webSocketOptions?.maxPayloadSize
-+
-+    const parser = new ByteParser(this, parsedExtensions, {
-+      maxFragments,
-+      maxPayloadSize
-+    })
-     parser.on('drain', onParserDrain)
-     parser.on('error', onParserError.bind(this))
- 
+     /*! formdata-polyfill. MIT License. Jimmy Wärting <https://jimmy.warting.se/opensource> */
 
 --- a/lib/core/request.js
 +++ b/lib/core/request.js
@@ -359,76 +50,52 @@
      if (!Number.isFinite(request.contentLength)) {
        throw new InvalidArgumentError('invalid content-length header')
 
---- a/docs/docs/api/Errors.md
-+++ b/docs/docs/api/Errors.md
-@@ -27,6 +27,7 @@ import { errors } from 'undici'
- | `InformationalError`                 | `UND_ERR_INFO`                        | expected error with reason                                                |
- | `ResponseExceededMaxSizeError`       | `UND_ERR_RES_EXCEEDED_MAX_SIZE`       | response body exceed the max size allowed                                 |
- | `SecureProxyConnectionError`         | `UND_ERR_PRX_TLS`                     | tls connection to a proxy failed                                          |
-+| `MessageSizeExceededError`           | `UND_ERR_WS_MESSAGE_SIZE_EXCEEDED`    | WebSocket decompressed message exceeded the maximum allowed size          |
+--- a/lib/core/errors.js
++++ b/lib/core/errors.js
+@@ -217,6 +217,15 @@ class SecureProxyConnectionError extends UndiciError {
+   }
+ }
 
- ### `SocketError`
-
---- a/docs/docs/api/WebSocket.md
-+++ b/docs/docs/api/WebSocket.md
-@@ -13,6 +13,15 @@ Arguments:
- * **url** `URL | string` - The url's protocol *must* be `ws` or `wss`.
- * **protocol** `string | string[] | WebSocketInit` (optional) - Subprotocol(s) to request the server use, or a [`Dispatcher`](./Dispatcher.md).
-
-+### WebSocketInit
++class MessageSizeExceededError extends UndiciError {
++  constructor (message) {
++    super(message)
++    this.name = 'MessageSizeExceededError'
++    this.message = message || 'Max decompressed message size exceeded'
++    this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
++  }
++}
 +
-+When passing an object as the second argument, the following options are available:
-+
-+* **protocols** `string | string[]` (optional) - Subprotocol(s) to request the server use.
-+* **dispatcher** `Dispatcher` (optional) - A custom [`Dispatcher`](/docs/docs/api/Dispatcher.md) to use for the connection.
-+* **headers** `HeadersInit` (optional) - Custom headers to include in the WebSocket handshake request.
-+* **maxDecompressedMessageSize** `number` (optional) - Maximum allowed size in bytes for decompressed messages when using the `permessage-deflate` extension. **Default:** `4194304` (4 MB).
-+
- ### Example:
-
- This example will not work in browsers or other platforms that don't allow passing an object.
-@@ -35,6 +44,20 @@ import { WebSocket } from 'undici'
-
- const ws = new WebSocket('wss://echo.websocket.events', ['echo', 'chat'])
- ```
-+
-+### Example with custom decompression limit:
-+
-+To protect against decompression bombs (small compressed payloads that expand to very large sizes), you can set a custom limit:
-+
-+```mjs
-+import { WebSocket } from 'undici'
-+
-+const ws = new WebSocket('wss://echo.websocket.events', {
-+  maxDecompressedMessageSize: 1 * 1024 * 1024
-+})
-+```
-+
-+> ⚠️ **Security Note**: The `maxDecompressedMessageSize` option protects against memory exhaustion attacks where a malicious server sends a small compressed payload that decompresses to an extremely large size. If you increase this limit significantly above the default, ensure your application can handle the increased memory usage.
-
- ## Read More
-
+ module.exports = {
+   AbortError,
+   HTTPParserError,
+@@ -241,4 +250,5 @@ module.exports = {
+   RequestRetryError,
+   ResponseError,
+-  SecureProxyConnectionError
++  SecureProxyConnectionError,
++  MessageSizeExceededError
+ }
 --- a/lib/web/websocket/permessage-deflate.js
 +++ b/lib/web/websocket/permessage-deflate.js
 @@ -2,20 +2,38 @@
- 
+
  const { createInflateRaw, Z_DEFAULT_WINDOWBITS } = require('node:zlib')
  const { isValidClientWindowBits } = require('./util')
 +const { MessageSizeExceededError } = require('../../core/errors')
- 
+
  const tail = Buffer.from([0x00, 0x00, 0xff, 0xff])
  const kBuffer = Symbol('kBuffer')
  const kLength = Symbol('kLength')
- 
+
 +// Default maximum decompressed message size: 4 MB
 +const kDefaultMaxDecompressedSize = 4 * 1024 * 1024
 +
  class PerMessageDeflate {
    /** @type {import('node:zlib').InflateRaw} */
    #inflate
- 
+
    #options = {}
- 
+
 -  constructor (extensions) {
 +  /** @type {number} */
 +  #maxDecompressedSize
@@ -448,12 +115,12 @@
      this.#options.serverMaxWindowBits = extensions.get('server_max_window_bits')
 +    this.#maxDecompressedSize = options.maxDecompressedMessageSize ?? kDefaultMaxDecompressedSize
    }
- 
+
    decompress (chunk, fin, callback) {
-@@ -24,6 +42,11 @@ class PerMessageDeflate {
+@@ -24,6 +42,11 @@
      //     payload of the message.
      // 2.  Decompress the resulting data using DEFLATE.
- 
+
 +    if (this.#aborted) {
 +      callback(new MessageSizeExceededError())
 +      return
@@ -461,10 +128,10 @@
 +
      if (!this.#inflate) {
        let windowBits = Z_DEFAULT_WINDOWBITS
- 
-@@ -41,8 +64,27 @@ class PerMessageDeflate {
+
+@@ -41,8 +64,27 @@
        this.#inflate[kLength] = 0
- 
+
        this.#inflate.on('data', (data) => {
 -        this.#inflate[kBuffer].push(data)
 +        if (this.#aborted) {
@@ -489,47 +156,94 @@
 +
 +        this.#inflate[kBuffer].push(data)
        })
- 
+
        this.#inflate.on('error', (err) => {
-@@ -51,16 +93,22 @@ class PerMessageDeflate {
+@@ -51,16 +93,22 @@
        })
      }
- 
+
 +    this.#currentCallback = callback
      this.#inflate.write(chunk)
      if (fin) {
        this.#inflate.write(tail)
      }
- 
+
      this.#inflate.flush(() => {
 +      if (this.#aborted || !this.#inflate) {
 +        return
 +      }
 +
        const full = Buffer.concat(this.#inflate[kBuffer], this.#inflate[kLength])
- 
+
        this.#inflate[kBuffer].length = 0
        this.#inflate[kLength] = 0
 +      this.#currentCallback = null
- 
+
        callback(null, full)
      })
+--- a/lib/web/websocket/receiver.js
++++ b/lib/web/websocket/receiver.js
+@@ -18,6 +18,7 @@
+ const { WebsocketFrameSend } = require('./frame')
+ const { closeWebSocketConnection } = require('./connection')
+ const { PerMessageDeflate } = require('./permessage-deflate')
++const { MessageSizeExceededError } = require('../../core/errors')
+
+ // This code was influenced by ws released under the MIT license.
+ // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
+@@ -37,14 +38,23 @@
+   /** @type {Map<string, PerMessageDeflate>} */
+   #extensions
+
+-  constructor (ws, extensions) {
++  /** @type {{ maxDecompressedMessageSize?: number }} */
++  #options
++
++  /**
++   * @param {import('./websocket').WebSocket} ws
++   * @param {Map<string, string>|null} extensions
++   * @param {{ maxDecompressedMessageSize?: number }} [options]
++   */
++  constructor (ws, extensions, options = {}) {
+     super()
+
+     this.ws = ws
+     this.#extensions = extensions == null ? new Map() : extensions
++    this.#options = options
+
+     if (this.#extensions.has('permessage-deflate')) {
+-      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions))
++      this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
+     }
+   }
+
+@@ -223,7 +233,9 @@
+           } else {
+             this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
+               if (error) {
+-                closeWebSocketConnection(this.ws, 1007, error.message, error.message.length)
++                // Use 1009 (Message Too Big) for decompression size limit errors
++                const code = error instanceof MessageSizeExceededError ? 1009 : 1007
++                closeWebSocketConnection(this.ws, code, error.message, error.message.length)
+                 return
+               }
+
 --- a/lib/web/websocket/websocket.js
 +++ b/lib/web/websocket/websocket.js
-@@ -44,6 +44,9 @@ class WebSocket extends EventTarget {
+@@ -44,6 +44,9 @@
    /** @type {SendQueue} */
    #sendQueue
- 
+
 +  /** @type {{ maxDecompressedMessageSize?: number }} */
 +  #options
 +
    /**
     * @param {string} url
     * @param {string|string[]} protocols
-@@ -115,6 +118,11 @@ class WebSocket extends EventTarget {
+@@ -117,6 +120,11 @@
      // 10. Set this's url to urlRecord.
      this[kWebSocketURL] = new URL(urlRecord.href)
- 
+
 +    // Store options for later use (e.g., maxDecompressedMessageSize)
 +    this.#options = {
 +      maxDecompressedMessageSize: options.maxDecompressedMessageSize
@@ -537,21 +251,20 @@
 +
      // 11. Let client be this's relevant settings object.
      const client = environmentSettingsObject.settingsObject
- 
-@@ -439,7 +447,8 @@ class WebSocket extends EventTarget {
- 
-     const parser = new ByteParser(this, parsedExtensions, {
-       maxFragments,
--      maxPayloadSize
-+      maxPayloadSize,
-+      maxDecompressedMessageSize: this.#options.maxDecompressedMessageSize
-     })
+
+@@ -436,6 +444,6 @@
+     this[kResponse] = response
+
+-    const parser = new ByteParser(this, parsedExtensions)
++    const parser = new ByteParser(this, parsedExtensions, this.#options)
      parser.on('drain', onParserDrain)
      parser.on('error', onParserError.bind(this))
-@@ -543,6 +552,19 @@ webidl.converters.WebSocketInit = webidl.dictionaryConverter([
+
+@@ -538,7 +546,20 @@
    {
      key: 'headers',
      converter: webidl.nullableConverter(webidl.converters.HeadersInit)
+-  }
 +  },
 +  {
 +    key: 'maxDecompressedMessageSize',
@@ -565,12 +278,13 @@
 +      }
 +      return V
 +    })
-   }
++  }
  ])
- 
+
+ webidl.converters['DOMString or sequence<DOMString> or WebSocketInit'] = function (V) {
 --- a/types/errors.d.ts
 +++ b/types/errors.d.ts
-@@ -146,4 +146,10 @@ declare namespace Errors {
+@@ -146,4 +146,10 @@
      name: 'SecureProxyConnectionError';
      code: 'UND_ERR_PRX_TLS';
    }
@@ -583,7 +297,7 @@
  }
 --- a/types/websocket.d.ts
 +++ b/types/websocket.d.ts
-@@ -146,5 +146,12 @@ export declare const ErrorEvent: {
+@@ -146,5 +146,12 @@
  interface WebSocketInit {
    protocols?: string | string[],
    dispatcher?: Dispatcher,
@@ -597,290 +311,220 @@
 +   */
 +  maxDecompressedMessageSize?: number
  }
+
+Description: Fix CVE-2026-1527 CRLF injection in upgrade header
+ Add validation for the upgrade option in Request constructor using
+ isValidHeaderValue() to prevent CRLF injection attacks that could
+ enable protocol smuggling to internal services such as Redis,
+ Memcached, or Elasticsearch.
+Origin: upstream, https://github.com/nodejs/undici/commit/77594f923cef4c27ee0bad365e7b4c44a199edae
+Author: Matteo Collina <hello@matteocollina.com>
+Bug: https://github.com/nodejs/undici/security/advisories/GHSA-4992-7rv2-5pvq
+CVE: CVE-2026-1527
+
+--- a/lib/core/request.js
++++ b/lib/core/request.js
+@@ -66,6 +66,10 @@
+       throw new InvalidArgumentError('upgrade must be a string')
+     }
+ 
++    if (upgrade && !isValidHeaderValue(upgrade)) {
++      throw new InvalidArgumentError('invalid upgrade header')
++    }
++
+     if (headersTimeout != null && (!Number.isFinite(headersTimeout) || headersTimeout < 0)) {
+       throw new InvalidArgumentError('invalid headersTimeout')
+     }
 --- /dev/null
-+++ b/test/websocket/permessage-deflate-limit.js
-@@ -0,0 +1,282 @@
++++ b/test/upgrade-crlf.js
+@@ -0,0 +1,188 @@
 +'use strict'
 +
-+const { test } = require('node:test')
-+const { once } = require('node:events')
-+const http = require('node:http')
-+const crypto = require('node:crypto')
-+const zlib = require('node:zlib')
-+const { WebSocketServer } = require('ws')
-+const { WebSocket } = require('../..')
++const { tspl } = require('@matteo.collina/tspl')
++const { test, after } = require('node:test')
++const { Client, errors } = require('..')
++const net = require('node:net')
 +
-+/**
-+ * Creates a WebSocket frame.
-+ * @param {object} options
-+ * @param {number} options.opcode - Frame opcode (1=text, 2=binary)
-+ * @param {boolean} options.fin - Final frame flag
-+ * @param {boolean} options.rsv1 - RSV1 flag (compression)
-+ * @param {Buffer} options.payload - Frame payload
-+ * @returns {Buffer}
-+ */
-+function createWebSocketFrame ({ opcode, fin = true, rsv1 = false, payload }) {
-+  const payloadLength = payload.length
-+  let headerLength = 2
++test('CRLF injection in upgrade header via CRLF sequence', async (t) => {
++  t = tspl(t, { plan: 2 })
 +
-+  if (payloadLength > 65535) {
-+    headerLength += 8
-+  } else if (payloadLength > 125) {
-+    headerLength += 2
-+  }
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
 +
-+  const header = Buffer.alloc(headerLength)
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
 +
-+  // First byte: FIN + RSV1 + opcode
-+  header[0] = (fin ? 0x80 : 0x00) | (rsv1 ? 0x40 : 0x00) | opcode
-+
-+  // Second byte: MASK (0) + payload length
-+  if (payloadLength > 65535) {
-+    header[1] = 127
-+    header.writeBigUInt64BE(BigInt(payloadLength), 2)
-+  } else if (payloadLength > 125) {
-+    header[1] = 126
-+    header.writeUInt16BE(payloadLength, 2)
-+  } else {
-+    header[1] = payloadLength
-+  }
-+
-+  return Buffer.concat([header, payload])
-+}
-+
-+/**
-+ * Creates a compressed payload using DEFLATE raw.
-+ * @param {number} targetSize - Target decompressed size in bytes
-+ * @returns {Buffer}
-+ */
-+function createCompressedPayload (targetSize) {
-+  // Create highly compressible data (repeated 'A' characters)
-+  const data = Buffer.alloc(targetSize, 0x41)
-+  return zlib.deflateRawSync(data)
-+}
-+
-+test('Compressed message under limit decompresses successfully', async (t) => {
-+  const server = new WebSocketServer({
-+    port: 0,
-+    perMessageDeflate: true
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\r\n\r\nSET pwned true'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
 +  })
 +
-+  t.after(() => server.close())
-+
-+  await once(server, 'listening')
-+
-+  server.on('connection', (ws) => {
-+    // Send 1 KB of data (well under any reasonable limit)
-+    ws.send(Buffer.alloc(1024, 0x41), { binary: true })
-+  })
-+
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`)
-+
-+  const [event] = await once(client, 'message')
-+  t.assert.strictEqual(event.data.size, 1024)
-+  client.close()
++  await t.completed
 +})
 +
-+test('Custom maxDecompressedMessageSize is enforced', async (t) => {
-+  const server = new WebSocketServer({
-+    port: 0,
-+    perMessageDeflate: true
++test('CRLF injection in upgrade header via lone CR', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\rinjected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
 +  })
 +
-+  t.after(() => server.close())
-+
-+  await once(server, 'listening')
-+
-+  let messageReceived = false
-+
-+  server.on('connection', (ws) => {
-+    // Send 2 MB of data
-+    ws.send(Buffer.alloc(2 * 1024 * 1024, 0x41), { binary: true })
-+  })
-+
-+  // Set custom limit of 1 MB
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, {
-+    maxDecompressedMessageSize: 1 * 1024 * 1024
-+  })
-+
-+  client.addEventListener('message', () => {
-+    messageReceived = true
-+  })
-+
-+  // Wait for the connection to close
-+  await once(client, 'close')
-+
-+  // The message should NOT have been received due to size limit
-+  t.assert.strictEqual(messageReceived, false)
++  await t.completed
 +})
 +
-+test('Message exactly at limit succeeds', async (t) => {
-+  const limit = 1 * 1024 * 1024 // 1 MB
-+  const server = new WebSocketServer({
-+    port: 0,
-+    perMessageDeflate: true
++test('CRLF injection in upgrade header via lone LF', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\ninjected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
 +  })
 +
-+  t.after(() => server.close())
-+
-+  await once(server, 'listening')
-+
-+  server.on('connection', (ws) => {
-+    ws.send(Buffer.alloc(limit, 0x41), { binary: true })
-+  })
-+
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, {
-+    maxDecompressedMessageSize: limit
-+  })
-+
-+  const [event] = await once(client, 'message')
-+  t.assert.strictEqual(event.data.size, limit)
-+  client.close()
++  await t.completed
 +})
 +
-+test('Message one byte over limit fails', async (t) => {
-+  const limit = 1 * 1024 * 1024 // 1 MB
-+  const server = new WebSocketServer({
-+    port: 0,
-+    perMessageDeflate: true
++test('CRLF injection in upgrade header via null byte', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.upgrade({
++        path: '/',
++        method: 'GET',
++        protocol: 'websocket\0injected'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
 +  })
 +
-+  t.after(() => server.close())
-+
-+  await once(server, 'listening')
-+
-+  server.on('connection', (ws) => {
-+    ws.send(Buffer.alloc(limit + 1, 0x41), { binary: true })
-+  })
-+
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, {
-+    maxDecompressedMessageSize: limit
-+  })
-+
-+  const [event] = await once(client, 'error')
-+  t.assert.ok(event.error instanceof Error)
++  await t.completed
 +})
 +
-+test('Connection closes when limit exceeded', async (t) => {
-+  const server = new WebSocketServer({
-+    port: 0,
-+    perMessageDeflate: true
++test('CRLF injection in upgrade option via client.request', async (t) => {
++  t = tspl(t, { plan: 2 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    try {
++      await client.request({
++        path: '/',
++        method: 'GET',
++        upgrade: 'websocket\r\n\r\nGET /smuggled HTTP/1.1'
++      })
++      t.fail('should have thrown')
++    } catch (err) {
++      t.ok(err instanceof errors.InvalidArgumentError)
++      t.strictEqual(err.message, 'invalid upgrade header')
++    }
 +  })
 +
-+  t.after(() => server.close())
-+
-+  await once(server, 'listening')
-+
-+  server.on('connection', (ws) => {
-+    ws.send(Buffer.alloc(2 * 1024 * 1024, 0x41), { binary: true })
-+  })
-+
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, {
-+    maxDecompressedMessageSize: 1 * 1024 * 1024
-+  })
-+
-+  const [event] = await once(client, 'close')
-+  // Connection should be closed - code 1006 (abnormal) or 1009 (too big)
-+  t.assert.ok(event.code === 1006 || event.code === 1009)
++  await t.completed
 +})
 +
-+test('Non-compressed messages are not affected by decompression limit', async (t) => {
-+  const server = new WebSocketServer({
-+    port: 0,
-+    perMessageDeflate: false // Compression disabled
++test('valid upgrade value is accepted', async (t) => {
++  t = tspl(t, { plan: 1 })
++
++  const server = net.createServer({ joinDuplicateHeaders: true }, (c) => {
++    c.on('data', () => {
++      c.write('HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')
++    })
++    c.on('error', () => {})
++  })
++  after(() => server.close())
++
++  server.listen(0, async () => {
++    const client = new Client(`http://localhost:${server.address().port}`)
++    after(() => client.close())
++
++    const { socket } = await client.upgrade({
++      path: '/',
++      method: 'GET',
++      protocol: 'websocket'
++    })
++    t.ok(socket)
++    socket.destroy()
 +  })
 +
-+  t.after(() => server.close())
-+
-+  await once(server, 'listening')
-+
-+  server.on('connection', (ws) => {
-+    ws.send(Buffer.alloc(2 * 1024 * 1024, 0x41), { binary: true })
-+  })
-+
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, {
-+    maxDecompressedMessageSize: 1 * 1024 * 1024
-+  })
-+
-+  // Should succeed because compression is not used
-+  const [event] = await once(client, 'message')
-+  t.assert.strictEqual(event.data.size, 2 * 1024 * 1024)
-+  client.close()
-+})
-+
-+test('Decompression bomb is mitigated via raw WebSocket handshake', async (t) => {
-+  // This test validates the fix using a technique similar to the original PoC
-+  // by creating a minimal malicious server that sends a compressed payload
-+  const server = http.createServer()
-+
-+  let messageReceived = false
-+
-+  server.on('upgrade', (req, socket) => {
-+    const key = req.headers['sec-websocket-key']
-+    const accept = crypto
-+      .createHash('sha1')
-+      .update(key + '258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
-+      .digest('base64')
-+
-+    socket.write([
-+      'HTTP/1.1 101 Switching Protocols',
-+      'Upgrade: websocket',
-+      'Connection: Upgrade',
-+      `Sec-WebSocket-Accept: ${accept}`,
-+      'Sec-WebSocket-Extensions: permessage-deflate',
-+      '', ''
-+    ].join('\r\n'))
-+
-+    // Send a small payload that decompresses to ~10 MB
-+    setTimeout(() => {
-+      const bomb = createCompressedPayload(10 * 1024 * 1024)
-+      const frame = createWebSocketFrame({ opcode: 2, rsv1: true, payload: bomb })
-+      socket.write(frame)
-+    }, 100)
-+  })
-+
-+  await new Promise(resolve => server.listen(0, resolve))
-+  t.after(() => server.close())
-+
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, {
-+    maxDecompressedMessageSize: 1 * 1024 * 1024 // 1 MB limit
-+  })
-+
-+  client.addEventListener('message', () => {
-+    messageReceived = true
-+  })
-+
-+  // Wait for the connection to close
-+  await once(client, 'close')
-+
-+  // The message should NOT have been received due to size limit
-+  t.assert.strictEqual(messageReceived, false)
-+})
-+
-+test('Higher custom limit allows larger messages', async (t) => {
-+  const server = new WebSocketServer({
-+    port: 0,
-+    perMessageDeflate: true
-+  })
-+
-+  t.after(() => server.close())
-+
-+  await once(server, 'listening')
-+
-+  const dataSize = 5 * 1024 * 1024 // 5 MB
-+
-+  server.on('connection', (ws) => {
-+    ws.send(Buffer.alloc(dataSize, 0x41), { binary: true })
-+  })
-+
-+  // Set custom limit of 10 MB
-+  const client = new WebSocket(`ws://127.0.0.1:${server.address().port}`, {
-+    maxDecompressedMessageSize: 10 * 1024 * 1024
-+  })
-+
-+  const [event] = await once(client, 'message')
-+  t.assert.strictEqual(event.data.size, dataSize)
-+  client.close()
++  await t.completed
 +})
 
 --- a/lib/web/websocket/receiver.js
@@ -910,25 +554,6 @@
          this.#state = parserStates.READ_DATA
        } else if (this.#state === parserStates.READ_DATA) {
          if (this.#byteOffset < this.#info.payloadLength) {
-
---- a/lib/web/fetch/index.js
-+++ b/lib/web/fetch/index.js
-@@ -2126,6 +2126,15 @@
-             // "All content-coding values are case-insensitive..."
-             codings = contentEncoding.toLowerCase().split(',').map((x) => x.trim())
-           }
-+
-+          // Limit the number of content-encodings to prevent resource exhaustion.
-+          // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
-+          const maxContentEncodings = 5
-+          if (codings.length > maxContentEncodings) {
-+            reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
-+            return true
-+          }
-+
-           location = headersList.get('location', true)
-
-           this.body = new Readable({ read: resume })
 
 --- a/lib/web/websocket/permessage-deflate.js
 +++ b/lib/web/websocket/permessage-deflate.js
@@ -1217,3 +842,397 @@
 +    t.assert.ok(true, 'Process did not crash')
 +  })
 +})
+
+--- a/lib/web/cookies/parse.js
++++ b/lib/web/cookies/parse.js
+@@ -275,32 +275,25 @@ function parseUnparsedAttributes (unparsedAttributes, cookieAttributeList = {})
+     // If the attribute-name case-insensitively matches the string
+     // "SameSite", the user agent MUST process the cookie-av as follows:
+
+-    // 1. Let enforcement be "Default".
+-    let enforcement = 'Default'
+-
+     const attributeValueLowercase = attributeValue.toLowerCase()
+-    // 2. If cookie-av's attribute-value is a case-insensitive match for
+-    //    "None", set enforcement to "None".
+-    if (attributeValueLowercase.includes('none')) {
+-      enforcement = 'None'
+-    }
+
+-    // 3. If cookie-av's attribute-value is a case-insensitive match for
+-    //    "Strict", set enforcement to "Strict".
+-    if (attributeValueLowercase.includes('strict')) {
+-      enforcement = 'Strict'
++    // 1. If cookie-av's attribute-value is a case-insensitive match for
++    //    "None", append an attribute to the cookie-attribute-list with an
++    //    attribute-name of "SameSite" and an attribute-value of "None".
++    if (attributeValueLowercase === 'none') {
++      cookieAttributeList.sameSite = 'None'
++    } else if (attributeValueLowercase === 'strict') {
++      // 2. If cookie-av's attribute-value is a case-insensitive match for
++      //    "Strict", append an attribute to the cookie-attribute-list with
++      //    an attribute-name of "SameSite" and an attribute-value of
++      //    "Strict".
++      cookieAttributeList.sameSite = 'Strict'
++    } else if (attributeValueLowercase === 'lax') {
++      // 3. If cookie-av's attribute-value is a case-insensitive match for
++      //    "Lax", append an attribute to the cookie-attribute-list with an
++      //    attribute-name of "SameSite" and an attribute-value of "Lax".
++      cookieAttributeList.sameSite = 'Lax'
+     }
+-
+-    // 4. If cookie-av's attribute-value is a case-insensitive match for
+-    //    "Lax", set enforcement to "Lax".
+-    if (attributeValueLowercase.includes('lax')) {
+-      enforcement = 'Lax'
+-    }
+-
+-    // 5. Append an attribute to the cookie-attribute-list with an
+-    //    attribute-name of "SameSite" and an attribute-value of
+-    //    enforcement.
+-    cookieAttributeList.sameSite = enforcement
+   } else {
+     cookieAttributeList.unparsed ??= []
+
+
+--- a/lib/core/errors.js
++++ b/lib/core/errors.js
+@@ -217,6 +217,7 @@
+   }
+ }
+ 
++const kMessageSizeExceededError = Symbol.for('undici.error.UND_ERR_WS_MESSAGE_SIZE_EXCEEDED')
+ class MessageSizeExceededError extends UndiciError {
+   constructor (message) {
+     super(message)
+@@ -224,6 +225,14 @@
+     this.message = message || 'Max decompressed message size exceeded'
+     this.code = 'UND_ERR_WS_MESSAGE_SIZE_EXCEEDED'
+   }
++
++  static [Symbol.hasInstance] (instance) {
++    return instance && instance[kMessageSizeExceededError] === true
++  }
++
++  get [kMessageSizeExceededError] () {
++    return true
++  }
+ }
+ 
+ module.exports = {
+--- a/lib/dispatcher/agent.js
++++ b/lib/dispatcher/agent.js
+@@ -24,7 +24,7 @@
+ 
+ class Agent extends DispatcherBase {
+   constructor ({ factory = defaultFactory, maxRedirections = 0, connect, ...options } = {}) {
+-    super()
++    super(options)
+ 
+     if (typeof factory !== 'function') {
+       throw new InvalidArgumentError('factory must be a function.')
+--- a/lib/dispatcher/client.js
++++ b/lib/dispatcher/client.js
+@@ -106,9 +106,10 @@
+     autoSelectFamilyAttemptTimeout,
+     // h2
+     maxConcurrentStreams,
+-    allowH2
++    allowH2,
++    webSocket
+   } = {}) {
+-    super()
++    super({ webSocket })
+ 
+     if (keepAlive !== undefined) {
+       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
+--- a/lib/dispatcher/dispatcher-base.js
++++ b/lib/dispatcher/dispatcher-base.js
+@@ -11,15 +11,24 @@
+ const kOnDestroyed = Symbol('onDestroyed')
+ const kOnClosed = Symbol('onClosed')
+ const kInterceptedDispatch = Symbol('Intercepted Dispatch')
++const kWebSocketOptions = Symbol('webSocketOptions')
+ 
+ class DispatcherBase extends Dispatcher {
+-  constructor () {
++  constructor (opts) {
+     super()
+ 
+     this[kDestroyed] = false
+     this[kOnDestroyed] = null
+     this[kClosed] = false
+     this[kOnClosed] = []
++    this[kWebSocketOptions] = opts?.webSocket ?? {}
++  }
++
++  get webSocketOptions () {
++    return {
++      maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
++      maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024
++    }
+   }
+ 
+   get destroyed () {
+--- a/lib/dispatcher/pool-base.js
++++ b/lib/dispatcher/pool-base.js
+@@ -19,8 +19,8 @@
+ const kStats = Symbol('stats')
+ 
+ class PoolBase extends DispatcherBase {
+-  constructor () {
+-    super()
++  constructor (opts) {
++    super(opts)
+ 
+     this[kQueue] = new FixedQueue()
+     this[kClients] = []
+--- a/lib/dispatcher/pool.js
++++ b/lib/dispatcher/pool.js
+@@ -37,7 +37,7 @@
+     allowH2,
+     ...options
+   } = {}) {
+-    super()
++    super(options)
+ 
+     if (connections != null && (!Number.isFinite(connections) || connections < 0)) {
+       throw new InvalidArgumentError('invalid connections')
+--- a/lib/web/websocket/receiver.js
++++ b/lib/web/websocket/receiver.js
+@@ -20,6 +20,11 @@
+ const { PerMessageDeflate } = require('./permessage-deflate')
+ const { MessageSizeExceededError } = require('../../core/errors')
+ 
++function failWebsocketConnectionWithCode (ws, code, reason) {
++  closeWebSocketConnection(ws, code, reason, Buffer.byteLength(reason))
++  failWebsocketConnection(ws, reason)
++}
++
+ // This code was influenced by ws released under the MIT license.
+ // Copyright (c) 2011 Einar Otto Stangvik <einaros@gmail.com>
+ // Copyright (c) 2013 Arnout Kazemier and contributors
+@@ -27,6 +32,7 @@
+ 
+ class ByteParser extends Writable {
+   #buffers = []
++  #fragmentsBytes = 0
+   #byteOffset = 0
+   #loop = false
+ 
+@@ -38,13 +44,19 @@
+   /** @type {Map<string, PerMessageDeflate>} */
+   #extensions
+ 
+-  /** @type {{ maxDecompressedMessageSize?: number }} */
++  /** @type {{ maxDecompressedMessageSize?: number, maxFragments?: number, maxPayloadSize?: number }} */
+   #options
+ 
++  /** @type {number} */
++  #maxFragments
++
++  /** @type {number} */
++  #maxPayloadSize
++
+   /**
+    * @param {import('./websocket').WebSocket} ws
+    * @param {Map<string, string>|null} extensions
+-   * @param {{ maxDecompressedMessageSize?: number }} [options]
++   * @param {{ maxDecompressedMessageSize?: number, maxFragments?: number, maxPayloadSize?: number }} [options]
+    */
+   constructor (ws, extensions, options = {}) {
+     super()
+@@ -52,6 +64,8 @@
+     this.ws = ws
+     this.#extensions = extensions == null ? new Map() : extensions
+     this.#options = options
++    this.#maxFragments = options.maxFragments ?? 0
++    this.#maxPayloadSize = options.maxPayloadSize ?? 0
+ 
+     if (this.#extensions.has('permessage-deflate')) {
+       this.#extensions.set('permessage-deflate', new PerMessageDeflate(extensions, options))
+@@ -70,6 +84,19 @@
+     this.run(callback)
+   }
+ 
++  #validatePayloadLength () {
++    if (
++      this.#maxPayloadSize > 0 &&
++      !isControlFrame(this.#info.opcode) &&
++      this.#info.payloadLength + this.#fragmentsBytes > this.#maxPayloadSize
++    ) {
++      failWebsocketConnectionWithCode(this.ws, 1009, 'Payload size exceeds maximum allowed size')
++      return false
++    }
++
++    return true
++  }
++
+   /**
+    * Runs whenever a new chunk is received.
+    * Callback is called whenever there are no more chunks buffering,
+@@ -173,6 +200,10 @@
+         this.#info.masked = masked
+         this.#info.fin = fin
+         this.#info.fragmented = fragmented
++
++        if (payloadLength <= 125 && !this.#validatePayloadLength()) {
++          return
++        }
+       } else if (this.#state === parserStates.PAYLOADLENGTH_16) {
+         if (this.#byteOffset < 2) {
+           return callback()
+@@ -182,6 +213,10 @@
+ 
+         this.#info.payloadLength = buffer.readUInt16BE(0)
+         this.#state = parserStates.READ_DATA
++
++        if (!this.#validatePayloadLength()) {
++          return
++        }
+       } else if (this.#state === parserStates.PAYLOADLENGTH_64) {
+         if (this.#byteOffset < 8) {
+           return callback()
+@@ -204,6 +239,10 @@
+ 
+         this.#info.payloadLength = lower
+         this.#state = parserStates.READ_DATA
++
++        if (!this.#validatePayloadLength()) {
++          return
++        }
+       } else if (this.#state === parserStates.READ_DATA) {
+         if (this.#byteOffset < this.#info.payloadLength) {
+           return callback()
+@@ -216,29 +255,40 @@
+           this.#state = parserStates.INFO
+         } else {
+           if (!this.#info.compressed) {
+-            this.#fragments.push(body)
++            if (!this.writeFragments(body)) {
++              return
++            }
++
++            if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
++              failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
++              return
++            }
+ 
+             // If the frame is not fragmented, a message has been received.
+             // If the frame is fragmented, it will terminate with a fin bit set
+             // and an opcode of 0 (continuation), therefore we handle that when
+             // parsing continuation frames, not here.
+             if (!this.#info.fragmented && this.#info.fin) {
+-              const fullMessage = Buffer.concat(this.#fragments)
+-              websocketMessageReceived(this.ws, this.#info.binaryType, fullMessage)
+-              this.#fragments.length = 0
++              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
+             }
+ 
+             this.#state = parserStates.INFO
+           } else {
+             this.#extensions.get('permessage-deflate').decompress(body, this.#info.fin, (error, data) => {
+               if (error) {
+-                // Use 1009 (Message Too Big) for decompression size limit errors
+                 const code = error instanceof MessageSizeExceededError ? 1009 : 1007
+-                closeWebSocketConnection(this.ws, code, error.message, error.message.length)
++                failWebsocketConnectionWithCode(this.ws, code, error.message)
+                 return
+               }
+ 
+-              this.#fragments.push(data)
++              if (!this.writeFragments(data)) {
++                return
++              }
++
++              if (this.#maxPayloadSize > 0 && this.#fragmentsBytes > this.#maxPayloadSize) {
++                failWebsocketConnectionWithCode(this.ws, 1009, new MessageSizeExceededError().message)
++                return
++              }
+ 
+               if (!this.#info.fin) {
+                 this.#state = parserStates.INFO
+@@ -247,11 +297,10 @@
+                 return
+               }
+ 
+-              websocketMessageReceived(this.ws, this.#info.binaryType, Buffer.concat(this.#fragments))
++              websocketMessageReceived(this.ws, this.#info.binaryType, this.consumeFragments())
+ 
+               this.#loop = true
+               this.#state = parserStates.INFO
+-              this.#fragments.length = 0
+               this.run(callback)
+             })
+ 
+@@ -305,6 +354,35 @@
+     return buffer
+   }
+ 
++  writeFragments (fragment) {
++    if (
++      this.#maxFragments > 0 &&
++      this.#fragments.length === this.#maxFragments
++    ) {
++      failWebsocketConnectionWithCode(this.ws, 1008, 'Too many message fragments')
++      return false
++    }
++
++    this.#fragmentsBytes += fragment.length
++    this.#fragments.push(fragment)
++    return true
++  }
++
++  consumeFragments () {
++    const fragments = this.#fragments
++
++    if (fragments.length === 1) {
++      this.#fragmentsBytes = 0
++      return fragments.shift()
++    }
++
++    const output = Buffer.concat(fragments, this.#fragmentsBytes)
++    this.#fragments = []
++    this.#fragmentsBytes = 0
++
++    return output
++  }
++
+   parseCloseBody (data) {
+     assert(data.length !== 1)
+ 
+--- a/lib/web/websocket/websocket.js
++++ b/lib/web/websocket/websocket.js
+@@ -441,7 +441,12 @@
+     // once this happens, the connection is open
+     this[kResponse] = response
+ 
+-    const parser = new ByteParser(this, parsedExtensions, this.#options)
++    const webSocketOptions = this[kController]?.dispatcher?.webSocketOptions
++    const parser = new ByteParser(this, parsedExtensions, {
++      maxFragments: webSocketOptions?.maxFragments,
++      maxPayloadSize: webSocketOptions?.maxPayloadSize,
++      maxDecompressedMessageSize: this.#options.maxDecompressedMessageSize
++    })
+     parser.on('drain', onParserDrain)
+     parser.on('error', onParserError.bind(this))
+ 
+
+--- a/lib/web/fetch/index.js
++++ b/lib/web/fetch/index.js
+@@ -2126,6 +2126,15 @@
+             // "All content-coding values are case-insensitive..."
+             codings = contentEncoding.toLowerCase().split(',').map((x) => x.trim())
+           }
++
++          // Limit the number of content-encodings to prevent resource exhaustion.
++          // CVE fix similar to urllib3 (GHSA-gm62-xv2j-4w53) and curl (CVE-2022-32206).
++          const maxContentEncodings = 5
++          if (codings.length > maxContentEncodings) {
++            reject(new Error(`too many content-encodings in response: ${codings.length}, maximum allowed is ${maxContentEncodings}`))
++            return true
++          }
++
+           location = headersList.get('location', true)
+
+           this.body = new Readable({ read: resume })
