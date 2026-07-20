@@ -1,581 +1,226 @@
-diff --git a/modules/pam_namespace/namespace.init b/modules/pam_namespace/namespace.init
-index 67d4aa2d..aa6d51de 100755
---- a/modules/pam_namespace/namespace.init
-+++ b/modules/pam_namespace/namespace.init
-@@ -1,25 +1,43 @@
- #!/bin/sh
--# It receives polydir path as $1, the instance path as $2,
--# a flag whether the instance dir was newly created (0 - no, 1 - yes) in $3,
--# and user name in $4.
-+# It receives as arguments:
-+# - $1 polydir path (see WARNING below)
-+# - $2 instance path (see WARNING below)
-+# - $3 flag whether the instance dir was newly created (0 - no, 1 - yes)
-+# - $4 user name
-+# - $5 flag whether the polydir path ($1) is safe (0 - unsafe, 1 -safe)
-+# - $6 flag whether the instance path ($2) is safe (0 - unsafe, 1 - safe)
-+#
-+# WARNING: This script is invoked with full root privileges. Accessing
-+# the polydir ($1) and the instance ($2) directories in this context may be
-+# extremely dangerous as those can be under user control. The flags $5 and $6
-+# are provided to let you know if all the segments part of the path (except the
-+# last one) are owned by root and are writable by root only. If the path does
-+# not meet these criteria, you expose yourself to possible symlink attacks when
-+# accessing these path.
-+# However, even if the path components are safe, the content of the
-+# directories may still be owned/writable by a user, so care must be taken!
- #
- # The following section will copy the contents of /etc/skel if this is a
- # newly created home directory.
--if [ "$3" = 1 ]; then
--        # This line will fix the labeling on all newly created directories
--        [ -x /sbin/restorecon ] && /sbin/restorecon "$1"
--        user="$4"
--        passwd=$(getent passwd "$user")
--        homedir=$(echo "$passwd" | cut -f6 -d":")
--        if [ "$1" = "$homedir" ]; then
--                gid=$(echo "$passwd" | cut -f4 -d":")
--                cp -rT /etc/skel "$homedir"
--                chown -R "$user":"$gid" "$homedir"
--                mask=$(awk '/^UMASK/{gsub("#.*$", "", $2); print $2; exit}' /etc/login.defs)
--                mode=$(printf "%o" $((0777 & ~$mask)))
--                chmod ${mode:-700} "$homedir"
--                [ -x /sbin/restorecon ] && /sbin/restorecon -R "$homedir"
--        fi
--fi
- 
-+# Executes only if the polydir path is safe
-+if [ "$5" = 1 ]; then
-+
-+    if [ "$3" = 1 ]; then
-+            # This line will fix the labeling on all newly created directories
-+            [ -x /sbin/restorecon ] && /sbin/restorecon "$1"
-+            user="$4"
-+            passwd=$(getent passwd "$user")
-+            homedir=$(echo "$passwd" | cut -f6 -d":")
-+            if [ "$1" = "$homedir" ]; then
-+                    gid=$(echo "$passwd" | cut -f4 -d":")
-+                    cp -rT /etc/skel "$homedir"
-+                    chown -R "$user":"$gid" "$homedir"
-+                    mask=$(awk '/^UMASK/{gsub("#.*$", "", $2); print $2; exit}' /etc/login.defs)
-+                    mode=$(printf "%o" $((0777 & ~$mask)))
-+                    chmod ${mode:-700} "$homedir"
-+                    [ -x /sbin/restorecon ] && /sbin/restorecon -R "$homedir"
-+            fi
-+    fi
-+fi
- exit 0
-diff --git a/modules/pam_namespace/pam_namespace.c b/modules/pam_namespace/pam_namespace.c
-index 63b5c665..b8149a6f 100644
---- a/modules/pam_namespace/pam_namespace.c
-+++ b/modules/pam_namespace/pam_namespace.c
-@@ -39,6 +39,45 @@
- #include "pam_namespace.h"
- #include "argv_parse.h"
- 
-+#define MAGIC_LNK_FD_SIZE 64
-+
-+/* Define missing macros and functions */
-+#ifndef O_PATH
-+#define O_PATH 0x10000000
-+#endif
-+
-+#ifndef UNUSED
-+#define UNUSED __attribute__((unused))
-+#endif
-+
-+/* Missing function declarations */
-+extern int asprintf(char **strp, const char *fmt, ...);
-+extern int unshare(int flags);
-+
-+/* Utility function to strip trailing slashes */
-+static void strip_trailing_slashes(char *str)
-+{
-+	int len = strlen(str);
-+	while (len > 1 && str[len - 1] == '/') {
-+		str[--len] = '\0';
-+	}
-+}
-+
-+/* Utility function to get base name of path */
-+static const char *base_name(const char *path)
-+{
-+	const char *base = strrchr(path, '/');
-+	return base ? base + 1 : path;
-+}
-+
-+/* Forward declarations for secure functions */
-+static int protect_mount(int dfd, const char *path, struct instance_data *idata);
-+static int secure_opendir(const char *path, int opm, mode_t mode, struct instance_data *idata);
-+static int secure_umount(const char *path);
-+static int secure_opendir_stateless(const char *path);
-+static void secure_try_rmdir(const char *path);
-+static int check_safe_path(const char *path, struct instance_data *idata);
-+
- /*
-  * Adds an entry for a polyinstantiated directory to the linked list of
-  * polyinstantiated directories. It is called from process_line() while
-@@ -90,7 +129,7 @@ static void unprotect_dirs(struct protect_dir_s *dir)
- 	struct protect_dir_s *next;
- 
- 	while (dir != NULL) {
--		umount(dir->dir);
-+		secure_umount(dir->dir);
- 		free(dir->dir);
- 		next = dir->next;
- 		free(dir);
-@@ -98,6 +137,287 @@ static void unprotect_dirs(struct protect_dir_s *dir)
- 	}
- }
- 
-+/*
-+ * Returns a fd to the given absolute path, acquired securely. This means:
-+ * - iterating on each segment of the path,
-+ * - not following user symlinks,
-+ * - using race-free operations.
-+ *
-+ * Takes a bit mask to specify the operation mode:
-+ * - SECURE_OPENDIR_PROTECT: call protect_mount() on each unsafe segment of path
-+ * - SECURE_OPENDIR_MKDIR: create last segment of path if does not exist
-+ * - SECURE_OPENDIR_FULL_FD: open the directory with O_RDONLY instead of O_PATH,
-+ *     allowing more operations to be done with the returned fd
-+ *
-+ * Be aware that using SECURE_OPENDIR_PROTECT:
-+ * - will modify some external state (global structure...) and should not be
-+ *   called in cleanup code paths. See wrapper secure_opendir_stateless()
-+ * - need a non-NULL idata to call protect_mount()
-+ */
-+static int secure_opendir(const char *path, int opm, mode_t mode,
-+	struct instance_data *idata)
-+{
-+	char *p;
-+	char *d;
-+	char *dir;
-+	int dfd = -1;
-+	int dfd_next;
-+	int save_errno;
-+	int flags = O_DIRECTORY | O_CLOEXEC;
-+	int rv = -1;
-+	struct stat st;
-+
-+	if (opm & SECURE_OPENDIR_FULL_FD)
-+		flags |= O_RDONLY;
-+	else
-+		flags |= O_PATH;
-+
-+	/* Check for args consistency */
-+	if ((opm & SECURE_OPENDIR_PROTECT) && idata == NULL)
-+		return -1;
-+
-+	/* Accept only absolute paths */
-+	if (*path != '/')
-+		return -1;
-+
-+	dir = p = strdup(path);
-+	if (p == NULL)
-+		return -1;
-+
-+	/* Assume '/' is safe */
-+	dfd = open("/", flags);
-+	if (dfd == -1)
-+		goto error;
-+
-+	/* Needed to not loop too far and call openat() on NULL */
-+	strip_trailing_slashes(p);
-+
-+	dir++;
-+
-+	/* In case path is '/' */
-+	if (*dir == '\0') {
-+		free(p);
-+		return dfd;
-+	}
-+
-+	while ((d=strchr(dir, '/')) != NULL) {
-+		*d = '\0';
-+
-+		dfd_next = openat(dfd, dir, flags);
-+		if (dfd_next == -1)
-+			goto error;
-+
-+		if (fstat(dfd_next, &st) != 0) {
-+			close(dfd_next);
-+			goto error;
-+		}
-+
-+		if ((flags & O_NOFOLLOW) && (opm & SECURE_OPENDIR_PROTECT)) {
-+			/* we are inside user-owned dir - protect */
-+			if (protect_mount(dfd_next, p, idata) == -1) {
-+				close(dfd_next);
-+				goto error;
-+			}
-+			/*
-+			 * Reopen the directory to obtain a new descriptor
-+			 * after protect_mount(), this is necessary in cases
-+			 * when another directory is going to be mounted over
-+			 * the given path.
-+			 */
-+			close(dfd_next);
-+			dfd_next = openat(dfd, dir, flags);
-+			if (dfd_next == -1)
-+				goto error;
-+		} else if (st.st_uid != 0
-+		           || (st.st_mode & (S_IWGRP|S_IWOTH))) {
-+			/* do not follow symlinks on subdirectories */
-+			flags |= O_NOFOLLOW;
-+		}
-+
-+		close(dfd);
-+		dfd = dfd_next;
-+
-+		*d = '/';
-+		dir = d + 1;
-+	}
-+
-+	rv = openat(dfd, dir, flags);
-+
-+	if (rv == -1) {
-+		if ((opm & SECURE_OPENDIR_MKDIR) && mkdirat(dfd, dir, mode) == 0)
-+			rv = openat(dfd, dir, flags);
-+
-+		if (rv == -1)
-+			goto error;
-+	}
-+
-+	if ((flags & O_NOFOLLOW) && (opm & SECURE_OPENDIR_PROTECT)) {
-+		/* we are inside user-owned dir - protect */
-+		if (protect_mount(rv, p, idata) == -1) {
-+			save_errno = errno;
-+			close(rv);
-+			rv = -1;
-+			errno = save_errno;
-+		}
-+		/*
-+		 * Reopen the directory to obtain a new descriptor after
-+		 * protect_mount(), this is necessary in cases when another
-+		 * directory is going to be mounted over the given path.
-+		 */
-+		close(rv);
-+		rv = openat(dfd, dir, flags);
-+	}
-+
-+error:
-+	save_errno = errno;
-+	free(p);
-+	if (dfd >= 0)
-+		close(dfd);
-+	errno = save_errno;
-+
-+	return rv;
-+}
-+
-+/*
-+ * Returns a fd to the given path, acquired securely.
-+ * It can be called in all situations, including in cleanup code paths, as
-+ * it does not modify external state (no access to global structures...).
-+ */
-+static int secure_opendir_stateless(const char *path)
-+{
-+	return secure_opendir(path, 0, 0, NULL);
-+}
-+
-+/*
-+ * Umount securely the given path, even if the directories along
-+ * the path are under user control. It should protect against
-+ * symlinks attacks and race conditions.
-+ */
-+static int secure_umount(const char *path)
-+{
-+	int save_errno;
-+	int rv = -1;
-+	int dfd = -1;
-+	char s_path[MAGIC_LNK_FD_SIZE];
-+
-+	dfd = secure_opendir_stateless(path);
-+	if (dfd == -1)
-+		return rv;
-+
-+	if (snprintf(s_path, sizeof(s_path), "/proc/self/fd/%d", dfd) >= (int)sizeof(s_path))
-+		goto error;
-+
-+	/*
-+	* We still have a fd open to path itself,
-+	* so we need to do a lazy umount.
-+	*/
-+	rv = umount2(s_path, MNT_DETACH);
-+
-+error:
-+	save_errno = errno;
-+	close(dfd);
-+	errno = save_errno;
-+	return rv;
-+}
-+
-+/*
-+ * Rmdir the given path securely, protecting against symlinks attacks
-+ * and race conditions.
-+ */
-+static void secure_try_rmdir(const char *path)
-+{
-+	int dfd;
-+	char *buf;
-+	char *parent;
-+
-+	buf = strdup(path);
-+	if (buf == NULL)
-+		return;
-+
-+	parent = dirname(buf);
-+
-+	dfd = secure_opendir_stateless(parent);
-+	if (dfd >= 0) {
-+		unlinkat(dfd, base_name(path), AT_REMOVEDIR);
-+		close(dfd);
-+	}
-+
-+	free(buf);
-+}
-+
-+/*
-+ * Check for a given absolute path that all segments except the last one are:
-+ * 1. a directory owned by root and not writable by group or others
-+ * 2. a symlink owned by root and referencing a directory respecting 1.
-+ * Returns 0 if safe, -1 is unsafe.
-+ * If the path is not accessible (does not exist, hidden under a mount...),
-+ * returns -1 (unsafe).
-+ */
-+static int check_safe_path(const char *path, struct instance_data *idata)
-+{
-+    char *p = strdup(path);
-+    char *d;
-+    char *dir = p;
-+    struct stat st;
-+
-+    if (p == NULL)
-+        return -1;
-+
-+    /* Check path is absolute */
-+    if (p[0] != '/')
-+        goto error;
-+
-+    strip_trailing_slashes(p);
-+
-+    /* Last segment of the path may be owned by the user */
-+    if ((d = strrchr(dir, '/')) != NULL)
-+        *d = '\0';
-+
-+    while ((d=strrchr(dir, '/')) != NULL) {
-+
-+        /* Do not follow symlinks */
-+        if (lstat(dir, &st) != 0)
-+            goto error;
-+
-+        if (S_ISLNK(st.st_mode)) {
-+            if (st.st_uid != 0) {
-+                if (idata->flags & PAMNS_DEBUG)
-+                    pam_syslog(idata->pamh, LOG_DEBUG,
-+                            "Path deemed unsafe: Symlink %s should be owned by root", dir);
-+                goto error;
-+            }
-+
-+            /* Follow symlinks */
-+            if (stat(dir, &st) != 0)
-+                goto error;
-+        }
-+
-+        if (!S_ISDIR(st.st_mode)) {
-+                if (idata->flags & PAMNS_DEBUG)
-+                    pam_syslog(idata->pamh, LOG_DEBUG,
-+                        "Path deemed unsafe: %s is expected to be a directory", dir);
-+            goto error;
-+        }
-+
-+        if (st.st_uid != 0 ||
-+            ((st.st_mode & (S_IWGRP|S_IWOTH)) && !(st.st_mode & S_ISVTX))) {
-+                if (idata->flags & PAMNS_DEBUG)
-+                    pam_syslog(idata->pamh, LOG_DEBUG,
-+                        "Path deemed unsafe: %s should be owned by root, and not be writable by group or others", dir);
-+            goto error;
-+        }
-+
-+        *d = '\0';
-+    }
-+
-+    free(p);
-+    return 0;
-+
-+error:
-+    free(p);
-+    return -1;
-+}
-+
- static void cleanup_polydir_data(pam_handle_t *pamh UNUSED , void *data, int err UNUSED)
- {
- 	del_polydir_list(data);
-@@ -796,6 +1116,23 @@ static char *md5hash(const char *instname, struct instance_data *idata)
- }
- 
- #ifdef WITH_SELINUX
-+static char *secure_getfilecon(pam_handle_t *pamh, const char *dir)
-+{
-+	char *ctx = NULL;
-+	int dfd = secure_opendir(dir, SECURE_OPENDIR_FULL_FD, 0, NULL);
-+	if (dfd < 0) {
-+		pam_syslog(pamh, LOG_ERR, "Error getting fd to %s: %m", dir);
-+		return NULL;
-+	}
-+	if (fgetfilecon(dfd, &ctx) < 0)
-+		ctx = NULL;
-+	if (ctx == NULL)
-+		pam_syslog(pamh, LOG_ERR,
-+			   "Error getting poly dir context for %s: %m", dir);
-+	close(dfd);
-+	return ctx;
-+}
-+
- static int form_context(const struct polydir_s *polyptr,
- 		security_context_t *i_context, security_context_t *origcon,
- 		struct instance_data *idata)
-@@ -807,12 +1144,9 @@ static int form_context(const struct polydir_s *polyptr,
- 	/*
- 	 * Get the security context of the directory to polyinstantiate.
- 	 */
--	rc = getfilecon(polyptr->dir, origcon);
--	if (rc < 0 || *origcon == NULL) {
--		pam_syslog(idata->pamh, LOG_ERR,
--				"Error getting poly dir context, %m");
-+	*origcon = secure_getfilecon(idata->pamh, polyptr->dir);
-+	if (*origcon == NULL)
- 		return PAM_SESSION_ERR;
--	}
- 
- 	if (polyptr->method == USER) return PAM_SUCCESS;
- 
-@@ -1281,7 +1615,10 @@ static int inst_init(const struct polydir_s *polyptr, const char *ipath,
- 				}
- 
- 				if (execle(init_script, init_script,
--					polyptr->dir, ipath, newdir?"1":"0", idata->user, NULL, envp) < 0)
-+					polyptr->dir, ipath, newdir?"1":"0", idata->user,
-+					(check_safe_path(polyptr->dir, idata) == -1) ? "0":"1",
-+					(check_safe_path(ipath, idata) == -1) ? "0":"1",
-+					NULL, envp) < 0)
- 					_exit(1);
- 			} else if (pid > 0) {
- 				while (((rc = waitpid(pid, &status, 0)) == (pid_t)-1) &&
-@@ -1349,11 +1686,13 @@ static int create_polydir(struct polydir_s *polyptr,
-     }
+Description: CVE-2024-10041 - pam_unix: always use helper for shadow entries
+ A vulnerability was found in PAM where secret information (password
+ hashes from /etc/shadow) is stored in memory via pam_modutil_getspnam()
+ during authentication.  An attacker able to influence the victim
+ process can exploit speculative execution (branch predictor / ROP) to
+ leak those hashes.
+ .
+ Upstream fix (b3020da): stop calling pam_modutil_getspnam() from
+ pam_unix.so for shadowed accounts and always invoke the setuid helper
+ (unix_chkpwd) instead, so hashes are not retained in the calling
+ process address space.
+ .
+ Follow-up (b7b9636): always attempt setuid(0) before exec'ing the
+ helper so credential checks still work when the caller has CAP_SETUID
+ but geteuid() != 0.
+ .
+ Backport notes for Debian bullseye (1.4.0-9+deb11u2):
+ - passverify.c still has Debian's pam_unix_fix_sgid_shadow_auth
+   logic (try getspnam first, helper only on failure); rewrite that
+   path to match upstream always-helper semantics.
+ - HELPER_COMPILE continues to use pam_modutil_getspnam (macro'd to
+   getspnam in the helper build).
+Origin: backport, https://github.com/linux-pam/linux-pam/commit/b3020da7da384d769f27a8713257fbe1001878be
+Origin: backport, https://github.com/linux-pam/linux-pam/commit/b7b96362087414e52524d3d9d9b3faa21e1db620
+Bug: https://github.com/linux-pam/linux-pam/issues/846
+Bug: https://github.com/linux-pam/linux-pam/pull/686
+Bug-Debian: https://security-tracker.debian.org/tracker/CVE-2024-10041
+Author: Dmitry V. Levin <ldv@strace.io>
+Author: Tobias Stoeckmann <tobias@stoeckmann.org>
+Last-Update: 2026-07-20
+
+--- a/modules/pam_unix/passverify.c
++++ b/modules/pam_unix/passverify.c
+@@ -239,17 +239,21 @@
+ 			return PAM_UNIX_RUN_HELPER;
  #endif
- 
--    rc = protect_dir(dir, mode, 1, idata);
-+    rc = secure_opendir(dir,
-+            SECURE_OPENDIR_PROTECT | SECURE_OPENDIR_MKDIR | SECURE_OPENDIR_FULL_FD,
-+            mode, idata);
-     if (rc == -1) {
-             pam_syslog(idata->pamh, LOG_ERR,
-                        "Error creating directory %s: %m", dir);
--            return PAM_SESSION_ERR;
-+            return -1;
+ 		} else if (is_pwd_shadowed(*pwd)) {
++#ifdef HELPER_COMPILE
+ 			/*
+-			 * ...and shadow password file entry for this user,
++			 * shadow password file entry for this user,
+ 			 * if shadowing is enabled
+ 			 */
+ 			*spwdent = pam_modutil_getspnam(pamh, name);
+-#ifndef HELPER_COMPILE
+-			if (*spwdent == NULL && (geteuid() || SELINUX_ENABLED))
+-				return PAM_UNIX_RUN_HELPER;
+-#endif
+ 			if (*spwdent == NULL || (*spwdent)->sp_pwdp == NULL)
+ 				return PAM_AUTHINFO_UNAVAIL;
++#else
++			/*
++			 * The helper has to be invoked to deal with
++			 * the shadow password file entry (CVE-2024-10041).
++			 */
++			return PAM_UNIX_RUN_HELPER;
++#endif
+ 		}
+ 	} else {
+ 		return PAM_USER_UNKNOWN;
+--- a/modules/pam_unix/pam_unix_acct.c
++++ b/modules/pam_unix/pam_unix_acct.c
+@@ -110,14 +110,15 @@
+       _exit(PAM_AUTHINFO_UNAVAIL);
      }
  
- #ifdef WITH_SELINUX
-@@ -1374,9 +1713,9 @@ static int create_polydir(struct polydir_s *polyptr,
- 		pam_syslog(idata->pamh, LOG_ERR,
- 			   "Error changing mode of directory %s: %m", dir);
-                 close(rc);
--                umount(dir); /* undo the eventual protection bind mount */
--		rmdir(dir);
--		return PAM_SESSION_ERR;
-+		secure_umount(dir); /* undo the eventual protection bind mount */
-+		secure_try_rmdir(dir);
-+		return -1;
+-    if (geteuid() == 0) {
+-      /* must set the real uid to 0 so the helper will not error
+-         out if pam is called from setuid binary (su, sudo...) */
+-      if (setuid(0) == -1) {
+-          pam_syslog(pamh, LOG_ERR, "setuid failed: %m");
+-          printf("-1\n");
+-          fflush(stdout);
+-          _exit(PAM_AUTHINFO_UNAVAIL);
++    /* must set the real uid to 0 so the helper will not error
++       out if pam is called from setuid binary (su, sudo...) */
++    if (setuid(0) == -1) {
++      uid_t euid = geteuid();
++      pam_syslog(pamh, euid == 0 ? LOG_ERR : LOG_DEBUG, "setuid failed: %m");
++      if (euid == 0) {
++	printf("-1\n");
++	fflush(stdout);
++	_exit(PAM_AUTHINFO_UNAVAIL);
+       }
+     }
+ 
+--- a/modules/pam_unix/support.c
++++ b/modules/pam_unix/support.c
+@@ -513,13 +513,13 @@
+ 		_exit(PAM_AUTHINFO_UNAVAIL);
  	}
-     }
  
-@@ -1394,18 +1733,16 @@ static int create_polydir(struct polydir_s *polyptr,
-         pam_syslog(idata->pamh, LOG_ERR,
-                    "Unable to change owner on directory %s: %m", dir);
-         close(rc);
--        umount(dir); /* undo the eventual protection bind mount */
--	rmdir(dir);
--	return PAM_SESSION_ERR;
-+	secure_umount(dir); /* undo the eventual protection bind mount */
-+	secure_try_rmdir(dir);
-+	return -1;
-     }
+-	if (geteuid() == 0) {
+-          /* must set the real uid to 0 so the helper will not error
+-	     out if pam is called from setuid binary (su, sudo...) */
+-	  if (setuid(0) == -1) {
+-             D(("setuid failed"));
+-	     _exit(PAM_AUTHINFO_UNAVAIL);
+-          }
++	/* must set the real uid to 0 so the helper will not error
++	   out if pam is called from setuid binary (su, sudo...) */
++	if (setuid(0) == -1) {
++	   D(("setuid failed"));
++	   if (geteuid() == 0) {
++	      _exit(PAM_AUTHINFO_UNAVAIL);
++	   }
+ 	}
  
--    close(rc);
--
-     if (idata->flags & PAMNS_DEBUG)
- 	pam_syslog(idata->pamh, LOG_DEBUG,
- 	           "Polydir owner %u group %u", uid, gid);
+ 	/* exec binary helper */
+
+Description: CVE-2026-54411 - pam_userdb: constant-time password comparison
+ The pam_userdb module compared the user-supplied password against the
+ stored plaintext password using strncmp()/strncasecmp() guarded by a
+ strlen() length check.  The length pre-check leaks the password length
+ via early exit, and the strncmp/strncasecmp comparisons leak prefix
+ bytes through their non-constant-time behaviour (CWE-208 - Observable
+ Timing Discrepancy).
+ .
+ Replace the comparison with a constant-time equality check.  Two
+ helpers are added to libpam/include/pam_inline.h:
+ pam_consttime_streq (case-sensitive) and pam_consttime_strcaseeq
+ (case-insensitive).  Both run for exactly strlen(userinput)+1
+ iterations regardless of the secret, eliminating the timing oracle.
+ .
+ Backport notes for Debian bullseye (1.4.0-9+deb11u2):
+ - Upstream already had pam_consttime_streq; v1.4.0 lacks both helpers,
+   so both are added here.
+ - pam_overwrite_string() is available via Debian's 0018-secure_erase
+   backport, matching upstream's use in the pam_userdb change.
+Origin: backport, https://github.com/linux-pam/linux-pam/commit/c7e885a4298cf459820bcaf9b657521cbe04825e
+Bug: https://github.com/linux-pam/linux-pam/issues/992
+Bug: https://github.com/linux-pam/linux-pam/pull/991
+Bug-Debian: https://security-tracker.debian.org/tracker/CVE-2026-54411
+Author: Valentin Lefebvre <valentin.lefebvre@suse.com>
+Last-Update: 2026-07-20
+Forwarded: https://github.com/linux-pam/linux-pam/pull/991
+
+--- a/libpam/include/pam_inline.h
++++ b/libpam/include/pam_inline.h
+@@ -9,6 +9,7 @@
+ #define PAM_INLINE_H
  
--    return PAM_SUCCESS;
-+    return rc;
- }
+ #include "pam_cc_compat.h"
++#include <ctype.h>
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -157,4 +158,44 @@
+ 	pam_snprintf((str_), sizeof(str_) + PAM_MUST_BE_ARRAY(str_), (fmt_),	\
+ 		     ##__VA_ARGS__)
  
- /*
-@@ -1537,18 +1874,17 @@ static int ns_setup(struct polydir_s *polyptr,
-         pam_syslog(idata->pamh, LOG_DEBUG,
-                "Set namespace for directory %s", polyptr->dir);
- 
--    retval = protect_dir(polyptr->dir, 0, 0, idata);
--
--    if (retval < 0 && errno != ENOENT) {
--	pam_syslog(idata->pamh, LOG_ERR, "Polydir %s access error: %m",
--		polyptr->dir);
--	return PAM_SESSION_ERR;
--    }
-+    retval = secure_opendir(polyptr->dir, SECURE_OPENDIR_PROTECT, 0, idata);
- 
-     if (retval < 0) {
--	if ((polyptr->flags & POLYDIR_CREATE) &&
--		create_polydir(polyptr, idata) != PAM_SUCCESS)
--		return PAM_SESSION_ERR;
-+        if (errno != ENOENT || !(polyptr->flags & POLYDIR_CREATE)) {
-+            pam_syslog(idata->pamh, LOG_ERR, "Polydir %s access error: %m",
-+                    polyptr->dir);
-+            return PAM_SESSION_ERR;
-+        }
-+        retval = create_polydir(polyptr, idata);
-+        if (retval < 0)
-+            return PAM_SESSION_ERR;
-     } else {
- 	close(retval);
-     }
-@@ -1868,7 +2204,7 @@ static int setup_namespace(struct instance_data *idata, enum unmnt_op unmnt)
-                     }
-                 }
- 
--                if (umount(pptr->rdir) < 0) {
-+            if (secure_umount(pptr->rdir) < 0) {
- 		    int saved_errno = errno;
- 		    pam_syslog(idata->pamh, LOG_ERR, "Unmount of %s failed, %m",
- 			pptr->rdir);
-@@ -1938,7 +2274,7 @@ static int orig_namespace(struct instance_data *idata)
- 			"Unmounting instance dir for user %d & dir %s",
-                        idata->uid, pptr->dir);
- 
--            if (umount(pptr->dir) < 0) {
-+            if (secure_umount(pptr->dir) < 0) {
-                 pam_syslog(idata->pamh, LOG_ERR, "Unmount of %s failed, %m",
-                        pptr->dir);
-                 return PAM_SESSION_ERR;
-diff --git a/modules/pam_namespace/pam_namespace.h b/modules/pam_namespace/pam_namespace.h
-index 3a1e4ba3..8c1d4726 100644
---- a/modules/pam_namespace/pam_namespace.h
-+++ b/modules/pam_namespace/pam_namespace.h
-@@ -123,6 +123,13 @@
- #define NAMESPACE_POLYDIR_DATA "pam_namespace:polydir_data"
- #define NAMESPACE_PROTECT_DATA "pam_namespace:protect_data"
- 
-+/*
-+ * Operation mode for function secure_opendir()
-+ */
-+#define SECURE_OPENDIR_PROTECT     0x00000001
-+#define SECURE_OPENDIR_MKDIR       0x00000002
-+#define SECURE_OPENDIR_FULL_FD     0x00000004
 +
- /*
-  * Polyinstantiation method options, based on user, security context
-  * or both
++/*
++ * Constant-time string equality check.
++ * Runs for exactly strlen(userinput)+1 iterations regardless of secret,
++ * so neither the length of the secret nor the position of the first
++ * differing byte is leaked through timing.
++ */
++static inline int
++pam_consttime_streq(const char *userinput, const char *secret) {
++	volatile const char *u = userinput, *s = secret;
++	volatile int ret = 0;
++
++	do {
++		ret |= *u ^ *s;
++
++		s += !!*s;
++	} while (*u++ != '\0');
++
++	return ret == 0;
++}
++
++/*
++ * Constant-time, case-insensitive string equality check.
++ * Same contract as pam_consttime_streq but uses tolower() on each byte.
++ * Runs for exactly strlen(userinput)+1 iterations regardless of secret.
++ */
++static inline int
++pam_consttime_strcaseeq(const char *userinput, const char *secret) {
++	volatile const char *u = userinput, *s = secret;
++	volatile int ret = 0;
++
++	do {
++		ret |= tolower((unsigned char)*u) ^ tolower((unsigned char)*s);
++
++		s += !!*s;
++	} while (*u++ != '\0');
++
++	return ret == 0;
++}
++
+ #endif /* PAM_INLINE_H */
+--- a/modules/pam_userdb/pam_userdb.c
++++ b/modules/pam_userdb/pam_userdb.c
+@@ -242,15 +242,24 @@
+ 	} else {
+ 
+ 	  /* Unknown password encryption method -
+-	   * default to plaintext password storage
++	   * default to plaintext password storage.
++	   * Use constant-time comparison: strncmp/strncasecmp leak prefix bytes
++	   * and the length pre-check leaks the password length (CWE-208).
+ 	   */
+ 
+-	  if (strlen(pass) != (size_t)data.dsize) {
+-	    compare = 1; /* wrong password len -> wrong password */
+-	  } else if (ctrl & PAM_ICASE_ARG) {
+-	    compare = strncasecmp(data.dptr, pass, data.dsize);
++	  /* libdb is not guaranteed to produce null-terminated strings */
++	  char *stored = strndup(data.dptr, data.dsize);
++	  if (stored == NULL) {
++	    pam_syslog(pamh, LOG_CRIT, "strndup failed: data.dptr");
++	    compare = -2;
+ 	  } else {
+-	    compare = strncmp(data.dptr, pass, data.dsize);
++	    if (ctrl & PAM_ICASE_ARG) {
++	      compare = pam_consttime_strcaseeq(pass, stored) ? 0 : 1;
++	    } else {
++	      compare = pam_consttime_streq(pass, stored) ? 0 : 1;
++	    }
++	    pam_overwrite_string(stored);
++	    free(stored);
+ 	  }
+ 
+ 	  if (cryptmode && pam_str_skip_icase_prefix(cryptmode, "none") == NULL
+

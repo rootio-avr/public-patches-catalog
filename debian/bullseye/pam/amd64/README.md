@@ -1,10 +1,11 @@
-# pam : 1.4.0-9+deb11u1.root.io.1
+# pam : 1.4.0-9+deb11u2.root.io.8
 
-This patch is based on pam version 1.4.0-9+deb11u1.root.io.1, which is available at:
-https://sources.debian.org/src/pam/1.4.0-9+deb11u1/
+This patch is based on pam version 1.4.0-9+deb11u2.root.io.8, which is available at:
+https://sources.debian.org/src/pam/1.4.0-9+deb11u2/
 
 ## Affected CVEs:
-- CVE-2025-6020
+- CVE-2024-10041
+- CVE-2026-54411
 
 ## How to Apply:
 1. Obtain the source package: `apt source pam`
