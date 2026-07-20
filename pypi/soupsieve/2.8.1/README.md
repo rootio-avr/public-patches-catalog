@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-49476
+- CVE-2026-49477
 
 ## How to Apply:
 1. Clone or download the source code for soupsieve
