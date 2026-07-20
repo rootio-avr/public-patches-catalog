@@ -1,6 +1,6 @@
-# libheif : 1.11.0-1+deb11u2.root.io.3
+# libheif : 1.11.0-1+deb11u2.root.io.4
 
-This patch is based on libheif version 1.11.0-1+deb11u2.root.io.3, which is available at:
+This patch is based on libheif version 1.11.0-1+deb11u2.root.io.4, which is available at:
 https://sources.debian.org/src/libheif/1.11.0-1+deb11u2/
 
 ## Affected CVEs:
@@ -8,7 +8,12 @@ https://sources.debian.org/src/libheif/1.11.0-1+deb11u2/
 - CVE-2026-32740
 - CVE-2026-32882
 - CVE-2026-32741
-- CVE-2026-41071 
+- CVE-2026-41071
+- CVE-2026-41069
+- CVE-2026-32814
+- CVE-2026-32739
+- CVE-2026-47178
+- CVE-2026-49271
 
 ## How to Apply:
 1. Obtain the source package: `apt source libheif`
