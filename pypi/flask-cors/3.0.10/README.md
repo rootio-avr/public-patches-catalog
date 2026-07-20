@@ -6,6 +6,9 @@ unknown
 ## Affected CVEs:
 - CVE-2024-6221
 - CVE-2024-6866
+- CVE-2024-6844
+- CVE-2024-6839
+- CVE-2024-1681
 
 ## How to Apply:
 1. Clone or download the source code for flask-cors
