@@ -1,6 +1,6 @@
-# libheif : 1.19.8-1.root.io.5
+# libheif : 1.19.8-1.root.io.6
 
-This patch is based on libheif version 1.19.8-1.root.io.5, which is available at:
+This patch is based on libheif version 1.19.8-1.root.io.6, which is available at:
 https://sources.debian.org/src/libheif/1.19.8-1/
 
 ## Affected CVEs:
@@ -11,6 +11,10 @@ https://sources.debian.org/src/libheif/1.19.8-1/
 - CVE-2026-41071
 - CVE-2026-32739
 - CVE-2026-32738
+- CVE-2026-32814
+- CVE-2026-41069
+- CVE-2026-47178
+- CVE-2026-49271
 
 ## How to Apply:
 1. Obtain the source package: `apt source libheif`
