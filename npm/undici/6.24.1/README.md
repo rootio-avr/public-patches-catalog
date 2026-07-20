@@ -4,6 +4,7 @@ This patch is based on undici version 6.24.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-9679
 - CVE-2026-12151
 
 ## How to Apply:
