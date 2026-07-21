@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2023-2976
+- CVE-2018-10237
 
 ## How to Apply:
 1. Clone or download the source code for com.google.guava:guava
