@@ -1,6 +1,6 @@
-# curl : 7.74.0-1.3+deb11u16.root.io.16
+# curl : 7.74.0-1.3+deb11u16.root.io.17
 
-This patch is based on curl version 7.74.0-1.3+deb11u16.root.io.16, which is available at:
+This patch is based on curl version 7.74.0-1.3+deb11u16.root.io.17, which is available at:
 https://sources.debian.org/src/curl/7.74.0-1.3+deb11u16/
 
 ## Affected CVEs:
@@ -17,13 +17,15 @@ https://sources.debian.org/src/curl/7.74.0-1.3+deb11u16/
 - CVE-2026-8932
 - CVE-2026-9547
 - CVE-2026-8286
-- CVE-2026-12064
 - CVE-2026-5773
 - CVE-2026-6253
 - CVE-2026-6429
 - CVE-2026-7168
 - CVE-2026-6276
 - CVE-2026-4873
+- CVE-2026-8927
+- CVE-2026-11856
+- CVE-2026-5545
 
 ## How to Apply:
 1. Obtain the source package: `apt source curl`
