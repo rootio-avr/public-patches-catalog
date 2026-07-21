@@ -1,0 +1,358 @@
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -271,37 +271,51 @@
+     return soft_str(s).lower()
+ 
+ 
++_space_re = re.compile(r"\s", flags=re.ASCII)
++
++
+ @pass_eval_context
+ def do_xmlattr(
+     eval_ctx: "EvalContext", d: t.Mapping[str, t.Any], autospace: bool = True
+ ) -> str:
+     """Create an SGML/XML attribute string based on the items in a dict.
+-    All values that are neither `none` nor `undefined` are automatically
+-    escaped:
++
++    If any key contains a space, this fails with a ``ValueError``. Values that
++    are neither ``none`` nor ``undefined`` are automatically escaped.
+ 
+     .. sourcecode:: html+jinja
+ 
+         <ul{{ {'class': 'my_list', 'missing': none,
+                 'id': 'list-%d'|format(variable)}|xmlattr }}>
+         ...
+         </ul>
+ 
+     Results in something like this:
+ 
+     .. sourcecode:: html
+ 
+         <ul class="my_list" id="list-42">
+         ...
+         </ul>
+ 
+     As you can see it automatically prepends a space in front of the item
+     if the filter returned something unless the second parameter is false.
++
++    .. versionchanged:: 3.1.3
++        Keys with spaces are not allowed.
+     """
+-    rv = " ".join(
+-        f'{escape(key)}="{escape(value)}"'
+-        for key, value in d.items()
+-        if value is not None and not isinstance(value, Undefined)
+-    )
++    items = []
++
++    for key, value in d.items():
++        if value is None or isinstance(value, Undefined):
++            continue
++
++        if _space_re.search(key) is not None:
++            raise ValueError(f"Spaces are not allowed in attributes: '{key}'")
++
++        items.append(f'{escape(key)}="{escape(value)}"')
++
++    rv = " ".join(items)
+ 
+     if autospace and rv:
+         rv = " " + rv
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -462,6 +462,12 @@
+         assert 'bar="23"' in out
+         assert 'blub:blub="&lt;?&gt;"' in out
+ 
++    def test_xmlattr_key_with_spaces(self, env):
++        with pytest.raises(ValueError, match="Spaces are not allowed"):
++            env.from_string(
++                "{{ {'src=1 onerror=alert(1)': 'my_class'}|xmlattr }}"
++            ).render()
++
+     def test_sort1(self, env):
+         tmpl = env.from_string("{{ [2, 3, 1]|sort }}|{{ [2, 3, 1]|sort(true) }}")
+         assert tmpl.render() == "[1, 2, 3]|[3, 2, 1]"
+
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -272,7 +272,9 @@
+     return soft_str(s).lower()
+ 
+ 
+-_space_re = re.compile(r"\s", flags=re.ASCII)
++# Check for characters that would move the parser state from key to value.
++# https://html.spec.whatwg.org/#attribute-name-state
++_attr_key_re = re.compile(r"[\s/>=]", flags=re.ASCII)
+ 
+ 
+ @pass_eval_context
+@@ -310,7 +312,7 @@
+         if value is None or isinstance(value, Undefined):
+             continue
+ 
+-        if _space_re.search(key) is not None:
+-            raise ValueError(f"Spaces are not allowed in attributes: '{key}'")
++        if _attr_key_re.search(key) is not None:
++            raise ValueError(f"Invalid character in attribute name: {key!r}")
+ 
+         items.append(f'{escape(key)}="{escape(value)}"')
+--- a/tests/test_filters.py
++++ b/tests/test_filters.py
+@@ -470,3 +470,10 @@
+             ).render()
+ 
++    @pytest.mark.parametrize("sep", ("\t", "\n", "\f", " ", "/", ">", "="))
++    def test_xmlattr_key_invalid(self, env, sep):
++        with pytest.raises(ValueError, match="Invalid character"):
++            env.from_string("{{ {key: 'my_class'}|xmlattr }}").render(
++                key=f"class{sep}onclick=alert(1)"
++            )
++
+     def test_sort1(self, env):
+
+--- a/src/jinja2/sandbox.py
++++ b/src/jinja2/sandbox.py
+@@ -7,6 +7,7 @@
+ from _string import formatter_field_name_split  # type: ignore
+ from collections import abc
+ from collections import deque
++from functools import update_wrapper
+ from string import Formatter
+
+ from markupsafe import EscapeFormatter
+@@ -80,20 +81,6 @@
+ )
+
+
+-def inspect_format_method(callable: t.Callable) -> t.Optional[str]:
+-    if not isinstance(
+-        callable, (types.MethodType, types.BuiltinMethodType)
+-    ) or callable.__name__ not in ("format", "format_map"):
+-        return None
+-
+-    obj = callable.__self__
+-
+-    if isinstance(obj, str):
+-        return obj
+-
+-    return None
+-
+-
+ def safe_range(*args: int) -> range:
+     """A range that can't generate ranges with a length of more than
+     MAX_RANGE items.
+@@ -313,6 +300,9 @@
+                     except AttributeError:
+                         pass
+                     else:
++                        fmt = self.wrap_str_format(value)
++                        if fmt is not None:
++                            return fmt
+                         if self.is_safe_attribute(obj, argument, value):
+                             return value
+                         return self.unsafe_undefined(obj, argument)
+@@ -330,6 +320,9 @@
+             except (TypeError, LookupError):
+                 pass
+         else:
++            fmt = self.wrap_str_format(value)
++            if fmt is not None:
++                return fmt
+             if self.is_safe_attribute(obj, attribute, value):
+                 return value
+             return self.unsafe_undefined(obj, attribute)
+@@ -345,34 +338,49 @@
+             exc=SecurityError,
+         )
+
+-    def format_string(
+-        self,
+-        s: str,
+-        args: t.Tuple[t.Any, ...],
+-        kwargs: t.Dict[str, t.Any],
+-        format_func: t.Optional[t.Callable] = None,
+-    ) -> str:
+-        """If a format call is detected, then this is routed through this
+-        method so that our safety sandbox can be used for it.
++    def wrap_str_format(self, value: t.Any) -> t.Optional[t.Callable[..., str]]:
++        """If the given value is a ``str.format`` or ``str.format_map`` method,
++        return a new function than handles sandboxing. This is done at access
++        rather than in :meth:`call`, so that calls made without ``call`` are
++        also sandboxed.
+         """
++        if not isinstance(
++            value, (types.MethodType, types.BuiltinMethodType)
++        ) or value.__name__ not in ("format", "format_map"):
++            return None
++
++        f_self: t.Any = value.__self__
++
++        if not isinstance(f_self, str):
++            return None
++
++        str_type: t.Type[str] = type(f_self)
++        is_format_map = value.__name__ == "format_map"
+         formatter: SandboxedFormatter
+-        if isinstance(s, Markup):
+-            formatter = SandboxedEscapeFormatter(self, escape=s.escape)
++
++        if isinstance(f_self, Markup):
++            formatter = SandboxedEscapeFormatter(self, escape=f_self.escape)
+         else:
+             formatter = SandboxedFormatter(self)
+
+-        if format_func is not None and format_func.__name__ == "format_map":
+-            if len(args) != 1 or kwargs:
+-                raise TypeError(
+-                    "format_map() takes exactly one argument"
+-                    f" {len(args) + (kwargs is not None)} given"
+-                )
++        vformat = formatter.vformat
++
++        def wrapper(*args: t.Any, **kwargs: t.Any) -> str:
++            if is_format_map:
++                if kwargs:
++                    raise TypeError("format_map() takes no keyword arguments")
++
++                if len(args) != 1:
++                    raise TypeError(
++                        f"format_map() takes exactly one argument ({len(args)} given)"
++                    )
++
++                kwargs = args[0]
++                args = ()
+
+-            kwargs = args[0]
+-            args = ()
++            return str_type(vformat(f_self, args, kwargs))
+
+-        rv = formatter.vformat(s, args, kwargs)
+-        return type(s)(rv)
++        return update_wrapper(wrapper, value)
+
+     def call(
+         __self,  # noqa: B902
+@@ -382,9 +390,6 @@
+         **kwargs: t.Any,
+     ) -> t.Any:
+         """Call an object from sandboxed code."""
+-        fmt = inspect_format_method(__obj)
+-        if fmt is not None:
+-            return __self.format_string(fmt, args, kwargs, __obj)
+
+         # the double prefixes are to avoid double keyword argument
+         # errors when proxying the call.
+--- a/tests/test_security.py
++++ b/tests/test_security.py
+@@ -171,3 +171,20 @@
+             '{{ ("a{x.foo}b{y}"|safe).format_map({"x":{"foo": 42}, "y":"<foo>"}) }}'
+         )
+         assert t.render() == "a42b&lt;foo&gt;"
++
++    def test_indirect_call(self):
++        def run(value, arg):
++            return value.run(arg)
++
++        env = SandboxedEnvironment()
++        env.filters["run"] = run
++        t = env.from_string(
++            """{% set
++                ns = namespace(run="{0.__call__.__builtins__[__import__]}".format)
++            %}
++            {{ ns | run(not_here) }}
++            """
++        )
++
++        with pytest.raises(SecurityError):
++            t.render()
+
+--- a/src/jinja2/sandbox.py
++++ b/src/jinja2/sandbox.py
+@@ -338,10 +338,10 @@
+ 
+     def wrap_str_format(self, value: t.Any) -> t.Optional[t.Callable[..., str]]:
+         """If the given value is a ``str.format`` or ``str.format_map`` method,
+         return a new function than handles sandboxing. This is done at access
+         rather than in :meth:`call`, so that calls made without ``call`` are
+-        also sandboxed.
++        also sandboxed (for example, indirect calls via namespace objects).
+         """
+         if not isinstance(
+             value, (types.MethodType, types.BuiltinMethodType)
+         ) or value.__name__ not in ("format", "format_map"):
+
+--- a/src/jinja2/filters.py
++++ b/src/jinja2/filters.py
+@@ -6,6 +6,7 @@
+ import typing as t
+ import warnings
+ from collections import abc
++from inspect import getattr_static
+ from itertools import chain
+ from itertools import groupby
+ 
+@@ -1358,31 +1359,25 @@
+ def do_attr(
+     environment: "Environment", obj: t.Any, name: str
+ ) -> t.Union[Undefined, t.Any]:
+-    """Get an attribute of an object.  ``foo|attr("bar")`` works like
+-    ``foo.bar`` just that always an attribute is returned and items are not
+-    looked up.
++    """Get an attribute of an object. ``foo|attr("bar")`` works like
++    ``foo.bar``, but returns undefined instead of falling back to ``foo["bar"]``
++    if the attribute doesn't exist.
+ 
+     See :ref:`Notes on subscriptions <notes-on-subscriptions>` for more details.
+     """
++    # Environment.getattr will fall back to obj[name] if obj.name doesn't exist.
++    # But we want to call env.getattr to get behavior such as sandboxing.
++    # Determine if the attr exists first, so we know the fallback won't trigger.
+     try:
+-        name = str(name)
+-    except UnicodeError:
+-        pass
+-    else:
+-        try:
+-            value = getattr(obj, name)
+-        except AttributeError:
+-            pass
+-        else:
+-            if environment.sandboxed:
+-                environment = t.cast("SandboxedEnvironment", environment)
+-
+-                if not environment.is_safe_attribute(obj, name, value):
+-                    return environment.unsafe_undefined(obj, name)
+-
+-            return value
++        # This avoids executing properties/descriptors, but misses __getattr__
++        # and __getattribute__ dynamic attrs.
++        getattr_static(obj, name)
++    except AttributeError:
++        # This finds dynamic attrs, and we know it's not a descriptor at this point.
++        if not hasattr(obj, name):
++            return environment.undefined(obj=obj, name=name)
+ 
+-    return environment.undefined(obj=obj, name=name)
++    return environment.getattr(obj, name)
+ 
+ 
+ @typing.overload
+--- a/tests/test_security.py
++++ b/tests/test_security.py
+@@ -188,3 +188,14 @@
+ 
+         with pytest.raises(SecurityError):
+             t.render()
++
++
++    def test_attr_filter(self):
++        env = SandboxedEnvironment()
++        t = env.from_string(
++            """{{ "{0.__call__.__builtins__[__import__]}"
++                  | attr("format")(not_here) }}"""
++        )
++
++        with pytest.raises(SecurityError):
++            t.render()
