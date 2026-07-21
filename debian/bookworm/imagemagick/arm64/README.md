@@ -1,6 +1,6 @@
-# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u12.root.io.52
+# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u12.root.io.53
 
-This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u12.root.io.52, which is available at:
+This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u12.root.io.53, which is available at:
 https://sources.debian.org/src/imagemagick/8:6.9.11.60+dfsg-1.6+deb12u12/
 
 ## Affected CVEs:
@@ -8,6 +8,7 @@ https://sources.debian.org/src/imagemagick/8:6.9.11.60+dfsg-1.6+deb12u12/
 - CVE-2026-61870
 - CVE-2026-61866
 - CVE-2026-61863
+- CVE-2026-56362
 
 ## How to Apply:
 1. Obtain the source package: `apt source imagemagick`
