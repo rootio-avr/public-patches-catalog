@@ -657,3 +657,196 @@ new file mode 100644
 +                .build();
 +    }
 +}
+
+Description: Fix CVE-2026-54514 SSRF via InetSocketAddress DNS resolution during deserialization
+ jackson-databind's FromStringDeserializer constructed InetSocketAddress instances using
+ the constructor that performs eager DNS resolution during deserialization. An application
+ binding untrusted JSON into a type containing an InetSocketAddress field would issue an
+ attacker-chosen DNS query during readValue, before any application-level validation.
+ Switch to InetSocketAddress.createUnresolved(host, port), postponing DNS lookup until
+ an explicit connect occurs.
+ .
+ Upstream fix 1f5a1037 modifies a single _inetSocketAddress(host, port) helper that was
+ introduced after 2.13.3; in 2.13.3 the three call sites still inline the unsafe
+ constructor, so each is rewritten directly. Test changes from the upstream commit are
+ adapted to JUnit 3 / TestCase assertion style used in the 2.13.x test base.
+Origin: backport, https://github.com/FasterXML/jackson-databind/commit/1f5a1037b1e9e05920e755cb35f198bcd46667e4
+Bug: https://github.com/FasterXML/jackson-databind/security/advisories/GHSA-hgj6-7826-r7m5
+Author: Tatu Saloranta <tatu.saloranta@iki.fi>
+Last-Update: 2026-06-25
+
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/std/FromStringDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/std/FromStringDeserializer.java
+@@ -355,14 +355,15 @@
+                     int j = value.indexOf(':', i);
+                     int port = j > -1 ? Integer.parseInt(value.substring(j + 1)) : 0;
+-                    return new InetSocketAddress(value.substring(0, i + 1), port);
++                    // [databind#5951] Prevent DNS lookup:
++                    return InetSocketAddress.createUnresolved(value.substring(0, i + 1), port);
+                 }
+                 int ix = value.indexOf(':');
+                 if (ix >= 0 && value.indexOf(':', ix + 1) < 0) {
+                     // host:port
+                     int port = Integer.parseInt(value.substring(ix+1));
+-                    return new InetSocketAddress(value.substring(0, ix), port);
++                    return InetSocketAddress.createUnresolved(value.substring(0, ix), port);
+                 }
+                 // host or unbracketed IPv6, without port number
+-                return new InetSocketAddress(value, 0);
++                return InetSocketAddress.createUnresolved(value, 0);
+             }
+             VersionUtil.throwInternal();
+--- a/src/test/java/com/fasterxml/jackson/databind/deser/jdk/JDKStringLikeTypeDeserTest.java
++++ b/src/test/java/com/fasterxml/jackson/databind/deser/jdk/JDKStringLikeTypeDeserTest.java
+@@ -160,15 +160,15 @@
+     public void testInetSocketAddress() throws IOException
+     {
+         InetSocketAddress address = MAPPER.readValue(q("127.0.0.1"), InetSocketAddress.class);
+-        assertEquals("127.0.0.1", address.getAddress().getHostAddress());
++        assertEquals("127.0.0.1", address.getHostName());
+ 
+         InetSocketAddress ip6 = MAPPER.readValue(
+                 q("2001:db8:85a3:8d3:1319:8a2e:370:7348"), InetSocketAddress.class);
+-        assertEquals("2001:db8:85a3:8d3:1319:8a2e:370:7348", ip6.getAddress().getHostAddress());
++        assertEquals("2001:db8:85a3:8d3:1319:8a2e:370:7348", ip6.getHostName());
+ 
+         InetSocketAddress ip6port = MAPPER.readValue(
+                 q("[2001:db8:85a3:8d3:1319:8a2e:370:7348]:443"), InetSocketAddress.class);
+-        assertEquals("2001:db8:85a3:8d3:1319:8a2e:370:7348", ip6port.getAddress().getHostAddress());
++        assertEquals("[2001:db8:85a3:8d3:1319:8a2e:370:7348]", ip6port.getHostName());
+         assertEquals(443, ip6port.getPort());
+ 
+         // should we try resolving host names? That requires connectivity...
+@@ -180,6 +180,11 @@
+         address = MAPPER.readValue(q(HOST_AND_PORT), InetSocketAddress.class);
+         assertEquals(HOST, address.getHostName());
+         assertEquals(80, address.getPort());
++
++        // [databind#5951]: should NOT resolve address
++        address = MAPPER.readValue(q("localhost:9999"), InetSocketAddress.class);
++        assertTrue("`InetSocketAddress` resolved localhost during deserialization: " + address,
++                address.isUnresolved());
+     }
+ 
+     public void testPattern() throws IOException
+--- a/src/test/java/com/fasterxml/jackson/databind/ser/jdk/JDKTypeSerializationTest.java
++++ b/src/test/java/com/fasterxml/jackson/databind/ser/jdk/JDKTypeSerializationTest.java
+@@ -112,8 +112,12 @@
+     {
+         assertEquals(q("127.0.0.1:8080"),
+                 MAPPER.writeValueAsString(new InetSocketAddress("127.0.0.1", 8080)));
++        assertEquals(q("127.0.0.1:8080"),
++                MAPPER.writeValueAsString(InetSocketAddress.createUnresolved("127.0.0.1", 8080)));
+         assertEquals(q("google.com:6667"),
+                 MAPPER.writeValueAsString(new InetSocketAddress("google.com", 6667)));
++        assertEquals(q("google.com:6667"),
++                MAPPER.writeValueAsString(InetSocketAddress.createUnresolved("google.com", 6667)));
+         assertEquals(q("[2001:db8:85a3:8d3:1319:8a2e:370:7348]:443"),
+                 MAPPER.writeValueAsString(new InetSocketAddress("2001:db8:85a3:8d3:1319:8a2e:370:7348", 443)));
+     }
+
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerBase.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerBase.java
+@@ -808,7 +808,10 @@
+             // 16-May-2016, tatu: How about per-property case-insensitivity?
+             Boolean B = format.getFeature(JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_PROPERTIES);
+             if (B != null) {
+-                BeanPropertyMap propsOrig = _beanProperties;
++                // [databind#5962]: must rebuild from the (possibly filtered) contextual
++                // BeanPropertyMap so that per-property @JsonIgnoreProperties exclusions
++                // applied by _handleByNameInclusion() above are preserved.
++                BeanPropertyMap propsOrig = contextual._beanProperties;
+                 BeanPropertyMap props = propsOrig.withCaseInsensitivity(B.booleanValue());
+                 if (props != propsOrig) {
+                     contextual = contextual.withBeanProperties(props);
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/deser/filter/IgnorePropertiesCaseInsensitive5962Test.java
+@@ -0,0 +1,88 @@
++package com.fasterxml.jackson.databind.deser.filter;
++
++import com.fasterxml.jackson.annotation.JsonFormat;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++
++import com.fasterxml.jackson.databind.BaseMapTest;
++import com.fasterxml.jackson.databind.ObjectMapper;
++
++import static org.junit.Assert.assertNotEquals;
++
++/**
++ * [databind#5962]: Case-insensitive BeanPropertyMap rebuild undoes per-property
++ * {@code @JsonIgnoreProperties}.
++ *
++ * {@code BeanDeserializerBase.createContextual()} calls {@code _handleByNameInclusion()}
++ * to filter properties according to per-property {@code @JsonIgnoreProperties}, producing
++ * a contextual deserializer with the restricted {@code BeanPropertyMap}. However, the
++ * subsequent case-insensitivity block read {@code _beanProperties} (the *original*
++ * unfiltered map from {@code this}) rather than {@code contextual._beanProperties} (the
++ * filtered map). {@code withCaseInsensitivity()} then rebuilt the map from the unfiltered
++ * source, and {@code contextual.withBeanProperties(props)} overwrote the filtered map with
++ * the unfiltered one — any properties removed by {@code _handleByNameInclusion} were
++ * restored.
++ *
++ * Patch: source the case-insensitive rebuild from {@code contextual._beanProperties}.
++ */
++public class IgnorePropertiesCaseInsensitive5962Test extends BaseMapTest
++{
++    static class AdminDto {
++        public String adminKey = "DEFAULT";
++        public String username;
++    }
++
++    // Container that ignores "adminKey" on the AdminDto field AND enables case-insensitive matching
++    static class Container {
++        @JsonIgnoreProperties("adminKey")
++        @JsonFormat(with = JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)
++        public AdminDto admin;
++    }
++
++    // Baseline container: only @JsonIgnoreProperties, no case-insensitive format override
++    static class BaselineContainer {
++        @JsonIgnoreProperties("adminKey")
++        public AdminDto admin;
++    }
++
++    /**
++     * NEGATIVE CONTROL: without the @JsonFormat case-insensitive override, @JsonIgnoreProperties
++     * correctly suppresses adminKey on the nested AdminDto field.
++     */
++    public void testNegativeControlWithoutCaseInsensitivity() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder().build();
++        String json = "{\"admin\":{\"adminKey\":\"HACKED\",\"username\":\"alice\"}}";
++        BaselineContainer result = mapper.readValue(json, BaselineContainer.class);
++        // Without case-insensitive format, @JsonIgnoreProperties blocks adminKey
++        assertNotEquals("@JsonIgnoreProperties alone (no case-insensitive format) should block adminKey",
++                "HACKED", result.admin.adminKey);
++        assertEquals("alice", result.admin.username);
++    }
++
++    /**
++     * EXPLOIT PATH: the case-insensitive BeanPropertyMap rebuild (triggered by
++     * @JsonFormat ACCEPT_CASE_INSENSITIVE_PROPERTIES) restores the unfiltered original
++     * _beanProperties, undoing the @JsonIgnoreProperties("adminKey") exclusion.
++     * Case-insensitive matching then routes "adminKey" (or "ADMINKEY") to the setter.
++     *
++     * Security assertion: adminKey must NOT be settable via JSON when the enclosing
++     * container declares @JsonIgnoreProperties("adminKey") on the field.
++     */
++    public void testCaseInsensitiveRebuildRestoresIgnoredProperty() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder().build();
++
++        // Exact case — should be blocked by @JsonIgnoreProperties
++        String json = "{\"admin\":{\"adminKey\":\"HACKED\",\"username\":\"alice\"}}";
++        Container result = mapper.readValue(json, Container.class);
++        assertNotEquals("[databind#5962]: case-insensitive BeanPropertyMap rebuild restored 'adminKey' " +
++                "after it was removed by @JsonIgnoreProperties. The property was set to 'HACKED'.",
++                "HACKED", result.admin.adminKey);
++        assertEquals("alice", result.admin.username);
++
++        // Mixed case — exploits the case-insensitive rebuild more directly
++        String jsonMixed = "{\"admin\":{\"AdminKey\":\"HACKED2\",\"username\":\"bob\"}}";
++        Container result2 = mapper.readValue(jsonMixed, Container.class);
++        assertNotEquals("[databind#5962]: 'AdminKey' (mixed case) matched 'adminKey' via case-insensitive " +
++                "lookup that was rebuilt from the unfiltered property map.",
++                "HACKED2", result2.admin.adminKey);
++    }
++}
