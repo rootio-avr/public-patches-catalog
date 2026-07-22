@@ -4,6 +4,7 @@ This patch is based on tar version 6.1.15, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-23950
 - CVE-2026-26960
 
 ## How to Apply:
