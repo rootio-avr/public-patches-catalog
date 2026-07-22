@@ -4,6 +4,7 @@ This patch is based on serialize-javascript version 1.9.1, which is available at
 unknown
 
 ## Affected CVEs:
+- CVE-2019-16769
 - CVE-2020-7660
 - GHSA-5c6j-r48x-rmvq
 
