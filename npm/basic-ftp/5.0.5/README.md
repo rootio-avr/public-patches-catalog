@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-27699
+- GHSA-6v7q-wjvx-w8wg
 
 ## How to Apply:
 1. Clone or download the source code for basic-ftp
