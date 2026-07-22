@@ -1006,3 +1006,209 @@ diff -ruN package/CVE-2026-42038.note p42038/CVE-2026-42038.note
  }
 
  /**
+
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -56,7 +56,15 @@
+  * @returns {boolean} True if value is an FormData, otherwise false
+  */
+ function isFormData(val) {
+-  return (typeof FormData !== 'undefined') && (val instanceof FormData);
++  if (!val) return false;
++  if ((typeof FormData !== 'undefined') && (val instanceof FormData)) return true;
++  // Reject plain objects whose prototype is Object.prototype so
++  // prototype-pollution gadgets (e.g. polluted append/Symbol.toStringTag)
++  // cannot duck-type as FormData (GHSA-6chq-wfr3-2hj9).
++  var proto = Object.getPrototypeOf(val);
++  if (!proto || proto === Object.prototype) return false;
++  // Require append to be an own property, not inherited via prototype pollution.
++  return Object.prototype.hasOwnProperty.call(val, 'append') && isFunction(val.append);
+ }
+ 
+ /**
+@@ -167,7 +175,10 @@
+  * @returns {boolean} True if value is a Stream, otherwise false
+  */
+ function isStream(val) {
+-  return isObject(val) && isFunction(val.pipe);
++  // Require pipe to be an own property to block prototype-pollution
++  // gadgets that spoof streams via a polluted Object.prototype.pipe
++  // (GHSA-6chq-wfr3-2hj9).
++  return isObject(val) && Object.prototype.hasOwnProperty.call(val, 'pipe') && isFunction(val.pipe);
+ }
+ 
+ /**
+
+--- a/CVE-2026-42041.note	1970-01-01 00:00:00.000000000 +0000
++++ b/CVE-2026-42041.note	2026-07-22 00:00:00.000000000 +0000
+@@ -0,0 +1 @@
++CVE-2026-42041: mergeConfig hasOwnProp / own-property hardening for axios 0.21.1 is already applied by CVE-2026-42033 in this ordered patch set.
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -12,6 +12,7 @@
+ var zlib = require('zlib');
+ var pkg = require('./../../package.json');
+ var createError = require('../core/createError');
++var streamModule = require('stream');
+ var enhanceError = require('../core/enhanceError');
+
+ var isHttps = /https:?/;
+@@ -293,9 +294,43 @@
+
+     // Send the request
+     if (utils.isStream(data)) {
+-      data.on('error', function handleStreamError(err) {
++      var dataStream = data.on('error', function handleStreamError(err) {
+         reject(enhanceError(err, config, null, req));
+-      }).pipe(req);
++      });
++
++      // Enforce maxBodyLength for streamed uploads on the native http/https
++      // transport (maxRedirects === 0); follow-redirects enforces it on the
++      // other path. See GHSA-5c9x-8gcm-mpgx.
++      var uploadStream = dataStream;
++      if (config.maxBodyLength > -1 && config.maxRedirects === 0) {
++        var limit = config.maxBodyLength;
++        var bytesSent = 0;
++        uploadStream = streamModule.pipeline(
++          [
++            dataStream,
++            new streamModule.Transform({
++              transform: function transform(chunk, _enc, cb) {
++                bytesSent += chunk.length;
++                if (bytesSent > limit) {
++                  return cb(createError(
++                    'Request body larger than maxBodyLength limit',
++                    config,
++                    'ERR_BAD_REQUEST',
++                    req
++                  ));
++                }
++                cb(null, chunk);
++              }
++            })
++          ],
++          function noop() {}
++        );
++        uploadStream.on('error', function handleUploadError(err) {
++          if (!req.destroyed) req.destroy(err);
++        });
++      }
++
++      uploadStream.pipe(req);
+     } else {
+       req.end(data);
+     }
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -227,6 +227,21 @@
+       };
+
+       if (config.responseType === 'stream') {
++        // Enforce maxContentLength on streamed responses; previously this
++        // was applied only to buffered responses, allowing unbounded
++        // response bodies to bypass the cap. See GHSA-vf2m-468p-8v99.
++        if (config.maxContentLength > -1) {
++          var totalResponseBytes = 0;
++          stream.on('data', function handleStreamData(chunk) {
++            totalResponseBytes += chunk.length;
++            if (totalResponseBytes > config.maxContentLength) {
++              stream.destroy();
++              reject(createError('maxContentLength size of ' + config.maxContentLength + ' exceeded',
++                config, null, lastRequest));
++            }
++          });
++        }
++
+         response.data = stream;
+         settle(resolve, reject, response);
+       } else {
+
+diff --git a/lib/adapters/http.js b/lib/adapters/http.js
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -16,6 +16,30 @@ var enhanceError = require('../core/enhanceError');
+ 
+ var isHttps = /https:?/;
+ 
++// CVE-2026-40175: strip CRLF and other forbidden characters from
++// outgoing HTTP header values to prevent HTTP header injection /
++// response-splitting via CRLF-bearing inputs (e.g. values smuggled in
++// from prototype-pollution primitives).
++function sanitizeHeaderValue(value) {
++  if (value === null || value === undefined || value === false) {
++    return value;
++  }
++  if (Array.isArray(value)) {
++    return value.map(sanitizeHeaderValue);
++  }
++  // Coerce non-strings (numbers, booleans, etc.) to string.
++  var str = typeof value === 'string' ? value : String(value);
++  // Remove characters that are invalid inside an HTTP header field-value:
++  // CR, LF, NUL, and other ASCII control bytes (0x00-0x1F except HTAB 0x09)
++  // plus DEL (0x7F).
++  // eslint-disable-next-line no-control-regex
++  str = str.replace(/[\x00-\x08\x0A-\x1F\x7F]/g, '');
++  // Trim leading/trailing whitespace (including HTAB) - matches upstream
++  // behavior: ' ok\r\nInjected: yes\t' -> 'okInjected: yes'.
++  str = str.replace(/^\s+|\s+$/g, '');
++  return str;
++}
++
+ /**
+  *
+  * @param {http.ClientRequestArgs} options
+@@ -169,6 +193,17 @@ module.exports = function httpAdapter(config) {
+       }
+     }
+ 
++    // CVE-2026-40175: sanitize all outbound header values to prevent
++    // CRLF / header-injection attacks (incl. proxy-authorization headers
++    // added below by setProxy).
++    if (options.headers) {
++      Object.keys(options.headers).forEach(function sanitizeOutboundHeader(name) {
++        if (Object.prototype.hasOwnProperty.call(options.headers, name)) {
++          options.headers[name] = sanitizeHeaderValue(options.headers[name]);
++        }
++      });
++    }
++
+     if (proxy) {
+       options.headers.host = parsed.hostname + (parsed.port ? ':' + parsed.port : '');
+       setProxy(options, proxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path);
+
+--- a/lib/adapters/xhr.js
++++ b/lib/adapters/xhr.js
+@@ -13,6 +13,8 @@ module.exports = function xhrAdapter(config) {
+   return new Promise(function dispatchXhrRequest(resolve, reject) {
+     var requestData = config.data;
+     var requestHeaders = config.headers;
++    // Guard against prototype pollution (GHSA-xx6v-rp6x-q39c): only honor own properties.
++    var withXSRFToken = Object.prototype.hasOwnProperty.call(config, 'withXSRFToken') ? config.withXSRFToken : undefined;
+
+     if (utils.isFormData(requestData)) {
+       delete requestHeaders['Content-Type']; // Let the browser set it
+@@ -105,12 +107,15 @@ module.exports = function xhrAdapter(config) {
+     // Specifically not if we're in a web worker, or react-native.
+     if (utils.isStandardBrowserEnv()) {
+       // Add xsrf header
+-      var xsrfValue = (config.withCredentials || isURLSameOrigin(fullPath)) && config.xsrfCookieName ?
+-        cookies.read(config.xsrfCookieName) :
+-        undefined;
+-
+-      if (xsrfValue) {
+-        requestHeaders[config.xsrfHeaderName] = xsrfValue;
++      if (utils.isFunction(withXSRFToken)) {
++        withXSRFToken = withXSRFToken(config);
++      }
++      // Strict boolean check (GHSA-xx6v-rp6x-q39c): only `true` short-circuits the same-origin guard.
++      if (withXSRFToken === true || (withXSRFToken !== false && isURLSameOrigin(fullPath))) {
++        var xsrfValue = config.xsrfHeaderName && config.xsrfCookieName && cookies.read(config.xsrfCookieName);
++        if (xsrfValue) {
++          requestHeaders[config.xsrfHeaderName] = xsrfValue;
++        }
+       }
+     }
+
