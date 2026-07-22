@@ -696,3 +696,581 @@ new file mode 100644
 
        <!-- 12-Nov-2022, tatu: [databind#3659] add verification of compatibility
  	   wrt Android SDK versions using AnimalSniffer with "gummy bears" signatures.
+
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerBase.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializerBase.java
+@@ -894,7 +894,10 @@ ClassUtil.nameOf(handledType()), ClassUtil.name(propName)));
+             // 16-May-2016, tatu: How about per-property case-insensitivity?
+             Boolean B = format.getFeature(JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_PROPERTIES);
+             if (B != null) {
+-                BeanPropertyMap propsOrig = _beanProperties;
++                // [databind#5962]: must rebuild from the (possibly filtered) contextual
++                // BeanPropertyMap so that per-property @JsonIgnoreProperties exclusions
++                // applied by _handleByNameInclusion() above are preserved.
++                BeanPropertyMap propsOrig = contextual._beanProperties;
+                 BeanPropertyMap props = propsOrig.withCaseInsensitivity(B.booleanValue());
+                 if (props != propsOrig) {
+                     contextual = contextual.withBeanProperties(props);
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/deser/filter/IgnorePropertiesCaseInsensitive5962Test.java
+@@ -0,0 +1,94 @@
++package com.fasterxml.jackson.databind.deser.filter;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonFormat;
++import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
++
++import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * [databind#5962]: Case-insensitive BeanPropertyMap rebuild undoes per-property
++ * {@code @JsonIgnoreProperties}.
++ *
++ * {@code BeanDeserializerBase.createContextual()} calls {@code _handleByNameInclusion()}
++ * to filter properties according to per-property {@code @JsonIgnoreProperties}, producing
++ * a contextual deserializer with the restricted {@code BeanPropertyMap}. However, the
++ * subsequent case-insensitivity block read {@code _beanProperties} (the *original*
++ * unfiltered map from {@code this}) rather than {@code contextual._beanProperties} (the
++ * filtered map). {@code withCaseInsensitivity()} then rebuilt the map from the unfiltered
++ * source, and {@code contextual.withBeanProperties(props)} overwrote the filtered map with
++ * the unfiltered one — any properties removed by {@code _handleByNameInclusion} were
++ * restored.
++ *
++ * Patch: source the case-insensitive rebuild from {@code contextual._beanProperties}.
++ */
++public class IgnorePropertiesCaseInsensitive5962Test extends DatabindTestUtil
++{
++    static class AdminDto {
++        public String adminKey = "DEFAULT";
++        public String username;
++    }
++
++    // Container that ignores "adminKey" on the AdminDto field AND enables case-insensitive matching
++    static class Container {
++        @JsonIgnoreProperties("adminKey")
++        @JsonFormat(with = JsonFormat.Feature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)
++        public AdminDto admin;
++    }
++
++    // Baseline container: only @JsonIgnoreProperties, no case-insensitive format override
++    static class BaselineContainer {
++        @JsonIgnoreProperties("adminKey")
++        public AdminDto admin;
++    }
++
++    /**
++     * NEGATIVE CONTROL: without the @JsonFormat case-insensitive override, @JsonIgnoreProperties
++     * correctly suppresses adminKey on the nested AdminDto field.
++     */
++    @Test
++    public void test5962_negativeControl_withoutCaseInsensitivity() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder().build();
++        String json = "{\"admin\":{\"adminKey\":\"HACKED\",\"username\":\"alice\"}}";
++        BaselineContainer result = mapper.readValue(json, BaselineContainer.class);
++        // Without case-insensitive format, @JsonIgnoreProperties blocks adminKey
++        assertNotEquals("HACKED", result.admin.adminKey,
++                "@JsonIgnoreProperties alone (no case-insensitive format) should block adminKey");
++        assertEquals("alice", result.admin.username);
++    }
++
++    /**
++     * EXPLOIT PATH: the case-insensitive BeanPropertyMap rebuild (triggered by
++     * @JsonFormat ACCEPT_CASE_INSENSITIVE_PROPERTIES) restores the unfiltered original
++     * _beanProperties, undoing the @JsonIgnoreProperties("adminKey") exclusion.
++     * Case-insensitive matching then routes "adminKey" (or "ADMINKEY") to the setter.
++     *
++     * Security assertion: adminKey must NOT be settable via JSON when the enclosing
++     * container declares @JsonIgnoreProperties("adminKey") on the field.
++     */
++    @Test
++    public void test5962_caseInsensitiveRebuildRestoresIgnoredProperty() throws Exception {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++                .build();
++
++        // Exact case — should be blocked by @JsonIgnoreProperties
++        String json = "{\"admin\":{\"adminKey\":\"HACKED\",\"username\":\"alice\"}}";
++        Container result = mapper.readValue(json, Container.class);
++        assertNotEquals("HACKED", result.admin.adminKey,
++                "[databind#5962]: case-insensitive BeanPropertyMap rebuild restored 'adminKey' " +
++                        "after it was removed by @JsonIgnoreProperties. The property was set to 'HACKED'.");
++        assertEquals("alice", result.admin.username);
++
++        // Mixed case — exploits the case-insensitive rebuild more directly
++        String jsonMixed = "{\"admin\":{\"AdminKey\":\"HACKED2\",\"username\":\"bob\"}}";
++        Container result2 = mapper.readValue(jsonMixed, Container.class);
++        assertNotEquals("HACKED2", result2.admin.adminKey,
++                "[databind#5962]: 'AdminKey' (mixed case) matched 'adminKey' via case-insensitive " +
++                        "lookup that was rebuilt from the unfiltered property map.");
++    }
++}
+
+--- a/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertiesCollector.java
++++ b/src/main/java/com/fasterxml/jackson/databind/introspect/POJOPropertiesCollector.java
+@@ -1586,6 +1586,11 @@ ctor.creator()));
+                 if (isRecordType() || !prop.anyExplicitsWithoutIgnoral()) {
+                     continue;
+                 }
++                // [databind#5967]: Strip inferred non-visible field mutators to preserve @JsonIgnore
++                // semantics. The ignored name was collected because couldDeserialize()==false,
++                // meaning any retained fields are non-visible (kept only by INFER_PROPERTY_MUTATORS).
++                // Removing them ensures the renamed property remains read-only (serialization only).
++                prop.removeFields();
+             }
+ 
+             Collection<PropertyName> l = prop.findExplicitNames();
+--- /dev/null
++++ b/src/test-jdk17/java/com/fasterxml/jackson/databind/records/RecordRenamedPropertyIgnoreFieldBypass5967Test.java
+@@ -0,0 +1,32 @@
++package com.fasterxml.jackson.databind.records;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonProperty;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++// [databind#5967] Records take a different path in
++// POJOPropertiesCollector#_renameProperties (always skipped by isRecordType()
++// when the property name is in _ignoredPropertyNames), so the field-stripping
++// fix added for non-records must not regress record renaming.
++public class RecordRenamedPropertyIgnoreFieldBypass5967Test extends DatabindTestUtil
++{
++    public record RenamedRecord(@JsonProperty("renamedProp") String prop) {}
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    @Test
++    public void recordWithRenamedPropertyRoundTrips() throws Exception
++    {
++        RenamedRecord original = new RenamedRecord("someValue");
++        String json = MAPPER.writeValueAsString(original);
++        assertEquals("{\"renamedProp\":\"someValue\"}", json);
++
++        RenamedRecord result = MAPPER.readValue(json, RenamedRecord.class);
++        assertEquals("someValue", result.prop());
++    }
++}
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/introspect/JsonIgnoreSetterFieldBypass5398Test.java
+@@ -0,0 +1,156 @@
++package com.fasterxml.jackson.databind.introspect;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.*;
++
++import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * Tests covering the [databind#5398] follow-up: when a property's setter is
++ * {@code @JsonIgnore}d (and the getter carries {@code @JsonProperty} that
++ * keeps the property non-ignored as a whole), the inferred field mutator
++ * retained via {@code MapperFeature.INFER_PROPERTY_MUTATORS} must NOT be
++ * used to bypass the ignored setter. The property should remain
++ * serialization-only (read-only).
++ */
++public class JsonIgnoreSetterFieldBypass5398Test extends DatabindTestUtil
++{
++    static class RenamedGetterIgnoredSetter {
++        private String prop;
++
++        @JsonProperty("renamedProp")
++        public String getProp() {
++            return prop;
++        }
++
++        @JsonIgnore
++        public void setProp(String prop) {
++            this.prop = prop;
++        }
++    }
++
++    static class StandardGetterIgnoredSetter {
++        private String prop;
++
++        @JsonProperty
++        public String getProp() {
++            return prop;
++        }
++
++        @JsonIgnore
++        public void setProp(String prop) {
++            this.prop = prop;
++        }
++    }
++
++    // Sibling shape: READ_ONLY access on getter rather than @JsonIgnore on setter.
++    static class ReadOnlyRenamedGetter {
++        private String prop;
++
++        @JsonProperty(value = "renamedProp", access = JsonProperty.Access.READ_ONLY)
++        public String getProp() {
++            return prop;
++        }
++
++        public void setProp(String prop) {
++            this.prop = prop;
++        }
++    }
++
++    // 2.x defaults FAIL_ON_UNKNOWN_PROPERTIES to true; disable so the "not written"
++    // outcome (rather than an exception) is what we assert on read paths.
++    private final ObjectMapper MAPPER = jsonMapperBuilder()
++            .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++            .build();
++
++    @Test
++    public void renamedGetterStillSerializes() throws Exception
++    {
++        RenamedGetterIgnoredSetter bean = new RenamedGetterIgnoredSetter();
++        bean.setProp("someValue");
++        assertEquals("{\"renamedProp\":\"someValue\"}",
++                MAPPER.writeValueAsString(bean));
++    }
++
++    @Test
++    public void standardGetterStillSerializes() throws Exception
++    {
++        StandardGetterIgnoredSetter bean = new StandardGetterIgnoredSetter();
++        bean.setProp("someValue");
++        assertEquals("{\"prop\":\"someValue\"}",
++                MAPPER.writeValueAsString(bean));
++    }
++
++    // The renamed property must be read-only: @JsonIgnore on the setter
++    // blocks the write, and the inferred field mutator must not bypass it.
++    @Test
++    public void renamedIgnoredSetterDoesNotBypassViaField() throws Exception
++    {
++        RenamedGetterIgnoredSetter result = MAPPER.readValue(
++                "{\"renamedProp\":\"someValue\"}",
++                RenamedGetterIgnoredSetter.class);
++        assertNotNull(result);
++        assertNull(result.getProp());
++    }
++
++    @Test
++    public void standardIgnoredSetterDoesNotBypassViaField() throws Exception
++    {
++        StandardGetterIgnoredSetter result = MAPPER.readValue(
++                "{\"prop\":\"someValue\"}",
++                StandardGetterIgnoredSetter.class);
++        assertNotNull(result);
++        assertNull(result.getProp());
++    }
++
++    // Control: feeding the implicit field name (rather than the renamed
++    // public name) also does not write the field.
++    @Test
++    public void implicitFieldNameDoesNotWriteWhenSetterIgnored() throws Exception
++    {
++        RenamedGetterIgnoredSetter result = MAPPER.readerFor(RenamedGetterIgnoredSetter.class)
++                .without(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++                .readValue("{\"prop\":\"someValue\"}");
++        assertNotNull(result);
++        assertNull(result.getProp());
++    }
++
++    // Bypass must also stay closed when INFER_PROPERTY_MUTATORS is disabled,
++    // i.e. the fix is not just an artifact of inference being on.
++    @Test
++    public void inferMutatorsDisabledStillBlocksWrite() throws Exception
++    {
++        ObjectMapper mapper = jsonMapperBuilder()
++                .disable(MapperFeature.INFER_PROPERTY_MUTATORS)
++                .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++                .build();
++        RenamedGetterIgnoredSetter result = mapper.readValue(
++                "{\"renamedProp\":\"someValue\"}",
++                RenamedGetterIgnoredSetter.class);
++        assertNotNull(result);
++        assertNull(result.getProp());
++    }
++
++    // Sibling: @JsonProperty(access = READ_ONLY) on the renamed getter must
++    // produce the same outcome — serialize under the new name, not write
++    // back via the inferred field mutator.
++    @Test
++    public void readOnlyRenamedGetterIsSerializeOnly() throws Exception
++    {
++        ReadOnlyRenamedGetter bean = new ReadOnlyRenamedGetter();
++        bean.setProp("someValue");
++        assertEquals("{\"renamedProp\":\"someValue\"}",
++                MAPPER.writeValueAsString(bean));
++
++        ReadOnlyRenamedGetter result = MAPPER.readValue(
++                "{\"renamedProp\":\"someValue\"}",
++                ReadOnlyRenamedGetter.class);
++        assertNotNull(result);
++        assertNull(result.getProp());
++    }
++
++}
+--- a/src/test/java/com/fasterxml/jackson/databind/introspect/JsonPropertyRename5398Test.java
++++ b/src/test/java/com/fasterxml/jackson/databind/introspect/JsonPropertyRename5398Test.java
+@@ -53,11 +53,14 @@ public class JsonPropertyRename5398Test extends DatabindTestUtil
+         // Should serialize with renamed property
+         assertEquals("{\"renamedProp\":\"someValue\"}", json);
+ 
+-        // Should be able to deserialize back (setter is ignored, so field remains default)
+-        TestRename5398 result = MAPPER.readValue(json, TestRename5398.class);
++        // @JsonIgnore on the setter prevents write access to the backing field
++        // ([databind#5967] fix: inferred non-visible field mutator stripped when setter is @JsonIgnore).
++        // Deserialization of "renamedProp" is blocked; field stays at its default (null).
++        TestRename5398 result = MAPPER.readerFor(TestRename5398.class)
++                .without(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++                .readValue(json);
+         assertNotNull(result);
+-        // The setter is ignored but the property is still considered read-write
+-		assertEquals("someValue", result.getProp());
++        assertNull(result.getProp());
+     }
+ 
+     @Test
+@@ -68,13 +71,15 @@ public class JsonPropertyRename5398Test extends DatabindTestUtil
+ 
+         String json = MAPPER.writeValueAsString(original);
+ 
+-        // Should serialize with renamed property
++        // Should serialize under the implicit property name
+         assertEquals("{\"prop\":\"someValue\"}", json);
+ 
+-        // Should be able to deserialize back (setter is ignored, so field remains default)
+-        TestStd5398 result = MAPPER.readValue(json, TestStd5398.class);
++        // @JsonIgnore on the setter prevents write access to the backing field.
++        // Field stays at its default (null) after deserialization.
++        TestStd5398 result = MAPPER.readerFor(TestStd5398.class)
++                .without(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
++                .readValue(json);
+         assertNotNull(result);
+-		// The setter is ignored but the property is still considered read-write
+-		assertEquals("someValue", result.getProp());
++        assertNull(result.getProp());
+     }
+ }
+
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/BeanDeserializer.java
+@@ -483,6 +483,13 @@ public class BeanDeserializer
+                 // [databind#3938]: except if it's MethodProperty
+                 (!_beanType.isRecordType() || (prop instanceof MethodProperty))) {
+ 
++                // [databind#5969]: must honor active view here too -- otherwise
++                // setterless/merging collection properties hidden by view can be
++                // populated via the buffering path below.
++                if ((activeView != null) && !prop.visibleInView(activeView)) {
++                    p.skipChildren();
++                    continue;
++                }
+                 // 12-Aug-2025, tatu: [databind#5237] Mergeable properties need
+                 //    special handling: must defer deserialization until POJO
+                 //    is constructed.
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/views/SetterlessViewBypass5969Test.java
+@@ -0,0 +1,92 @@
++package com.fasterxml.jackson.databind.views;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.annotation.JsonView;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++// [databind#5969]: @JsonView bypass for setterless creator properties.
++//
++// Regression introduced when setterless collection properties were enrolled
++// in the merging buffer path of BeanDeserializer._deserializeUsingPropertyBased():
++// the regular-property buffering branch had no `prop.visibleInView(activeView)` check,
++// so a setterless collection annotated `@JsonView(Admin.class)` could still be populated
++// when deserializing under a non-Admin view via a class with a `@JsonCreator` constructor.
++public class SetterlessViewBypass5969Test extends DatabindTestUtil
++{
++    static class PublicView {}
++    static class AdminView extends PublicView {}
++
++    public static class CreatorBean {
++        @JsonView(PublicView.class)
++        private String name;
++
++        // Setterless collection: no setter -> SetterlessProperty.
++        // @JsonView(AdminView) means it must be invisible in PublicView.
++        @JsonView(AdminView.class)
++        private final List<String> roles = new ArrayList<>();
++
++        @JsonCreator
++        public CreatorBean(@JsonProperty("name") @JsonView(PublicView.class) String name) {
++            this.name = name;
++        }
++
++        @JsonView(PublicView.class)
++        public String getName() { return name; }
++
++        @JsonView(AdminView.class)
++        public List<String> getRoles() { return roles; }
++    }
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    // Regular case: Admin view should populate both name and roles.
++    @Test
++    public void testAdminView_negativeControl() throws Exception {
++        CreatorBean result = MAPPER
++                .readerWithView(AdminView.class)
++                .forType(CreatorBean.class)
++                .readValue("{\"name\":\"alice\",\"roles\":[\"admin\"]}");
++        assertEquals("alice", result.getName());
++        assertEquals(Arrays.asList("admin"), result.getRoles());
++    }
++
++    // Formerly failing case: roles appears BEFORE the creator property "name", forcing the
++    // regular-property buffering path. Under PublicView, roles must remain empty.
++    @Test
++    public void testSetterlessViewBypassInCreatorDeser() throws Exception {
++        CreatorBean result = MAPPER
++                .readerWithView(PublicView.class)
++                .forType(CreatorBean.class)
++                .readValue("{\"roles\":[\"admin\"],\"name\":\"alice\"}");
++
++        assertEquals("alice", result.getName());
++        assertTrue(result.getRoles().isEmpty(),
++                "[databind#5969] setterless property @JsonView(AdminView) was " +
++                "populated in PublicView via isMerging() buffer path. roles = " + result.getRoles());
++    }
++
++    // Formerly failing case: roles appears AFTER the creator property.
++    @Test
++    public void testSetterlessViewBypass_rolesAfterCreator() throws Exception {
++        CreatorBean result = MAPPER
++                .readerWithView(PublicView.class)
++                .forType(CreatorBean.class)
++                .readValue("{\"name\":\"alice\",\"roles\":[\"admin\"]}");
++
++        assertEquals("alice", result.getName());
++        assertTrue(result.getRoles().isEmpty(),
++                "[databind#5969] roles populated in PublicView. roles = " + result.getRoles());
++    }
++}
+
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/impl/UnwrappedPropertyHandler.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/impl/UnwrappedPropertyHandler.java
+@@ -85,7 +85,13 @@ public class UnwrappedPropertyHandler
+             DeserializationContext ctxt, PropertyValueBuffer values, TokenBuffer buffered)
+         throws IOException
+     {
++        // [databind#5971]: honor active @JsonView -- skip creator properties not
++        // visible in the active view rather than populating them from buffered input.
++        final Class<?> activeView = ctxt.getActiveView();
+         for (SettableBeanProperty prop : _creatorProperties) {
++            if ((activeView != null) && !prop.visibleInView(activeView)) {
++                continue;
++            }
+             JsonParser p = buffered.asParser(originalParser.streamReadConstraints());
+             p.nextToken();
+             values.assignParameter(prop, prop.deserialize(p, ctxt));
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/views/UnwrappedCreatorViewBypass5971Test.java
+@@ -0,0 +1,81 @@
++package com.fasterxml.jackson.databind.views;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonCreator;
++import com.fasterxml.jackson.annotation.JsonProperty;
++import com.fasterxml.jackson.annotation.JsonUnwrapped;
++import com.fasterxml.jackson.annotation.JsonView;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++// [databind#5971]: @JsonView bypass for unwrapped creator parameters.
++//
++// UnwrappedPropertyHandler.processUnwrappedCreatorProperties() iterated over
++// _creatorProperties and called prop.deserialize() without checking
++// visibleInView(activeView). When an application uses JsonView as a write-side
++// access-control boundary, an @JsonView(Admin) constructor parameter annotated
++// with @JsonUnwrapped could still be populated from untrusted JSON while reading
++// with a different (less-privileged) active view.
++public class UnwrappedCreatorViewBypass5971Test extends DatabindTestUtil
++{
++    static class PublicView {}
++    static class AdminView extends PublicView {}
++
++    public static class Address {
++        @JsonView(AdminView.class)
++        public String street;
++
++        @JsonView(PublicView.class)
++        public String city;
++    }
++
++    public static class UserBean {
++        @JsonView(PublicView.class)
++        public final String name;
++
++        @JsonView(AdminView.class)
++        public final Address address;
++
++        @JsonCreator
++        public UserBean(
++                @JsonProperty("name") @JsonView(PublicView.class) String name,
++                @JsonView(AdminView.class) @JsonUnwrapped Address address) {
++            this.name = name;
++            this.address = address;
++        }
++    }
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    // Negative control: AdminView populates both creator params.
++    @Test
++    public void testAdminView_negativeControl() throws Exception {
++        UserBean result = MAPPER
++                .readerWithView(AdminView.class)
++                .forType(UserBean.class)
++                .readValue("{\"name\":\"alice\",\"street\":\"1 Main St\",\"city\":\"Springfield\"}");
++        assertEquals("alice", result.name);
++        assertNotNull(result.address);
++        assertEquals("1 Main St", result.address.street);
++        assertEquals("Springfield", result.address.city);
++    }
++
++    // Formerly failing case: under PublicView, the @JsonView(AdminView)
++    // @JsonUnwrapped creator parameter must not be populated.
++    @Test
++    public void testUnwrappedCreatorParamHonorsJsonView() throws Exception {
++        UserBean result = MAPPER
++                .readerWithView(PublicView.class)
++                .forType(UserBean.class)
++                .readValue("{\"name\":\"alice\",\"street\":\"1 Main St\",\"city\":\"Springfield\"}");
++
++        assertEquals("alice", result.name);
++        assertNull(result.address,
++                "[databind#5971] @JsonView(AdminView) @JsonUnwrapped creator parameter " +
++                "was populated in PublicView. address = " + result.address);
++    }
++}
