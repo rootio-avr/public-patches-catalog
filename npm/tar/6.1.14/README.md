@@ -4,8 +4,13 @@ This patch is based on tar version 6.1.14, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-23745
+- CVE-2026-23950
+- CVE-2026-24842
 - CVE-2026-26960
 - CVE-2026-29786
+- CVE-2026-31802
+- CVE-2026-53655
 
 ## How to Apply:
 1. Clone or download the source code for tar
