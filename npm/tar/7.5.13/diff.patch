@@ -1,0 +1,244 @@
+# Patch for CVE-2026-53655
+# Fix PAX header smuggling / tar interpretation-conflict in node-tar
+#
+# A PAX extended header (x/g) describes the *next file entry*, per POSIX pax,
+# not the GNU long-name (L) / long-link (K) or further PAX (x/g) headers that
+# may sit between it and that file. Header.decode previously applied the
+# pending ex/gex overrides (notably size) to whatever header was decoded next,
+# including those intermediary extension headers. A crafted stream ordered
+# x(size=N) -> L -> file would advance the cursor by N for the L header
+# instead of by L's true payload length, desynchronizing the parser relative
+# to GNU tar, libarchive, Python tarfile and the Rust tar crates. This is a
+# tar interpretation-conflict / file-smuggling primitive (CWE-436).
+#
+# Fix: only apply extended-header overrides to entries whose typeflag belongs
+# to a new `normalFsTypes` allow-list of known filesystem entry types
+# ('0','','1','2','3','4','5','6','7','D'). Intermediary L/K/x/g blocks no
+# longer have ex/gex fields applied, so the parser advances by the block's
+# own payload length and stays in sync with other tar implementations.
+#
+# This patch targets the published npm package's compiled dist/ files
+# (commonjs + esm). The TypeScript change in upstream src/header.ts and
+# src/types.ts is translated to the lowered JS form here:
+#   * `as EntryTypeCode` cast is dropped (no types at runtime).
+#   * The `normalFsTypes` Set is exported as `exports.normalFsTypes` for
+#     commonjs and `export const normalFsTypes` for esm, matching how each
+#     module already exports `name`/`code`.
+#   * The typeflag decode `const t = decString(buf, off + 156, 1)` is moved
+#     above the field decode, exactly as upstream; the duplicate decode that
+#     used to live just before `if (types.isCode(t))` is removed.
+#
+# Affected version: tar@7.5.13
+# Advisory: https://github.com/isaacs/node-tar/security/advisories/GHSA-vmf3-w455-68vh
+# Upstream commit: https://github.com/isaacs/node-tar/commit/21a822027658c8063542be330530bbecdf0dbbfe
+
+--- a/dist/commonjs/types.js
++++ b/dist/commonjs/types.js
+@@ -1,10 +1,26 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+-exports.code = exports.name = exports.isName = exports.isCode = void 0;
++exports.code = exports.name = exports.normalFsTypes = exports.isName = exports.isCode = void 0;
+ const isCode = (c) => exports.name.has(c);
+ exports.isCode = isCode;
+ const isName = (c) => exports.code.has(c);
+ exports.isName = isName;
++// types that are a normal file system entry, not metadata.
++// These can be the subject of extended/globalExtended headers, long path
++// names, long linkpath names, etc. Any other types are meta, and cannot be
++// targetted by extended PAX headers.
++exports.normalFsTypes = new Set([
++    '0',
++    '',
++    '1',
++    '2',
++    '3',
++    '4',
++    '5',
++    '6',
++    '7',
++    'D',
++]);
+ // map types from key to human-friendly name
+ exports.name = new Map([
+     ['0', 'File'],
+--- a/dist/commonjs/header.js
++++ b/dist/commonjs/header.js
+@@ -78,22 +78,40 @@ class Header {
+         if (!buf || !(buf.length >= off + 512)) {
+             throw new Error('need 512 bytes for header');
+         }
+-        this.path = ex?.path ?? decString(buf, off, 100);
+-        this.mode = ex?.mode ?? gex?.mode ?? decNumber(buf, off + 100, 8);
+-        this.uid = ex?.uid ?? gex?.uid ?? decNumber(buf, off + 108, 8);
+-        this.gid = ex?.gid ?? gex?.gid ?? decNumber(buf, off + 116, 8);
+-        this.size = ex?.size ?? gex?.size ?? decNumber(buf, off + 124, 12);
+-        this.mtime = ex?.mtime ?? gex?.mtime ?? decDate(buf, off + 136, 12);
++        // Decode the typeflag (independent of any pending PAX/GNU extended
++        // header) up front so we can tell whether THIS block is itself an
++        // intermediary extension header (PAX `x`/`g`, GNU long-name `L`,
++        // GNU long-link `K`). Per POSIX pax, a PAX extended header describes
++        // the *next file entry*, not the extension headers that may sit
++        // between it and that file. Applying the pending PAX overrides
++        // (notably `size`) to an intervening L/K/x/g header desynchronizes
++        // the stream relative to other tar implementations and enables tar
++        // interpretation-conflict / file-smuggling attacks (CVE-2026-53655).
++        const t = decString(buf, off + 156, 1);
++        const isNormalFS = types.normalFsTypes.has(t);
++        const exForFields = isNormalFS ? ex : undefined;
++        const gexForFields = isNormalFS ? gex : undefined;
++        this.path = exForFields?.path ?? decString(buf, off, 100);
++        this.mode =
++            exForFields?.mode ?? gexForFields?.mode ?? decNumber(buf, off + 100, 8);
++        this.uid =
++            exForFields?.uid ?? gexForFields?.uid ?? decNumber(buf, off + 108, 8);
++        this.gid =
++            exForFields?.gid ?? gexForFields?.gid ?? decNumber(buf, off + 116, 8);
++        this.size =
++            exForFields?.size ?? gexForFields?.size ?? decNumber(buf, off + 124, 12);
++        this.mtime =
++            exForFields?.mtime ?? gexForFields?.mtime ?? decDate(buf, off + 136, 12);
+         this.cksum = decNumber(buf, off + 148, 12);
+         // if we have extended or global extended headers, apply them now
+         // See https://github.com/npm/node-tar/pull/187
+-        // Apply global before local, so it overrides
+-        if (gex)
+-            this.#slurp(gex, true);
+-        if (ex)
+-            this.#slurp(ex);
++        // Apply global before local, so it overrides. Never slurp the pending
++        // extended-header fields onto an intermediary extension header.
++        if (gexForFields)
++            this.#slurp(gexForFields, true);
++        if (exForFields)
++            this.#slurp(exForFields);
+         // old tar versions marked dirs as a file with a trailing /
+-        const t = decString(buf, off + 156, 1);
+         if (types.isCode(t)) {
+             this.#type = t || '0';
+         }
+@@ -111,12 +129,18 @@ class Header {
+         this.linkpath = decString(buf, off + 157, 100);
+         if (buf.subarray(off + 257, off + 265).toString() === 'ustar\u000000') {
+             /* c8 ignore start */
+-            this.uname = ex?.uname ?? gex?.uname ?? decString(buf, off + 265, 32);
+-            this.gname = ex?.gname ?? gex?.gname ?? decString(buf, off + 297, 32);
++            this.uname =
++                exForFields?.uname ??
++                    gexForFields?.uname ??
++                    decString(buf, off + 265, 32);
++            this.gname =
++                exForFields?.gname ??
++                    gexForFields?.gname ??
++                    decString(buf, off + 297, 32);
+             this.devmaj =
+-                ex?.devmaj ?? gex?.devmaj ?? decNumber(buf, off + 329, 8) ?? 0;
++                exForFields?.devmaj ?? gexForFields?.devmaj ?? decNumber(buf, off + 329, 8) ?? 0;
+             this.devmin =
+-                ex?.devmin ?? gex?.devmin ?? decNumber(buf, off + 337, 8) ?? 0;
++                exForFields?.devmin ?? gexForFields?.devmin ?? decNumber(buf, off + 337, 8) ?? 0;
+             /* c8 ignore stop */
+             if (buf[off + 475] !== 0) {
+                 // definitely a prefix, definitely >130 chars.
+--- a/dist/esm/types.js
++++ b/dist/esm/types.js
+@@ -1,5 +1,21 @@
+ export const isCode = (c) => name.has(c);
+ export const isName = (c) => code.has(c);
++// types that are a normal file system entry, not metadata.
++// These can be the subject of extended/globalExtended headers, long path
++// names, long linkpath names, etc. Any other types are meta, and cannot be
++// targetted by extended PAX headers.
++export const normalFsTypes = new Set([
++    '0',
++    '',
++    '1',
++    '2',
++    '3',
++    '4',
++    '5',
++    '6',
++    '7',
++    'D',
++]);
+ // map types from key to human-friendly name
+ export const name = new Map([
+     ['0', 'File'],
+--- a/dist/esm/header.js
++++ b/dist/esm/header.js
+@@ -42,22 +42,40 @@ export class Header {
+         if (!buf || !(buf.length >= off + 512)) {
+             throw new Error('need 512 bytes for header');
+         }
+-        this.path = ex?.path ?? decString(buf, off, 100);
+-        this.mode = ex?.mode ?? gex?.mode ?? decNumber(buf, off + 100, 8);
+-        this.uid = ex?.uid ?? gex?.uid ?? decNumber(buf, off + 108, 8);
+-        this.gid = ex?.gid ?? gex?.gid ?? decNumber(buf, off + 116, 8);
+-        this.size = ex?.size ?? gex?.size ?? decNumber(buf, off + 124, 12);
+-        this.mtime = ex?.mtime ?? gex?.mtime ?? decDate(buf, off + 136, 12);
++        // Decode the typeflag (independent of any pending PAX/GNU extended
++        // header) up front so we can tell whether THIS block is itself an
++        // intermediary extension header (PAX `x`/`g`, GNU long-name `L`,
++        // GNU long-link `K`). Per POSIX pax, a PAX extended header describes
++        // the *next file entry*, not the extension headers that may sit
++        // between it and that file. Applying the pending PAX overrides
++        // (notably `size`) to an intervening L/K/x/g header desynchronizes
++        // the stream relative to other tar implementations and enables tar
++        // interpretation-conflict / file-smuggling attacks (CVE-2026-53655).
++        const t = decString(buf, off + 156, 1);
++        const isNormalFS = types.normalFsTypes.has(t);
++        const exForFields = isNormalFS ? ex : undefined;
++        const gexForFields = isNormalFS ? gex : undefined;
++        this.path = exForFields?.path ?? decString(buf, off, 100);
++        this.mode =
++            exForFields?.mode ?? gexForFields?.mode ?? decNumber(buf, off + 100, 8);
++        this.uid =
++            exForFields?.uid ?? gexForFields?.uid ?? decNumber(buf, off + 108, 8);
++        this.gid =
++            exForFields?.gid ?? gexForFields?.gid ?? decNumber(buf, off + 116, 8);
++        this.size =
++            exForFields?.size ?? gexForFields?.size ?? decNumber(buf, off + 124, 12);
++        this.mtime =
++            exForFields?.mtime ?? gexForFields?.mtime ?? decDate(buf, off + 136, 12);
+         this.cksum = decNumber(buf, off + 148, 12);
+         // if we have extended or global extended headers, apply them now
+         // See https://github.com/npm/node-tar/pull/187
+-        // Apply global before local, so it overrides
+-        if (gex)
+-            this.#slurp(gex, true);
+-        if (ex)
+-            this.#slurp(ex);
++        // Apply global before local, so it overrides. Never slurp the pending
++        // extended-header fields onto an intermediary extension header.
++        if (gexForFields)
++            this.#slurp(gexForFields, true);
++        if (exForFields)
++            this.#slurp(exForFields);
+         // old tar versions marked dirs as a file with a trailing /
+-        const t = decString(buf, off + 156, 1);
+         if (types.isCode(t)) {
+             this.#type = t || '0';
+         }
+@@ -75,12 +93,18 @@ export class Header {
+         this.linkpath = decString(buf, off + 157, 100);
+         if (buf.subarray(off + 257, off + 265).toString() === 'ustar\u000000') {
+             /* c8 ignore start */
+-            this.uname = ex?.uname ?? gex?.uname ?? decString(buf, off + 265, 32);
+-            this.gname = ex?.gname ?? gex?.gname ?? decString(buf, off + 297, 32);
++            this.uname =
++                exForFields?.uname ??
++                    gexForFields?.uname ??
++                    decString(buf, off + 265, 32);
++            this.gname =
++                exForFields?.gname ??
++                    gexForFields?.gname ??
++                    decString(buf, off + 297, 32);
+             this.devmaj =
+-                ex?.devmaj ?? gex?.devmaj ?? decNumber(buf, off + 329, 8) ?? 0;
++                exForFields?.devmaj ?? gexForFields?.devmaj ?? decNumber(buf, off + 329, 8) ?? 0;
+             this.devmin =
+-                ex?.devmin ?? gex?.devmin ?? decNumber(buf, off + 337, 8) ?? 0;
++                exForFields?.devmin ?? gexForFields?.devmin ?? decNumber(buf, off + 337, 8) ?? 0;
+             /* c8 ignore stop */
+             if (buf[off + 475] !== 0) {
+                 // definitely a prefix, definitely >130 chars.
