@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-45740
 - CVE-2026-48712
+- CVE-2026-59877
 
 ## How to Apply:
 1. Clone or download the source code for protobufjs
