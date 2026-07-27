@@ -4,6 +4,7 @@ This patch is based on ajv version 5.5.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2020-15366
 - CVE-2025-69873
 
 ## How to Apply:
