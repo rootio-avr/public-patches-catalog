@@ -1,13 +1,13 @@
-# ffmpeg : 7:4.4.2-0ubuntu0.22.04.1
+# ffmpeg : 7:4.4.2-0ubuntu0.22.04.1.aikido.3
 
-This patch is based on ffmpeg version 7:4.4.2-0ubuntu0.22.04.1, which is available at:
-https://launchpad.net/ubuntu/+source/ffmpeg/7:4.4.2-0ubuntu0.22.04.1/
+This patch is based on ffmpeg version 7:4.4.2-0ubuntu0.22.04.1.aikido.3, which is available at:
+https://sources.debian.org/src/ffmpeg/7:4.4.2-0ubuntu0.22.04.1/
 
 ## Affected CVEs:
 - CVE-2024-7055
 
 ## How to Apply:
-1. Download the original Ubuntu source package: `apt source ffmpeg`
+1. Obtain the source package: `apt source ffmpeg`
 2. Apply the patch: `patch -p1 < diff.patch`
 3. Build the package: `debuild -b -uc -us`
 
