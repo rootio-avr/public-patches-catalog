@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-69873
+- CVE-2020-15366
 
 ## How to Apply:
 1. Clone or download the source code for ajv
