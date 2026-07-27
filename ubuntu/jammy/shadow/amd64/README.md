@@ -1,13 +1,13 @@
-# shadow : 1:4.8.1-2ubuntu2.2
+# shadow : 1:4.8.1-2ubuntu2.2.aikido.5
 
-This patch is based on shadow version 1:4.8.1-2ubuntu2.2, which is available at:
-https://launchpad.net/ubuntu/+source/shadow/1:4.8.1-2ubuntu2.2/
+This patch is based on shadow version 1:4.8.1-2ubuntu2.2.aikido.5, which is available at:
+https://sources.debian.org/src/shadow/1:4.8.1-2ubuntu2.2/
 
 ## Affected CVEs:
 - CVE-2023-29383
 
 ## How to Apply:
-1. Download the original Ubuntu source package: `apt source shadow`
+1. Obtain the source package: `apt source shadow`
 2. Apply the patch: `patch -p1 < diff.patch`
 3. Build the package: `debuild -b -uc -us`
 
