@@ -4,6 +4,7 @@ This patch is based on http-proxy-middleware version 3.0.5, which is available a
 unknown
 
 ## Affected CVEs:
+- CVE-2026-55602
 - CVE-2026-55603
 
 ## How to Apply:
