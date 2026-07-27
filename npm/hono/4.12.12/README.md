@@ -5,6 +5,19 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-54290
+- CVE-2026-54288
+- CVE-2026-54289
+- CVE-2026-47676
+- CVE-2026-56761
+- CVE-2026-47674
+- CVE-2026-47675
+- CVE-2026-54287
+- CVE-2026-44455
+- CVE-2026-54286
+- CVE-2026-44458
+- CVE-2026-47673
+- CVE-2026-44457
+- CVE-2026-44456
 
 ## How to Apply:
 1. Clone or download the source code for hono
