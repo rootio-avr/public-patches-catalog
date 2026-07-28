@@ -8,6 +8,7 @@ unknown
 - CVE-2019-14863
 - CVE-2020-7676
 - CVE-2024-21490
+- CVE-2026-11998
 - GHSA-5cp4-xmrw-59wf
 - GHSA-28hp-fgcr-2r4h
 
