@@ -4,9 +4,10 @@ This patch is based on com.fasterxml.jackson.core:jackson-databind version 2.15.
 unknown
 
 ## Affected CVEs:
-- CVE-2026-54513
 - CVE-2026-54512
-- CVE-BUILD-FIX
+- CVE-2026-54513
+- CVE-2026-54514
+- CVE-2026-54515
 
 ## How to Apply:
 1. Clone or download the source code for com.fasterxml.jackson.core:jackson-databind
