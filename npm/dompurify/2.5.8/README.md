@@ -4,15 +4,20 @@ This patch is based on dompurify version 2.5.8, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-41239
-- CVE-2026-41240
 - CVE-2025-15599
-- GHSA-39q2-94rc-95cp
-- GHSA-cj63-jhhr-wcxv
-- GHSA-cjmm-f4jc-qw8r
-- GHSA-h8r8-wccr-v5f2
 - CVE-2025-26791
 - CVE-2026-0540
+- CVE-2026-41239
+- CVE-2026-41240
+- CVE-2026-49458
+- CVE-2026-49459
+- CVE-2026-49978
+- GHSA-39q2-94rc-95cp
+- GHSA-76mc-f452-cxcm
+- GHSA-cj63-jhhr-wcxv
+- GHSA-cjmm-f4jc-qw8r
+- GHSA-cmwh-pvxp-8882
+- GHSA-h8r8-wccr-v5f2
 
 ## How to Apply:
 1. Clone or download the source code for dompurify
