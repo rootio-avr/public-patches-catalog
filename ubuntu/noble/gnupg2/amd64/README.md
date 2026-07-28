@@ -1,6 +1,6 @@
-# gnupg2 : 2.4.4-2ubuntu17.root.io.4
+# gnupg2 : 2.4.4-2ubuntu17.aikido.5
 
-This patch is based on gnupg2 version 2.4.4-2ubuntu17.root.io.4, which is available at:
+This patch is based on gnupg2 version 2.4.4-2ubuntu17.aikido.5, which is available at:
 https://sources.debian.org/src/gnupg2/2.4.4-2ubuntu17/
 
 ## Affected CVEs:
