@@ -1,0 +1,151 @@
+Description: CVE-2026-11856 - digest: flush state on origin or credential change
+ libcurl reused HTTP Digest auth state across requests on the same easy
+ handle, even when the destination origin (host/port/protocol) or the
+ credentials changed between requests. As a result, an Authorization
+ header computed for hostA could be sent to hostB on a subsequent
+ transfer, allowing the operator of hostB to capture the response and
+ replay the request to impersonate the client to hostA. This is the
+ host-side analogue of CVE-2026-7168 (proxy auth).
+ .
+ This is a backport of upstream commit
+ 5c6b4880357ab3e72967c1c45cae0f96ffabc535 to curl 8.5.0. The upstream
+ fix uses Curl_peer_* / Curl_creds_* helpers introduced after 8.5.0
+ (lib/creds.c). Those helpers do not exist in 8.5.0, so the patch is a
+ semantic reimplementation on 8.5.0 primitives:
+   - struct digestdata gains five fields tracking the host name, remote
+     port, protocol id, username and password seen the last time digest
+     state was populated for this easy handle (visible to both the SSPI
+     and non-SSPI branches of the struct).
+   - In Curl_output_digest, before computing a Digest response on the
+     host (non-proxy) path, the cached origin and credentials are
+     compared against data->conn (host name / remote_port /
+     handler->protocol) and the resolved userp/passwdp. Any mismatch
+     triggers Curl_auth_digest_cleanup() to flush the stale state
+     before the new response is computed; the cache is then refreshed
+     from the current connection. Allocation failure while refreshing
+     the cache also flushes digest state (fail closed) so a partial
+     cache cannot disable subsequent origin/credential checks.
+   - Curl_auth_digest_cleanup() (non-SSPI and SSPI builds) frees the
+     new cache fields so they cannot leak across cleanups.
+ .
+ Upstream's Curl_peer_same_destination compares hostname+port (not
+ scheme); this backport also compares handler->protocol, which is
+ slightly stricter and still correct for the CVE.
+ .
+ Upstream test 1686 is intentionally omitted from this Ubuntu security
+ update (fix-only). The 8.5.0 libtest harness macros (easy_init /
+ easy_setopt) have a different shape than the post-8.5.0 framework the
+ upstream test was written against, so porting the test produced an
+ unbalanced translation unit. Per Ubuntu security update conventions
+ this patch ships the fix without the upstream test additions.
+Origin: backport, https://github.com/curl/curl/commit/5c6b4880357ab3e72967c1c45cae0f96ffabc535
+Bug: https://curl.se/docs/CVE-2026-11856.html
+Author: Daniel Stenberg <daniel@haxx.se>
+Last-Update: 2026-07-28
+---
+--- a/lib/urldata.h
++++ b/lib/urldata.h
+@@ -346,6 +346,15 @@
+ #ifndef CURL_DISABLE_DIGEST_AUTH
+ /* Struct used for Digest challenge-response authentication */
+ struct digestdata {
++  /* Origin and credentials seen the last time this digest state was
++     populated for the owning easy handle. Used to detect cross-origin
++     or credential changes between requests on the same handle so the
++     digest state can be flushed (CVE-2026-11856). */
++  char *cached_host;
++  int cached_port;
++  unsigned int cached_proto;
++  char *cached_user;
++  char *cached_passwd;
+ #if defined(USE_WINDOWS_SSPI)
+   BYTE *input_token;
+   size_t input_token_len;
+--- a/lib/http_digest.c
++++ b/lib/http_digest.c
+@@ -111,6 +111,53 @@
+     authp = &data->state.authhost;
+   }
+ 
++  /* CVE-2026-11856: flush digest state if the destination origin or
++     credentials changed since the state was last populated on this
++     easy handle. Without this, an Authorization header computed for
++     a previous host can be sent to a different host on the same
++     handle. Matches upstream 5c6b488 semantics using 8.5.0 primitives
++     (no Curl_peer_* / Curl_creds_*). */
++  if(!proxy && data->conn) {
++    bool flush = FALSE;
++    const char *cur_host = data->conn->host.name ? data->conn->host.name : "";
++    int cur_port = data->conn->remote_port;
++    unsigned int cur_proto = data->conn->handler ?
++      data->conn->handler->protocol : 0;
++    const char *cur_user = userp ? userp : "";
++    const char *cur_passwd = passwdp ? passwdp : "";
++
++    if(digest->cached_host &&
++       (!strcasecompare(digest->cached_host, cur_host) ||
++        digest->cached_port != cur_port ||
++        digest->cached_proto != cur_proto))
++      flush = TRUE;
++    else if(digest->cached_user &&
++            (strcmp(digest->cached_user, cur_user) ||
++             strcmp(digest->cached_passwd ? digest->cached_passwd : "",
++                    cur_passwd)))
++      flush = TRUE;
++
++    if(flush)
++      Curl_auth_digest_cleanup(digest);
++
++    Curl_safefree(digest->cached_host);
++    digest->cached_host = strdup(cur_host);
++    digest->cached_port = cur_port;
++    digest->cached_proto = cur_proto;
++    Curl_safefree(digest->cached_user);
++    digest->cached_user = strdup(cur_user);
++    Curl_safefree(digest->cached_passwd);
++    digest->cached_passwd = strdup(cur_passwd);
++    if(!digest->cached_host || !digest->cached_user ||
++       !digest->cached_passwd) {
++      /* Fail closed: a partial origin/credential cache would disable
++         subsequent change detection while digest challenge state may
++         still be present. */
++      Curl_auth_digest_cleanup(digest);
++      return CURLE_OUT_OF_MEMORY;
++    }
++  }
++
+   Curl_safefree(*allocuserpwd);
+ 
+   /* not set means empty */
+--- a/lib/vauth/digest.c
++++ b/lib/vauth/digest.c
+@@ -977,6 +977,13 @@
+  */
+ void Curl_auth_digest_cleanup(struct digestdata *digest)
+ {
++  /* CVE-2026-11856: free origin/credential cache so the next request
++     on this handle is not matched against stale data. */
++  Curl_safefree(digest->cached_host);
++  Curl_safefree(digest->cached_user);
++  Curl_safefree(digest->cached_passwd);
++  digest->cached_port = 0;
++  digest->cached_proto = 0;
+   Curl_safefree(digest->nonce);
+   Curl_safefree(digest->cnonce);
+   Curl_safefree(digest->realm);
+--- a/lib/vauth/digest_sspi.c
++++ b/lib/vauth/digest_sspi.c
+@@ -663,6 +663,13 @@
+   /* Free the copy of user/passwd used to make the identity for http_context */
+   Curl_safefree(digest->user);
+   Curl_safefree(digest->passwd);
++  /* CVE-2026-11856: free origin/credential cache so the next request
++     on this handle is not matched against stale data. */
++  Curl_safefree(digest->cached_host);
++  Curl_safefree(digest->cached_user);
++  Curl_safefree(digest->cached_passwd);
++  digest->cached_port = 0;
++  digest->cached_proto = 0;
+ }
+ 
+ #endif /* USE_WINDOWS_SSPI && !CURL_DISABLE_DIGEST_AUTH */
