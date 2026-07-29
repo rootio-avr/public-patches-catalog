@@ -1,11 +1,9 @@
-# perl : 5.36.0-7+deb12u3.root.io.12
+# perl : 5.36.0-7+deb12u3.aikido.13
 
-This patch is based on perl version 5.36.0-7+deb12u3.root.io.12, which is available at:
+This patch is based on perl version 5.36.0-7+deb12u3.aikido.13, which is available at:
 https://sources.debian.org/src/perl/5.36.0-7+deb12u3/
 
 ## Affected CVEs:
-- CVE-2023-31484
-- CVE-2025-40909
 - CVE-2011-4116
 - CVE-2023-31486
 - CVE-2026-42496
@@ -20,6 +18,7 @@ https://sources.debian.org/src/perl/5.36.0-7+deb12u3/
 - CVE-2026-13221
 - CVE-2026-48961
 - CVE-2026-57432
+- CVE-2026-57433
 
 ## How to Apply:
 1. Obtain the source package: `apt source perl`
