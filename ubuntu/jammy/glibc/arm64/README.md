@@ -1,14 +1,14 @@
-# glibc : 2.35-0ubuntu3.13.root.io.2
+# glibc : 2.35-0ubuntu3.14.aikido.3
 
-This patch is based on glibc version 2.35-0ubuntu3.13.root.io.2, which is available at:
-https://sources.debian.org/src/glibc/2.35-0ubuntu3.13/
+This patch is based on glibc version 2.35-0ubuntu3.14.aikido.3, which is available at:
+https://sources.debian.org/src/glibc/2.35-0ubuntu3.14/
 
 ## Affected CVEs:
 - CVE-2026-4046
+- CVE-2026-5435
+- CVE-2026-6238
 - CVE-2026-4437
 - CVE-2026-4438
-- CVE-2026-6238
-- CVE-2026-5435
 
 ## How to Apply:
 1. Obtain the source package: `apt source glibc`
