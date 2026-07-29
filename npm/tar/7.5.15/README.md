@@ -5,7 +5,9 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-53655
+- CVE-2026-59871
 - CVE-2026-59873
+- CVE-2026-59874
 
 ## How to Apply:
 1. Clone or download the source code for tar
