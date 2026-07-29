@@ -4,6 +4,7 @@ This patch is based on brace-expansion version 5.0.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-13149
 - CVE-2026-33750
 - CVE-2026-45149
 
