@@ -1,14 +1,17 @@
-# apache2 : 2.4.67-1~deb13u3.root.io.3
+# apache2 : 2.4.67-1~deb13u3.aikido.4
 
-This patch is based on apache2 version 2.4.67-1~deb13u3.root.io.3, which is available at:
+This patch is based on apache2 version 2.4.67-1~deb13u3.aikido.4, which is available at:
 https://sources.debian.org/src/apache2/2.4.67-1~deb13u3/
 
 ## Affected CVEs:
 - CVE-2026-29167
+- CVE-2026-29170
 - CVE-2026-34355
 - CVE-2026-34356
 - CVE-2026-42535
 - CVE-2026-42536
+- CVE-2026-43951
+- CVE-2026-44119
 - CVE-2026-44185
 - CVE-2026-44186
 - CVE-2026-44631
