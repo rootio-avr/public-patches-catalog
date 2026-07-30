@@ -1,0 +1,1434 @@
+--- a/pypdf/xmp.py
++++ b/pypdf/xmp.py
+@@ -19,13 +19,17 @@ from typing import (
+ from xml.dom.expatbuilder import ExpatBuilderNS
+ from xml.dom.minidom import Document
+ from xml.dom.minidom import Element as XmlElement
++from xml.dom.xmlbuilder import Options
+ from xml.parsers.expat import ExpatError, XMLParserType
+ 
+ from ._protocols import XmpInformationProtocol
+ from ._utils import StreamType, deprecate_with_replacement, deprecation_no_replacement
+-from .errors import PdfReadError, XmpDocumentError
++from .errors import LimitReachedError, PdfReadError, XmpDocumentError
+ from .generic import ContentStream, PdfObject
+ 
++XMP_MAX_INPUT_LENGTH = 5_000_000
++XMP_MAX_ELEMENT_COUNT = 100_000
++
+ RDF_NAMESPACE = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+ DC_NAMESPACE = "http://purl.org/dc/elements/1.1/"
+ XMP_NAMESPACE = "http://ns.adobe.com/xap/1.0/"
+@@ -173,6 +177,10 @@ class _XmpBuilder(ExpatBuilderNS):
+     but not cases like quadratic entity expansion which can still cause quite some memory usage.
+     """
+ 
++    def __init__(self, options: Optional[Options] = None) -> None:
++        super().__init__(options=options)
++        self._element_count = 0
++
+     def custom_entity_declaration_handler(
+             self,
+             entity_name: str,
+@@ -185,10 +193,17 @@ class _XmpBuilder(ExpatBuilderNS):
+     ) -> None:
+         raise ExpatError(f"Forbidden entities: {entity_name!r}")
+ 
++    def start_element_handler(self, name: str, attributes: list[str]) -> None:
++        self._element_count += 1
++        if self._element_count > XMP_MAX_ELEMENT_COUNT:
++            raise LimitReachedError(f"XMP metadata exceeds limit of {XMP_MAX_ELEMENT_COUNT} elements.")
++        super().start_element_handler(name=name, attributes=attributes)
++
+     def install(self, parser: XMLParserType) -> None:
+         super().install(parser)
+ 
+         parser.EntityDeclHandler = self.custom_entity_declaration_handler
++        parser.StartElementHandler = self.start_element_handler
+ 
+ 
+ class XmpInformation(XmpInformationProtocol, PdfObject):
+@@ -205,6 +220,8 @@ class XmpInformation(XmpInformationProtocol, PdfObject):
+         self.stream = stream
+         try:
+             data = self.stream.get_data()
++            if (length := len(data)) > XMP_MAX_INPUT_LENGTH:
++                raise LimitReachedError(f"XMP stream size {length} exceeds limit of {XMP_MAX_INPUT_LENGTH}.")
+             doc_root: Document = _XmpBuilder().parseString(data)
+         except (AttributeError, ExpatError) as e:
+             raise PdfReadError(f"XML in XmpInformation was invalid: {e}")
+--- a/tests/test_xmp.py
++++ b/tests/test_xmp.py
+@@ -7,7 +7,7 @@ import pytest
+ import pypdf.generic
+ import pypdf.xmp
+ from pypdf import PdfReader, PdfWriter
+-from pypdf.errors import PdfReadError, XmpDocumentError
++from pypdf.errors import LimitReachedError, PdfReadError, XmpDocumentError
+ from pypdf.generic import ContentStream, NameObject, StreamObject
+ from pypdf.xmp import XmpInformation
+ 
+@@ -963,3 +963,34 @@ def test_xmp_information__quadratic_entity_expansion():
+             match=r"^XML in XmpInformation was invalid: Forbidden entities: 'a'$"
+     ):
+         XmpInformation(stream)
++
++
++@pytest.mark.timeout(10)
++def test_xmp_information__input_limit():
++    stream = ContentStream(pdf=None, stream=None)
++    stream.set_data(b"A" * 10_000_000)
++
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^XMP stream size 10000000 exceeds limit of 5000000\.$"
++    ):
++        XmpInformation(stream)
++
++
++@pytest.mark.timeout(10)
++def test_xmp_information__element_limit():
++    stream = ContentStream(pdf=None, stream=None)
++
++    xmp = b'<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?>\n'
++    xmp += b'<x:xmpmeta xmlns:x="adobe:ns:meta/">'
++    xmp += b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
++    xmp += b'<rdf:Description rdf:about="" xmlns:custom="urn:custom">'
++    xmp += b"<custom:a/>" * 100_010
++    xmp += b"</rdf:Description></rdf:RDF></x:xmpmeta>"
++    stream.set_data(xmp)
++
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^XMP metadata exceeds limit of 100000 elements\.$"
++    ):
++        XmpInformation(stream)
+
+--- a/pypdf/_page.py
++++ b/pypdf/_page.py
+@@ -1678,7 +1678,7 @@ class PageObject(DictionaryObject):
+ 
+     def _extract_text(
+         self,
+-        obj: Any,
++        obj: DictionaryObject,
+         pdf: Any,
+         orientations: tuple[int, ...] = (0, 90, 180, 270),
+         space_width: float = 200.0,
+@@ -1686,6 +1686,8 @@ class PageObject(DictionaryObject):
+         visitor_operand_before: Optional[Callable[[Any, Any, Any, Any], None]] = None,
+         visitor_operand_after: Optional[Callable[[Any, Any, Any, Any], None]] = None,
+         visitor_text: Optional[Callable[[Any, Any, Any, Any, Any], None]] = None,
++        *,
++        known_ids: Optional[set[int]] = None,
+     ) -> str:
+         """
+         See extract_text for most arguments.
+@@ -1696,18 +1698,15 @@ class PageObject(DictionaryObject):
+                 default = "/Content"
+ 
+         """
++        if known_ids is None:
++            known_ids = set()
++
+         extractor = TextExtraction()
+         font_resources: dict[str, DictionaryObject] = {}
+         fonts: dict[str, Font] = {}
+ 
+         try:
+-            objr = obj
+-            while NameObject(PG.RESOURCES) not in objr:
+-                # /Resources can be inherited so we look to parents
+-                objr = objr["/Parent"].get_object()
+-                # If no parents then no /Resources will be available,
+-                # so an exception will be raised
+-            resources_dict = cast(DictionaryObject, objr[PG.RESOURCES])
++            resources_dict = cast(DictionaryObject, obj.get_inherited(key=PG.RESOURCES, default=DictionaryObject()))
+         except Exception:
+             # No resources means no text is possible (no font); we consider the
+             # file as not damaged, no need to check for TJ or Tj
+@@ -1796,16 +1795,31 @@ class PageObject(DictionaryObject):
+                 except IndexError:
+                     pass
+                 try:
+-                    xobj = resources_dict["/XObject"]
+-                    if xobj[operands[0]]["/Subtype"] != "/Image":  # type: ignore
+-                        text = self.extract_xform_text(
+-                            xobj[operands[0]],  # type: ignore
+-                            orientations,
+-                            space_width,
+-                            visitor_operand_before,
+-                            visitor_operand_after,
+-                            visitor_text,
+-                        )
++                    xobj = cast(DictionaryObject, resources_dict["/XObject"])
++                    xform = cast(EncodedStreamObject, xobj[operands[0]])
++                    if xform["/Subtype"] != NameObject("/Image"):
++                        xform_id = id(xform)
++                        if xform_id in known_ids:
++                            logger_warning(
++                                "Detected cyclic form XObject reference, skipping %(operand)s.",
++                                source=__name__,
++                                operand=operands[0]
++                            )
++                            text = ""
++                        else:
++                            known_ids.add(xform_id)
++                            try:
++                                text = self.extract_xform_text(
++                                    xform,
++                                    orientations,
++                                    space_width,
++                                    visitor_operand_before,
++                                    visitor_operand_after,
++                                    visitor_text,
++                                    known_ids=known_ids,
++                                )
++                            finally:
++                                known_ids.discard(xform_id)
+                         extractor.output += text
+                         if visitor_text is not None:
+                             visitor_text(
+@@ -2071,6 +2085,8 @@ class PageObject(DictionaryObject):
+         visitor_operand_before: Optional[Callable[[Any, Any, Any, Any], None]] = None,
+         visitor_operand_after: Optional[Callable[[Any, Any, Any, Any], None]] = None,
+         visitor_text: Optional[Callable[[Any, Any, Any, Any, Any], None]] = None,
++        *,
++        known_ids: Optional[set[int]] = None,
+     ) -> str:
+         """
+         Extract text from an XObject.
+@@ -2096,6 +2112,7 @@ class PageObject(DictionaryObject):
+             visitor_operand_before,
+             visitor_operand_after,
+             visitor_text,
++            known_ids=known_ids,
+         )
+ 
+     def _get_fonts(self) -> tuple[set[str], set[str]]:
+--- a/tests/test_text_extraction.py
++++ b/tests/test_text_extraction.py
+@@ -596,3 +596,52 @@ def test_fixed_width_page__excessive_needed_spaces(caplog):
+ 
+     assert result == " " * 10_000 + "X"
+     assert caplog.messages == ["Limiting excessive whitespace from 13000 to 10000 characters."]
++
++
++"""
++objects[3] = (
++    b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
++    b" /Resources << /XObject << /X1 4 0 R >> >>"
++    b" /Contents 5 0 R >>"
++)
++# Form XObject X1: its content stream is "/X1 Do" -- a self-reference.
++# X1's /Resources also lists X1 -> itself, so /Do resolves to X1.
++xform_content = b"/X1 Do"
++objects[4] = (
++    b"<< /Type /XObject /Subtype /Form /BBox [0 0 100 100]"
++    b" /Resources << /XObject << /X1 4 0 R >> >>"
++    b" /Length " + str(len(xform_content)).encode() + b" >>\n"
++    b"stream\n" + xform_content + b"\nendstream"
++)
++# Page content stream invokes X1 once.
++page_content = b"q /X1 Do Q"
++objects[5] = (
++    b"<< /Length " + str(len(page_content)).encode() + b" >>\n"
++    b"stream\n" + page_content + b"\nendstream"
++)
++"""
++
++
++def test_page__extract_text__xform__self_references(caplog):
++    writer = PdfWriter()
++    page = writer.add_blank_page(width=10, height=10)
++
++    form = ContentStream(stream=None, pdf=writer)
++    form[NameObject("/Type")] = NameObject("/XObject")
++    form[NameObject("/Subtype")] = NameObject("/Form")
++    form.set_data(b"/X1 Do")
++    form_reference = writer._add_object(form)
++    form[NameObject("/Resources")] = DictionaryObject({
++        NameObject("/XObject"): DictionaryObject({
++            NameObject("/X1"): form_reference
++        })
++    })
++
++    page[NameObject("/Resources")] = form[NameObject("/Resources")]
++    content = ContentStream(stream=None, pdf=writer)
++    content.set_data(b"q /X1 Do Q")
++    page.replace_contents(content)
++
++    assert page.extract_text() == ""
++    assert caplog.messages == ["Detected cyclic form XObject reference, skipping /X1."]
++
+
+--- a/pypdf/_page.py
++++ b/pypdf/_page.py
+@@ -1850,20 +1850,24 @@
+ 
+         """
+         # Font retrieval logic adapted from pypdf.PageObject._extract_text()
+-        objr: Any = self
++        obj: Any = self
+         fonts: dict[str, Font] = {}
+-        while objr is not None:
+-            try:
+-                resources_dict: Any = objr[PG.RESOURCES]
+-            except KeyError:
+-                resources_dict = {}
++        visited: set[int] = set()
++        while True:
++            obj_id = id(obj)
++            if obj_id in visited:
++                logger_warning("Detected cycle in /Parent hierarchy when retrieving fonts.", source=__name__)
++                break
++            visited.add(obj_id)
++
++            resources_dict: Any = obj.get(PG.RESOURCES, {})
+             if "/Font" in resources_dict and self.pdf is not None:
+                 for font_name in resources_dict["/Font"]:
+                     fonts[font_name] = Font.from_font_resource(resources_dict["/Font"][font_name])
+-            try:
+-                objr = objr["/Parent"].get_object()
+-            except KeyError:
+-                objr = None
++
++            if "/Parent" not in obj:
++                break
++            obj = obj["/Parent"].get_object()
+ 
+         return fonts
+ 
+--- a/pypdf/_writer.py
++++ b/pypdf/_writer.py
+@@ -2789,7 +2789,7 @@
+         _ro = reader.root_object
+         if import_outline and CO.OUTLINES in _ro:
+             outline = self._get_filtered_outline(
+-                _ro.get(CO.OUTLINES, None), srcpages, reader
++                node=_ro.get(CO.OUTLINES, None), pages=srcpages, reader=reader
+             )
+             self._insert_filtered_outline(
+                 outline, outline_item_typ, None
+@@ -3054,54 +3054,69 @@
+ 
+     def _get_filtered_outline(
+         self,
++        *,
+         node: Any,
+         pages: dict[int, PageObject],
+         reader: PdfReader,
++        visited: Optional[set[int]] = None,
+     ) -> list[Destination]:
+         """
+         Extract outline item entries that are part of the specified page set.
+ 
+-        Args:
+-            node:
+-            pages:
+-            reader:
+-
+         Returns:
+             A list of destination objects.
+ 
+         """
+-        new_outline = []
++        if visited is None:
++            visited = set()
++        new_outline: list[Destination] = []
+         if node is None:
+-            node = NullObject()
++            return new_outline
+         node = node.get_object()
+         if is_null_or_none(node):
+             node = DictionaryObject()
++
+         if node.get("/Type", "") == "/Outlines" or "/Title" not in node:
++            node_id = id(node)
++            if node_id in visited:
++                logger_warning("Detected cycle in outlines.", source=__name__)
++                return []
++            visited.add(node_id)
++
+             node = node.get("/First", None)
+             if node is not None:
+                 node = node.get_object()
+-                new_outline += self._get_filtered_outline(node, pages, reader)
++                new_outline += self._get_filtered_outline(node=node, pages=pages, reader=reader, visited=visited)
+         else:
+-            v: Union[None, IndirectObject, NullObject]
+-            while node is not None:
++            cloned_page: Union[None, IndirectObject, NullObject]
++            while True:
+                 node = node.get_object()
+-                o = cast("Destination", reader._build_outline_item(node))
+-                v = self._get_cloned_page(cast("PageObject", o["/Page"]), pages, reader)
+-                if v is None:
+-                    v = NullObject()
+-                o[NameObject("/Page")] = v
++                node_id = id(node)
++                if node_id in visited:
++                    logger_warning("Detected cycle in outlines.", source=__name__)
++                    break
++                visited.add(node_id)
++
++                destination = cast("Destination", reader._build_outline_item(node))
++                cloned_page = self._get_cloned_page(cast("PageObject", destination["/Page"]), pages, reader)
++                if cloned_page is None:
++                    cloned_page = NullObject()
++                destination[NameObject("/Page")] = cloned_page
+                 if "/First" in node:
+-                    o._filtered_children = self._get_filtered_outline(
+-                        node["/First"], pages, reader
++                    destination._filtered_children = self._get_filtered_outline(
++                        node=node["/First"], pages=pages, reader=reader, visited=visited
+                     )
+                 else:
+-                    o._filtered_children = []
++                    destination._filtered_children = []
+                 if (
+-                    not isinstance(o["/Page"], NullObject)
+-                    or len(o._filtered_children) > 0
++                    not isinstance(cloned_page, NullObject)
++                    or len(destination._filtered_children) > 0
+                 ):
+-                    new_outline.append(o)
+-                node = node.get("/Next", None)
++                    new_outline.append(destination)
++
++                if "/Next" not in node:
++                    break
++                node = node["/Next"]
+         return new_outline
+ 
+     def _clone_outline(self, dest: Destination) -> TreeObject:
+--- a/tests/test_text_extraction.py
++++ b/tests/test_text_extraction.py
+@@ -645,2 +645,31 @@
+     assert page.extract_text() == ""
+     assert caplog.messages == ["Detected cyclic form XObject reference, skipping /X1."]
++
++
++@pytest.mark.timeout(5)
++def test_page_object__layout_mode_fonts__cyclic(caplog) -> None:
++    writer = PdfWriter()
++
++    font = DictionaryObject({
++        NameObject("/Type"): NameObject("/Font"),
++        NameObject("/Subtype"): NameObject("/Type1"),
++        NameObject("/BaseFont"): NameObject("/Helvetica"),
++    })
++    fonts = {"/F1": Font.from_font_resource(font)}
++    page = writer.add_blank_page(width=10, height=10)
++    dictionary2 = DictionaryObject(DictionaryObject({
++        NameObject("/Resources"): DictionaryObject({
++            NameObject("/Font"): DictionaryObject({
++                NameObject("/F1"): font
++            })
++        })
++    }))
++    reference2 = writer._add_object(dictionary2)
++    dictionary3 = DictionaryObject({NameObject("/Parent"): reference2})
++    reference3 = writer._add_object(dictionary3)
++    page[NameObject("/Parent")] = reference3
++    dictionary2[NameObject("/Parent")] = page.indirect_reference
++    page.pdf = writer
++
++    assert page._layout_mode_fonts() == fonts
++    assert caplog.messages == ["Detected cycle in /Parent hierarchy when retrieving fonts."]
+--- a/tests/test_writer.py
++++ b/tests/test_writer.py
+@@ -3218,3 +3218,80 @@
+ 
+     with pytest.raises(NotImplementedError):
+         writer.encrypt(user_password="dummy")
++
++
++@pytest.mark.timeout(5)
++def test_get_filtered_outline__first__cyclic(caplog) -> None:
++    writer = PdfWriter()
++    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
++
++    dictionary1 = DictionaryObject({
++        NameObject("/Type"): NameObject("/Outlines")
++    })
++    reference1 = writer._add_object(dictionary1)
++    dictionary2 = DictionaryObject({
++        NameObject("/Type"): NameObject("/Outlines")
++    })
++    reference2 = writer._add_object(dictionary2)
++    dictionary3 = DictionaryObject({
++        NameObject("/First"): reference2,
++        NameObject("/Type"): NameObject("/Outlines")
++    })
++    reference3 = writer._add_object(dictionary3)
++    dictionary1[NameObject("/First")] = reference3
++    dictionary2[NameObject("/First")] = reference1
++
++    assert writer._get_filtered_outline(node=dictionary1, pages={}, reader=reader) == []
++    assert caplog.messages == ["Detected cycle in outlines."]
++
++
++@pytest.mark.timeout(5)
++def test_get_filtered_outline__next_first__cyclic(caplog) -> None:
++    writer = PdfWriter()
++    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
++
++    dictionary1 = DictionaryObject({
++        NameObject("/Title"): TextStringObject("test")
++    })
++    _reference1 = writer._add_object(dictionary1)
++    dictionary2 = DictionaryObject({
++        NameObject("/Type"): NameObject("/Outlines")
++    })
++    reference2 = writer._add_object(dictionary2)
++    dictionary1[NameObject("/Next")] = reference2
++    dictionary2[NameObject("/First")] = reference2
++
++    assert writer._get_filtered_outline(node=dictionary1, pages={}, reader=reader) == []
++    assert caplog.messages == ["Detected cycle in outlines."]
++
++
++@pytest.mark.timeout(5)
++def test_get_filtered_outline__next_next__cyclic(caplog) -> None:
++    writer = PdfWriter()
++    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
++
++    dictionary1 = DictionaryObject({
++        NameObject("/Title"): TextStringObject("test")
++    })
++    reference1 = writer._add_object(dictionary1)
++    dictionary2 = DictionaryObject({
++        NameObject("/Title"): TextStringObject("test")
++    })
++    reference2 = writer._add_object(dictionary2)
++    dictionary3 = DictionaryObject({
++        NameObject("/Next"): reference2,
++        NameObject("/Title"): TextStringObject("test")
++    })
++    reference3 = writer._add_object(dictionary3)
++    dictionary1[NameObject("/Next")] = reference3
++    dictionary2[NameObject("/Next")] = reference1
++
++    assert writer._get_filtered_outline(node=dictionary1, pages={}, reader=reader) == []
++    assert caplog.messages == ["Detected cycle in outlines."]
++
++
++def test_get_filtered_outline__node_is_none() -> None:
++    writer = PdfWriter()
++    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
++
++    assert writer._get_filtered_outline(node=None, pages={}, reader=reader) == []
+
+--- a/pypdf/_utils.py
++++ b/pypdf/_utils.py
+@@ -42,6 +42,7 @@
+ from typing import (
+     IO,
+     Any,
++    NoReturn,
+     Optional,
+     Union,
+ )
+@@ -60,6 +61,7 @@
+ from .errors import (
+     STREAM_TRUNCATED_PREMATURELY,
+     DeprecationError,
++    LimitReachedError,
+     PdfStreamError,
+ )
+ 
+@@ -242,44 +244,51 @@
+                 raise PdfStreamError("File ended unexpectedly.")
+ 
+ 
+-def read_until_regex(stream: StreamType, regex: Pattern[bytes]) -> bytes:
++def read_until_regex(*, stream: StreamType, regex: Pattern[bytes], length: int = sys.maxsize) -> bytes:
+     """
+     Read until the regular expression pattern matched (ignore the match).
+     Treats EOF on the underlying stream as the end of the token to be matched.
+ 
+     Args:
+-        regex: re.Pattern
++        stream: The stream to read from.
++        regex: The pattern to search for.
++        length: The (approximated) maximum number of bytes to read before raising an exception.
+ 
+     Returns:
+         The read bytes.
+ 
+     """
+     parts: list[bytes] = []
+-    total_len = 0
++    total_length = 0
+     tail = b""
+     chunk_size = 16
+     while True:
+-        tok = stream.read(chunk_size)
+-        if not tok:
++        token = stream.read(chunk_size)
++        if not token:
+             return b"".join(parts)
++        token_length = len(token)
++        if (current_length := total_length + token_length) >= length:
++            raise LimitReachedError(
++                f"Read stream length of {current_length} exceeds maximum allowed length of {length}."
++            )
++
+         # Search overlap of previous tail + new chunk to catch
+         # multi-byte regex matches spanning chunk boundaries.
+-        buf = tail + tok
+-        m = regex.search(buf)
+-        if m is not None:
++        current_buffer = tail + token
++        search_match = regex.search(current_buffer)
++        parts.append(token)
++        if search_match is not None:
+             overlap = len(tail)
+-            actual_start = total_len - overlap + m.start()
+-            stream.seek(actual_start - total_len - len(tok), 1)
+-            parts.append(tok)
++            actual_start = total_length - overlap + search_match.start()
++            stream.seek(actual_start - total_length - token_length, 1)
+             return b"".join(parts)[:actual_start]
+-        parts.append(tok)
+-        total_len += len(tok)
++        total_length += token_length
++
+         # Fixed overlap: 16 bytes is sufficient for the short
+         # delimiter patterns used in PDF parsing.
+-        tail = tok[-16:]
++        tail = token[-16:]
+         if chunk_size < 8192:
+             chunk_size <<= 1
+-    return b"".join(parts)
+ 
+ 
+ def read_block_backwards(stream: BinaryStreamType, to_read: int) -> bytes:
+@@ -390,7 +399,7 @@
+     warnings.warn(msg, DeprecationWarning, stacklevel=stacklevel)
+ 
+ 
+-def deprecation(msg: str) -> None:
++def deprecation(msg: str) -> NoReturn:
+     raise DeprecationError(msg)
+ 
+ 
+@@ -402,7 +411,7 @@
+     )
+ 
+ 
+-def deprecation_with_replacement(old_name: str, new_name: str, removed_in: str) -> None:
++def deprecation_with_replacement(old_name: str, new_name: str, removed_in: str) -> NoReturn:
+     """Raise an exception that a feature was already removed, but has a replacement."""
+     deprecation(
+         f"{old_name} is deprecated and was removed in pypdf {removed_in}. Use {new_name} instead."
+@@ -414,7 +423,7 @@
+     deprecate(f"{name} is deprecated and will be removed in pypdf {removed_in}.", 4)
+ 
+ 
+-def deprecation_no_replacement(name: str, removed_in: str) -> None:
++def deprecation_no_replacement(name: str, removed_in: str) -> NoReturn:
+     """Raise an exception that a feature was already removed without replacement."""
+     deprecation(f"{name} is deprecated and was removed in pypdf {removed_in}.")
+ 
+--- a/pypdf/generic/_base.py
++++ b/pypdf/generic/_base.py
+@@ -411,21 +411,21 @@
+ 
+     def __getitem__(self, key: Any) -> Any:
+         # items should be extracted from pointed Object
+-        return self._get_object_with_check()[key]  # type: ignore
++        return self._get_object_with_check()[key]  # type: ignore[index]
+ 
+     def __contains__(self, key: Any) -> bool:
+-        return key in self._get_object_with_check()  # type: ignore
++        return key in self._get_object_with_check()  # type: ignore[operator]
+ 
+     def __iter__(self) -> Any:
+-        return self._get_object_with_check().__iter__()  # type: ignore
++        return self._get_object_with_check().__iter__()  # type: ignore[union-attr]
+ 
+     def __float__(self) -> str:
+         # in this case we are looking for the pointed data
+-        return self.get_object().__float__()  # type: ignore
++        return self.get_object().__float__()  # type: ignore[union-attr, no-any-return]
+ 
+     def __int__(self) -> int:
+         # in this case we are looking for the pointed data
+-        return self.get_object().__int__()  # type: ignore
++        return self.get_object().__int__()  # type: ignore[union-attr, no-any-return]
+ 
+     def __str__(self) -> str:
+         # in this case we are looking for the pointed data
+@@ -550,6 +550,7 @@
+ 
+ class NumberObject(int, PdfObject):
+     NumberPattern = re.compile(b"[^+-.0-9]")
++    _LENGTH_LIMIT = 64
+ 
+     def __new__(cls, value: Any) -> Self:
+         try:
+@@ -594,7 +595,7 @@
+ 
+     @staticmethod
+     def read_from_stream(stream: StreamType) -> Union["NumberObject", "FloatObject"]:
+-        num = read_until_regex(stream, NumberObject.NumberPattern)
++        num = read_until_regex(stream=stream, regex=NumberObject.NumberPattern, length=NumberObject._LENGTH_LIMIT)
+         if b"." in num:
+             return FloatObject(num)
+         return NumberObject(num)
+@@ -812,6 +813,7 @@
+         **{chr(i): f"#{i:02X}".encode() for i in b"#()<>[]{}/%"},
+         **{chr(i): f"#{i:02X}".encode() for i in range(33)},
+     }
++    _LENGTH_LIMIT = 4096
+ 
+     def clone(
+         self,
+@@ -907,7 +909,7 @@
+         name = stream.read(1)
+         if name != NameObject.prefix:
+             raise PdfReadError("Name read error")
+-        name += read_until_regex(stream, NameObject.delimiter_pattern)
++        name += read_until_regex(stream=stream, regex=NameObject.delimiter_pattern, length=NameObject._LENGTH_LIMIT)
+         try:
+             # Name objects should represent irregular characters
+             # with a '#' followed by the symbol's hex number
+--- a/pypdf/generic/_data_structures.py
++++ b/pypdf/generic/_data_structures.py
+@@ -30,6 +30,7 @@
+ __author_email__ = "biziqe@mathieu.fenniak.net"
+ 
+ import logging
++import os
+ import re
+ import sys
+ from collections.abc import Iterable, Sequence
+@@ -121,7 +122,7 @@
+     ) -> "ArrayObject":
+         """Clone object into pdf_dest."""
+         try:
+-            if self.indirect_reference.pdf == pdf_dest and not force_duplicate:  # type: ignore
++            if self.indirect_reference.pdf == pdf_dest and not force_duplicate:  # type: ignore[union-attr]
+                 return self
+         except Exception:
+             pass
+@@ -294,7 +295,7 @@
+     ) -> "DictionaryObject":
+         """Clone object into pdf_dest."""
+         try:
+-            if self.indirect_reference.pdf == pdf_dest and not force_duplicate:  # type: ignore
++            if self.indirect_reference.pdf == pdf_dest and not force_duplicate:  # type: ignore[union-attr]
+                 return self
+         except Exception:
+             pass
+@@ -452,15 +453,26 @@
+             Current key or inherited one, otherwise default value.
+ 
+         """
+-        if key in self:
+-            return self[key]
+-        try:
+-            if "/Parent" not in self:
++        current = self
++        visited: set[int] = set()
++
++        while True:
++            # Detect cyclic parent references
++            obj_id = id(current)
++            if obj_id in visited:
++                raise LimitReachedError(f"Detected cycle in /Parent hierarchy when retrieving value for key {key!r}.")
++            visited.add(obj_id)
++
++            if key in current:
++                return current[key]
++
++            if "/Parent" not in current:
+                 return default
+-            raise KeyError("Not present")
+-        except KeyError:
+-            return cast("DictionaryObject", self["/Parent"].get_object()).get_inherited(
+-                key, default
++
++            # Walk upward
++            current = cast(
++                "DictionaryObject",
++                current["/Parent"].get_object(),
+             )
+ 
+     def __setitem__(self, key: Any, value: Any) -> Any:
+@@ -526,22 +538,34 @@
+     ) -> int:
+         out = position_end
+         for generation in generations:
+-            location = pdf.xref[generation]
+-            values = [x for x in location.values() if position_before < x <= position_end]
+-            if values:
+-                out = min(out, *values)
++            for x in pdf.xref[generation].values():
++                if position_before < x <= position_end:
++                    out = min(out, x)
+         return out
+ 
+     @classmethod
+     def _read_unsized_from_stream(
+-            cls, stream: BinaryStreamType, pdf: PdfReaderProtocol
++            cls, *, stream: BinaryStreamType, pdf: PdfReaderProtocol, length: int,
+     ) -> bytes:
+-        object_position = cls._get_next_object_position(
+-            position_before=stream.tell(), position_end=2 ** 32, generations=list(pdf.xref), pdf=pdf
+-        ) - 1
+         current_position = stream.tell()
++
++        # Determine stream size.
++        try:
++            stream.seek(0, os.SEEK_END)
++            stream_length = stream.tell()
++        finally:
++            stream.seek(current_position)
++
++        object_position = cls._get_next_object_position(
++            position_before=current_position, position_end=stream_length, generations=list(pdf.xref), pdf=pdf
++        )
++
++        bytes_to_read = object_position - current_position
++        if bytes_to_read >= length:
++            raise LimitReachedError(f"Requested length of {bytes_to_read} exceeds maximum allowed length.")
++
+         # Read until the next object position.
+-        read_value = stream.read(object_position - stream.tell())
++        read_value = stream.read(bytes_to_read)
+         endstream_position = read_value.find(b"endstream")
+         if endstream_position < 0:
+             raise PdfReadError(
+@@ -650,15 +674,16 @@
+             if length is None:  # if the PDF is damaged
+                 length = -1
+             pstart = stream.tell()
++
++            from ..filters import MAX_DECLARED_STREAM_LENGTH  # noqa: PLC0415
+             if length >= 0:
+-                from ..filters import MAX_DECLARED_STREAM_LENGTH  # noqa: PLC0415
+                 if length > MAX_DECLARED_STREAM_LENGTH:
+                     raise LimitReachedError(f"Declared stream length of {length} exceeds maximum allowed length.")
+ 
+                 data["__streamdata__"] = stream.read(length)
+             else:
+                 data["__streamdata__"] = read_until_regex(
+-                    stream, re.compile(b"endstream")
++                    stream=stream, regex=re.compile(b"endstream"), length=MAX_DECLARED_STREAM_LENGTH,
+                 )
+             e = read_non_whitespace(stream)
+             ndstream = stream.read(8)
+@@ -677,7 +702,9 @@
+                     data["__streamdata__"] = data["__streamdata__"][:-1]
+                 elif pdf is not None and not pdf.strict:
+                     stream.seek(pstart, 0)
+-                    data["__streamdata__"] = DictionaryObject._read_unsized_from_stream(stream, pdf)
++                    data["__streamdata__"] = DictionaryObject._read_unsized_from_stream(
++                        stream=stream, pdf=pdf, length=MAX_DECLARED_STREAM_LENGTH
++                    )
+                     pos = stream.tell()
+                 else:
+                     stream.seek(pos, 0)
+@@ -725,7 +752,7 @@
+ 
+             if child == last:
+                 return
+-            child_ref = child.get(NameObject("/Next"))  # type: ignore
++            child_ref = child.get(NameObject("/Next"))  # type: ignore[union-attr]
+             if is_null_or_none(child_ref):
+                 return
+             child = child_ref.get_object()
+@@ -835,7 +862,7 @@
+                 del next_obj[NameObject("/Prev")]
+                 self[NameObject("/First")] = next_ref
+                 self[NameObject("/Count")] = NumberObject(
+-                    self[NameObject("/Count")] - 1  # type: ignore
++                    self[NameObject("/Count")] - 1  # type: ignore[operator]
+                 )
+ 
+             else:
+@@ -855,7 +882,7 @@
+                 assert cur == last
+                 del prev[NameObject("/Next")]
+                 self[NameObject("/Last")] = prev_ref
+-            self[NameObject("/Count")] = NumberObject(self[NameObject("/Count")] - 1)  # type: ignore
++            self[NameObject("/Count")] = NumberObject(self[NameObject("/Count")] - 1)  # type: ignore[operator]
+ 
+     def remove_child(self, child: Any) -> None:
+         child_obj = child.get_object()
+@@ -870,7 +897,7 @@
+         prev_ref = None
+         prev = None
+         cur_ref: Optional[Any] = self[NameObject("/First")]
+-        cur: Optional[dict[str, Any]] = cur_ref.get_object()  # type: ignore
++        cur: Optional[dict[str, Any]] = cur_ref.get_object()  # type: ignore[union-attr]
+         last_ref = self[NameObject("/Last")]
+         last = last_ref.get_object()
+         while cur is not None:
+@@ -1179,6 +1206,7 @@
+     * when .set_data() is called, ._operations is set to None.
+     * when .operations is set, ._data is set to None.
+     """
++    _OPERATOR_LENGTH_LIMIT = 128
+ 
+     def __init__(
+         self,
+@@ -1285,7 +1313,7 @@
+ 
+         """
+         try:
+-            if self.indirect_reference.pdf == pdf_dest and not force_duplicate:  # type: ignore
++            if self.indirect_reference.pdf == pdf_dest and not force_duplicate:  # type: ignore[union-attr]
+                 return self
+         except Exception:
+             pass
+@@ -1338,7 +1366,9 @@
+                 break
+             stream.seek(-1, 1)
+             if peek.isalpha() or peek in (b"'", b'"'):
+-                operator = read_until_regex(stream, NameObject.delimiter_pattern)
++                operator = read_until_regex(
++                    stream=stream, regex=NameObject.delimiter_pattern, length=self._OPERATOR_LENGTH_LIMIT
++                )
+                 if operator == b"BI":
+                     # begin inline image - a completely different parsing
+                     # mechanism is required, of course... thanks buddy...
+@@ -1418,14 +1448,22 @@
+             data = extract_inline_default(stream)
+ 
+         ei = stream.read(3)
+-        stream.seek(-1, 1)
+-        if ei[:2] != b"EI" or ei[2:3] not in WHITESPACES:
++        # An `EI` at the very end of the stream yields only two bytes; rewinding
++        # unconditionally would step back into the marker (#3468).
++        if len(ei) == 3:
++            stream.seek(-1, 1)
++        ei_trailing = ei[2:3]
++        if ei[:2] != b"EI" or (ei_trailing != b"" and ei_trailing not in WHITESPACES):
+             # Deal with wrong/missing `EI` tags. Example: Wrong dimensions specified above.
+             stream.seek(savpos, 0)
+             data = extract_inline_default(stream)
+             ei = stream.read(3)
+-            stream.seek(-1, 1)
+-            if ei[:2] != b"EI" or ei[2:3] not in WHITESPACES:  # pragma: no cover
++            if len(ei) == 3:
++                stream.seek(-1, 1)
++            ei_trailing = ei[2:3]
++            if ei[:2] != b"EI" or (
++                ei_trailing != b"" and ei_trailing not in WHITESPACES
++            ):  # pragma: no cover
+                 # Check the same condition again. This should never fail as
+                 # edge cases are covered by `extract_inline_default` above,
+                 # but check this ot make sure that we are behind the `EI` afterwards.
+--- a/tests/generic/test_base.py
++++ b/tests/generic/test_base.py
+@@ -4,7 +4,8 @@
+ import pytest
+ 
+ from pypdf import PdfReader, PdfWriter
+-from pypdf.generic import read_hex_string_from_stream
++from pypdf.errors import LimitReachedError
++from pypdf.generic import FloatObject, NameObject, NumberObject, read_hex_string_from_stream
+ from tests import get_data_from_url
+ 
+ 
+@@ -34,12 +35,36 @@
+         writer_page.merge_page(page)
+ 
+         assert writer_page.extract_text() == (
+-            "无译形带 r的参 z慧队手行 c要枪互工先调 uC一在你 k该方导最 xT况 M味政没出 v大同团\n"
+-            "想急压游这体构主 m基重张预另做内已织程术并 U种规被中应 s过小立就公测和 F更为 BS\n"
+-            "把强型 w利 qfJ现能您关文）己个言 VW是 Z亲社 y。说准密令 K络通自力 i诸旦明量放及 I\n"
+-            "成战康养 d都蜂多开 pE次提朋动比台有培愿 A确 l充计标去人如么 b灵 N它 g弃语看 X；j\n"
+-            "轮 HG采共由地友入（器 Y果感建切理情从集德翻 a单第识任 Q模 eh目经相哪受起时着 DR\n"
+-            "用好 o备划付信、度解效作协读 O讨高具击始者意群治扩到 P才兰网认 t马倒来本整 L们 n\n"
++            "无译形带r的参 z慧队手行 c要枪互工先调 uC一在你 k该方导最 xT况 M味政没出 v大同团\n"
++            "想急压游这体构主m基重张预另做内已织程术并 U种规被中应 s过小立就公测和 F更为 BS\n"
++            "把强型w利 qfJ现能您关文）己个言 VW是 Z亲社 y。说准密令K络通自力 i诸旦明量放及 I\n"
++            "成战康养d都蜂多开 pE次提朋动比台有培愿 A确 l充计标去人如么 b灵 N它 g弃语看 X；j\n"
++            "轮HG采共由地友入（器Y果感建切理情从集德翻a单第识任 Q模 eh目经相哪受起时着 DR\n"
++            "用好o备划付信、度解效作协读 O讨高具击始者意群治扩到 P才兰网认 t马倒来本整 L们 n\n"
+             "系可论，步各之但\n"
+             "12"
+         )
++
++
++def test_number_object__read_from_stream__limits() -> None:
++    stream = BytesIO(b"13.37\n")
++    assert NumberObject.read_from_stream(stream) == FloatObject("13.37")
++
++    stream = BytesIO(f"{'1' * 100}\n".encode())
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 101 exceeds maximum allowed length of 64\.$"
++    ):
++        NumberObject.read_from_stream(stream)
++
++
++def test_name_object__read_from_stream__limits() -> None:
++    stream = BytesIO(b"/My#20Name\n")
++    assert NameObject.read_from_stream(stream, pdf=None) == NameObject("/My Name")
++
++    stream = BytesIO(f"/{'SomeName' * 5000}\n".encode())
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 8176 exceeds maximum allowed length of 4096\.$"
++    ):
++        NameObject.read_from_stream(stream, pdf=None)
+--- a/tests/generic/test_data_structures.py
++++ b/tests/generic/test_data_structures.py
+@@ -5,6 +5,7 @@
+ from io import BytesIO
+ from pathlib import Path
+ from typing import Callable
++from unittest import mock
+ 
+ import pytest
+ 
+@@ -17,6 +18,7 @@
+     DictionaryObject,
+     NameObject,
+     NullObject,
++    NumberObject,
+     RectangleObject,
+     StreamObject,
+     TextStringObject,
+@@ -358,3 +360,101 @@
+     reader = PdfReader(buffer, strict=False)
+     with pytest.raises(expected_exception=PdfReadError, match=r"^Cannot find Root object in pdf$"):
+         assert len(reader.pages) == 0
++
++
++@pytest.mark.timeout(5)
++def test_dictionary_object__get_inherited__cyclic() -> None:
++    writer = PdfWriter()
++
++    dictionary1 = DictionaryObject()
++    reference1 = writer._add_object(dictionary1)
++    dictionary2 = DictionaryObject()
++    reference2 = writer._add_object(dictionary2)
++    dictionary3 = DictionaryObject({NameObject("/Parent"): reference2})
++    reference3 = writer._add_object(dictionary3)
++    dictionary1[NameObject("/Parent")] = reference3
++    dictionary2[NameObject("/Parent")] = reference1
++
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Detected cycle in /Parent hierarchy when retrieving value for key '/FT'\.$"
++    ):
++        writer.get_pages_showing_field(reference1)
++
++
++def _make_pdf__read_from_stream__limit() -> bytes:
++    offsets = []
++    pdf = bytearray(b"%PDF-1.4\n")
++
++    def add_obj(n: int, body: bytes) -> None:
++        offsets.append((n, len(pdf)))
++        pdf.extend(f"{n} 0 obj\n".encode())
++        pdf.extend(body)
++        pdf.extend(b"\nendobj\n")
++
++    add_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
++    add_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
++    add_obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R /Resources << >> >>")
++    offsets.append((4, len(pdf)))
++    pdf.extend(b"4 0 obj\n")
++    pdf.extend(b"<< >>\nstream\n")
++    pdf.extend(b"A" * 75_000_001)
++    pdf.extend(b"\nendstream\nendobj\n")
++    xref_offset = len(pdf)
++    pdf.extend(b"xref\n0 5\n0000000000 65535 f \n")
++    offset_map = dict(offsets)
++    for n in range(1, 5):
++        pdf.extend(f"{offset_map[n]:010d} 00000 n \n".encode())
++    pdf.extend(f"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode())
++    return bytes(pdf)
++
++
++@pytest.mark.timeout(5)
++def test_dictionary_object__read_from_stream__missing_length__limit() -> None:
++    reader = PdfReader(BytesIO(_make_pdf__read_from_stream__limit()))
++    page = reader.pages[0]
++
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 75000187 exceeds maximum allowed length of 75000000\.$"
++    ):
++        page.get_contents()
++
++
++def test_dictionary_object__read_from_stream__read_unsized__limit() -> None:
++    reader = PdfReader(RESOURCE_ROOT / "issue-301.pdf")
++
++    with mock.patch.object(DictionaryObject, "_read_unsized_from_stream", return_value=b"dummy") as read_mock:
++        obj = reader.get_object(13)
++        assert obj is not None
++        assert obj == DictionaryObject({
++            NameObject("/Filter"): NameObject("/FlateDecode"),
++            NameObject("/Length1"): NumberObject(218)
++        })
++    read_mock.assert_called_once_with(stream=reader.stream, pdf=reader, length=75_000_000)
++
++
++def test_dictionary_object__read_unsized_from_stream__limit() -> None:
++    reader = PdfReader(RESOURCE_ROOT / "issue-301.pdf")
++
++    reader.stream.seek(63101, 0)  # pstart value from the corresponding call
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Requested length of 236 exceeds maximum allowed length\.$"
++    ):
++        DictionaryObject._read_unsized_from_stream(stream=reader.stream, pdf=reader, length=137)
++
++
++def test_content_stream__parse_content_stream__limits() -> None:
++    content_stream = ContentStream(stream=None, pdf=None)
++
++    stream = BytesIO(b"/Do TESTING\n")
++    content_stream._parse_content_stream(stream)
++    assert content_stream.operations == [(["/Do"], b"TESTING")]
++
++    stream = BytesIO(f"/Do {'TESTING' * 100}\n".encode())
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 240 exceeds maximum allowed length of 128\.$"
++    ):
++        content_stream._parse_content_stream(stream)
+--- a/tests/test_reader.py
++++ b/tests/test_reader.py
+@@ -374,6 +374,88 @@
+     reader.pages[0]
+ 
+ 
++def test_startxref_corrupt_trailing_pointer(caplog):
++    """
++    A corrupt trailing startxref keyword (e.g. ``tartxref``) must not prevent
++    reading when an earlier, intact startxref from a previous revision is still
++    present further up the file. See #3238.
++    """
++    pdf_data = (
++        b"%%PDF-1.7\n"
++        b"1 0 obj << /Count 1 /Kids [4 0 R] /Type /Pages >> endobj\n"
++        b"2 0 obj << >> endobj\n"
++        b"3 0 obj << >> endobj\n"
++        b"4 0 obj << /Contents 3 0 R /CropBox [0.0 0.0 2550.0 3508.0]"
++        b" /MediaBox [0.0 0.0 2550.0 3508.0] /Parent 1 0 R"
++        b" /Resources << /Font << >> >>"
++        b" /Rotate 0 /Type /Page >> endobj\n"
++        b"5 0 obj << /Pages 1 0 R /Type /Catalog >> endobj\n"
++        b"xref 1 5\n"
++        b"%010d 00000 n\n"
++        b"%010d 00000 n\n"
++        b"%010d 00000 n\n"
++        b"%010d 00000 n\n"
++        b"%010d 00000 n\n"
++        b"trailer << /Root 5 0 R /Size 6 >>\n"
++        b"startxref\n"
++        b"%d\n"
++        b"%%%%EOF\n"
++        # A corrupt, trailing cross-reference pointer left behind by a broken
++        # incremental update: the keyword has lost its leading 's'.
++        b"tartxref\n"
++        b"99999\n"
++        b"%%%%EOF"
++    )
++    pdf_data = pdf_data % (
++        # - 1 below in the find because of the double % at the beginning
++        pdf_data.find(b"1 0 obj") - 1,
++        pdf_data.find(b"2 0 obj") - 1,
++        pdf_data.find(b"3 0 obj") - 1,
++        pdf_data.find(b"4 0 obj") - 1,
++        pdf_data.find(b"5 0 obj") - 1,
++        pdf_data.find(b"xref") - 1,
++    )
++    reader = PdfReader(io.BytesIO(pdf_data))
++    assert len(reader.pages) == 1
++    assert reader.pages[0].mediabox.width == 2550
++    assert normalize_warnings(caplog.text) == [
++        "found startxref pointing to a previous revision after a corrupt one",
++    ]
++
++    # Recovering from the corrupt pointer violates the standard, so it must
++    # only happen in non-strict mode; strict mode raises instead.
++    with pytest.raises(PdfReadError, match="startxref not found"):
++        PdfReader(io.BytesIO(pdf_data), strict=True)
++
++
++def test_find_previous_startxref_pos_recovery_variants():
++    """Cover the backward-scan branches of _find_previous_startxref_pos (#3238)."""
++
++    def scan(data: bytes) -> int:
++        stream = io.BytesIO(data)
++        stream.seek(0, 2)
++        return PdfReader._find_previous_startxref_pos(stream)
++
++    # Offset on the line below the keyword (the usual layout)
++    assert scan(b"startxref\n12345\ngarbage\n") == 12345
++
++    # Keyword and offset share a line
++    assert scan(b"startxref 6789\ngarbage\n") == 6789
++
++    # A startxref keyword with no numeric offset above it cannot be recovered
++    with pytest.raises(PdfReadError, match="startxref not found"):
++        scan(b"startxref\nnot-a-number\n")
++
++    # No startxref keyword at all: the scan exhausts the stream and gives up
++    with pytest.raises(PdfReadError, match="startxref not found"):
++        scan(b"only some bytes\nand more\n")
++
++    # The backward scan is bounded: a long stream without a recoverable
++    # pointer hits the line cap and gives up instead of scanning forever
++    with pytest.raises(PdfReadError, match="startxref not found"):
++        scan(b"x\n" * (PdfReader._MAX_STARTXREF_RECOVERY_LINES + 100))
++
++
+ @pytest.mark.parametrize(
+     ("pdffile", "password", "should_fail"),
+     [
+@@ -602,6 +684,88 @@
+     assert "Circular xref chain detected" in caplog.text
+ 
+ 
++def test_cyclic_pages_tree():
++    """Circular /Pages reference (multi-hop cycle) must raise PdfReadError, not recurse infinitely (#3847)."""
++    # Page tree: root /Pages (obj 2) -> /Pages obj 3 -> /Pages obj 4 -> /Pages obj 5 -> obj 3 (cycle)
++    # obj 6 is the only real /Page (reachable directly from root).
++    pdf_data = b"""%PDF-1.7
++
++1 0 obj
++  << /Type /Catalog
++     /Pages 2 0 R
++  >>
++endobj
++
++2 0 obj
++  << /Type /Pages
++     /Kids [6 0 R 3 0 R]
++     /Count 2
++     /MediaBox [0 0 595 842]
++  >>
++endobj
++
++3 0 obj
++  << /Type /Pages
++     /Kids [4 0 R]
++     /Count 1
++     /MediaBox [0 0 595 842]
++  >>
++endobj
++
++4 0 obj
++  << /Type /Pages
++     /Kids [5 0 R]
++     /Count 1
++     /MediaBox [0 0 595 842]
++  >>
++endobj
++
++5 0 obj
++  << /Type /Pages
++     /Kids [3 0 R]
++     /Count 1
++     /MediaBox [0 0 595 842]
++  >>
++endobj
++
++6 0 obj
++  << /Type /Page
++     /Parent 2 0 R
++     /Resources << /Font << /F1 << /Type /Font /Subtype /Type1 /BaseFont /Courier >> >> >>
++     /Contents [7 0 R]
++  >>
++endobj
++
++7 0 obj
++  << /Length 44 >>
++stream
++  BT /F1 22 Tf 30 800 Td (Test) Tj ET
++endstream
++endobj
++
++xref
++0 8
++0000000000 65535 f\x20
++0000000010 00000 n\x20
++0000000069 00000 n\x20
++0000000176 00000 n\x20
++0000000277 00000 n\x20
++0000000378 00000 n\x20
++0000000479 00000 n\x20
++0000000744 00000 n\x20
++trailer
++  << /Root 1 0 R
++     /Size 8
++  >>
++startxref
++841
++%%EOF
++"""
++    with pytest.raises(PdfReadError, match=r"^Detected cyclic page references\.$"):
++        reader = PdfReader(io.BytesIO(pdf_data), strict=False)
++        len(reader.pages)
++
++
+ def test_read_missing_startxref():
+     pdf_data = (
+         b"%%PDF-1.7\n"
+@@ -870,8 +1034,17 @@
+     assert exc.value.args[0] == "Sequence index out of range"
+ 
+ 
+-def test_convert_to_int():
+-    assert convert_to_int(b"\x01", 8) == 1
++@pytest.mark.parametrize(
++    ("d", "size", "expected"),
++    [
++        (b"\x01", 8, 1),
++        # Cross-reference stream entry fields are >= 0 (ISO 32000-2, Table 18),
++        # so a wide field with the high bit set must not decode to a negative value.
++        (b"\x80\x00\x00\x00\x00\x00\x00\x01", 8, 0x8000000000000001),
++    ],
++)
++def test_convert_to_int(d, size, expected):
++    assert convert_to_int(d, size) == expected
+ 
+ 
+ def test_convert_to_int_error():
+@@ -1879,7 +2052,9 @@
+     url = "https://github.com/user-attachments/files/17187711/crash-e8a85d82de01cab5eb44e7993304d8b9d1544970.pdf"
+     name = "issue2886.pdf"
+ 
+-    with pytest.raises(PdfReadError, match=r"Unexpected empty line in Xref table\."):
++    # Actual: 100_067
++    with mock.patch("pypdf.generic._base.NumberObject._LENGTH_LIMIT", 200_000), \
++            pytest.raises(PdfReadError, match=r"Unexpected empty line in Xref table\."):
+         _ = PdfReader(BytesIO(get_data_from_url(url=url, name=name)))
+ 
+ 
+@@ -1931,6 +2106,32 @@
+     assert reader.pages[0].extract_text() == "Hello World!"
+ 
+ 
++def test_read_standard_xref_table__entry_invalid_but_object_found(caplog):
++    """Tests for #3841"""
++    body = (
++        b"%PDF-1.7\n"
++        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
++        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
++        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
++    )
++    xref_offset = len(body)
++    corrupt_entry = b"xxxxxxxxxxxxxxxx 0\r\n"
++    assert len(corrupt_entry) == 20
++    data = body + (
++        b"xref\n1 3\n"
++        + corrupt_entry
++        + b"%010d 00000 n\r\n" % body.index(b"2 0 obj")
++        + b"%010d 00000 n\r\n" % body.index(b"3 0 obj")
++        + b"trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n"
++        + b"%d" % xref_offset
++        + b"\n%%EOF"
++    )
++
++    reader = PdfReader(BytesIO(data))
++    assert len(reader.pages) == 1
++    assert "entry 1 in Xref table invalid but object found" in caplog.text
++
++
+ @pytest.mark.enable_socket
+ def test_root_object_recovery_limit(caplog):
+     url = "https://github.com/user-attachments/files/24525509/root_object_recovery_limit.pdf"
+@@ -2293,7 +2494,7 @@
+         _ = reader.pages[0]
+     assert caplog.messages == []
+ 
+-    with pytest.raises(PdfReadError, match=r"^Maximum recursion depth reached during page flattening\.$"):
++    with pytest.raises(PdfReadError, match=r"cyclic page references|Maximum recursion depth"):
+         reader = PdfReader(BytesIO(pdf), strict=False)
+         _ = reader.pages[0]
+     assert caplog.messages == [
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -94,13 +94,13 @@
+ 
+ def test_read_until_regex_premature_ending_name():
+     stream = io.BytesIO(b"")
+-    assert read_until_regex(stream, re.compile(b".")) == b""
++    assert read_until_regex(stream=stream, regex=re.compile(b".")) == b""
+ 
+ 
+ def test_read_until_regex_match_in_first_chunk():
+     """Match within the first 16-byte chunk."""
+     stream = io.BytesIO(b"hello world")
+-    result = read_until_regex(stream, re.compile(b" "))
++    result = read_until_regex(stream=stream, regex=re.compile(b" "))
+     assert result == b"hello"
+     assert stream.tell() == 5
+ 
+@@ -111,7 +111,7 @@
+     assert len(payload) == 20
+     data = payload + b" rest"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b" "))
++    result = read_until_regex(stream=stream, regex=re.compile(b" "))
+     assert result == payload
+     assert stream.tell() == 20
+ 
+@@ -122,7 +122,7 @@
+     assert len(payload) == 16
+     data = payload + b" after"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b" "))
++    result = read_until_regex(stream=stream, regex=re.compile(b" "))
+     assert result == payload
+     assert stream.tell() == 16
+ 
+@@ -134,7 +134,7 @@
+     assert len(payload) == 15
+     data = payload + b"XYafter"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b"XY"))
++    result = read_until_regex(stream=stream, regex=re.compile(b"XY"))
+     assert result == payload
+     assert stream.tell() == 15
+ 
+@@ -143,7 +143,7 @@
+     """No match - stream is fully consumed and all data returned."""
+     data = b"0123456789" * 10
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b"ZZZ"))
++    result = read_until_regex(stream=stream, regex=re.compile(b"ZZZ"))
+     assert result == data
+ 
+ 
+@@ -153,7 +153,7 @@
+     assert len(payload) == 50_000
+     data = payload + b"|done"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(rb"\|"))
++    result = read_until_regex(stream=stream, regex=re.compile(rb"\|"))
+     assert result == payload
+     assert stream.tell() == 50_000
+ 
+@@ -166,7 +166,7 @@
+     assert len(payload) == 47
+     data = payload + b"ENDrest"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b"END"))
++    result = read_until_regex(stream=stream, regex=re.compile(b"END"))
+     assert result == payload
+     assert stream.tell() == 47
+ 
+@@ -186,7 +186,7 @@
+     payload = b"x" * 47
+     data = payload + pattern + b"rest"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(re.escape(pattern)))
++    result = read_until_regex(stream=stream, regex=re.compile(re.escape(pattern)))
+     assert result == payload
+     assert stream.tell() == 47
+ 
