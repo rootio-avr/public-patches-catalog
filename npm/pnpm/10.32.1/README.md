@@ -4,14 +4,21 @@ This patch is based on pnpm version 10.32.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-48995
+- CVE-2026-50014
 - CVE-2026-50015
 - CVE-2026-50016
+- CVE-2026-50017
+- CVE-2026-50021
+- CVE-2026-50573
+- CVE-2026-55180
 - CVE-2026-55487
 - CVE-2026-55697
-- GHSA-72r4-9c5j-mj57
-- GHSA-qrv3-253h-g69c
-- GHSA-fr4h-3cph-29xv
 - CVE-2026-55698
+- CVE-2026-55699
+- GHSA-72r4-9c5j-mj57
+- GHSA-fr4h-3cph-29xv
+- GHSA-qrv3-253h-g69c
 
 ## How to Apply:
 1. Clone or download the source code for pnpm
