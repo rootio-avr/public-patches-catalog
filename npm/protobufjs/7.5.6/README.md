@@ -7,6 +7,7 @@ unknown
 - CVE-2026-45740
 - CVE-2026-48712
 - CVE-2026-59877
+- CVE-2026-54269
 
 ## How to Apply:
 1. Clone or download the source code for protobufjs
