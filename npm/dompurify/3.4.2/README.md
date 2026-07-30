@@ -7,6 +7,7 @@ unknown
 - CVE-2026-49458
 - CVE-2026-49459
 - CVE-2026-49978
+- GHSA-76mc-f452-cxcm
 - GHSA-cmwh-pvxp-8882
 
 ## How to Apply:
