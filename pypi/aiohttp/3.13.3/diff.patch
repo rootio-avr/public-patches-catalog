@@ -2834,6 +2834,322 @@ CVE: CVE-2026-54273
      """Test RequestInfo can be created without real_url."""
      url = URL("http://example.com")
 
+CVE-2026-54276: Scope DigestAuthMiddleware credentials to the request origin
+
+Backport of upstream commit 38d16060037e1bfcd6d677abababa3c2a4bb58fa
+(aio-libs/aiohttp 3.14 branch, PR #12839; from PR #12825).
+
+aiohttp's DigestAuthMiddleware previously transmitted a Digest
+Authorization response on any request, including cross-origin redirect
+targets. An attacker controlling the redirect target (or exploiting an
+open-redirect on the original host) could capture the digest response
+computed from the configured credentials.
+
+This change pins the middleware to the origin of the first request it
+handles. Subsequent requests to a different origin pass through
+untouched, unless the anchor origin's challenge advertised the other
+origin via the RFC 7616 ``domain`` directive.
+
+Notes for the 3.13.3 backport:
+ - Type annotations adjusted to match the target file's style:
+   the new ``_origin`` instance attribute is typed
+   ``Union[URL, None]`` (target uses ``typing.Union``/``typing.List``
+   throughout; ``Optional`` is not imported), and the surrounding
+   context line keeps ``List[str]``.
+ - Docs (``docs/client_reference.rst``) and the changelog fragment
+   (``CHANGES/12825.bugfix.rst``) from the upstream commit are
+   intentionally NOT carried here -- they don't affect runtime
+   behaviour and the CHANGES/ directory is reset on releases.
+ - Paired regression tests from the upstream commit are included
+   to validate the fix.
+
+Origin: upstream, https://github.com/aio-libs/aiohttp/commit/38d16060037e1bfcd6d677abababa3c2a4bb58fa
+References: GHSA-hpj7-wq8m-9hgp, https://github.com/aio-libs/aiohttp/pull/12825,
+            https://github.com/aio-libs/aiohttp/pull/12839
+
+--- a/aiohttp/client_middleware_digest_auth.py
++++ b/aiohttp/client_middleware_digest_auth.py
+@@ -171,6 +171,15 @@ class DigestAuthMiddleware:
+     - Includes replay attack protection with client nonce count tracking
+     - Supports preemptive authentication per RFC 7616 Section 3.6
+
++    Origin scoping:
++    The credentials are scoped to the origin of the first request the
++    middleware handles. A request to a different origin is passed through
++    untouched, so it never receives a digest response computed from those
++    credentials, unless that origin falls within a protection space the
++    anchor origin advertised through the RFC 7616 ``domain`` directive. Make
++    the first request through the middleware against the intended origin, as
++    the anchor is pinned to it and not reset for the life of the instance.
++
+     Standards compliance:
+     - RFC 7616: HTTP Digest Access Authentication (primary reference)
+     - RFC 2617: HTTP Authentication (deprecated by RFC 7616)
+@@ -207,6 +216,8 @@ class DigestAuthMiddleware:
+         self._preemptive: bool = preemptive
+         # Set of URLs defining the protection space
+         self._protection_space: List[str] = []
++        # Origin the credentials are scoped to; set on the first request.
++        self._origin: Union[URL, None] = None
+
+     async def _encode(
+         self, method: str, url: URL, body: Union[Payload, Literal[b""]]
+@@ -454,6 +465,16 @@ class DigestAuthMiddleware:
+         self, request: ClientRequest, handler: ClientHandlerType
+     ) -> ClientResponse:
+         """Run the digest auth middleware."""
++        # Credentials are scoped to the first request's origin. Other origins
++        # pass through untouched unless a challenge from the anchor origin
++        # advertised them via RFC 7616 domain; mirrors aiohttp stripping
++        # Authorization on cross-origin redirects.
++        origin = request.url.origin()
++        if self._origin is None:
++            self._origin = origin
++        elif origin != self._origin and not self._in_protection_space(request.url):
++            return await handler(request)
++
+         response = None
+         for retry_count in range(2):
+             # Apply authorization header if:
+--- a/tests/test_client_middleware_digest_auth.py
++++ b/tests/test_client_middleware_digest_auth.py
+@@ -1149,6 +1149,176 @@ async def test_preemptive_auth_without_domain_uses_origin(
+     )  # Second request - preemptive auth (entire origin)
+
+
++async def test_does_not_answer_cross_origin_redirect_challenge(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A cross-origin redirect target must not receive a digest response.
++
++    aiohttp strips the Authorization header on cross-origin redirects; the
++    digest middleware must not re-add one for the redirect target, otherwise
++    the configured credentials leak to an origin the caller never targeted.
++    """
++    target_auth_headers: list[str | None] = []
++
++    async def target_handler(request: Request) -> Response:
++        auth_header = request.headers.get(hdrs.AUTHORIZATION)
++        target_auth_headers.append(auth_header)
++        assert auth_header is None
++        return Response(
++            status=401,
++            headers={
++                hdrs.WWW_AUTHENTICATE: 'Digest realm="evil", nonce="cross-origin"'
++            },
++        )
++
++    target_app = Application()
++    target_app.router.add_get("/", target_handler)
++    target_server = await aiohttp_server(target_app)
++
++    async def source_handler(request: Request) -> Response:
++        return Response(
++            status=302, headers={hdrs.LOCATION: str(target_server.make_url("/"))}
++        )
++
++    source_app = Application()
++    source_app.router.add_get("/", source_handler)
++    source_server = await aiohttp_server(source_app)
++
++    digest_auth = DigestAuthMiddleware("victim", "secret")
++    async with (
++        ClientSession(middlewares=(digest_auth,)) as session,
++        session.get(source_server.make_url("/")) as response,
++    ):
++        await response.text()
++
++    assert target_auth_headers == [None]
++
++
++async def test_answers_same_origin_redirect_challenge(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A same-origin redirect that issues a challenge must still authenticate."""
++    auth_headers: list[str | None] = []
++
++    async def handler(request: Request) -> Response:
++        if request.path == "/start":
++            return Response(status=302, headers={hdrs.LOCATION: "/protected"})
++        auth_header = request.headers.get(hdrs.AUTHORIZATION)
++        auth_headers.append(auth_header)
++        if auth_header is None:
++            return Response(
++                status=401,
++                headers={hdrs.WWW_AUTHENTICATE: 'Digest realm="good", nonce="abc"'},
++            )
++        return Response(text="OK")
++
++    app = Application()
++    app.router.add_get("/start", handler)
++    app.router.add_get("/protected", handler)
++    server = await aiohttp_server(app)
++
++    digest_auth = DigestAuthMiddleware("user", "pass")
++    async with (
++        ClientSession(middlewares=(digest_auth,)) as session,
++        session.get(server.make_url("/start")) as response,
++    ):
++        assert response.status == 200
++        assert await response.text() == "OK"
++
++    assert auth_headers[0] is None
++    assert auth_headers[1] is not None
++    assert auth_headers[1].startswith("Digest")
++
++
++async def test_answers_cross_origin_within_domain_protection_space(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """A different origin advertised via the ``domain`` directive is honored.
++
++    RFC 7616 allows a challenge to define a protection space spanning other
++    servers through the ``domain`` directive. The anchor origin vouches for
++    those URIs, so preemptive auth to them is expected.
++    """
++    other_auth_headers: list[str | None] = []
++
++    async def other_handler(request: Request) -> Response:
++        other_auth_headers.append(request.headers.get(hdrs.AUTHORIZATION))
++        return Response(text="other")
++
++    other_app = Application()
++    other_app.router.add_get("/", other_handler)
++    other_server = await aiohttp_server(other_app)
++    other_origin = str(other_server.make_url("/").origin())
++
++    async def anchor_handler(request: Request) -> Response:
++        if request.headers.get(hdrs.AUTHORIZATION) is None:
++            challenge = f'Digest realm="anchor", nonce="n1", domain="{other_origin}/"'
++            return Response(status=401, headers={hdrs.WWW_AUTHENTICATE: challenge})
++        return Response(text="anchor")
++
++    anchor_app = Application()
++    anchor_app.router.add_get("/", anchor_handler)
++    anchor_server = await aiohttp_server(anchor_app)
++
++    digest_auth = DigestAuthMiddleware("user", "pass")
++    async with ClientSession(middlewares=(digest_auth,)) as session:
++        async with session.get(anchor_server.make_url("/")) as response:
++            assert response.status == 200
++        async with session.get(other_server.make_url("/")) as response:
++            assert response.status == 200
++
++    assert other_auth_headers[0] is not None
++    assert other_auth_headers[0].startswith("Digest")
++
++
++async def test_does_not_answer_cross_origin_challenge_without_redirect(
++    aiohttp_server: AiohttpServer,
++) -> None:
++    """Origin scoping applies to any cross-origin request, not just redirects.
++
++    After authenticating against the anchor origin, a direct request to a
++    different origin that issues its own challenge must not be answered with a
++    digest response computed from the configured credentials.
++    """
++    other_auth_headers: list[str | None] = []
++
++    async def other_handler(request: Request) -> Response:
++        auth_header = request.headers.get(hdrs.AUTHORIZATION)
++        other_auth_headers.append(auth_header)
++        assert auth_header is None
++        return Response(
++            status=401,
++            headers={hdrs.WWW_AUTHENTICATE: 'Digest realm="evil", nonce="x"'},
++        )
++
++    other_app = Application()
++    other_app.router.add_get("/", other_handler)
++    other_server = await aiohttp_server(other_app)
++
++    async def anchor_handler(request: Request) -> Response:
++        if request.headers.get(hdrs.AUTHORIZATION) is None:
++            return Response(
++                status=401,
++                headers={hdrs.WWW_AUTHENTICATE: 'Digest realm="anchor", nonce="n1"'},
++            )
++        return Response(text="anchor")
++
++    anchor_app = Application()
++    anchor_app.router.add_get("/", anchor_handler)
++    anchor_server = await aiohttp_server(anchor_app)
++
++    digest_auth = DigestAuthMiddleware("user", "pass")
++    async with ClientSession(middlewares=(digest_auth,)) as session:
++        async with session.get(anchor_server.make_url("/")) as response:
++            assert response.status == 200
++        async with session.get(other_server.make_url("/")) as response:
++            assert response.status == 401
++
++    # The other origin only ever saw the unauthenticated request; the
++    # middleware never answered its challenge.
++    assert other_auth_headers == [None]
++
++
+ @pytest.mark.parametrize(
+     ("status", "headers", "expected"),
+     [
+
+--- /dev/null
++++ b/CHANGES/12826.bugfix.rst
+@@ -0,0 +1 @@
++Fixed the C HTTP parser not enforcing ``max_line_size`` on a request target or response reason phrase that is split across multiple reads; each fragment was checked on its own, so an accumulated line could exceed the limit without raising ``LineTooLong``. The accumulated length is now checked, matching the pure-Python parser -- by :user:`bdraco`.
+--- a/aiohttp/_http_parser.pyx
++++ b/aiohttp/_http_parser.pyx
+@@ -723,7 +723,7 @@ cdef int cb_on_url(cparser.llhttp_t* parser,
+                    const char *at, size_t length) except -1:
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             status = pyparser._buf + at[:length]
+             raise LineTooLong(status[:100] + b"...", pyparser._max_line_size)
+         extend(pyparser._buf, at, length)
+@@ -738,7 +738,7 @@ cdef int cb_on_status(cparser.llhttp_t* parser,
+                       const char *at, size_t length) except -1:
+     cdef HttpParser pyparser = <HttpParser>parser.data
+     try:
+-        if length > pyparser._max_line_size:
++        if len(pyparser._buf) + length > pyparser._max_line_size:
+             reason = pyparser._buf + at[:length]
+             raise LineTooLong(reason[:100] + b"...", pyparser._max_line_size)
+         extend(pyparser._buf, at, length)
+--- a/tests/test_http_parser.py
++++ b/tests/test_http_parser.py
+@@ -1216,6 +1216,15 @@ def test_http_request_max_status_line_under_limit(parser) -> None:
+     assert msg.url == URL("/path" + path.decode())
+
+
++def test_http_request_max_status_line_fragmented(parser) -> None:
++    # Split an overlong request target across reads so that each callback
++    # fragment is under the limit but the accumulated target is not.
++    match = r"400, message:\n  Got more than 8190 bytes \(\d+\) when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        parser.feed_data(b"GET /" + b"a" * 8000)
++        parser.feed_data(b"a" * 8000 + b" HTTP/1.1\r\nHost: a\r\n\r\n")
++
++
+ def test_http_response_parser_utf8(response) -> None:
+     text = "HTTP/1.1 200 Ok\r\nx-test:тест\r\n\r\n".encode()
+
+@@ -1299,6 +1308,15 @@ def test_http_response_parser_status_line_under_limit(response) -> None:
+     assert msg.reason == reason.decode()
+
+
++def test_http_response_parser_status_line_too_long_fragmented(response) -> None:
++    # Split an overlong reason phrase across reads so that each callback
++    # fragment is under the limit but the accumulated reason is not.
++    match = r"400, message:\n  Got more than 8190 bytes \(\d+\) when reading"
++    with pytest.raises(http_exceptions.LineTooLong, match=match):
++        response.feed_data(b"HTTP/1.1 200 " + b"a" * 8000)
++        response.feed_data(b"a" * 8000 + b"\r\n\r\n")
++
++
+ def test_http_response_parser_bad_version(response) -> None:
+     with pytest.raises(http_exceptions.BadHttpMessage):
+         response.feed_data(b"HT/11 200 Ok\r\n\r\n")
+
 --- /dev/null
 +++ b/CHANGES/12828.bugfix.rst
 @@ -0,0 +1 @@
