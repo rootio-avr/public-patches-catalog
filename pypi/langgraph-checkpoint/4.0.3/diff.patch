@@ -1,0 +1,278 @@
+--- a/langgraph/checkpoint/serde/jsonplus.py
++++ b/langgraph/checkpoint/serde/jsonplus.py
+@@ -155,27 +155,6 @@ class JsonPlusSerializer(SerializerProtocol):
+             )
+         return clone
+ 
+-    def _encode_constructor_args(
+-        self,
+-        constructor: Callable | type[Any],
+-        *,
+-        method: None | str | Sequence[None | str] = None,
+-        args: Sequence[Any] | None = None,
+-        kwargs: dict[str, Any] | None = None,
+-    ) -> dict[str, Any]:
+-        out = {
+-            "lc": 2,
+-            "type": "constructor",
+-            "id": (*constructor.__module__.split("."), constructor.__name__),
+-        }
+-        if method is not None:
+-            out["method"] = method
+-        if args is not None:
+-            out["args"] = args
+-        if kwargs is not None:
+-            out["kwargs"] = kwargs
+-        return out
+-
+     def _reviver(self, value: dict[str, Any]) -> Any:
+         if (
+             value.get("lc", None) == 2
+@@ -201,45 +180,44 @@ class JsonPlusSerializer(SerializerProtocol):
+         self._check_allowed_json_modules(value)
+ 
+         [*module, name] = value["id"]
++        # The `method` field on lc:2 envelopes is intentionally ignored.
++        # Revival is restricted to the default constructor so that no
++        # `getattr` dispatch happens on an attacker-influenced name. The
++        # encoder has not emitted `method=` since the msgpack migration, and
++        # the only legacy emission was `method=(None, "construct")` for
++        # pydantic models, whose first entry (`None`) already meant "default
++        # constructor" -- which is what happens unconditionally here.
+         try:
+             mod = importlib.import_module(".".join(module))
+             cls = getattr(mod, name)
+-            method = value.get("method")
+-            if isinstance(method, str):
+-                methods = [getattr(cls, method)]
+-            elif isinstance(method, list):
+-                methods = [cls if m is None else getattr(cls, m) for m in method]
+-            else:
+-                methods = [cls]
++            if isclass(cls) and issubclass(cls, BaseException):
++                return None
+             args = value.get("args")
+             kwargs = value.get("kwargs")
+-            for method in methods:
+-                try:
+-                    if isclass(method) and issubclass(method, BaseException):
+-                        return None
+-                    if args and kwargs:
+-                        return method(*args, **kwargs)
+-                    elif args:
+-                        return method(*args)
+-                    elif kwargs:
+-                        return method(**kwargs)
+-                    else:
+-                        return method()
+-                except Exception:
+-                    continue
+-        except Exception:
++            if args and kwargs:
++                return cls(*args, **kwargs)
++            elif args:
++                return cls(*args)
++            elif kwargs:
++                return cls(**kwargs)
++            else:
++                return cls()
++        except Exception as exc:
++            # Legacy `method=[None, "construct"]` payloads no longer fall back
++            # to `cls.construct(**kwargs)` when the default constructor rejects
++            # the serialized kwargs. Warn so operators can spot payloads that
++            # now revive to `None` instead of failing silently.
++            logger.warning(
++                "Failed to revive lc:2 envelope %s "
++                "(legacy_method_field=%s, error=%s); returning None",
++                ".".join((*module, name)),
++                "method" in value,
++                type(exc).__name__,
++            )
+             return None
+ 
+     def _check_allowed_json_modules(self, value: dict[str, Any]) -> None:
+         needed = tuple(value["id"])
+-        method = value.get("method")
+-        if isinstance(method, list):
+-            method_display = ",".join(m or "<init>" for m in method)
+-        elif isinstance(method, str):
+-            method_display = method
+-        else:
+-            method_display = "<init>"
+-
+         dotted = ".".join(needed)
+         # Safe types (the same set already allowed for msgpack deserialization) are
+         # permitted without an explicit allowlist — they are known-safe LangGraph and
+@@ -250,7 +228,7 @@ class JsonPlusSerializer(SerializerProtocol):
+ 
+         if not self._allowed_json_modules:
+             raise InvalidModuleError(
+-                f"Refused to deserialize JSON constructor: {dotted} (method: {method_display}). "
++                f"Refused to deserialize JSON constructor: {dotted}. "
+                 "No allowed_json_modules configured.\n\n"
+                 "Unblock with ONE of:\n"
+                 f"  • JsonPlusSerializer(allowed_json_modules=[{needed!r}, ...])\n"
+@@ -265,7 +243,7 @@ class JsonPlusSerializer(SerializerProtocol):
+             return
+ 
+         raise InvalidModuleError(
+-            f"Refused to deserialize JSON constructor: {dotted} (method: {method_display}). "
++            f"Refused to deserialize JSON constructor: {dotted}. "
+             "Symbol is not in the deserialization allowlist.\n\n"
+             "Add exactly this symbol to unblock:\n"
+             f"  JsonPlusSerializer(allowed_json_modules=[{needed!r}, ...])\n"
+--- a/tests/test_jsonplus.py
++++ b/tests/test_jsonplus.py
+@@ -1048,3 +1048,152 @@ def test_msgpack_nested_pydantic_serializes_as_dict(
+     # No blocking should occur - inner is serialized as dict, not ext
+     assert "blocked" not in caplog.text.lower()
+     assert result == obj
++
++
++def test_lc2_json_method_field_is_ignored() -> None:
++    """The `method` field on lc=2 envelopes is ignored.
++
++    Regression test for GHSA-fjqc-hq36-qh5p: `_revive_lc2` previously resolved
++    `getattr(cls, method)` from the envelope, which let an attacker pivot a
++    safe pydantic class (e.g. AIMessage) to `parse_raw(..., allow_pickle=True)`
++    and reach `pickle.loads`. Revival now uses only the default constructor.
++    """
++    from langchain_core.messages import AIMessage
++
++    serde = JsonPlusSerializer(
++        allowed_json_modules=[("langchain_core", "messages", "ai", "AIMessage")]
++    )
++    load = {
++        "lc": 2,
++        "type": "constructor",
++        "id": ["langchain_core", "messages", "ai", "AIMessage"],
++        "method": "parse_raw",
++        "args": ["default-ctor-ran"],
++        "kwargs": {"content_type": "application/pickle", "allow_pickle": True},
++    }
++    result = serde._revive_lc2(load)
++    # The default constructor takes `content` as its first positional argument.
++    # Had `parse_raw` been invoked it would have attempted pickle parsing and
++    # raised (or run the gadget); neither produces this result.
++    assert isinstance(result, AIMessage)
++    assert result.content == "default-ctor-ran"
++
++
++def test_lc2_json_init_still_works() -> None:
++    """lc=2 revival without a `method` field still constructs the class."""
++    from langchain_core.messages import AIMessage
++
++    serde = JsonPlusSerializer(
++        allowed_json_modules=[("langchain_core", "messages", "ai", "AIMessage")]
++    )
++    load = {
++        "lc": 2,
++        "type": "constructor",
++        "id": ["langchain_core", "messages", "ai", "AIMessage"],
++        "kwargs": {"content": "hi", "type": "ai"},
++    }
++    result = serde._revive_lc2(load)
++    assert isinstance(result, AIMessage)
++    assert result.content == "hi"
++
++
++def test_lc2_json_legacy_pydantic_method_list_uses_default_ctor() -> None:
++    """Legacy ``method=(None, "construct")`` envelopes revive via the default ctor.
++
++    Pre-October-2025 langgraph emitted pydantic models with
++    ``method=(None, "construct")``, meaning "try the default constructor, fall
++    back to pydantic ``construct``". The first entry (``None``) was always the
++    default constructor, which is what happens unconditionally now, so these
++    envelopes keep working as long as the kwargs are valid.
++    """
++    from langchain_core.messages import AIMessage
++
++    serde = JsonPlusSerializer(
++        allowed_json_modules=[("langchain_core", "messages", "ai", "AIMessage")]
++    )
++    load = {
++        "lc": 2,
++        "type": "constructor",
++        "id": ["langchain_core", "messages", "ai", "AIMessage"],
++        "method": [None, "construct"],
++        "kwargs": {"content": "legacy", "type": "ai"},
++    }
++    result = serde._revive_lc2(load)
++    assert isinstance(result, AIMessage)
++    assert result.content == "legacy"
++
++
++def test_lc2_json_legacy_construct_payload_logs_warning_when_init_rejects(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    """Legacy `construct` payloads the default ctor rejects revive to None and warn.
++
++    Removing method dispatch also removed the `cls.construct(**kwargs)`
++    fallback, so these payloads now fail validation. The warning makes that
++    observable instead of letting the envelope quietly degrade.
++    """
++    serde = JsonPlusSerializer(
++        allowed_json_modules=[("langchain_core", "messages", "ai", "AIMessage")]
++    )
++    load = {
++        "lc": 2,
++        "type": "constructor",
++        "id": ["langchain_core", "messages", "ai", "AIMessage"],
++        "method": [None, "construct"],
++        # `type` fails AIMessage's Literal["ai"] validator under the default
++        # constructor. Before this fix it fell back to `cls.construct(**kwargs)`.
++        "kwargs": {"content": "legacy", "type": "not-a-real-message-type"},
++    }
++
++    with caplog.at_level(
++        logging.WARNING, logger="langgraph.checkpoint.serde.jsonplus"
++    ):
++        result = serde._revive_lc2(load)
++
++    assert result is None
++    assert [
++        r
++        for r in caplog.records
++        if r.name == "langgraph.checkpoint.serde.jsonplus"
++        and r.levelno == logging.WARNING
++        and "langchain_core.messages.ai.AIMessage" in r.getMessage()
++        and "legacy_method_field=True" in r.getMessage()
++    ], [(r.name, r.levelname, r.getMessage()) for r in caplog.records]
++
++
++def test_lc2_json_pickle_payload_does_not_execute() -> None:
++    """End-to-end: a `parse_raw` pickle gadget payload must not run."""
++    import os
++    import pickle
++    import tempfile
++
++    marker = tempfile.NamedTemporaryFile(
++        prefix="lc2_block_proof_", suffix=".out", delete=False
++    ).name
++    os.remove(marker)  # ensure absent before the test runs
++
++    class _Gadget:
++        def __reduce__(self) -> tuple:
++            return (os.system, (f"touch {marker}",))
++
++    gadget_bytes = pickle.dumps(_Gadget(), protocol=0).decode("latin1")
++    envelope = {
++        "lc": 2,
++        "type": "constructor",
++        "id": ["langchain_core", "messages", "ai", "AIMessage"],
++        "method": "parse_raw",
++        "args": [gadget_bytes],
++        "kwargs": {"content_type": "application/pickle", "allow_pickle": True},
++    }
++
++    serde = JsonPlusSerializer(
++        allowed_json_modules=[("langchain_core", "messages", "ai", "AIMessage")]
++    )
++    try:
++        serde.loads_typed(("json", json.dumps(envelope).encode()))
++    except Exception:
++        pass
++
++    assert not os.path.exists(marker), (
++        "Pickle gadget executed via parse_raw on AIMessage lc=2 envelope"
++    )
