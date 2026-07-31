@@ -1,0 +1,532 @@
+--- a/dist/immutable.js
++++ b/dist/immutable.js
+@@ -886,6 +886,28 @@
+     return smi(hashed);
+   }
+ 
++  // Per-process seed for the secondary collision hash. Never exposed nor
++  // serialized, so the public `hash()` stays deterministic. An odd base in
++  // [3, 2^20) keeps `base * h` exact as a double (no `Math.imul`).
++  var COLLISION_HASH_BASE = ((Math.random() * 0x100000) | 1) % 0x100000 || 0x9e37;
++
++  // Secondary hash to index entries within a `HashCollisionNode`, where every
++  // key shares the same primary `hash()`. Using a different, seeded base
++  // scatters crafted collision families (e.g. "Aa"/"BB", which only collide
++  // under base 31) that an attacker cannot precompute without the seed. It only
++  // narrows candidates -- `is()` still decides equality -- so non-string keys
++  // can safely fall back to the (here constant) primary hash and a linear scan.
++  function hashCollisionKey(key) {
++    if (typeof key !== 'string') {
++      return hash(key);
++    }
++    var hashed = 0;
++    for (var ii = 0; ii < key.length; ii++) {
++      hashed = (COLLISION_HASH_BASE * hashed + key.charCodeAt(ii)) | 0;
++    }
++    return hashed;
++  }
++
+   function hashSymbol(sym) {
+     var hashed = symbolMap[sym];
+     if (hashed !== undefined) {
+@@ -2796,16 +2818,66 @@
+     this.ownerID = ownerID;
+     this.keyHash = keyHash;
+     this.entries = entries;
++    // Lazy `{ [secondaryHash]: number[] }`, built only past
++    // MIN_HASH_COLLISION_INDEX_SIZE so small buckets keep their linear path.
++    this._index = undefined;
+   };
+ 
+-  HashCollisionNode.prototype.get = function get (shift, keyHash, key, notSetValue) {
++  // Returns the position of `key` in `this.entries`, or -1. Uses the secondary
++  // index when present; builds it only when `buildIndex` is true (reads and
++  // transient inserts, where the node is reused so the O(n) build amortizes).
++  // Persistent inserts already pay an O(n) copy, so a throwaway index is skipped.
++  HashCollisionNode.prototype._positionOf = function _positionOf (key, buildIndex) {
++    var entries = this.entries;
++    var index = this._index;
++    if (
++      index === undefined &&
++      buildIndex &&
++      entries.length >= MIN_HASH_COLLISION_INDEX_SIZE
++    ) {
++      index = this._buildIndex();
++    }
++    if (index !== undefined) {
++      var positions = index[hashCollisionKey(key)];
++      if (positions !== undefined) {
++        for (var jj = 0; jj < positions.length; jj++) {
++          var ii = positions[jj];
++          if (is(key, entries[ii][0])) {
++            return ii;
++          }
++        }
++      }
++      return -1;
++    }
++    for (var ii$1 = 0, len = entries.length; ii$1 < len; ii$1++) {
++      if (is(key, entries[ii$1][0])) {
++        return ii$1;
++      }
++    }
++    return -1;
++  };
++
++  // Builds and memoizes the secondary index. A plain object, not `Map` -- which
++  // in this module resolves to the *Immutable* Map, not the native one.
++  HashCollisionNode.prototype._buildIndex = function _buildIndex () {
++    var index = Object.create(null);
+     var entries = this.entries;
+     for (var ii = 0, len = entries.length; ii < len; ii++) {
+-      if (is(key, entries[ii][0])) {
+-        return entries[ii][1];
++      var secondaryHash = hashCollisionKey(entries[ii][0]);
++      var positions = index[secondaryHash];
++      if (positions !== undefined) {
++        positions.push(ii);
++      } else {
++        index[secondaryHash] = [ii];
+       }
+     }
+-    return notSetValue;
++    this._index = index;
++    return index;
++  };
++
++  HashCollisionNode.prototype.get = function get (shift, keyHash, key, notSetValue) {
++    var idx = this._positionOf(key, true);
++    return idx === -1 ? notSetValue : this.entries[idx][1];
+   };
+ 
+   HashCollisionNode.prototype.update = function update (ownerID, shift, keyHash, key, value, didChangeSize, didAlter) {
+@@ -2825,14 +2897,11 @@
+     }
+ 
+     var entries = this.entries;
+-    var idx = 0;
+     var len = entries.length;
+-    for (; idx < len; idx++) {
+-      if (is(key, entries[idx][0])) {
+-        break;
+-      }
+-    }
+-    var exists = idx < len;
++    var isEditable = ownerID && ownerID === this.ownerID;
++    var foundIdx = this._positionOf(key, isEditable);
++    var idx = foundIdx === -1 ? len : foundIdx;
++    var exists = foundIdx !== -1;
+ 
+     if (exists ? entries[idx][1] === value : removed) {
+       return this;
+@@ -2845,7 +2914,6 @@
+       return new ValueNode(ownerID, this.keyHash, entries[idx ^ 1]);
+     }
+ 
+-    var isEditable = ownerID && ownerID === this.ownerID;
+     var newEntries = isEditable ? entries : arrCopy(entries);
+ 
+     if (exists) {
+@@ -2853,11 +2921,27 @@
+         idx === len - 1
+           ? newEntries.pop()
+           : (newEntries[idx] = newEntries.pop());
++        // The swap-pop reshuffles positions; drop the stale index (rebuilt lazily).
++        if (isEditable) {
++          this._index = undefined;
++        }
+       } else {
++        // Same key, same position: the index stays valid.
+         newEntries[idx] = [key, value];
+       }
+     } else {
+       newEntries.push([key, value]);
++      // Keep the index in sync on the transient insert path. Persistent inserts
++      // return a fresh node below whose index rebuilds lazily, so skip them.
++      if (isEditable && this._index !== undefined) {
++        var secondaryHash = hashCollisionKey(key);
++        var positions = this._index[secondaryHash];
++        if (positions !== undefined) {
++          positions.push(len);
++        } else {
++          this._index[secondaryHash] = [len];
++        }
++      }
+     }
+ 
+     if (isEditable) {
+@@ -3191,6 +3275,12 @@
+   var MAX_BITMAP_INDEXED_SIZE = SIZE / 2;
+   var MIN_HASH_ARRAY_MAP_SIZE = SIZE / 4;
+ 
++  // Above this many colliding entries, a `HashCollisionNode` builds a seeded
++  // secondary index instead of scanning linearly. Kept small so the rare,
++  // naturally-occurring collision buckets stay overhead-free, while adversarial
++  // hash-flooding (thousands of keys sharing one hash) degrades gracefully.
++  var MIN_HASH_COLLISION_INDEX_SIZE = 16;
++
+   var IS_LIST_SYMBOL = '@@__IMMUTABLE_LIST__@@';
+ 
+   function isList(maybeList) {
+--- a/dist/immutable.es.js
++++ b/dist/immutable.es.js
+@@ -880,6 +880,28 @@ function hashString(string) {
+   return smi(hashed);
+ }
+ 
++// Per-process seed for the secondary collision hash. Never exposed nor
++// serialized, so the public `hash()` stays deterministic. An odd base in
++// [3, 2^20) keeps `base * h` exact as a double (no `Math.imul`).
++var COLLISION_HASH_BASE = ((Math.random() * 0x100000) | 1) % 0x100000 || 0x9e37;
++
++// Secondary hash to index entries within a `HashCollisionNode`, where every
++// key shares the same primary `hash()`. Using a different, seeded base
++// scatters crafted collision families (e.g. "Aa"/"BB", which only collide
++// under base 31) that an attacker cannot precompute without the seed. It only
++// narrows candidates -- `is()` still decides equality -- so non-string keys
++// can safely fall back to the (here constant) primary hash and a linear scan.
++function hashCollisionKey(key) {
++  if (typeof key !== 'string') {
++    return hash(key);
++  }
++  var hashed = 0;
++  for (var ii = 0; ii < key.length; ii++) {
++    hashed = (COLLISION_HASH_BASE * hashed + key.charCodeAt(ii)) | 0;
++  }
++  return hashed;
++}
++
+ function hashSymbol(sym) {
+   var hashed = symbolMap[sym];
+   if (hashed !== undefined) {
+@@ -2790,16 +2812,66 @@ var HashCollisionNode = function HashCollisionNode(ownerID, keyHash, entries) {
+   this.ownerID = ownerID;
+   this.keyHash = keyHash;
+   this.entries = entries;
++  // Lazy `{ [secondaryHash]: number[] }`, built only past
++  // MIN_HASH_COLLISION_INDEX_SIZE so small buckets keep their linear path.
++  this._index = undefined;
+ };
+ 
+-HashCollisionNode.prototype.get = function get (shift, keyHash, key, notSetValue) {
++// Returns the position of `key` in `this.entries`, or -1. Uses the secondary
++// index when present; builds it only when `buildIndex` is true (reads and
++// transient inserts, where the node is reused so the O(n) build amortizes).
++// Persistent inserts already pay an O(n) copy, so a throwaway index is skipped.
++HashCollisionNode.prototype._positionOf = function _positionOf (key, buildIndex) {
++  var entries = this.entries;
++  var index = this._index;
++  if (
++    index === undefined &&
++    buildIndex &&
++    entries.length >= MIN_HASH_COLLISION_INDEX_SIZE
++  ) {
++    index = this._buildIndex();
++  }
++  if (index !== undefined) {
++    var positions = index[hashCollisionKey(key)];
++    if (positions !== undefined) {
++      for (var jj = 0; jj < positions.length; jj++) {
++        var ii = positions[jj];
++        if (is(key, entries[ii][0])) {
++          return ii;
++        }
++      }
++    }
++    return -1;
++  }
++  for (var ii$1 = 0, len = entries.length; ii$1 < len; ii$1++) {
++    if (is(key, entries[ii$1][0])) {
++      return ii$1;
++    }
++  }
++  return -1;
++};
++
++// Builds and memoizes the secondary index. A plain object, not `Map` -- which
++// in this module resolves to the *Immutable* Map, not the native one.
++HashCollisionNode.prototype._buildIndex = function _buildIndex () {
++  var index = Object.create(null);
+   var entries = this.entries;
+   for (var ii = 0, len = entries.length; ii < len; ii++) {
+-    if (is(key, entries[ii][0])) {
+-      return entries[ii][1];
++    var secondaryHash = hashCollisionKey(entries[ii][0]);
++    var positions = index[secondaryHash];
++    if (positions !== undefined) {
++      positions.push(ii);
++    } else {
++      index[secondaryHash] = [ii];
+     }
+   }
+-  return notSetValue;
++  this._index = index;
++  return index;
++};
++
++HashCollisionNode.prototype.get = function get (shift, keyHash, key, notSetValue) {
++  var idx = this._positionOf(key, true);
++  return idx === -1 ? notSetValue : this.entries[idx][1];
+ };
+ 
+ HashCollisionNode.prototype.update = function update (ownerID, shift, keyHash, key, value, didChangeSize, didAlter) {
+@@ -2819,14 +2891,11 @@ HashCollisionNode.prototype.update = function update (ownerID, shift, keyHash, k
+   }
+ 
+   var entries = this.entries;
+-  var idx = 0;
+   var len = entries.length;
+-  for (; idx < len; idx++) {
+-    if (is(key, entries[idx][0])) {
+-      break;
+-    }
+-  }
+-  var exists = idx < len;
++  var isEditable = ownerID && ownerID === this.ownerID;
++  var foundIdx = this._positionOf(key, isEditable);
++  var idx = foundIdx === -1 ? len : foundIdx;
++  var exists = foundIdx !== -1;
+ 
+   if (exists ? entries[idx][1] === value : removed) {
+     return this;
+@@ -2839,7 +2908,6 @@ HashCollisionNode.prototype.update = function update (ownerID, shift, keyHash, k
+     return new ValueNode(ownerID, this.keyHash, entries[idx ^ 1]);
+   }
+ 
+-  var isEditable = ownerID && ownerID === this.ownerID;
+   var newEntries = isEditable ? entries : arrCopy(entries);
+ 
+   if (exists) {
+@@ -2847,11 +2915,27 @@ HashCollisionNode.prototype.update = function update (ownerID, shift, keyHash, k
+       idx === len - 1
+         ? newEntries.pop()
+         : (newEntries[idx] = newEntries.pop());
++      // The swap-pop reshuffles positions; drop the stale index (rebuilt lazily).
++      if (isEditable) {
++        this._index = undefined;
++      }
+     } else {
++      // Same key, same position: the index stays valid.
+       newEntries[idx] = [key, value];
+     }
+   } else {
+     newEntries.push([key, value]);
++    // Keep the index in sync on the transient insert path. Persistent inserts
++    // return a fresh node below whose index rebuilds lazily, so skip them.
++    if (isEditable && this._index !== undefined) {
++      var secondaryHash = hashCollisionKey(key);
++      var positions = this._index[secondaryHash];
++      if (positions !== undefined) {
++        positions.push(len);
++      } else {
++        this._index[secondaryHash] = [len];
++      }
++    }
+   }
+ 
+   if (isEditable) {
+@@ -3185,6 +3269,12 @@ var MAX_ARRAY_MAP_SIZE = SIZE / 4;
+ var MAX_BITMAP_INDEXED_SIZE = SIZE / 2;
+ var MIN_HASH_ARRAY_MAP_SIZE = SIZE / 4;
+ 
++// Above this many colliding entries, a `HashCollisionNode` builds a seeded
++// secondary index instead of scanning linearly. Kept small so the rare,
++// naturally-occurring collision buckets stay overhead-free, while adversarial
++// hash-flooding (thousands of keys sharing one hash) degrades gracefully.
++var MIN_HASH_COLLISION_INDEX_SIZE = 16;
++
+ var IS_LIST_SYMBOL = '@@__IMMUTABLE_LIST__@@';
+ 
+ function isList(maybeList) {
+--- a/dist/immutable.min.js
++++ b/dist/immutable.min.js
+@@ -25,7 +25,7 @@
+ )||Y(t)}function J(t){return t&&"function"==typeof t.next}function V(t){var e=Y(t);return e&&e.call(t)}function Y(t){t=t&&(L&&t[L]||t[C]);if("function"==typeof t)return t}P.prototype.toString=function(){return"[Iterator]"},P.KEYS=U,P.VALUES=T,P.ENTRIES=K,P.prototype.inspect=P.prototype.toSource=function(){return""+this},P.prototype[B]=function(){return this};var Q=Object.prototype.hasOwnProperty;function X(t){return Array.isArray(t)||"string"==typeof t||t&&"object"==typeof t&&Number.isInteger(t.length)&&0<=t.length&&(0===t.length?1===Object.keys(t).length:t.hasOwnProperty(t.length-1))}var F=function(t){function e(t){return null==t?it():A(t)?t.toSeq():function(t){var e=st(t);if(e)return function(t){var e=Y(t);return e&&e===t.entries}(t)?e.fromEntrySeq():function(t){var e=Y(t);return e&&e===t.keys}(t)?e.toSetSeq():e;if("object"!=typeof t)throw new TypeError("Expected Array or collection object of values, or keyed object: "+t);return new et(t)}(t)}return e.__proto__=t,((e.prototype=Object.create(t.prototype)).constructor=e).prototype.toSeq=function(){return this},e.prototype.toString=function(){return this.__toString("Seq {","}")},e.prototype.cacheResult=function(){return!this._cache&&this.__iterateUncached&&(this._cache=this.entrySeq().toArray(),this.size=this._cache.length),this},e.prototype.__iterate=function(t,e){var r=this._cache;if(r){for(var n=r.length,i=0;i!==n;){var o=r[e?n-++i:i++];if(!1===t(o[1],o[0],this))break}return i}return this.__iterateUncached(t,e)},e.prototype.__iterator=function(e,r){var n=this._cache;if(n){var i=n.length,o=0;return new P(function(){if(o===i)return N();var t=n[r?i-++o:o++];return W(e,t[0],t[1])})}return this.__iteratorUncached(e,r)},e}(I),G=function(t){function e(t){return null==t?it().toKeyedSeq():f(t)?a(t)?t.toSeq():t.fromEntrySeq():x(t)?t.toSeq():ot(t)}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.toKeyedSeq=function(){return this},e}(F),Z=function(t){function e(t){return null==t?it():f(t)?a(t)?t.entrySeq():t.toIndexedSeq():x(t
+ )?t.toSeq().entrySeq():ut(t)}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).of=function(){return e(arguments)},e.prototype.toIndexedSeq=function(){return this},e.prototype.toString=function(){return this.__toString("Seq [","]")},e}(F),$=function(t){function e(t){return(f(t)&&!b(t)?t:Z(t)).toSetSeq()}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).of=function(){return e(arguments)},e.prototype.toSetSeq=function(){return this},e}(F);F.isSeq=M,F.Keyed=G,F.Set=$,F.Indexed=Z,F.prototype[q]=!0;var tt=function(t){function e(t){this._array=t,this.size=t.length}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.get=function(t,e){return this.has(t)?this._array[h(this,t)]:e},e.prototype.__iterate=function(t,e){for(var r=this._array,n=r.length,i=0;i!==n;){var o=e?n-++i:i++;if(!1===t(r[o],o,this))break}return i},e.prototype.__iterator=function(e,r){var n=this._array,i=n.length,o=0;return new P(function(){if(o===i)return N();var t=r?i-++o:o++;return W(e,t,n[t])})},e}(Z),et=function(t){function e(t){var e=Object.keys(t).concat(Object.getOwnPropertySymbols?Object.getOwnPropertySymbols(t):[]);this._object=t,this._keys=e,this.size=e.length}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.get=function(t,e){return void 0===e||this.has(t)?this._object[t]:e},e.prototype.has=function(t){return Q.call(this._object,t)},e.prototype.__iterate=function(t,e){for(var r=this._object,n=this._keys,i=n.length,o=0;o!==i;){var u=n[e?i-++o:o++];if(!1===t(r[u],u,this))break}return o},e.prototype.__iterator=function(e,r){var n=this._object,i=this._keys,o=i.length,u=0;return new P(function(){if(u===o)return N();var t=i[r?o-++u:u++];return W(e,t,n[t])})},e}(G);et.prototype[k]=!0;var rt,nt=function(t){function e(t){this._collection=t,this.size=t.length||t.size}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.__iterateUncached=function(t,e){
+ if(e)return this.cacheResult().__iterate(t,e);var r,n=V(this._collection),i=0;if(J(n))for(;!(r=n.next()).done&&!1!==t(r.value,i++,this););return i},e.prototype.__iteratorUncached=function(e,t){if(t)return this.cacheResult().__iterator(e,t);var r=V(this._collection);if(!J(r))return new P(N);var n=0;return new P(function(){var t=r.next();return t.done?t:W(e,n++,t.value)})},e}(Z);function it(){return rt=rt||new tt([])}function ot(t){var e=st(t);if(e)return e.fromEntrySeq();if("object"==typeof t)return new et(t);throw new TypeError("Expected Array or collection object of [k, v] entries, or keyed object: "+t)}function ut(t){var e=st(t);if(e)return e;throw new TypeError("Expected Array or collection object of values: "+t)}function st(t){return X(t)?new tt(t):H(t)?new nt(t):void 0}var at="@@__IMMUTABLE_MAP__@@";function ct(t){return!(!t||!t[at])}function ft(t){return ct(t)&&R(t)}function ht(t){return!(!t||"function"!=typeof t.equals||"function"!=typeof t.hashCode)}function _t(t,e){if(t===e||t!=t&&e!=e)return!0;if(!t||!e)return!1;if("function"==typeof t.valueOf&&"function"==typeof e.valueOf){if((t=t.valueOf())===(e=e.valueOf())||t!=t&&e!=e)return!0;if(!t||!e)return!1}return!!(ht(t)&&ht(e)&&t.equals(e))}var pt="function"==typeof Math.imul&&-2==Math.imul(4294967295,2)?Math.imul:function(t,e){var r=65535&(t|=0),n=65535&(e|=0);return r*n+((t>>>16)*n+r*(e>>>16)<<16>>>0)|0};function lt(t){return t>>>1&1073741824|3221225471&t}var vt=Object.prototype.valueOf;function yt(t){if(null==t)return dt(t);if("function"==typeof t.hashCode)return lt(t.hashCode(t));var e,r=(e=t).valueOf!==vt&&"function"==typeof e.valueOf?e.valueOf(e):e;if(null==r)return dt(r);switch(typeof r){case"boolean":return r?1108378657:1108378656;case"number":return function(t){if(t!=t||t===1/0)return 0;var e=0|t;e!==t&&(e^=4294967295*t);for(;4294967295<t;)e^=t/=4294967295;return lt(e)}(r);case"string":return(jt<r.length?function(t){var e=Dt[t];void 0===e&&(e=gt(t),Mt===qt&&(Mt=0,Dt={}),Mt++,Dt[t]=e);return e}:gt)(r);case"object":case"function":return function(t){
+-var e;if(bt&&void 0!==(e=zt.get(t)))return e;if(void 0!==(e=t[Et]))return e;if(!wt){if(void 0!==(e=t.propertyIsEnumerable&&t.propertyIsEnumerable[Et]))return e;if(void 0!==(e=function(t){if(t&&0<t.nodeType)switch(t.nodeType){case 1:return t.uniqueID;case 9:return t.documentElement&&t.documentElement.uniqueID}}(t)))return e}if(e=St(),bt)zt.set(t,e);else{if(void 0!==mt&&!1===mt(t))throw Error("Non-extensible objects are not allowed as keys.");if(wt)Object.defineProperty(t,Et,{enumerable:!1,configurable:!1,writable:!1,value:e});else if(void 0!==t.propertyIsEnumerable&&t.propertyIsEnumerable===t.constructor.prototype.propertyIsEnumerable)t.propertyIsEnumerable=function(){return this.constructor.prototype.propertyIsEnumerable.apply(this,arguments)},t.propertyIsEnumerable[Et]=e;else{if(void 0===t.nodeType)throw Error("Unable to set a non-enumerable property on object.");t[Et]=e}}return e}(r);case"symbol":return void 0===(e=It[t=r])?(e=St(),It[t]=e):e;default:if("function"==typeof r.toString)return gt(""+r);throw Error("Value type "+typeof r+" cannot be hashed.")}}function dt(t){return null===t?1108378658:1108378659}function gt(t){for(var e=0,r=0;r<t.length;r++)e=31*e+t.charCodeAt(r)|0;return lt(e)}var mt=Object.isExtensible,wt=function(){try{return Object.defineProperty({},"@",{}),!0}catch(t){return!1}}();function St(){var t=++Ot;return 1073741824&Ot&&(Ot=0),t}var zt,bt="function"==typeof WeakMap;bt&&(zt=new WeakMap);var It=Object.create(null),Ot=0,Et="__immutablehash__";"function"==typeof Symbol&&(Et=Symbol(Et));var jt=16,qt=255,Mt=0,Dt={},xt=function(t){function e(t,e){this._iter=t,this._useKeys=e,this.size=t.size}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.get=function(t,e){return this._iter.get(t,e)},e.prototype.has=function(t){return this._iter.has(t)},e.prototype.valueSeq=function(){return this._iter.valueSeq()},e.prototype.reverse=function(){var t=this,e=Kt(this,!0);return this._useKeys||(e.valueSeq=function(){return t._iter.toSeq().reverse()}),e},
++var e;if(bt&&void 0!==(e=zt.get(t)))return e;if(void 0!==(e=t[Et]))return e;if(!wt){if(void 0!==(e=t.propertyIsEnumerable&&t.propertyIsEnumerable[Et]))return e;if(void 0!==(e=function(t){if(t&&0<t.nodeType)switch(t.nodeType){case 1:return t.uniqueID;case 9:return t.documentElement&&t.documentElement.uniqueID}}(t)))return e}if(e=St(),bt)zt.set(t,e);else{if(void 0!==mt&&!1===mt(t))throw Error("Non-extensible objects are not allowed as keys.");if(wt)Object.defineProperty(t,Et,{enumerable:!1,configurable:!1,writable:!1,value:e});else if(void 0!==t.propertyIsEnumerable&&t.propertyIsEnumerable===t.constructor.prototype.propertyIsEnumerable)t.propertyIsEnumerable=function(){return this.constructor.prototype.propertyIsEnumerable.apply(this,arguments)},t.propertyIsEnumerable[Et]=e;else{if(void 0===t.nodeType)throw Error("Unable to set a non-enumerable property on object.");t[Et]=e}}return e}(r);case"symbol":return void 0===(e=It[t=r])?(e=St(),It[t]=e):e;default:if("function"==typeof r.toString)return gt(""+r);throw Error("Value type "+typeof r+" cannot be hashed.")}}function dt(t){return null===t?1108378658:1108378659}function gt(t){for(var e=0,r=0;r<t.length;r++)e=31*e+t.charCodeAt(r)|0;return lt(e)}var COLLISION_HASH_BASE=(Math.random()*0x100000|1)%0x100000||0x9e37;function hashCollisionKey(t){if("string"!=typeof t)return yt(t);for(var e=0,r=0;r<t.length;r++)e=COLLISION_HASH_BASE*e+t.charCodeAt(r)|0;return e}var mt=Object.isExtensible,wt=function(){try{return Object.defineProperty({},"@",{}),!0}catch(t){return!1}}();function St(){var t=++Ot;return 1073741824&Ot&&(Ot=0),t}var zt,bt="function"==typeof WeakMap;bt&&(zt=new WeakMap);var It=Object.create(null),Ot=0,Et="__immutablehash__";"function"==typeof Symbol&&(Et=Symbol(Et));var jt=16,qt=255,Mt=0,Dt={},xt=function(t){function e(t,e){this._iter=t,this._useKeys=e,this.size=t.size}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.get=function(t,e){return this._iter.get(t,e)},e.prototype.has=function(t){return this._iter.has(t)},e.prototype.valueSeq=function(){return this._iter.valueSeq()},e.prototype.reverse=function(){var t=this,e=Kt(this,!0);return this._useKeys||(e.valueSeq=function(){return t._iter.toSeq().reverse()}),e},
+ e.prototype.map=function(t,e){var r=this,n=Tt(this,t,e);return this._useKeys||(n.valueSeq=function(){return r._iter.toSeq().map(t,e)}),n},e.prototype.__iterate=function(r,t){var n=this;return this._iter.__iterate(function(t,e){return r(t,e,n)},t)},e.prototype.__iterator=function(t,e){return this._iter.__iterator(t,e)},e}(G);xt.prototype[k]=!0;var At=function(t){function e(t){this._iter=t,this.size=t.size}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.includes=function(t){return this._iter.includes(t)},e.prototype.__iterate=function(e,r){var n=this,i=0;return r&&c(this),this._iter.__iterate(function(t){return e(t,r?n.size-++i:i++,n)},r)},e.prototype.__iterator=function(e,r){var n=this,i=this._iter.__iterator(T,r),o=0;return r&&c(this),new P(function(){var t=i.next();return t.done?t:W(e,r?n.size-++o:o++,t.value,t)})},e}(Z),kt=function(t){function e(t){this._iter=t,this.size=t.size}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.has=function(t){return this._iter.includes(t)},e.prototype.__iterate=function(e,t){var r=this;return this._iter.__iterate(function(t){return e(t,t,r)},t)},e.prototype.__iterator=function(e,t){var r=this._iter.__iterator(T,t);return new P(function(){var t=r.next();return t.done?t:W(e,t.value,t.value,t)})},e}($),Rt=function(t){function e(t){this._iter=t,this.size=t.size}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.entrySeq=function(){return this._iter.toSeq()},e.prototype.__iterate=function(r,t){var n=this;return this._iter.__iterate(function(t){if(t){Yt(t);var e=f(t);return r(e?t.get(1):t[1],e?t.get(0):t[0],n)}},t)},e.prototype.__iterator=function(n,t){var i=this._iter.__iterator(T,t);return new P(function(){for(;;){var t=i.next();if(t.done)return t;var e=t.value;if(e){Yt(e);var r=f(e);return W(n,r?e.get(0):e[0],r?e.get(1):e[1],t)}}})},e}(G);function Ut(i){var t=Xt(i);return t._iter=i,t.size=i.size,t.flip=function(){return i},t.reverse=function(){
+ var t=i.reverse.apply(this);return t.flip=function(){return i.reverse()},t},t.has=function(t){return i.includes(t)},t.includes=function(t){return i.has(t)},t.cacheResult=Ft,t.__iterateUncached=function(r,t){var n=this;return i.__iterate(function(t,e){return!1!==r(e,t,n)},t)},t.__iteratorUncached=function(t,e){if(t!==K)return i.__iterator(t===T?U:T,e);var r=i.__iterator(t,e);return new P(function(){var t,e=r.next();return e.done||(t=e.value[0],e.value[0]=e.value[1],e.value[1]=t),e})},t}function Tt(o,u,s){var t=Xt(o);return t.size=o.size,t.has=function(t){return o.has(t)},t.get=function(t,e){var r=o.get(t,v);return r===v?e:u.call(s,r,t,o)},t.__iterateUncached=function(n,t){var i=this;return o.__iterate(function(t,e,r){return!1!==n(u.call(s,t,e,r),e,i)},t)},t.__iteratorUncached=function(n,t){var i=o.__iterator(K,t);return new P(function(){var t=i.next();if(t.done)return t;var e=t.value,r=e[0];return W(n,r,u.call(s,e[1],r,o),t)})},t}function Kt(u,s){var a=this,t=Xt(u);return t._iter=u,t.size=u.size,t.reverse=function(){return u},u.flip&&(t.flip=function(){var t=Ut(u);return t.reverse=function(){return u.flip()},t}),t.get=function(t,e){return u.get(s?t:-1-t,e)},t.has=function(t){return u.has(s?t:-1-t)},t.includes=function(t){return u.includes(t)},t.cacheResult=Ft,t.__iterate=function(r,n){var i=this,o=0;return n&&c(u),u.__iterate(function(t,e){return r(t,s?e:n?i.size-++o:o++,i)},!n)},t.__iterator=function(r,n){var i=0;n&&c(u);var o=u.__iterator(K,!n);return new P(function(){var t=o.next();if(t.done)return t;var e=t.value;return W(r,s?e[0]:n?a.size-++i:i++,e[1],t)})},t}function Lt(u,s,a,c){var t=Xt(u);return c&&(t.has=function(t){var e=u.get(t,v);return e!==v&&!!s.call(a,e,t,u)},t.get=function(t,e){var r=u.get(t,v);return r!==v&&s.call(a,r,t,u)?r:e}),t.__iterateUncached=function(n,t){var i=this,o=0;return u.__iterate(function(t,e,r){if(s.call(a,t,e,r))return o++,n(t,c?e:o-1,i)},t),o},t.__iteratorUncached=function(n,t){var i=u.__iterator(K,t),o=0;return new P(function(){for(;;){var t=i.next();if(t.done)return t
+ ;var e=t.value,r=e[0],e=e[1];if(s.call(a,e,r,u))return W(n,c?r:o++,e,t)}})},t}function Ct(s,t,e,a){var r=s.size;if(p(t,e,r))return s;if(void 0===r&&(t<0||e<0))return Ct(s.toSeq().cacheResult(),t,e,a);var c,f=y(t,r),r=w(e,r)-f;r==r&&(c=r<0?0:r);r=Xt(s);return r.size=0===c?c:s.size&&c||void 0,!a&&M(s)&&0<=c&&(r.get=function(t,e){return 0<=(t=h(this,t))&&t<c?s.get(t+f,e):e}),r.__iterateUncached=function(r,t){var n=this;if(0===c)return 0;if(t)return this.cacheResult().__iterate(r,t);var i=0,o=!0,u=0;return s.__iterate(function(t,e){if(!(o=o&&i++<f))return u++,!1!==r(t,a?e:u-1,n)&&u!==c}),u},r.__iteratorUncached=function(e,t){if(0!==c&&t)return this.cacheResult().__iterator(e,t);if(0===c)return new P(N);var r=s.__iterator(e,t),n=0,i=0;return new P(function(){for(;n++<f;)r.next();if(++i>c)return N();var t=r.next();return a||e===T||t.done?t:W(e,i-1,e===U?void 0:t.value[1],t)})},r}function Bt(e,c,f,h){var t=Xt(e);return t.__iterateUncached=function(n,t){var i=this;if(t)return this.cacheResult().__iterate(n,t);var o=!0,u=0;return e.__iterate(function(t,e,r){if(!(o=o&&c.call(f,t,e,r)))return u++,n(t,h?e:u-1,i)}),u},t.__iteratorUncached=function(i,t){var o=this;if(t)return this.cacheResult().__iterator(i,t);var u=e.__iterator(K,t),s=!0,a=0;return new P(function(){var t;do{if((t=u.next()).done)return h||i===T?t:W(i,a++,i===U?void 0:t.value[1],t);var e=t.value,r=e[0],n=e[1];s=s&&c.call(f,n,r,o)}while(s);return i===K?t:W(i,r,n,t)})},t}function Pt(t,s,a){var c=Xt(t);return c.__iterateUncached=function(i,e){if(e)return this.cacheResult().__iterate(i,e);var o=0,u=!1;return function r(t,n){t.__iterate(function(t,e){return(!s||n<s)&&f(t)?r(t,n+1):(o++,!1===i(t,a?e:o-1,c)&&(u=!0)),!u},e)}(t,0),o},c.__iteratorUncached=function(r,n){if(n)return this.cacheResult().__iterator(r,n);var i=t.__iterator(r,n),o=[],u=0;return new P(function(){for(;i;){var t=i.next();if(!1===t.done){var e=t.value;if(r===K&&(e=e[1]),s&&!(o.length<s)||!f(e))return a?t:W(r,u++,e,t);o.push(i),i=e.__iterator(r,n)}else i=o.pop()}return N()})},c}function Wt(r,n,i){
+@@ -34,8 +34,8 @@ n=n||Gt;var t=a(r),o=0,u=r.toSeq().map(function(t,e){return[e,t,o++,i?i(t,e,r):t
+ e,r)}function me(t,e,r){return _e(this,t,e,r)}function we(){for(var t=[],e=arguments.length;e--;)t[e]=arguments[e];return ze(this,t)}function Se(t){for(var e=[],r=arguments.length-1;0<r--;)e[r]=arguments[r+1];if("function"!=typeof t)throw new TypeError("Invalid merger function: "+t);return ze(this,e,t)}function ze(t,e,i){for(var r=[],n=0;n<e.length;n++){var o=O(e[n]);0!==o.size&&r.push(o)}return 0===r.length?t:0!==t.toSeq().size||t.__ownerID||1!==r.length?t.withMutations(function(n){for(var t=i?function(e,r){de(n,r,v,function(t){return t===v?e:i(t,e,r)})}:function(t,e){n.set(e,t)},e=0;e<r.length;e++)r[e].forEach(t)}):t.constructor(r[0])}function be(t){for(var e=[],r=arguments.length-1;0<r--;)e[r]=arguments[r+1];return qe(t,e)}function Ie(t,e){for(var r=[],n=arguments.length-2;0<n--;)r[n]=arguments[n+2];return qe(e,r,t)}function Oe(t){for(var e=[],r=arguments.length-1;0<r--;)e[r]=arguments[r+1];return je(t,e)}function Ee(t,e){for(var r=[],n=arguments.length-2;0<n--;)r[n]=arguments[n+2];return je(e,r,t)}function je(t,e,r){return qe(t,e,(i=r,function t(e,r,n){return ie(e)&&ie(r)&&function(t,e){return t=F(t),e=F(e),z(t)===z(e)&&a(t)===a(e)}(e,r)?qe(e,[r],t):i?i(e,r,n):r}));var i}function qe(n,t,i){if(!ie(n))throw new TypeError("Cannot merge into non-data-structure value: "+n);if(A(n))return"function"==typeof i&&n.mergeWith?n.mergeWith.apply(n,[i].concat(t)):(n.merge?n.merge:n.concat).apply(n,t);for(var e=Array.isArray(n),o=n,r=e?E:O,u=e?function(t){o===n&&(o=ce(o)),o.push(t)}:function(t,e){var r;ae(e)||(t=(r=Q.call(o,e))&&i?i(o[e],t,e):t,r&&t===o[e]||(o===n&&(o=ce(o)),o[e]=t))},s=0;s<t.length;s++)r(t[s]).forEach(u);return o}function Me(){for(var t=[],e=arguments.length;e--;)t[e]=arguments[e];return je(this,t)}function De(t){for(var e=[],r=arguments.length-1;0<r--;)e[r]=arguments[r+1];return je(this,e,t)}function xe(t){for(var e=[],r=arguments.length-1;0<r--;)e[r]=arguments[r+1];return _e(this,t,Xe(),function(t){return qe(t,e)})}function Ae(t){for(var e=[],r=arguments.length-1;0<r--;)e[r]=arguments[r+1];return _e(this
+ ,t,Xe(),function(t){return je(t,e)})}function ke(t){var e=this.asMutable();return t(e),e.wasAltered()?e.__ensureOwner(this.__ownerID):this}function Re(){return this.__ownerID?this:this.__ensureOwner(new m)}function Ue(){return this.__ensureOwner()}function Te(){return this.__altered}var Ke=function(n){function t(e){return null==e?Xe():ct(e)&&!R(e)?e:Xe().withMutations(function(r){var t=n(e);te(t.size),t.forEach(function(t,e){return r.set(e,t)})})}return n&&(t.__proto__=n),((t.prototype=Object.create(n&&n.prototype)).constructor=t).of=function(){for(var r=[],t=arguments.length;t--;)r[t]=arguments[t];return Xe().withMutations(function(t){for(var e=0;e<r.length;e+=2){if(r.length<=e+1)throw Error("Missing value for key: "+r[e]);t.set(r[e],r[e+1])}})},t.prototype.toString=function(){return this.__toString("Map {","}")},t.prototype.get=function(t,e){return this._root?this._root.get(0,void 0,t,e):e},t.prototype.set=function(t,e){return Fe(this,t,e)},t.prototype.remove=function(t){return Fe(this,t,v)},t.prototype.deleteAll=function(t){var r=I(t);return 0===r.size?this:this.withMutations(function(e){r.forEach(function(t){return e.remove(t)})})},t.prototype.clear=function(){return 0===this.size?this:this.__ownerID?(this.size=0,this._root=null,this.__hash=void 0,this.__altered=!0,this):Xe()},t.prototype.sort=function(t){return Sr(Wt(this,t))},t.prototype.sortBy=function(t,e){return Sr(Wt(this,e,t))},t.prototype.map=function(n,i){var o=this;return this.withMutations(function(r){r.forEach(function(t,e){r.set(e,n.call(i,t,e,o))})})},t.prototype.__iterator=function(t,e){return new Je(this,t,e)},t.prototype.__iterate=function(e,t){var r=this,n=0;return this._root&&this._root.iterate(function(t){return n++,e(t[1],t[0],r)},t),n},t.prototype.__ensureOwner=function(t){return t===this.__ownerID?this:t?Qe(this.size,this._root,t,this.__hash):0===this.size?Xe():(this.__ownerID=t,this.__altered=!1,this)},t}(O);Ke.isMap=ct;var Le=Ke.prototype;Le[at]=!0,Le[e]=Le.remove,Le.removeAll=Le.deleteAll,Le.setIn=le,Le.removeIn=Le.deleteIn=ye,
+ Le.update=ge,Le.updateIn=me,Le.merge=Le.concat=we,Le.mergeWith=Se,Le.mergeDeep=Me,Le.mergeDeepWith=De,Le.mergeIn=xe,Le.mergeDeepIn=Ae,Le.withMutations=ke,Le.wasAltered=Te,Le.asImmutable=Ue,Le["@@transducer/init"]=Le.asMutable=Re,Le["@@transducer/step"]=function(t,e){return t.set(e[0],e[1])},Le["@@transducer/result"]=function(t){return t.asImmutable()};var Ce=function(t,e){this.ownerID=t,this.entries=e};Ce.prototype.get=function(t,e,r,n){for(var i=this.entries,o=0,u=i.length;o<u;o++)if(_t(r,i[o][0]))return i[o][1];return n},Ce.prototype.update=function(t,e,r,n,i,o,u){for(var s=i===v,a=this.entries,c=0,f=a.length;c<f&&!_t(n,a[c][0]);c++);var h=c<f;if(h?a[c][1]===i:s)return this;if(_(u),!s&&h||_(o),!s||1!==a.length){if(!h&&!s&&rr<=a.length)return function(t,e,r,n){t=t||new m;for(var i=new Ne(t,yt(r),[r,n]),o=0;o<e.length;o++){var u=e[o];i=i.update(t,0,void 0,u[0],u[1])}return i}(t,a,n,i);u=t&&t===this.ownerID,o=u?a:Zt(a);return h?s?c===f-1?o.pop():o[c]=o.pop():o[c]=[n,i]:o.push([n,i]),u?(this.entries=o,this):new Ce(t,o)}};var Be=function(t,e,r){this.ownerID=t,this.bitmap=e,this.nodes=r};Be.prototype.get=function(t,e,r,n){void 0===e&&(e=yt(r));var i=1<<((0===t?e:e>>>t)&g),o=this.bitmap;return 0==(o&i)?n:this.nodes[tr(o&i-1)].get(t+d,e,r,n)},Be.prototype.update=function(t,e,r,n,i,o,u){void 0===r&&(r=yt(n));var s=(0===e?r:r>>>e)&g,a=1<<s,c=this.bitmap,f=0!=(c&a);if(!f&&i===v)return this;var h=tr(c&a-1),_=this.nodes,p=f?_[h]:void 0,u=Ge(p,t,e+d,r,n,i,o,u);if(u===p)return this;if(!f&&u&&nr<=_.length)return function(t,e,r,n,i){for(var o=0,u=Array(l),s=0;0!==r;s++,r>>>=1)u[s]=1&r?e[o++]:void 0;return u[n]=i,new Pe(t,o+1,u)}(t,_,c,s,u);if(f&&!u&&2===_.length&&Ze(_[1^h]))return _[1^h];if(f&&u&&1===_.length&&Ze(u))return u;s=t&&t===this.ownerID,a=f?u?c:c^a:c|a,u=f?u?er(_,h,u,s):function(t,e,r){var n=t.length-1;if(r&&e===n)return t.pop(),t;for(var i=Array(n),o=0,u=0;u<n;u++)u===e&&(o=1),i[u]=t[u+o];return i}(_,h,s):function(t,e,r,n){var i=t.length+1;if(n&&e+1===i)return t[e]=r,t;for(var o=Array(i),u=0,s=0;s<i;s++)s===e?(o[s]=r
+-,u=-1):o[s]=t[s+u];return o}(_,h,u,s);return s?(this.bitmap=a,this.nodes=u,this):new Be(t,a,u)};var Pe=function(t,e,r){this.ownerID=t,this.count=e,this.nodes=r};Pe.prototype.get=function(t,e,r,n){void 0===e&&(e=yt(r));var i=this.nodes[(0===t?e:e>>>t)&g];return i?i.get(t+d,e,r,n):n},Pe.prototype.update=function(t,e,r,n,i,o,u){void 0===r&&(r=yt(n));var s=(0===e?r:r>>>e)&g,a=this.nodes,c=a[s];if(i===v&&!c)return this;o=Ge(c,t,e+d,r,n,i,o,u);if(o===c)return this;u=this.count;if(c){if(!o&&--u<ir)return function(t,e,r,n){for(var i=0,o=0,u=Array(r),s=0,a=1,c=e.length;s<c;s++,a<<=1){var f=e[s];void 0!==f&&s!==n&&(i|=a,u[o++]=f)}return new Be(t,i,u)}(t,a,u,s)}else u++;c=t&&t===this.ownerID,o=er(a,s,o,c);return c?(this.count=u,this.nodes=o,this):new Pe(t,u,o)};var We=function(t,e,r){this.ownerID=t,this.keyHash=e,this.entries=r};We.prototype.get=function(t,e,r,n){for(var i=this.entries,o=0,u=i.length;o<u;o++)if(_t(r,i[o][0]))return i[o][1];return n},We.prototype.update=function(t,e,r,n,i,o,u){void 0===r&&(r=yt(n));var s=i===v;if(r!==this.keyHash)return s?this:(_(u),_(o),$e(this,t,e,r,[n,i]));for(var a=this.entries,c=0,f=a.length;c<f&&!_t(n,a[c][0]);c++);r=c<f;if(r?a[c][1]===i:s)return this;if(_(u),!s&&r||_(o),s&&2===f)return new Ne(t,this.keyHash,a[1^c]);u=t&&t===this.ownerID,o=u?a:Zt(a);return r?s?c===f-1?o.pop():o[c]=o.pop():o[c]=[n,i]:o.push([n,i]),u?(this.entries=o,this):new We(t,this.keyHash,o)};var Ne=function(t,e,r){this.ownerID=t,this.keyHash=e,this.entry=r};Ne.prototype.get=function(t,e,r,n){return _t(r,this.entry[0])?this.entry[1]:n},Ne.prototype.update=function(t,e,r,n,i,o,u){var s=i===v,a=_t(n,this.entry[0]);return(a?i===this.entry[1]:s)?this:(_(u),s?void _(o):a?t&&t===this.ownerID?(this.entry[1]=i,this):new Ne(t,this.keyHash,[n,i]):(_(o),$e(this,t,e,yt(n),[n,i])))},Ce.prototype.iterate=We.prototype.iterate=function(t,e){for(var r=this.entries,n=0,i=r.length-1;n<=i;n++)if(!1===t(r[e?i-n:n]))return!1},Be.prototype.iterate=Pe.prototype.iterate=function(t,e){for(var r=this.nodes,n=0,i=r.length-1;n<=i;n++){
+-var o=r[e?i-n:n];if(o&&!1===o.iterate(t,e))return!1}},Ne.prototype.iterate=function(t,e){return t(this.entry)};var He,Je=function(t){function e(t,e,r){this._type=e,this._reverse=r,this._stack=t._root&&Ye(t._root)}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.next=function(){for(var t=this._type,e=this._stack;e;){var r=e.node,n=e.index++,i=void 0;if(r.entry){if(0==n)return Ve(t,r.entry)}else if(r.entries){if(n<=(i=r.entries.length-1))return Ve(t,r.entries[this._reverse?i-n:n])}else if(n<=(i=r.nodes.length-1)){n=r.nodes[this._reverse?i-n:n];if(n){if(n.entry)return Ve(t,n.entry);e=this._stack=Ye(n,e)}continue}e=this._stack=this._stack.__prev}return N()},e}(P);function Ve(t,e){return W(t,e[0],e[1])}function Ye(t,e){return{node:t,index:0,__prev:e}}function Qe(t,e,r,n){var i=Object.create(Le);return i.size=t,i._root=e,i.__ownerID=r,i.__hash=n,i.__altered=!1,i}function Xe(){return He=He||Qe(0)}function Fe(t,e,r){if(t._root){var n=u(),i=u(),o=Ge(t._root,t.__ownerID,0,void 0,e,r,n,i);if(!i.value)return t;n=t.size+(n.value?r===v?-1:1:0)}else{if(r===v)return t;n=1,o=new Ce(t.__ownerID,[[e,r]])}return t.__ownerID?(t.size=n,t._root=o,t.__hash=void 0,t.__altered=!0,t):o?Qe(n,o):Xe()}function Ge(t,e,r,n,i,o,u,s){return t?t.update(e,r,n,i,o,u,s):o===v?t:(_(s),_(u),new Ne(e,n,[i,o]))}function Ze(t){return t.constructor===Ne||t.constructor===We}function $e(t,e,r,n,i){if(t.keyHash===n)return new We(e,n,[t.entry,i]);var o=(0===r?t.keyHash:t.keyHash>>>r)&g,u=(0===r?n:n>>>r)&g,t=o==u?[$e(t,e,r+d,n,i)]:(i=new Ne(e,n,i),o<u?[t,i]:[i,t]);return new Be(e,1<<o|1<<u,t)}function tr(t){return t=(t=(858993459&(t-=t>>1&1431655765))+(t>>2&858993459))+(t>>4)&252645135,t+=t>>8,127&(t+=t>>16)}function er(t,e,r,n){t=n?t:Zt(t);return t[e]=r,t}var rr=l/4,nr=l/2,ir=l/4,or="@@__IMMUTABLE_LIST__@@";function ur(t){return!(!t||!t[or])}var sr=function(o){function t(t){var e=lr();if(null==t)return e;if(ur(t))return t;var n=o(t),i=n.size;return 0===i?e:(te(i),0<i&&i<l?pr(0,i,d,null,new cr(n.toArray())
++,u=-1):o[s]=t[s+u];return o}(_,h,u,s);return s?(this.bitmap=a,this.nodes=u,this):new Be(t,a,u)};var Pe=function(t,e,r){this.ownerID=t,this.count=e,this.nodes=r};Pe.prototype.get=function(t,e,r,n){void 0===e&&(e=yt(r));var i=this.nodes[(0===t?e:e>>>t)&g];return i?i.get(t+d,e,r,n):n},Pe.prototype.update=function(t,e,r,n,i,o,u){void 0===r&&(r=yt(n));var s=(0===e?r:r>>>e)&g,a=this.nodes,c=a[s];if(i===v&&!c)return this;o=Ge(c,t,e+d,r,n,i,o,u);if(o===c)return this;u=this.count;if(c){if(!o&&--u<ir)return function(t,e,r,n){for(var i=0,o=0,u=Array(r),s=0,a=1,c=e.length;s<c;s++,a<<=1){var f=e[s];void 0!==f&&s!==n&&(i|=a,u[o++]=f)}return new Be(t,i,u)}(t,a,u,s)}else u++;c=t&&t===this.ownerID,o=er(a,s,o,c);return c?(this.count=u,this.nodes=o,this):new Pe(t,u,o)};var We=function(t,e,r){this.ownerID=t,this.keyHash=e,this.entries=r,this._index=void 0};We.prototype._positionOf=function(t,e){var r=this.entries,n=this._index;if(void 0===n&&e&&r.length>=MIN_HASH_COLLISION_INDEX_SIZE&&(n=this._buildIndex()),void 0!==n){var i=n[hashCollisionKey(t)];if(void 0!==i)for(var o=0;o<i.length;o++){var u=i[o];if(_t(t,r[u][0]))return u}return-1}for(var s=0,a=r.length;s<a;s++)if(_t(t,r[s][0]))return s;return-1},We.prototype._buildIndex=function(){var t=Object.create(null),e=this.entries;for(var r=0,n=e.length;r<n;r++){var i=hashCollisionKey(e[r][0]),o=t[i];void 0!==o?o.push(r):t[i]=[r]}return this._index=t,t},We.prototype.get=function(t,e,r,n){var i=this._positionOf(r,!0);return-1===i?n:this.entries[i][1]},We.prototype.update=function(t,e,r,n,i,o,u){void 0===r&&(r=yt(n));var s=i===v;if(r!==this.keyHash)return s?this:(_(u),_(o),$e(this,t,e,r,[n,i]));var a=this.entries,c=a.length,f=t&&t===this.ownerID,h=this._positionOf(n,f),d=-1===h?c:h,p=-1!==h;if(p?a[d][1]===i:s)return this;if(_(u),!s&&p||_(o),s&&2===c)return new Ne(t,this.keyHash,a[1^d]);var g=f?a:Zt(a);if(p)s?(d===c-1?g.pop():g[d]=g.pop(),f&&(this._index=void 0)):g[d]=[n,i];else if(g.push([n,i]),f&&void 0!==this._index){var m=hashCollisionKey(n),y=this._index[m];void 0!==y?y.push(c):this._index[m]=[c]}return f?(this.entries=g,this):new We(t,this.keyHash,g)};var Ne=function(t,e,r){this.ownerID=t,this.keyHash=e,this.entry=r};Ne.prototype.get=function(t,e,r,n){return _t(r,this.entry[0])?this.entry[1]:n},Ne.prototype.update=function(t,e,r,n,i,o,u){var s=i===v,a=_t(n,this.entry[0]);return(a?i===this.entry[1]:s)?this:(_(u),s?void _(o):a?t&&t===this.ownerID?(this.entry[1]=i,this):new Ne(t,this.keyHash,[n,i]):(_(o),$e(this,t,e,yt(n),[n,i])))},Ce.prototype.iterate=We.prototype.iterate=function(t,e){for(var r=this.entries,n=0,i=r.length-1;n<=i;n++)if(!1===t(r[e?i-n:n]))return!1},Be.prototype.iterate=Pe.prototype.iterate=function(t,e){for(var r=this.nodes,n=0,i=r.length-1;n<=i;n++){
++var o=r[e?i-n:n];if(o&&!1===o.iterate(t,e))return!1}},Ne.prototype.iterate=function(t,e){return t(this.entry)};var He,Je=function(t){function e(t,e,r){this._type=e,this._reverse=r,this._stack=t._root&&Ye(t._root)}return t&&(e.__proto__=t),((e.prototype=Object.create(t&&t.prototype)).constructor=e).prototype.next=function(){for(var t=this._type,e=this._stack;e;){var r=e.node,n=e.index++,i=void 0;if(r.entry){if(0==n)return Ve(t,r.entry)}else if(r.entries){if(n<=(i=r.entries.length-1))return Ve(t,r.entries[this._reverse?i-n:n])}else if(n<=(i=r.nodes.length-1)){n=r.nodes[this._reverse?i-n:n];if(n){if(n.entry)return Ve(t,n.entry);e=this._stack=Ye(n,e)}continue}e=this._stack=this._stack.__prev}return N()},e}(P);function Ve(t,e){return W(t,e[0],e[1])}function Ye(t,e){return{node:t,index:0,__prev:e}}function Qe(t,e,r,n){var i=Object.create(Le);return i.size=t,i._root=e,i.__ownerID=r,i.__hash=n,i.__altered=!1,i}function Xe(){return He=He||Qe(0)}function Fe(t,e,r){if(t._root){var n=u(),i=u(),o=Ge(t._root,t.__ownerID,0,void 0,e,r,n,i);if(!i.value)return t;n=t.size+(n.value?r===v?-1:1:0)}else{if(r===v)return t;n=1,o=new Ce(t.__ownerID,[[e,r]])}return t.__ownerID?(t.size=n,t._root=o,t.__hash=void 0,t.__altered=!0,t):o?Qe(n,o):Xe()}function Ge(t,e,r,n,i,o,u,s){return t?t.update(e,r,n,i,o,u,s):o===v?t:(_(s),_(u),new Ne(e,n,[i,o]))}function Ze(t){return t.constructor===Ne||t.constructor===We}function $e(t,e,r,n,i){if(t.keyHash===n)return new We(e,n,[t.entry,i]);var o=(0===r?t.keyHash:t.keyHash>>>r)&g,u=(0===r?n:n>>>r)&g,t=o==u?[$e(t,e,r+d,n,i)]:(i=new Ne(e,n,i),o<u?[t,i]:[i,t]);return new Be(e,1<<o|1<<u,t)}function tr(t){return t=(t=(858993459&(t-=t>>1&1431655765))+(t>>2&858993459))+(t>>4)&252645135,t+=t>>8,127&(t+=t>>16)}function er(t,e,r,n){t=n?t:Zt(t);return t[e]=r,t}var rr=l/4,nr=l/2,ir=l/4,MIN_HASH_COLLISION_INDEX_SIZE=16,or="@@__IMMUTABLE_LIST__@@";function ur(t){return!(!t||!t[or])}var sr=function(o){function t(t){var e=lr();if(null==t)return e;if(ur(t))return t;var n=o(t),i=n.size;return 0===i?e:(te(i),0<i&&i<l?pr(0,i,d,null,new cr(n.toArray())
+ ):e.withMutations(function(r){r.setSize(i),n.forEach(function(t,e){return r.set(e,t)})}))}return o&&(t.__proto__=o),((t.prototype=Object.create(o&&o.prototype)).constructor=t).of=function(){return this(arguments)},t.prototype.toString=function(){return this.__toString("List [","]")},t.prototype.get=function(t,e){if(0<=(t=h(this,t))&&t<this.size){var r=dr(this,t+=this._origin);return r&&r.array[t&g]}return e},t.prototype.set=function(t,e){return function(t,e,r){if((e=h(t,e))!==e)return t;if(t.size<=e||e<0)return t.withMutations(function(t){e<0?gr(t,e).set(0,r):gr(t,0,e+1).set(e,r)});var n=t._tail,i=t._root,o=u();(e+=t._origin)>=mr(t._capacity)?n=vr(n,t.__ownerID,0,e,r,o):i=vr(i,t.__ownerID,t._level,e,r,o);if(!o.value)return t;if(t.__ownerID)return t._root=i,t._tail=n,t.__hash=void 0,t.__altered=!0,t;return pr(t._origin,t._capacity,t._level,i,n)}(this,t,e)},t.prototype.remove=function(t){return this.has(t)?0===t?this.shift():t===this.size-1?this.pop():this.splice(t,1):this},t.prototype.insert=function(t,e){return this.splice(t,0,e)},t.prototype.clear=function(){return 0===this.size?this:this.__ownerID?(this.size=this._origin=this._capacity=0,this._level=d,this._root=this._tail=this.__hash=void 0,this.__altered=!0,this):lr()},t.prototype.push=function(){var r=arguments,n=this.size;return this.withMutations(function(t){gr(t,0,n+r.length);for(var e=0;e<r.length;e++)t.set(n+e,r[e])})},t.prototype.pop=function(){return gr(this,0,-1)},t.prototype.unshift=function(){var r=arguments;return this.withMutations(function(t){gr(t,-r.length);for(var e=0;e<r.length;e++)t.set(e,r[e])})},t.prototype.shift=function(){return gr(this,1)},t.prototype.concat=function(){for(var t=arguments,r=[],e=0;e<arguments.length;e++){var n=t[e],n=o("string"!=typeof n&&H(n)?n:[n]);0!==n.size&&r.push(n)}return 0===r.length?this:0!==this.size||this.__ownerID||1!==r.length?this.withMutations(function(e){r.forEach(function(t){return t.forEach(function(t){return e.push(t)})})}):this.constructor(r[0])},t.prototype.setSize=function(t){return gr(this,0,t)},
+ t.prototype.map=function(r,n){var i=this;return this.withMutations(function(t){for(var e=0;e<i.size;e++)t.set(e,r.call(n,t.get(e),e,i))})},t.prototype.slice=function(t,e){var r=this.size;return p(t,e,r)?this:gr(this,y(t,r),w(e,r))},t.prototype.__iterator=function(e,r){var n=r?this.size:0,i=_r(this,r);return new P(function(){var t=i();return t===hr?N():W(e,r?--n:n++,t)})},t.prototype.__iterate=function(t,e){for(var r,n=e?this.size:0,i=_r(this,e);(r=i())!==hr&&!1!==t(r,e?--n:n++,this););return n},t.prototype.__ensureOwner=function(t){return t===this.__ownerID?this:t?pr(this._origin,this._capacity,this._level,this._root,this._tail,t,this.__hash):0===this.size?lr():(this.__ownerID=t,this.__altered=!1,this)},t}(E);sr.isList=ur;var ar=sr.prototype;ar[or]=!0,ar[e]=ar.remove,ar.merge=ar.concat,ar.setIn=le,ar.deleteIn=ar.removeIn=ye,ar.update=ge,ar.updateIn=me,ar.mergeIn=xe,ar.mergeDeepIn=Ae,ar.withMutations=ke,ar.wasAltered=Te,ar.asImmutable=Ue,ar["@@transducer/init"]=ar.asMutable=Re,ar["@@transducer/step"]=function(t,e){return t.push(e)},ar["@@transducer/result"]=function(t){return t.asImmutable()};var cr=function(t,e){this.array=t,this.ownerID=e};cr.prototype.removeBefore=function(t,e,r){if(r===e?1<<e:0===this.array.length)return this;var n=r>>>e&g;if(this.array.length<=n)return new cr([],t);var i=0==n;if(0<e){var o,u=this.array[n];if((o=u&&u.removeBefore(t,e-d,r))===u&&i)return this}if(i&&!o)return this;var s=yr(this,t);if(!i)for(var a=0;a<n;a++)s.array[a]=void 0;return o&&(s.array[n]=o),s},cr.prototype.removeAfter=function(t,e,r){if(r===(e?1<<e:0)||0===this.array.length)return this;var n=r-1>>>e&g;if(this.array.length<=n)return this;if(0<e){var i,o=this.array[n];if((i=o&&o.removeAfter(t,e-d,r))===o&&n==this.array.length-1)return this}t=yr(this,t);return t.array.splice(1+n),i&&(t.array[n]=i),t};var fr,hr={};function _r(t,s){var a=t._origin,c=t._capacity,o=mr(c),u=t._tail;return f(t._root,t._level,0);function f(t,e,r){return 0===e?function(t,e){var r=e===o?u&&u.array:t&&t.array,n=a<e?0:a-e,i=c-e;l<i&&(i=l)
+ ;return function(){if(n===i)return hr;var t=s?--i:n++;return r&&r[t]}}(t,r):function(t,e,r){var n,i=t&&t.array,o=a<r?0:a-r>>e,u=1+(c-r>>e);l<u&&(u=l);return function(){for(;;){if(n){var t=n();if(t!==hr)return t;n=null}if(o===u)return hr;t=s?--u:o++;n=f(i&&i[t],e-d,r+(t<<e))}}}(t,e,r)}}function pr(t,e,r,n,i,o,u){var s=Object.create(ar);return s.size=e-t,s._origin=t,s._capacity=e,s._level=r,s._root=n,s._tail=i,s.__ownerID=o,s.__hash=u,s.__altered=!1,s}function lr(){return fr=fr||pr(0,0,d)}function vr(t,e,r,n,i,o){var u,s=n>>>r&g,a=t&&s<t.array.length;if(!a&&void 0===i)return t;if(0<r){var c=t&&t.array[s],n=vr(c,e,r-d,n,i,o);return n===c?t:((u=yr(t,e)).array[s]=n,u)}return a&&t.array[s]===i?t:(o&&_(o),u=yr(t,e),void 0===i&&s==u.array.length-1?u.array.pop():u.array[s]=i,u)}function yr(t,e){return e&&t&&e===t.ownerID?t:new cr(t?t.array.slice():[],e)}function dr(t,e){if(e>=mr(t._capacity))return t._tail;if(e<1<<t._level+d){for(var r=t._root,n=t._level;r&&0<n;)r=r.array[e>>>n&g],n-=d;return r}}function gr(t,e,r){void 0!==e&&(e|=0),void 0!==r&&(r|=0);var n=t.__ownerID||new m,i=t._origin,o=t._capacity,u=i+e,s=void 0===r?o:r<0?o+r:i+r;if(u===i&&s===o)return t;if(s<=u)return t.clear();for(var a=t._level,c=t._root,f=0;u+f<0;)c=new cr(c&&c.array.length?[void 0,c]:[],n),f+=1<<(a+=d);f&&(u+=f,i+=f,s+=f,o+=f);for(var h=mr(o),_=mr(s);1<<a+d<=_;)c=new cr(c&&c.array.length?[c]:[],n),a+=d;e=t._tail,r=_<h?dr(t,s-1):h<_?new cr([],n):e;if(e&&h<_&&u<o&&e.array.length){for(var p=c=yr(c,n),l=a;d<l;l-=d)var v=h>>>l&g,p=p.array[v]=yr(p.array[v],n);p.array[h>>>d&g]=e}if(s<o&&(r=r&&r.removeAfter(n,0,s)),_<=u)u-=_,s-=_,a=d,c=null,r=r&&r.removeBefore(n,0,u);else if(i<u||_<h){for(f=0;c;){var y=u>>>a&g;if(y!=_>>>a&g)break;y&&(f+=(1<<a)*y),a-=d,c=c.array[y]}c&&i<u&&(c=c.removeBefore(n,a,u-f)),c&&_<h&&(c=c.removeAfter(n,a,_-f)),f&&(u-=f,s-=f)}return t.__ownerID?(t.size=s-u,t._origin=u,t._capacity=s,t._level=a,t._root=c,t._tail=r,t.__hash=void 0,t.__altered=!0,t):pr(u,s,a,c,r)}function mr(t){return t<l?0:t-1>>>d<<d}var wr,Sr=function(t){function e(e
+--- /dev/null
++++ b/test/cve-2026-59880.test.js
+@@ -0,0 +1,167 @@
++'use strict';
++
++// Regression test for CVE-2026-59880 (immutable-js hash-collision DoS, CWE-407).
++//
++// The upstream fix (__tests__/Map.collision.ts) adds a seeded secondary index
++// to HashCollisionNode so that buckets full of keys sharing one Immutable
++// hash() no longer degrade to an O(n^2) linear scan. The published npm package
++// ships only compiled dist/ bundles, so this replacement test grounds the same
++// behavior against the installed package via `require('immutable')`.
++//
++// Run with either `node test/cve-2026-59880.test.js` or under jest (the
++// describe/it globals are used only when present).
++
++const assert = require('assert');
++// Require the package's own compiled entry point relatively: this test ships
++// inside the (dist-only) package, so `require('immutable')` cannot self-resolve.
++// Exercising ../dist/immutable.js validates the actual published artifact.
++const { Map, Set, is, hash, fromJS } = require('../dist/immutable.js');
++
++// Generates `2 ** rounds` distinct strings that all share the same
++// Immutable.hash(), by concatenating the classic "Aa"/"BB" collision blocks
++// (both equal 65*31+97 === 66*31+66 === 2112 under the JVM-style 31*h+c string
++// hash). Inserting these into a Map forces them all into a single
++// HashCollisionNode -- the hash-flooding scenario the fix guards against.
++function collisionKeys(rounds) {
++  let keys = [''];
++  for (let i = 0; i < rounds; i++) {
++    const next = [];
++    for (const k of keys) {
++      next.push(k + 'Aa');
++      next.push(k + 'BB');
++    }
++    keys = next;
++  }
++  return keys;
++}
++
++function run() {
++  // 1. The generated keys really do collide (the test is meaningful).
++  const sample = collisionKeys(8); // 256 keys
++  const h = hash(sample[0]);
++  assert.ok(
++    sample.every(k => hash(k) === h),
++    'expected all crafted keys to share one hash()'
++  );
++  assert.strictEqual(
++    new global.Set(sample).size,
++    sample.length,
++    'expected the crafted keys to be distinct'
++  );
++
++  // 2. The public, deterministic hash() of strings is unchanged: the seeded
++  //    secondary hash must never leak into hash().
++  assert.strictEqual(hash('a'), 97, 'hash("a") must stay 97');
++  assert.strictEqual(
++    hash('immutable-js'),
++    510203252,
++    'hash("immutable-js") must stay 510203252'
++  );
++
++  // 3. Correctness with thousands of colliding keys (well above the index
++  //    threshold): store, retrieve, transient vs persistent, overwrite, remove.
++  const keys = collisionKeys(11); // 2048 keys
++  const obj = {};
++  keys.forEach((k, i) => (obj[k] = i));
++  const map = Map(obj);
++
++  assert.strictEqual(map.size, keys.length, 'size after bulk build');
++  assert.ok(keys.every((k, i) => map.get(k) === i), 'every colliding key found');
++  assert.strictEqual(map.get('not-a-colliding-key', 'default'), 'default');
++  assert.strictEqual(map.has(keys[0]), true);
++  assert.strictEqual(map.has('not-a-colliding-key'), false);
++
++  const transient = Map().withMutations(m => {
++    keys.forEach((k, i) => m.set(k, i));
++  });
++  let persistent = Map();
++  keys.forEach((k, i) => (persistent = persistent.set(k, i)));
++  assert.ok(is(transient, persistent), 'transient equals persistent build');
++  assert.ok(is(transient, map), 'both equal the object-built map');
++
++  const overwritten = map.set(keys[100], 9999);
++  assert.strictEqual(overwritten.get(keys[100]), 9999);
++  assert.strictEqual(overwritten.size, map.size);
++  assert.strictEqual(map.get(keys[100]), 100, 'original untouched (persistence)');
++
++  const removed = map.remove(keys[50]).remove(keys[51]).remove(keys[52]);
++  assert.strictEqual(removed.size, map.size - 3);
++  assert.strictEqual(removed.get(keys[50], 'gone'), 'gone');
++  assert.strictEqual(removed.get(keys[53]), 53, 'index stayed valid after removes');
++  assert.strictEqual(removed.get(keys[keys.length - 1]), keys.length - 1);
++
++  // 4. equals()/hashCode() stay consistent for colliding-key maps.
++  const a = Map(keys.map((k, i) => [k, i]));
++  const b = Map(keys.map((k, i) => [k, i]));
++  assert.ok(is(a, b));
++  assert.strictEqual(a.hashCode(), b.hashCode());
++  assert.ok(!is(a, a.set(keys[0], -1)));
++
++  // 5. Set (backed by Map) handles colliding values.
++  const set = Set(keys);
++  assert.strictEqual(set.size, keys.length);
++  assert.ok(keys.every(k => set.has(k)));
++  assert.strictEqual(set.remove(keys[10]).has(keys[10]), false);
++
++  // 6. merge()/mergeDeep() work with colliding keys.
++  const merged = Map({ existing: -1 }).merge(obj);
++  assert.strictEqual(merged.get('existing'), -1);
++  assert.strictEqual(merged.get(keys[123]), 123);
++  assert.strictEqual(merged.size, keys.length + 1);
++  const deep = Map({ existing: -1 }).mergeDeep(fromJS(obj));
++  assert.strictEqual(deep.get(keys[123]), 123);
++
++  // 7. Value-object keys that all share one hashCode: equality is decided by
++  //    is()/equals(), never by the (here constant) secondary hash.
++  class Collider {
++    constructor(id) {
++      this.id = id;
++    }
++    equals(other) {
++      return other instanceof Collider && other.id === this.id;
++    }
++    hashCode() {
++      return 7;
++    }
++  }
++  const items = Array.from({ length: 50 }, (_, i) => new Collider(i));
++  let vmap = Map();
++  items.forEach((c, i) => (vmap = vmap.set(c, i)));
++  assert.strictEqual(vmap.size, items.length);
++  assert.ok(items.every((c, i) => vmap.get(new Collider(i)) === i));
++  assert.strictEqual(vmap.get(new Collider(999), 'absent'), 'absent');
++  assert.strictEqual(vmap.remove(new Collider(25)).size, items.length - 1);
++
++  // 8. DoS regression guard: a large flood of colliding keys must build and be
++  //    queryable quickly. With the pre-fix linear scan this is ~O(n^2) and
++  //    takes seconds for 16384 keys; with the seeded index it is ~linear.
++  const flood = collisionKeys(14); // 16384 colliding keys
++  const floodObj = {};
++  flood.forEach((k, i) => (floodObj[k] = i));
++  const started = Date.now();
++  const floodMap = Map(floodObj);
++  assert.strictEqual(floodMap.size, flood.length);
++  assert.strictEqual(floodMap.get(flood[0]), 0);
++  assert.strictEqual(floodMap.get(flood[flood.length - 1]), flood.length - 1);
++  assert.strictEqual(
++    floodMap.get(flood[Math.floor(flood.length / 2)]),
++    Math.floor(flood.length / 2)
++  );
++  const elapsed = Date.now() - started;
++  assert.ok(
++    elapsed < 5000,
++    'building a 16384-key collision bucket must not degrade to O(n^2) (took ' +
++      elapsed +
++      'ms)'
++  );
++}
++
++if (typeof describe === 'function' && typeof it === 'function') {
++  describe('CVE-2026-59880 hash-collision DoS', () => {
++    it('indexes large hash-collision buckets and keeps Map correct', run);
++  });
++} else {
++  run();
++  // eslint-disable-next-line no-console
++  console.log('CVE-2026-59880 regression test passed');
++}
