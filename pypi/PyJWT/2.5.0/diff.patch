@@ -54,6 +54,134 @@
  _jws_global_obj = PyJWS()
  encode = _jws_global_obj.encode
 
+--- a/jwt/jwks_client.py
++++ b/jwt/jwks_client.py
+@@ -3,6 +3,7 @@
+ from functools import lru_cache
+ from typing import Any, List, Optional
+ from urllib.error import URLError
++from urllib.parse import urlparse
+ 
+ from .api_jwk import PyJWK, PyJWKSet
+ from .api_jwt import decode_complete as decode_token
+@@ -19,6 +20,16 @@
+         cache_jwk_set: bool = True,
+         lifespan: int = 300,
+     ):
++        # urllib's default OpenerDirector also handles file://, ftp://, and
++        # data: URIs. Reject anything that isn't http(s) eagerly so a caller
++        # passing an attacker-influenced URL (e.g. taken from a `jku` token
++        # header) can't read local files or reach other unintended schemes.
++        scheme = urlparse(uri).scheme.lower()
++        if scheme not in ("http", "https"):
++            raise PyJWKClientError(
++                f"Invalid JWKS URI scheme {scheme!r}: only 'http' and 'https' "
++                f"are supported."
++            )
+         self.uri = uri
+         self.jwk_set_cache: Optional[JWKSetCache] = None
+ 
+--- a/tests/test_jwks_client.py
++++ b/tests/test_jwks_client.py
+@@ -296,3 +296,33 @@
+         with pytest.raises(PyJWKClientError):
+             jwks_client = PyJWKClient(url, lifespan=-1)
+             assert jwks_client is None
++
++    @pytest.mark.parametrize(
++        "uri",
++        [
++            "file:///etc/passwd",
++            "ftp://example.org/keys.json",
++            'data:application/json,{"keys":[]}',
++            "/etc/passwd",  # urlparse gives scheme="" - also rejected
++            "ldap://internal.test/jwks",
++        ],
++    )
++    def test_pyjwkclient_rejects_non_http_schemes(self, uri: str) -> None:
++        # urllib's default OpenerDirector handles file://, ftp://, and data:
++        # URIs. PyJWKClient must reject these so callers can't be tricked
++        # into reading attacker-controlled local files or other unintended
++        # schemes via a manipulated URI.
++        with pytest.raises(PyJWKClientError, match="Invalid JWKS URI scheme"):
++            PyJWKClient(uri)
++
++    @pytest.mark.parametrize(
++        "uri",
++        [
++            "http://localhost/jwks.json",
++            "https://example.test/jwks.json",
++            "HTTPS://Example.Test/jwks.json",  # case-insensitive
++        ],
++    )
++    def test_pyjwkclient_accepts_http_https_schemes(self, uri: str) -> None:
++        # Construction succeeds; no fetch is made until get_jwk_set().
++        PyJWKClient(uri)
+
+--- a/jwt/jwks_client.py
++++ b/jwt/jwks_client.py
+@@ -39,17 +39,19 @@
+             self.get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)  # type: ignore
+ 
+     def fetch_data(self) -> Any:
+-        jwk_set: Any = None
+         try:
+             with urllib.request.urlopen(self.uri) as response:
+                 jwk_set = json.load(response)
+         except URLError as e:
+             raise PyJWKClientError(f'Fail to fetch data from the url, err: "{e}"')
+-        else:
+-            return jwk_set
+-        finally:
+-            if self.jwk_set_cache is not None:
+-                self.jwk_set_cache.put(jwk_set)
++
++        # Only update the cache on a successful fetch. Writing in a
++        # `finally` block with `jwk_set=None` on error clears any
++        # previously-cached JWKS, turning a transient outage into a cache
++        # wipe that breaks legitimate auth.
++        if self.jwk_set_cache is not None:
++            self.jwk_set_cache.put(jwk_set)
++        return jwk_set
+ 
+     def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
+         data = None
+--- a/tests/test_jwks_client.py
++++ b/tests/test_jwks_client.py
+@@ -250,18 +250,30 @@
+ 
+         assert repeated_call.call_count == 1
+ 
+-    def test_get_jwt_set_failed_request_should_clear_cache(self):
++    def test_get_jwt_set_failed_refresh_preserves_cached_jwks(self):
++        # Regression: a transient fetch failure used to clear the cache via
++        # the previous `finally: put(jwk_set=None)` pattern, turning one bad
++        # request from the JWKS endpoint into application-wide auth failure.
++        # The cache must survive.
+         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+ 
+         jwks_client = PyJWKClient(url)
+         with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+             jwks_client.get_jwk_set()
+ 
++        assert jwks_client.jwk_set_cache is not None
++        assert jwks_client.jwk_set_cache.get() is not None
++
+         with pytest.raises(PyJWKClientError):
+             with mocked_failed_response():
+                 jwks_client.get_jwk_set(refresh=True)
+ 
+-            assert jwks_client.jwk_set_cache is None
++        cached = jwks_client.jwk_set_cache.get()
++        assert cached is not None
++        # Subsequent reads still serve from cache without another fetch.
++        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as call:
++            jwks_client.get_jwk_set()
++        assert call.call_count == 0
+ 
+     def test_get_jwt_set_refresh_cache(self):
+         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+
 --- a/jwt/algorithms.py
 +++ b/jwt/algorithms.py
 @@ -185,12 +185,35 @@ class HMACAlgorithm(Algorithm):
