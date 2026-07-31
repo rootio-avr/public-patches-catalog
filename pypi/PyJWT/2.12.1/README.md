@@ -4,6 +4,10 @@ This patch is based on PyJWT version 2.12.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-48522
+- CVE-2026-48523
+- CVE-2026-48524
+- CVE-2026-48525
 - CVE-2026-48526
 
 ## How to Apply:
