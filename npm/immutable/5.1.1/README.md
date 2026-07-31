@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-29063
+- CVE-2026-59879
 
 ## How to Apply:
 1. Clone or download the source code for immutable
