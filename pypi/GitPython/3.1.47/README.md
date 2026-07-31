@@ -7,6 +7,10 @@ unknown
 - GHSA-mv93-w799-cj2w
 - CVE-2026-44243
 - CVE-2026-44244
+- GHSA-r9mr-m37c-5fr3
+- GHSA-2f96-g7mh-g2hx
+- GHSA-6p8h-3wgx-97gf
+- GHSA-3rp5-jjmw-4wv2
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
