@@ -4,6 +4,7 @@ This patch is based on org.apache.activemq:artemis-project version 2.31.2, which
 unknown
 
 ## Affected CVEs:
+- CVE-2025-27427
 - CVE-2026-27446
 
 ## How to Apply:
