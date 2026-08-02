@@ -4,6 +4,7 @@ This patch is based on org.apache.logging.log4j:log4j version 2.23.1, which is a
 unknown
 
 ## Affected CVEs:
+- CVE-2026-34477
 - CVE-2026-34478
 - CVE-2026-34479
 - CVE-2026-34480
