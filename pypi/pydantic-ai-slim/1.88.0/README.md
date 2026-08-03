@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-46678
+- CVE-2026-48782
 
 ## How to Apply:
 1. Clone or download the source code for pydantic-ai-slim
