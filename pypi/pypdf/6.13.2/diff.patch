@@ -1,0 +1,458 @@
+Description: Fix GHSA-jm82-fx9c-mx94 (CWE-400) memory exhaustion when parsing PDF
+ streams declared without an explicit /Length value. Apply
+ MAX_DECLARED_STREAM_LENGTH to streams without length as well, and add length
+ limits to NumberObject, NameObject and ContentStream parsing paths to prevent
+ unbounded memory allocation from crafted input.
+Origin: upstream, https://github.com/py-pdf/pypdf/commit/e7249787be367fc78818b1f7085d21ff22f24d71
+Bug: https://github.com/py-pdf/pypdf/security/advisories/GHSA-jm82-fx9c-mx94
+Bug: https://github.com/py-pdf/pypdf/pull/3871
+Author: pypdf maintainers
+Last-Update: 2026-06-29
+
+--- a/pypdf/_utils.py
++++ b/pypdf/_utils.py
+@@ -61,6 +61,7 @@ else:
+ from .errors import (
+     STREAM_TRUNCATED_PREMATURELY,
+     DeprecationError,
++    LimitReachedError,
+     PdfStreamError,
+ )
+ 
+@@ -243,41 +244,49 @@ def skip_over_comment(stream: StreamType) -> None:
+                 raise PdfStreamError("File ended unexpectedly.")
+ 
+ 
+-def read_until_regex(stream: StreamType, regex: Pattern[bytes]) -> bytes:
++def read_until_regex(*, stream: StreamType, regex: Pattern[bytes], length: int = sys.maxsize) -> bytes:
+     """
+     Read until the regular expression pattern matched (ignore the match).
+     Treats EOF on the underlying stream as the end of the token to be matched.
+ 
+     Args:
+-        regex: re.Pattern
++        stream: The stream to read from.
++        regex: The pattern to search for.
++        length: The (approximated) maximum number of bytes to read before raising an exception.
+ 
+     Returns:
+         The read bytes.
+ 
+     """
+     parts: list[bytes] = []
+-    total_len = 0
++    total_length = 0
+     tail = b""
+     chunk_size = 16
+     while True:
+-        tok = stream.read(chunk_size)
+-        if not tok:
++        token = stream.read(chunk_size)
++        if not token:
+             return b"".join(parts)
++        token_length = len(token)
++        if (current_length := total_length + token_length) >= length:
++            raise LimitReachedError(
++                f"Read stream length of {current_length} exceeds maximum allowed length of {length}."
++            )
++
+         # Search overlap of previous tail + new chunk to catch
+         # multi-byte regex matches spanning chunk boundaries.
+-        buf = tail + tok
+-        m = regex.search(buf)
+-        if m is not None:
++        current_buffer = tail + token
++        search_match = regex.search(current_buffer)
++        parts.append(token)
++        if search_match is not None:
+             overlap = len(tail)
+-            actual_start = total_len - overlap + m.start()
+-            stream.seek(actual_start - total_len - len(tok), 1)
+-            parts.append(tok)
++            actual_start = total_length - overlap + search_match.start()
++            stream.seek(actual_start - total_length - token_length, 1)
+             return b"".join(parts)[:actual_start]
+-        parts.append(tok)
+-        total_len += len(tok)
++        total_length += token_length
++
+         # Fixed overlap: 16 bytes is sufficient for the short
+         # delimiter patterns used in PDF parsing.
+-        tail = tok[-16:]
++        tail = token[-16:]
+         if chunk_size < 8192:
+             chunk_size <<= 1
+ 
+--- a/pypdf/generic/_base.py
++++ b/pypdf/generic/_base.py
+@@ -550,6 +550,7 @@ class FloatObject(float, PdfObject):
+ 
+ class NumberObject(int, PdfObject):
+     NumberPattern = re.compile(b"[^+-.0-9]")
++    _LENGTH_LIMIT = 64
+ 
+     def __new__(cls, value: Any) -> Self:
+         try:
+@@ -594,7 +595,7 @@ class NumberObject(int, PdfObject):
+ 
+     @staticmethod
+     def read_from_stream(stream: StreamType) -> Union["NumberObject", "FloatObject"]:
+-        num = read_until_regex(stream, NumberObject.NumberPattern)
++        num = read_until_regex(stream=stream, regex=NumberObject.NumberPattern, length=NumberObject._LENGTH_LIMIT)
+         if b"." in num:
+             return FloatObject(num)
+         return NumberObject(num)
+@@ -812,6 +813,7 @@ class NameObject(str, PdfObject):  # noqa: SLOT000
+         **{chr(i): f"#{i:02X}".encode() for i in b"#()<>[]{}/%"},
+         **{chr(i): f"#{i:02X}".encode() for i in range(33)},
+     }
++    _LENGTH_LIMIT = 4096
+ 
+     def clone(
+         self,
+@@ -907,7 +909,7 @@ class NameObject(str, PdfObject):  # noqa: SLOT000
+         name = stream.read(1)
+         if name != NameObject.prefix:
+             raise PdfReadError("Name read error")
+-        name += read_until_regex(stream, NameObject.delimiter_pattern)
++        name += read_until_regex(stream=stream, regex=NameObject.delimiter_pattern, length=NameObject._LENGTH_LIMIT)
+         try:
+             # Name objects should represent irregular characters
+             # with a '#' followed by the symbol's hex number
+--- a/pypdf/generic/_data_structures.py
++++ b/pypdf/generic/_data_structures.py
+@@ -30,6 +30,7 @@ __author__ = "Mathieu Fenniak"
+ __author_email__ = "biziqe@mathieu.fenniak.net"
+ 
+ import logging
++import os
+ import re
+ import sys
+ from collections.abc import Iterable, Sequence
+@@ -537,22 +538,34 @@ class DictionaryObject(dict[Any, Any], PdfObject):
+     ) -> int:
+         out = position_end
+         for generation in generations:
+-            location = pdf.xref[generation]
+-            values = [x for x in location.values() if position_before < x <= position_end]
+-            if values:
+-                out = min(out, *values)
++            for x in pdf.xref[generation].values():
++                if position_before < x <= position_end:
++                    out = min(out, x)
+         return out
+ 
+     @classmethod
+     def _read_unsized_from_stream(
+-            cls, stream: BinaryStreamType, pdf: PdfReaderProtocol
++            cls, *, stream: BinaryStreamType, pdf: PdfReaderProtocol, length: int,
+     ) -> bytes:
+-        object_position = cls._get_next_object_position(
+-            position_before=stream.tell(), position_end=2 ** 32, generations=list(pdf.xref), pdf=pdf
+-        ) - 1
+         current_position = stream.tell()
++
++        # Determine stream size.
++        try:
++            stream.seek(0, os.SEEK_END)
++            stream_length = stream.tell()
++        finally:
++            stream.seek(current_position)
++
++        object_position = cls._get_next_object_position(
++            position_before=current_position, position_end=stream_length, generations=list(pdf.xref), pdf=pdf
++        )
++
++        bytes_to_read = object_position - current_position
++        if bytes_to_read >= length:
++            raise LimitReachedError(f"Requested length of {bytes_to_read} exceeds maximum allowed length.")
++
+         # Read until the next object position.
+-        read_value = stream.read(object_position - stream.tell())
++        read_value = stream.read(bytes_to_read)
+         endstream_position = read_value.find(b"endstream")
+         if endstream_position < 0:
+             raise PdfReadError(
+@@ -661,15 +674,16 @@ class DictionaryObject(dict[Any, Any], PdfObject):
+             if length is None:  # if the PDF is damaged
+                 length = -1
+             pstart = stream.tell()
++
++            from ..filters import MAX_DECLARED_STREAM_LENGTH  # noqa: PLC0415
+             if length >= 0:
+-                from ..filters import MAX_DECLARED_STREAM_LENGTH  # noqa: PLC0415
+                 if length > MAX_DECLARED_STREAM_LENGTH:
+                     raise LimitReachedError(f"Declared stream length of {length} exceeds maximum allowed length.")
+ 
+                 data["__streamdata__"] = stream.read(length)
+             else:
+                 data["__streamdata__"] = read_until_regex(
+-                    stream, re.compile(b"endstream")
++                    stream=stream, regex=re.compile(b"endstream"), length=MAX_DECLARED_STREAM_LENGTH,
+                 )
+             e = read_non_whitespace(stream)
+             ndstream = stream.read(8)
+@@ -688,7 +702,9 @@ class DictionaryObject(dict[Any, Any], PdfObject):
+                     data["__streamdata__"] = data["__streamdata__"][:-1]
+                 elif pdf is not None and not pdf.strict:
+                     stream.seek(pstart, 0)
+-                    data["__streamdata__"] = DictionaryObject._read_unsized_from_stream(stream, pdf)
++                    data["__streamdata__"] = DictionaryObject._read_unsized_from_stream(
++                        stream=stream, pdf=pdf, length=MAX_DECLARED_STREAM_LENGTH
++                    )
+                     pos = stream.tell()
+                 else:
+                     stream.seek(pos, 0)
+@@ -1190,6 +1206,7 @@ class ContentStream(DecodedStreamObject):
+     * when .set_data() is called, ._operations is set to None.
+     * when .operations is set, ._data is set to None.
+     """
++    _OPERATOR_LENGTH_LIMIT = 128
+ 
+     def __init__(
+         self,
+@@ -1349,7 +1366,9 @@ class ContentStream(DecodedStreamObject):
+                 break
+             stream.seek(-1, 1)
+             if peek.isalpha() or peek in (b"'", b'"'):
+-                operator = read_until_regex(stream, NameObject.delimiter_pattern)
++                operator = read_until_regex(
++                    stream=stream, regex=NameObject.delimiter_pattern, length=self._OPERATOR_LENGTH_LIMIT
++                )
+                 if operator == b"BI":
+                     # begin inline image - a completely different parsing
+                     # mechanism is required, of course... thanks buddy...
+--- a/tests/generic/test_base.py
++++ b/tests/generic/test_base.py
+@@ -4,7 +4,8 @@ from io import BytesIO
+ import pytest
+ 
+ from pypdf import PdfReader, PdfWriter
+-from pypdf.generic import read_hex_string_from_stream
++from pypdf.errors import LimitReachedError
++from pypdf.generic import FloatObject, NameObject, NumberObject, read_hex_string_from_stream
+ from tests import get_data_from_url
+ 
+ 
+@@ -43,3 +44,27 @@ def test_text_string_object__wrongly_detected_bom() -> None:
+             "系可论，步各之但\n"
+             "12"
+         )
++
++
++def test_number_object__read_from_stream__limits() -> None:
++    stream = BytesIO(b"13.37\n")
++    assert NumberObject.read_from_stream(stream) == FloatObject("13.37")
++
++    stream = BytesIO(f"{'1' * 100}\n".encode())
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 101 exceeds maximum allowed length of 64\.$"
++    ):
++        NumberObject.read_from_stream(stream)
++
++
++def test_name_object__read_from_stream__limits() -> None:
++    stream = BytesIO(b"/My#20Name\n")
++    assert NameObject.read_from_stream(stream, pdf=None) == NameObject("/My Name")
++
++    stream = BytesIO(f"/{'SomeName' * 5000}\n".encode())
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 8176 exceeds maximum allowed length of 4096\.$"
++    ):
++        NameObject.read_from_stream(stream, pdf=None)
+--- a/tests/generic/test_data_structures.py
++++ b/tests/generic/test_data_structures.py
+@@ -5,6 +5,7 @@ import sys
+ from io import BytesIO
+ from pathlib import Path
+ from typing import Callable
++from unittest import mock
+ 
+ import pytest
+ 
+@@ -17,6 +18,7 @@ from pypdf.generic import (
+     DictionaryObject,
+     NameObject,
+     NullObject,
++    NumberObject,
+     RectangleObject,
+     StreamObject,
+     TextStringObject,
+@@ -378,3 +380,81 @@ def test_dictionary_object__get_inherited__cyclic() -> None:
+             match=r"^Detected cycle in /Parent hierarchy when retrieving value for key '/FT'\.$"
+     ):
+         writer.get_pages_showing_field(reference1)
++
++
++def _make_pdf__read_from_stream__limit() -> bytes:
++    offsets = []
++    pdf = bytearray(b"%PDF-1.4\n")
++
++    def add_obj(n: int, body: bytes) -> None:
++        offsets.append((n, len(pdf)))
++        pdf.extend(f"{n} 0 obj\n".encode())
++        pdf.extend(body)
++        pdf.extend(b"\nendobj\n")
++
++    add_obj(1, b"<< /Type /Catalog /Pages 2 0 R >>")
++    add_obj(2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
++    add_obj(3, b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 10 10] /Contents 4 0 R /Resources << >> >>")
++    offsets.append((4, len(pdf)))
++    pdf.extend(b"4 0 obj\n")
++    pdf.extend(b"<< >>\nstream\n")
++    pdf.extend(b"A" * 75_000_001)
++    pdf.extend(b"\nendstream\nendobj\n")
++    xref_offset = len(pdf)
++    pdf.extend(b"xref\n0 5\n0000000000 65535 f \n")
++    offset_map = dict(offsets)
++    for n in range(1, 5):
++        pdf.extend(f"{offset_map[n]:010d} 00000 n \n".encode())
++    pdf.extend(f"trailer\n<< /Size 5 /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n".encode())
++    return bytes(pdf)
++
++
++@pytest.mark.timeout(5)
++def test_dictionary_object__read_from_stream__missing_length__limit() -> None:
++    reader = PdfReader(BytesIO(_make_pdf__read_from_stream__limit()))
++    page = reader.pages[0]
++
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 75000187 exceeds maximum allowed length of 75000000\.$"
++    ):
++        page.get_contents()
++
++
++def test_dictionary_object__read_from_stream__read_unsized__limit() -> None:
++    reader = PdfReader(RESOURCE_ROOT / "issue-301.pdf")
++
++    with mock.patch.object(DictionaryObject, "_read_unsized_from_stream", return_value=b"dummy") as read_mock:
++        obj = reader.get_object(13)
++        assert obj is not None
++        assert obj == DictionaryObject({
++            NameObject("/Filter"): NameObject("/FlateDecode"),
++            NameObject("/Length1"): NumberObject(218)
++        })
++    read_mock.assert_called_once_with(stream=reader.stream, pdf=reader, length=75_000_000)
++
++
++def test_dictionary_object__read_unsized_from_stream__limit() -> None:
++    reader = PdfReader(RESOURCE_ROOT / "issue-301.pdf")
++
++    reader.stream.seek(63101, 0)  # pstart value from the corresponding call
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Requested length of 236 exceeds maximum allowed length\.$"
++    ):
++        DictionaryObject._read_unsized_from_stream(stream=reader.stream, pdf=reader, length=137)
++
++
++def test_content_stream__parse_content_stream__limits() -> None:
++    content_stream = ContentStream(stream=None, pdf=None)
++
++    stream = BytesIO(b"/Do TESTING\n")
++    content_stream._parse_content_stream(stream)
++    assert content_stream.operations == [(["/Do"], b"TESTING")]
++
++    stream = BytesIO(f"/Do {'TESTING' * 100}\n".encode())
++    with pytest.raises(
++            expected_exception=LimitReachedError,
++            match=r"^Read stream length of 240 exceeds maximum allowed length of 128\.$"
++    ):
++        content_stream._parse_content_stream(stream)
+--- a/tests/test_reader.py
++++ b/tests/test_reader.py
+@@ -2052,7 +2052,9 @@ def test_issue2886(caplog):
+     url = "https://github.com/user-attachments/files/17187711/crash-e8a85d82de01cab5eb44e7993304d8b9d1544970.pdf"
+     name = "issue2886.pdf"
+ 
+-    with pytest.raises(PdfReadError, match=r"Unexpected empty line in Xref table\."):
++    # Actual: 100_067
++    with mock.patch("pypdf.generic._base.NumberObject._LENGTH_LIMIT", 200_000), \
++            pytest.raises(PdfReadError, match=r"Unexpected empty line in Xref table\."):
+         _ = PdfReader(BytesIO(get_data_from_url(url=url, name=name)))
+ 
+ 
+--- a/tests/test_utils.py
++++ b/tests/test_utils.py
+@@ -94,13 +94,13 @@ def test_skip_over_comment(stream, remainder):
+ 
+ def test_read_until_regex_premature_ending_name():
+     stream = io.BytesIO(b"")
+-    assert read_until_regex(stream, re.compile(b".")) == b""
++    assert read_until_regex(stream=stream, regex=re.compile(b".")) == b""
+ 
+ 
+ def test_read_until_regex_match_in_first_chunk():
+     """Match within the first 16-byte chunk."""
+     stream = io.BytesIO(b"hello world")
+-    result = read_until_regex(stream, re.compile(b" "))
++    result = read_until_regex(stream=stream, regex=re.compile(b" "))
+     assert result == b"hello"
+     assert stream.tell() == 5
+ 
+@@ -111,7 +111,7 @@ def test_read_until_regex_match_in_second_chunk():
+     assert len(payload) == 20
+     data = payload + b" rest"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b" "))
++    result = read_until_regex(stream=stream, regex=re.compile(b" "))
+     assert result == payload
+     assert stream.tell() == 20
+ 
+@@ -122,7 +122,7 @@ def test_read_until_regex_match_at_chunk_boundary():
+     assert len(payload) == 16
+     data = payload + b" after"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b" "))
++    result = read_until_regex(stream=stream, regex=re.compile(b" "))
+     assert result == payload
+     assert stream.tell() == 16
+ 
+@@ -134,7 +134,7 @@ def test_read_until_regex_multi_byte_spanning_boundary():
+     assert len(payload) == 15
+     data = payload + b"XYafter"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b"XY"))
++    result = read_until_regex(stream=stream, regex=re.compile(b"XY"))
+     assert result == payload
+     assert stream.tell() == 15
+ 
+@@ -143,7 +143,7 @@ def test_read_until_regex_no_match_exhausted():
+     """No match - stream is fully consumed and all data returned."""
+     data = b"0123456789" * 10
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b"ZZZ"))
++    result = read_until_regex(stream=stream, regex=re.compile(b"ZZZ"))
+     assert result == data
+ 
+ 
+@@ -153,7 +153,7 @@ def test_read_until_regex_exponential_chunk_growth():
+     assert len(payload) == 50_000
+     data = payload + b"|done"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(rb"\|"))
++    result = read_until_regex(stream=stream, regex=re.compile(rb"\|"))
+     assert result == payload
+     assert stream.tell() == 50_000
+ 
+@@ -166,7 +166,7 @@ def test_read_until_regex_match_spanning_later_boundary():
+     assert len(payload) == 47
+     data = payload + b"ENDrest"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(b"END"))
++    result = read_until_regex(stream=stream, regex=re.compile(b"END"))
+     assert result == payload
+     assert stream.tell() == 47
+ 
+@@ -186,7 +186,7 @@ def test_read_until_regex_tail_overlap_is_fixed():
+     payload = b"x" * 47
+     data = payload + pattern + b"rest"
+     stream = io.BytesIO(data)
+-    result = read_until_regex(stream, re.compile(re.escape(pattern)))
++    result = read_until_regex(stream=stream, regex=re.compile(re.escape(pattern)))
+     assert result == payload
+     assert stream.tell() == 47
+ 
