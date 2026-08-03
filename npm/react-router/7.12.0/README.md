@@ -4,7 +4,11 @@ This patch is based on react-router version 7.12.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-33245
+- CVE-2026-34077
+- CVE-2026-40181
 - CVE-2026-42211
+- CVE-2026-42342
 
 ## How to Apply:
 1. Clone or download the source code for react-router
