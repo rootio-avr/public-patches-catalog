@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-53539
+- CVE-2026-53537
 
 ## How to Apply:
 1. Clone or download the source code for python-multipart
