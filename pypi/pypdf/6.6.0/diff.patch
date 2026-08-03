@@ -1722,6 +1722,215 @@
 +
 +    assert writer._get_filtered_outline(node=None, pages={}, reader=reader) == []
 
+Avoid infinite loops for incomplete ASCII85 and ASCIIHex inline images (CVE-2026-59935)
+
+A crafted PDF with an incomplete ASCII85 or ASCIIHex encoded inline image
+could cause the inline image extractors to loop forever: when the underlying
+stream is exhausted, stream.read(BUFFER_SIZE) returns an empty bytes object
+while read_non_whitespace() keeps returning the same trailing byte, so the
+buffer never shrinks and the "Unexpected end of stream" guard is never hit.
+Detect an exhausted read explicitly and raise PdfReadError instead of looping.
+
+--- a/pypdf/generic/_image_inline.py
++++ b/pypdf/generic/_image_inline.py
+@@ -60,9 +60,9 @@ def extract_inline__ascii_hex_decode(stream: StreamType) -> bytes:
+     data_out: bytes = b""
+     # Read data until delimiter > and EI as backup.
+     while True:
+-        data_buffered = read_non_whitespace(stream) + stream.read(BUFFER_SIZE)
+-        if not data_buffered:
+-            raise PdfReadError("Unexpected end of stream")
++        data_buffered = read_non_whitespace(stream) + (read_bytes := stream.read(BUFFER_SIZE))
++        if not data_buffered or not read_bytes:
++            raise PdfReadError("Unexpected end of stream.")
+         pos_tok = data_buffered.find(b">")
+         if pos_tok >= 0:  # found >
+             data_out += data_buffered[: pos_tok + 1]
+@@ -80,13 +80,13 @@ def extract_inline__ascii_hex_decode(stream: StreamType) -> bytes:
+             break
+         if len(data_buffered) == 2:
+             data_out += data_buffered
+-            raise PdfReadError("Unexpected end of stream")
++            raise PdfReadError("Unexpected end of stream.")
+         # Neither > nor EI found
+         data_out += data_buffered[:-2]
+         stream.seek(-2, 1)
+
+     if not _check_end_image_marker(stream):
+-        raise PdfReadError("EI stream not found")
++        raise PdfReadError("EI stream not found.")
+     return data_out
+
+
+@@ -98,9 +98,9 @@ def extract_inline__ascii85_decode(stream: StreamType) -> bytes:
+     data_out: bytes = b""
+     # Read data until delimiter ~>
+     while True:
+-        data_buffered = read_non_whitespace(stream) + stream.read(BUFFER_SIZE)
+-        if not data_buffered:
+-            raise PdfReadError("Unexpected end of stream")
++        data_buffered = read_non_whitespace(stream) + (read_bytes := stream.read(BUFFER_SIZE))
++        if not data_buffered or not read_bytes:
++            raise PdfReadError("Unexpected end of stream.")
+         pos_tok = data_buffered.find(b"~>")
+         if pos_tok >= 0:  # found!
+             data_out += data_buffered[: pos_tok + 2]
+@@ -108,14 +108,14 @@ def extract_inline__ascii85_decode(stream: StreamType) -> bytes:
+             break
+         if len(data_buffered) == 2:  # end of buffer
+             data_out += data_buffered
+-            raise PdfReadError("Unexpected end of stream")
++            raise PdfReadError("Unexpected end of stream.")
+         data_out += data_buffered[
+             :-2
+         ]  # back by one char in case of in the middle of ~>
+         stream.seek(-2, 1)
+
+     if not _check_end_image_marker(stream):
+-        raise PdfReadError("EI stream not found")
++        raise PdfReadError("EI stream not found.")
+     return data_out
+
+
+--- a/tests/generic/test_image_inline.py
++++ b/tests/generic/test_image_inline.py
+@@ -5,7 +5,11 @@ import pytest
+
+ from pypdf import PdfReader
+ from pypdf.errors import PdfReadError
+-from pypdf.generic._image_inline import is_followed_by_binary_data
++from pypdf.generic._image_inline import (
++    extract_inline__ascii85_decode,
++    extract_inline__ascii_hex_decode,
++    is_followed_by_binary_data,
++)
+ from tests import get_data_from_url
+
+
+@@ -86,3 +90,23 @@ def test_extract_inline_dct__multiple_eod():
+     for page in reader.pages:
+         for image in page.images:
+             _ = image.image.load()
++
++
++@pytest.mark.timeout(5)
++def test_extract_inline__ascii_hex_decode__early_end_of_file() -> None:
++    stream = BytesIO(b"ABCDE\nF G")
++
++    with pytest.raises(expected_exception=PdfReadError, match=r"^Unexpected end of stream\.$"):
++        extract_inline__ascii_hex_decode(stream)
++
++
++@pytest.mark.timeout(5)
++def test_extract_inline__ascii85_decode__early_end_of_file() -> None:
++    # Broken content stream, for example due to filter errors.
++    # Specific example:
++    #   Error -3 while decompressing data: invalid distance too far back
++    #   b'[...] \nBI\n/W 16 /H 16 /BPC 8 /CS /RGB /F [/A85 /Fl]\nID\nGar8O(o6*i%*56~\ne  L\ne  L9/ LL9/ L'
++    stream = BytesIO(b"Gar8O(o6*i%*56~\ne  L\ne  L9/ LL9/ L")
++
++    with pytest.raises(expected_exception=PdfReadError, match=r"^Unexpected end of stream\.$"):
++        extract_inline__ascii85_decode(stream)
+
+--- a/pypdf/_reader.py
++++ b/pypdf/_reader.py
+@@ -738,6 +738,15 @@ class PdfReader(PdfDocCommon):
+                 raise PdfReadError("startxref not found")
+         return startxref
+ 
++    def _load_recovery_cache(self, data: bytes) -> dict[int, tuple[int, int]]:
++        cache = {}
++        for object_number, generation_number, object_start in self._find_pdf_objects(data):
++            if object_number in cache:
++                # Always use the first match.
++                continue
++            cache[object_number] = (object_start, generation_number)
++        return cache
++
+     def _read_standard_xref_table(self, stream: StreamType) -> None:
+         # standard cross-reference table
+         ref = stream.read(3)
+@@ -746,6 +755,7 @@ class PdfReader(PdfDocCommon):
+         read_non_whitespace(stream)
+         stream.seek(-1, 1)
+         first_time = True  # check if the first time looking at the xref table
++        recovery_cache: Optional[dict[int, tuple[int, int]]] = None
+         while True:
+             num = cast(int, read_object(stream, self))
+             if first_time and num != 0:
+@@ -810,8 +820,10 @@ class PdfReader(PdfDocCommon):
+                         buf = stream.read(-1)
+                         stream.seek(p)
+ 
+-                    f = re.search(rf"{num}\s+(\d+)\s+obj".encode(), buf)
+-                    if f is None:
++                    if recovery_cache is None:
++                        recovery_cache = self._load_recovery_cache(buf)
++
++                    if num not in recovery_cache:
+                         logger_warning(
+                             f"entry {num} in Xref table invalid; object not found",
+                             __name__,
+@@ -824,8 +836,8 @@ class PdfReader(PdfDocCommon):
+                             f"entry {num} in Xref table invalid but object found",
+                             __name__,
+                         )
+-                        generation = int(f.group(1))
+-                        offset = f.start()
++                        generation, offset = recovery_cache[num]
++                        entry_type_b = b"n"
+ 
+                 if generation not in self.xref:
+                     self.xref[generation] = {}
+--- a/tests/test_reader.py
++++ b/tests/test_reader.py
+@@ -1978,3 +1978,45 @@ def test_find_pdf_objects():
+ def test_find_pdf_trailers(data: bytes, expected: list[int]):
+     result = list(PdfReader._find_pdf_trailers(data))
+     assert result == expected
++
++
++@pytest.mark.timeout(10)
++def test_read_standard_xref_table__malformed__speed():
++    body = (
++        b"%PDF-1.7\n"
++        b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
++        b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n"
++        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] >>\nendobj\n"
++    )
++    xref_offset = len(body)
++    corrupt_entry = b"xxxxxxxxxxxxxxxx 0\r\n"
++    assert len(corrupt_entry) == 20
++    entry_count = 20_000
++    data = (
++        body
++        + f"xref\n1 {entry_count}\n".encode("ascii")
++        + corrupt_entry * entry_count
++        + b"trailer\n<< /Size "
++        + str(entry_count + 1).encode("ascii")
++        + b" /Root 1 0 R >>\nstartxref\n"
++        + str(xref_offset).encode("ascii")
++        + b"\n%%EOF\n"
++    )
++
++    reader = PdfReader(BytesIO(data))
++    assert len(reader.pages) == 1
++
++
++def test_load_recovery_cache():
++    from unittest import mock
++
++    reader = PdfReader(RESOURCE_ROOT / "crazyones.pdf")
++
++    pdf_objects = [
++        (1, 0, 10),
++        (1, 1, 20),
++        (2, 0, 30),
++        (3, 1, 42),
++    ]
++    with mock.patch.object(reader, "_find_pdf_objects", return_value=iter(pdf_objects)):
++        assert reader._load_recovery_cache(b"") == {1: (10, 0), 2: (30, 0), 3: (42, 1)}
+
 --- a/pypdf/errors.py
 +++ b/pypdf/errors.py
 @@ -69,6 +69,7 @@
