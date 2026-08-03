@@ -1,0 +1,670 @@
+diff --git a/crates/uv-build-backend/src/metadata.rs b/crates/uv-build-backend/src/metadata.rs
+index b9c53ae..cbf0a64 100644
+--- a/crates/uv-build-backend/src/metadata.rs
++++ b/crates/uv-build-backend/src/metadata.rs
+@@ -59,6 +59,10 @@ pub enum ValidationError {
+         "Entrypoint groups must consist of letters and numbers separated by dots, invalid group: {0}"
+     )]
+     InvalidGroup(String),
++    #[error(
++        "Script entry point name `{0}` must include a non-dot character and consist only of letters, numbers, dots, underscores and dashes"
++    )]
++    InvalidScriptName(String),
+     #[error("Use `project.scripts` instead of `project.entry-points.console_scripts`")]
+     ReservedScripts,
+     #[error("Use `project.gui-scripts` instead of `project.entry-points.gui_scripts`")]
+@@ -730,10 +734,18 @@ impl PyProjectToml {
+ 
+         let _ = writeln!(writer, "[{group}]");
+         for (name, object_reference) in entries {
+-            if !name
+-                .chars()
+-                .all(|c| c.is_alphanumeric() || c == '.' || c == '-' || c == '_')
++            let compliant_name = name.chars().all(|character| {
++                character.is_alphanumeric() || matches!(character, '.' | '-' | '_')
++            });
++            let dot_only_name = name.chars().all(|character| character == '.');
++
++            if matches!(group, "console_scripts" | "gui_scripts")
++                && (name.is_empty() || dot_only_name || !compliant_name)
+             {
++                return Err(ValidationError::InvalidScriptName(name.clone()));
++            }
++
++            if !compliant_name {
+                 warn!(
+                     "Entrypoint names should consist of letters, numbers, dots, underscores and \
+                     dashes; non-compliant name: {name}"
+diff --git a/crates/uv-fs/src/path.rs b/crates/uv-fs/src/path.rs
+index 99c6b9d..2e58930 100644
+--- a/crates/uv-fs/src/path.rs
++++ b/crates/uv-fs/src/path.rs
+@@ -263,6 +263,21 @@ pub fn normalize_path<'path>(path: impl Into<Cow<'path, Path>>) -> Cow<'path, Pa
+     path
+ }
+ 
++/// Normalize `path`, returning it when it remains strictly under a non-empty `root`.
++///
++/// This comparison is lexical and does not resolve symlinks. The returned path is normalized, and
++/// equality with `root` is rejected.
++pub fn normalize_path_under(path: impl AsRef<Path>, root: impl AsRef<Path>) -> Option<PathBuf> {
++    let path = normalize_path(path.as_ref()).into_owned();
++    let root = normalize_path(root.as_ref());
++
++    if root.as_os_str().is_empty() || path.as_path() == root.as_ref() {
++        None
++    } else {
++        path.starts_with(root.as_ref()).then_some(path)
++    }
++}
++
+ /// Normalize a [`Path`].
+ ///
+ /// Unlike [`normalize_absolute_path`], this works with relative paths and does never error.
+@@ -727,6 +742,32 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn test_normalize_path_under() {
++        assert_eq!(
++            normalize_path_under("scripts/script", "scripts"),
++            Some(PathBuf::from("scripts/script"))
++        );
++        assert_eq!(
++            normalize_path_under("/scripts/script", "/scripts"),
++            Some(PathBuf::from("/scripts/script"))
++        );
++        assert_eq!(
++            normalize_path_under("scripts/nested/../script", "scripts"),
++            Some(PathBuf::from("scripts/script"))
++        );
++        assert_eq!(
++            normalize_path_under("/scripts/nested/../script", "/scripts"),
++            Some(PathBuf::from("/scripts/script"))
++        );
++        assert_eq!(normalize_path_under("scripts/.", "scripts"), None);
++        assert_eq!(normalize_path_under("/scripts/.", "/scripts"), None);
++        assert_eq!(normalize_path_under("scripts/../script", "scripts"), None);
++        assert_eq!(normalize_path_under("/scripts/../script", "/scripts"), None);
++        assert_eq!(normalize_path_under("scripts/script", "."), None);
++        assert_eq!(normalize_path_under("scripts/script", ""), None);
++    }
++
+     #[test]
+     fn test_normalize_trailing_path_separator() {
+         let cases = [
+diff --git a/crates/uv-install-wheel/src/lib.rs b/crates/uv-install-wheel/src/lib.rs
+index 0632d1d..bb49850 100644
+--- a/crates/uv-install-wheel/src/lib.rs
++++ b/crates/uv-install-wheel/src/lib.rs
+@@ -86,8 +86,8 @@ pub enum Error {
+     InvalidEggLink(PathBuf),
+     #[error(transparent)]
+     LauncherError(#[from] uv_trampoline_builder::Error),
+-    #[error("Scripts must not use the reserved name {0}")]
+-    ReservedScriptName(String),
++    #[error("Scripts must not use the reserved name `{reserved}`, got: `{declared}`")]
++    ReservedScriptName { reserved: String, declared: String },
+     #[error(transparent)]
+     Copy(#[from] uv_fs::link::LinkError),
+ }
+diff --git a/crates/uv-install-wheel/src/wheel.rs b/crates/uv-install-wheel/src/wheel.rs
+index ed00834..29babac 100644
+--- a/crates/uv-install-wheel/src/wheel.rs
++++ b/crates/uv-install-wheel/src/wheel.rs
+@@ -14,7 +14,7 @@ use sha2::{Digest, Sha256};
+ use tracing::{debug, instrument, trace, warn};
+ use walkdir::WalkDir;
+ 
+-use uv_fs::{PortablePath, Simplified, persist_with_retry_sync, relative_to};
++use uv_fs::{PortablePath, Simplified, normalize_path_under, persist_with_retry_sync, relative_to};
+ use uv_normalize::PackageName;
+ use uv_pypi_types::DirectUrl;
+ use uv_shell::escape_posix_for_single_quotes;
+@@ -160,69 +160,108 @@ fn get_script_executable(python_executable: &Path, is_gui: bool) -> PathBuf {
+     }
+ }
+ 
+-/// Determine the absolute path to an entrypoint script.
+-fn entrypoint_path(entrypoint: &Script, layout: &Layout) -> PathBuf {
+-    if cfg!(windows) {
+-        // On windows we actually build an .exe wrapper
+-        let script_name = entrypoint
+-            .name
+-            // FIXME: What are the in-reality rules here for names?
+-            .strip_suffix(".py")
+-            .unwrap_or(&entrypoint.name)
+-            .to_string()
+-            + ".exe";
+-
+-        layout.scheme.scripts.join(script_name)
+-    } else {
+-        layout.scheme.scripts.join(&entrypoint.name)
+-    }
++const RESERVED_SCRIPT_NAMES_ERROR: &[&str; 3] = &["python", "pythonw", "python3"];
++const RESERVED_SCRIPT_NAMES_WARN: &[&str; 2] = &["activate", "activate_this.py"];
++
++/// A form of [`Script`] guaranteed by [`ValidatedScript::try_from_script`] to be constrained to
++/// the scripts directory.
++struct ValidatedScript<'script> {
++    path: PathBuf,
++    script: &'script Script,
+ }
+ 
+-/// Create the wrapper scripts in the bin folder of the venv for launching console scripts.
+-pub(crate) fn write_script_entrypoints(
+-    layout: &Layout,
+-    relocatable: bool,
+-    site_packages: &Path,
+-    entrypoints: &[Script],
+-    record: &mut Vec<RecordEntry>,
+-    is_gui: bool,
+-) -> Result<(), Error> {
+-    for entrypoint in entrypoints {
+-        let warn_names = ["activate", "activate_this.py"];
+-        if warn_names.contains(&entrypoint.name.as_str())
+-            || entrypoint.name.starts_with("activate.")
+-        {
++impl<'script> ValidatedScript<'script> {
++    fn try_from_script(script: &'script Script, layout: &Layout) -> Result<Self, Error> {
++        let Some(path) = normalize_path_under(
++            layout.scheme.scripts.join(&script.name),
++            &layout.scheme.scripts,
++        ) else {
++            return Err(Error::InvalidWheel(format!(
++                "Script path must resolve to a file within the scripts directory: `{}`",
++                script.name
++            )));
++        };
++
++        let name = relative_to(&path, &layout.scheme.scripts)?
++            .to_string_lossy()
++            .into_owned();
++
++        if RESERVED_SCRIPT_NAMES_WARN.contains(&name.as_str()) || name.starts_with("activate.") {
+             warn_user_once!(
+                 "The script name `{}` is reserved for virtual environment activation scripts.",
+-                entrypoint.name
++                name
+             );
+         }
+-        let reserved_names = ["python", "pythonw", "python3"];
+-        if reserved_names.contains(&entrypoint.name.as_str())
+-            || entrypoint
+-                .name
++
++        if RESERVED_SCRIPT_NAMES_ERROR.contains(&name.as_str())
++            || name
+                 .strip_prefix("python3.")
+                 .is_some_and(|suffix| suffix.parse::<u8>().is_ok())
+         {
+-            return Err(Error::ReservedScriptName(entrypoint.name.clone()));
++            return Err(Error::ReservedScriptName {
++                reserved: name,
++                declared: script.name.clone(),
++            });
+         }
+ 
+-        let entrypoint_absolute = entrypoint_path(entrypoint, layout);
++        let path = if cfg!(windows) {
++            // On Windows we actually build an `.exe` wrapper.
++            let name = name
++                // FIXME: What are the in-reality rules here for names?
++                .strip_suffix(".py")
++                .unwrap_or(&name)
++                .to_string()
++                + std::env::consts::EXE_SUFFIX;
+ 
+-        let entrypoint_relative = pathdiff::diff_paths(&entrypoint_absolute, site_packages)
+-            .ok_or_else(|| {
+-                Error::Io(io::Error::other(format!(
+-                    "Could not find relative path for: {}",
+-                    entrypoint_absolute.simplified_display()
+-                )))
+-            })?;
++            layout.scheme.scripts.join(name)
++        } else {
++            layout.scheme.scripts.join(name)
++        };
++
++        Ok(Self { path, script })
++    }
++
++    fn as_path(&self) -> &Path {
++        &self.path
++    }
++
++    fn inner(&self) -> &Script {
++        self.script
++    }
++
++    /// Return the script destination relative to `site_packages` for use in `RECORD`.
++    ///
++    /// Entry points are installed in the scripts directory, which may sit outside
++    /// `site_packages`, so we use a lexical diff rather than stripping a prefix.
++    fn relative_to_site_package(&self, site_packages: &Path) -> Result<PathBuf, Error> {
++        pathdiff::diff_paths(self.as_path(), site_packages).ok_or_else(|| {
++            Error::Io(io::Error::other(format!(
++                "Could not find relative path for: {}",
++                self.as_path().simplified_display()
++            )))
++        })
++    }
++}
++
++/// Create the wrapper scripts in the bin folder of the venv for launching console scripts.
++pub(crate) fn write_script_entrypoints(
++    layout: &Layout,
++    relocatable: bool,
++    site_packages: &Path,
++    entrypoints: &[Script],
++    record: &mut Vec<RecordEntry>,
++    is_gui: bool,
++) -> Result<(), Error> {
++    for script in entrypoints {
++        let script = ValidatedScript::try_from_script(script, layout)?;
++        let entrypoint_relative = script.relative_to_site_package(site_packages)?;
+ 
+         // Generate the launcher script.
+         let launcher_executable = get_script_executable(&layout.sys_executable, is_gui);
+         let launcher_executable =
+             get_relocatable_executable(launcher_executable, layout, relocatable)?;
+         let launcher_python_script = get_script_launcher(
+-            entrypoint,
++            script.inner(),
+             &format_shebang(&launcher_executable, &layout.os_name, relocatable),
+         );
+ 
+@@ -248,8 +287,8 @@ pub(crate) fn write_script_entrypoints(
+                 use std::fs::Permissions;
+                 use std::os::unix::fs::PermissionsExt;
+ 
+-                let path = site_packages.join(entrypoint_relative);
+-                let permissions = fs::metadata(&path)?.permissions();
++                let path = script.as_path();
++                let permissions = fs::metadata(path)?.permissions();
+                 if permissions.mode() & 0o111 != 0o111 {
+                     fs::set_permissions(path, Permissions::from_mode(permissions.mode() | 0o111))?;
+                 }
+diff --git a/crates/uv/tests/it/build.rs b/crates/uv/tests/it/build.rs
+index 48c5d0d..b8b8772 100644
+--- a/crates/uv/tests/it/build.rs
++++ b/crates/uv/tests/it/build.rs
+@@ -2055,6 +2055,138 @@ fn build_fast_path() -> Result<()> {
+     Ok(())
+ }
+ 
++/// Reject path-shaped script entry point names before writing wheel metadata.
++#[test]
++fn build_unsafe_script_entry_point_name() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++
++    context.init().assert().success();
++
++    context
++        .temp_dir
++        .child("pyproject.toml")
++        .write_str(indoc! {r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++
++        [project.scripts]
++        "../script" = "project:main"
++
++        [build-system]
++        requires = ["uv_build>=0.5.15,<10000"]
++        build-backend = "uv_build"
++    "#})?;
++    context
++        .temp_dir
++        .child("src")
++        .child("project")
++        .child("__init__.py")
++        .touch()?;
++
++    uv_snapshot!(context.filters(), context.build().arg("--wheel"), @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    Building wheel (uv build backend)...
++      × Failed to build `[TEMP_DIR]/`
++      ├─▶ Invalid project metadata
++      ╰─▶ Script entry point name `../script` must include a non-dot character and consist only of letters, numbers, dots, underscores and dashes
++    ");
++
++    Ok(())
++}
++
++/// Reject dot-only script entry point names that do not resolve below the scripts directory.
++#[test]
++fn build_dot_script_entry_point_name() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++
++    context.init().assert().success();
++
++    context
++        .temp_dir
++        .child("pyproject.toml")
++        .write_str(indoc! {r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++
++        [project.scripts]
++        "." = "project:main"
++
++        [build-system]
++        requires = ["uv_build>=0.5.15,<10000"]
++        build-backend = "uv_build"
++    "#})?;
++    context
++        .temp_dir
++        .child("src")
++        .child("project")
++        .child("__init__.py")
++        .touch()?;
++
++    uv_snapshot!(context.filters(), context.build().arg("--wheel"), @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    Building wheel (uv build backend)...
++      × Failed to build `[TEMP_DIR]/`
++      ├─▶ Invalid project metadata
++      ╰─▶ Script entry point name `.` must include a non-dot character and consist only of letters, numbers, dots, underscores and dashes
++    ");
++
++    Ok(())
++}
++
++/// Reject script entry point names that PyPI rejects in uploaded wheels.
++#[test]
++fn build_nested_script_entry_point_name() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++
++    context.init().assert().success();
++
++    context
++        .temp_dir
++        .child("pyproject.toml")
++        .write_str(indoc! {r#"
++        [project]
++        name = "project"
++        version = "0.1.0"
++
++        [project.scripts]
++        "nested/script" = "project:main"
++
++        [build-system]
++        requires = ["uv_build>=0.5.15,<10000"]
++        build-backend = "uv_build"
++    "#})?;
++    context
++        .temp_dir
++        .child("src")
++        .child("project")
++        .child("__init__.py")
++        .touch()?;
++
++    uv_snapshot!(context.filters(), context.build().arg("--wheel"), @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    Building wheel (uv build backend)...
++      × Failed to build `[TEMP_DIR]/`
++      ├─▶ Invalid project metadata
++      ╰─▶ Script entry point name `nested/script` must include a non-dot character and consist only of letters, numbers, dots, underscores and dashes
++    ");
++
++    Ok(())
++}
++
+ /// Test the `--list` option.
+ #[test]
+ fn build_list_files() -> Result<()> {
+diff --git a/crates/uv/tests/it/pip_install.rs b/crates/uv/tests/it/pip_install.rs
+index 1fad6fd..a4bf4fe 100644
+--- a/crates/uv/tests/it/pip_install.rs
++++ b/crates/uv/tests/it/pip_install.rs
+@@ -12782,13 +12782,232 @@ fn reserved_script_name() -> Result<()> {
+     Prepared 1 package in [TIME]
+     Uninstalled 1 package in [TIME]
+     error: Failed to install: project-0.1.0-py3-none-any.whl (project==0.1.0 (from file://[TEMP_DIR]/))
+-      Caused by: Scripts must not use the reserved name python
++      Caused by: Scripts must not use the reserved name `python`, got: `python`
+     "
+     );
+ 
+     Ok(())
+ }
+ 
++fn repacked_wheel_with_entrypoint(
++    context: &TestContext,
++    section: &str,
++    entrypoint_name: &str,
++) -> Result<PathBuf> {
++    context.init().arg("--lib").arg("foo").assert().success();
++    context.build().arg("--wheel").arg("foo").assert().success();
++
++    let built_wheel = context.temp_dir.join("foo/dist/foo-0.1.0-py3-none-any.whl");
++    let unpacked = context.temp_dir.join("foo-unpacked");
++    uv_extract::unzip(File::open(&built_wheel)?, &unpacked)?;
++
++    fs::write(
++        unpacked.join("foo-0.1.0.dist-info/entry_points.txt"),
++        formatdoc! {"
++            [{section}]
++            {entrypoint_name} = foo:main
++            ",
++        },
++    )?;
++
++    let repacked_wheel = context.temp_dir.join("foo-0.1.0-py3-none-any.whl");
++    let mut writer = ZipFileWriter::new(Vec::new());
++    for entry in WalkDir::new(&unpacked) {
++        let entry = entry?;
++        let path = entry.path();
++        let name = path.strip_prefix(&unpacked)?;
++        if name.as_os_str().is_empty() {
++            continue;
++        }
++        // Zip entries must use forward slashes, even on Windows.
++        let mut name = PortablePath::from(name).to_string();
++        if path.is_dir() {
++            name.push('/');
++            let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
++            block_on(writer.write_entry_whole(entry, &[]))?;
++        } else {
++            let entry = ZipEntryBuilder::new(name.into(), Compression::Stored);
++            block_on(writer.write_entry_whole(entry, &fs_err::read(path)?))?;
++        }
++    }
++    fs_err::write(&repacked_wheel, block_on(writer.close())?)?;
++
++    Ok(repacked_wheel)
++}
++
++#[test]
++fn reject_wheel_entrypoint_paths() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++
++    // Build a normal wheel, then rewrite its entry-point metadata to exercise the installer
++    // directly, rather than relying on backend-side validation.
++    let escaped_entrypoint = context.temp_dir.child("escaped-entrypoint");
++    let repacked_wheel = repacked_wheel_with_entrypoint(
++        &context,
++        "console_scripts",
++        &escaped_entrypoint.path().portable_display().to_string(),
++    )?;
++
++    #[cfg(unix)]
++    uv_snapshot!(context.filters(), context.pip_install().arg(&repacked_wheel), @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 1 package in [TIME]
++    Prepared 1 package in [TIME]
++    error: Failed to install: foo-0.1.0-py3-none-any.whl (foo==0.1.0 (from file://[TEMP_DIR]/foo-0.1.0-py3-none-any.whl))
++      Caused by: The wheel is invalid: Script path must resolve to a file within the scripts directory: `[TEMP_DIR]/escaped-entrypoint`
++    "
++    );
++
++    #[cfg(windows)]
++    uv_snapshot!(context.filters(), context.pip_install().arg(&repacked_wheel), @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 1 package in [TIME]
++    Prepared 1 package in [TIME]
++    error: Failed to install: foo-0.1.0-py3-none-any.whl (foo==0.1.0 (from file://[TEMP_DIR]/foo-0.1.0-py3-none-any.whl))
++      Caused by: The wheel is invalid: invalid console script: '/uv-tmp/uv/tests/[TMP]/escaped-entrypoint = foo:main'
++    "
++    );
++
++    escaped_entrypoint.assert(predicates::path::missing());
++
++    Ok(())
++}
++
++#[test]
++fn reject_normalized_reserved_wheel_entrypoint_name() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++    let repacked_wheel =
++        repacked_wheel_with_entrypoint(&context, "console_scripts", "nested/../python")?;
++
++    uv_snapshot!(context.filters(), context.pip_install().arg(&repacked_wheel), @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 1 package in [TIME]
++    Prepared 1 package in [TIME]
++    error: Failed to install: foo-0.1.0-py3-none-any.whl (foo==0.1.0 (from file://[TEMP_DIR]/foo-0.1.0-py3-none-any.whl))
++      Caused by: Scripts must not use the reserved name `python`, got: `nested/../python`
++    "
++    );
++
++    Ok(())
++}
++
++#[test]
++fn reject_normalized_reserved_gui_wheel_entrypoint_name() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++    let repacked_wheel =
++        repacked_wheel_with_entrypoint(&context, "gui_scripts", "nested/../python")?;
++
++    uv_snapshot!(context.filters(), context.pip_install().arg(&repacked_wheel), @"
++    success: false
++    exit_code: 2
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 1 package in [TIME]
++    Prepared 1 package in [TIME]
++    error: Failed to install: foo-0.1.0-py3-none-any.whl (foo==0.1.0 (from file://[TEMP_DIR]/foo-0.1.0-py3-none-any.whl))
++      Caused by: Scripts must not use the reserved name `python`, got: `nested/../python`
++    "
++    );
++
++    Ok(())
++}
++
++#[test]
++fn warn_normalized_activation_wheel_entrypoint_name() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++    let repacked_wheel =
++        repacked_wheel_with_entrypoint(&context, "console_scripts", "nested/../activate.bash")?;
++
++    uv_snapshot!(context.filters(), context.pip_install().arg(&repacked_wheel), @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 1 package in [TIME]
++    Prepared 1 package in [TIME]
++    warning: The script name `activate.bash` is reserved for virtual environment activation scripts.
++    Installed 1 package in [TIME]
++     + foo==0.1.0 (from file://[TEMP_DIR]/foo-0.1.0-py3-none-any.whl)
++    "
++    );
++
++    Ok(())
++}
++
++#[test]
++fn accept_normalized_gui_wheel_entrypoint_paths() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++    let repacked_wheel =
++        repacked_wheel_with_entrypoint(&context, "gui_scripts", "nested/../normalized-gui")?;
++
++    uv_snapshot!(context.filters(), context.pip_install().arg(&repacked_wheel), @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 1 package in [TIME]
++    Prepared 1 package in [TIME]
++    Installed 1 package in [TIME]
++     + foo==0.1.0 (from file://[TEMP_DIR]/foo-0.1.0-py3-none-any.whl)
++    "
++    );
++
++    let script_name = if cfg!(windows) {
++        "normalized-gui.exe"
++    } else {
++        "normalized-gui"
++    };
++    let normalized_script = venv_bin_path(&context.venv).join(script_name);
++    assert!(normalized_script.exists());
++
++    Ok(())
++}
++
++#[test]
++fn accept_normalized_wheel_entrypoint_paths() -> Result<()> {
++    let context = uv_test::test_context!("3.12");
++    let repacked_wheel =
++        repacked_wheel_with_entrypoint(&context, "console_scripts", "nested/../normalized-script")?;
++
++    uv_snapshot!(context.filters(), context.pip_install().arg(&repacked_wheel), @"
++    success: true
++    exit_code: 0
++    ----- stdout -----
++
++    ----- stderr -----
++    Resolved 1 package in [TIME]
++    Prepared 1 package in [TIME]
++    Installed 1 package in [TIME]
++     + foo==0.1.0 (from file://[TEMP_DIR]/foo-0.1.0-py3-none-any.whl)
++    "
++    );
++
++    let script_name = if cfg!(windows) {
++        "normalized-script.exe"
++    } else {
++        "normalized-script"
++    };
++    let normalized_script = venv_bin_path(&context.venv).join(script_name);
++    assert!(normalized_script.exists());
++
++    Ok(())
++}
++
+ #[test]
+ fn pep_751_dependency() -> Result<()> {
+     let context = uv_test::test_context!("3.12");
