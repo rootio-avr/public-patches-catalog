@@ -1,10 +1,11 @@
-# gzip : 1.12-1.root.io.1
+# gzip : 1.12-1.aikido.2
 
-This patch is based on gzip version 1.12-1.root.io.1, which is available at:
+This patch is based on gzip version 1.12-1.aikido.2, which is available at:
 https://sources.debian.org/src/gzip/1.12-1/
 
 ## Affected CVEs:
 - CVE-2026-41992
+- CVE-2026-41991
 
 ## How to Apply:
 1. Obtain the source package: `apt source gzip`
