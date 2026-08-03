@@ -8,6 +8,7 @@ unknown
 - CVE-2022-31692
 - CVE-2024-38827
 - CVE-2023-20862
+- CVE-BUILD-FIX
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework.security:spring-security
