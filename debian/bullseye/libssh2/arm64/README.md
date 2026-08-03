@@ -1,12 +1,17 @@
-# libssh2 : 1.9.0-2+deb11u1.root.io.3
+# libssh2 : 1.9.0-2+deb11u1.aikido.4
 
-This patch is based on libssh2 version 1.9.0-2+deb11u1.root.io.3, which is available at:
+This patch is based on libssh2 version 1.9.0-2+deb11u1.aikido.4, which is available at:
 https://sources.debian.org/src/libssh2/1.9.0-2+deb11u1/
 
 ## Affected CVEs:
 - CVE-2026-55199
 - CVE-2026-55200
 - CVE-2026-7598
+- CVE-2026-66032
+- CVE-2026-66034
+- CVE-2026-66033
+- CVE-2026-66035
+- CVE-2025-15661
 
 ## How to Apply:
 1. Obtain the source package: `apt source libssh2`
