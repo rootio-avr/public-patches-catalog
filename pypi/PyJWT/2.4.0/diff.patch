@@ -53,6 +53,376 @@
  
  _jws_global_obj = PyJWS()
 
+--- a/jwt/jwks_client.py
++++ b/jwt/jwks_client.py
+@@ -1,7 +1,9 @@
+ import json
++import time
+ import urllib.request
+ from functools import lru_cache
+-from typing import Any, List
++from typing import Any, List, Optional
++from urllib.error import URLError
+ 
+ from .api_jwk import PyJWK, PyJWKSet
+ from .api_jwt import decode_complete as decode_token
+@@ -9,23 +11,60 @@
+ 
+ 
+ class PyJWKClient:
+-    def __init__(self, uri: str, cache_keys: bool = True, max_cached_keys: int = 16):
++    def __init__(
++        self,
++        uri: str,
++        cache_keys: bool = True,
++        max_cached_keys: int = 16,
++        cache_jwk_set: bool = True,
++        lifespan: float = 300,
++    ):
+         self.uri = uri
++        self.jwk_set_cache: Optional["_JWKSetCache"] = None
++        if cache_jwk_set:
++            if lifespan <= 0:
++                raise PyJWKClientError(
++                    f'Lifespan must be greater than 0, the input is "{lifespan}"'
++                )
++            self.jwk_set_cache = _JWKSetCache(lifespan)
+         if cache_keys:
+             # Cache signing keys
+             # Ignore mypy (https://github.com/python/mypy/issues/2427)
+             self.get_signing_key = lru_cache(maxsize=max_cached_keys)(self.get_signing_key)  # type: ignore
+ 
+     def fetch_data(self) -> Any:
+-        with urllib.request.urlopen(self.uri) as response:
+-            return json.load(response)
++        jwk_set: Any = None
++        try:
++            with urllib.request.urlopen(self.uri) as response:
++                jwk_set = json.load(response)
++        except (URLError, TimeoutError) as e:
++            # CVE-2026-48524 (GHSA-fhv5-28vv-h8m8): raise a client error on
++            # network failures. Do NOT clear the JWK Set cache on error --
++            # the previous behavior of writing None on transient outages
++            # turned network blips into cache wipes.
++            raise PyJWKClientError(
++                f'Fail to fetch data from the url, err: "{e}"'
++            ) from e
++        else:
++            if self.jwk_set_cache is not None:
++                self.jwk_set_cache.put(jwk_set)
++        return jwk_set
+ 
+-    def get_jwk_set(self) -> PyJWKSet:
+-        data = self.fetch_data()
++    def get_jwk_set(self, refresh: bool = False) -> PyJWKSet:
++        data = None
++        if self.jwk_set_cache is not None and not refresh:
++            data = self.jwk_set_cache.get()
++
++        if data is None:
++            data = self.fetch_data()
++
++        if not isinstance(data, dict):
++            raise PyJWKClientError("The JWKS endpoint did not return a JSON object")
++
+         return PyJWKSet.from_dict(data)
+ 
+-    def get_signing_keys(self) -> List[PyJWK]:
+-        jwk_set = self.get_jwk_set()
++    def get_signing_keys(self, refresh: bool = False) -> List[PyJWK]:
++        jwk_set = self.get_jwk_set(refresh)
+         signing_keys = [
+             jwk_set_key
+             for jwk_set_key in jwk_set.keys
+@@ -39,21 +78,69 @@
+ 
+     def get_signing_key(self, kid: str) -> PyJWK:
+         signing_keys = self.get_signing_keys()
+-        signing_key = None
++        signing_key = self.match_kid(signing_keys, kid)
+ 
+-        for key in signing_keys:
+-            if key.key_id == kid:
+-                signing_key = key
+-                break
+-
+         if not signing_key:
+-            raise PyJWKClientError(
+-                f'Unable to find a signing key that matches: "{kid}"'
+-            )
++            # CVE-2026-48524 (GHSA-fhv5-28vv-h8m8): if no matching signing
++            # key is found, refresh the JWK Set once and retry. Without
++            # this guard an attacker-supplied unknown kid triggered an
++            # unbounded HTTP request per token.
++            signing_keys = self.get_signing_keys(refresh=True)
++            signing_key = self.match_kid(signing_keys, kid)
+ 
++            if not signing_key:
++                raise PyJWKClientError(
++                    f'Unable to find a signing key that matches: "{kid}"'
++                )
++
+         return signing_key
+ 
+     def get_signing_key_from_jwt(self, token: str) -> PyJWK:
+         unverified = decode_token(token, options={"verify_signature": False})
+         header = unverified["header"]
+         return self.get_signing_key(header.get("kid"))
++
++    @staticmethod
++    def match_kid(signing_keys: List[PyJWK], kid: str) -> Optional[PyJWK]:
++        signing_key = None
++
++        for key in signing_keys:
++            if key.key_id == kid:
++                signing_key = key
++                break
++
++        return signing_key
++
++
++class _JWKSetCache:
++    """In-memory time-based cache for JWK Set responses.
++
++    Kept as a private helper (leading underscore) to avoid introducing a
++    new public module while still providing the caching behavior needed
++    to fix CVE-2026-48524 (GHSA-fhv5-28vv-h8m8).
++    """
++
++    def __init__(self, lifespan: float) -> None:
++        self.jwk_set: Any = None
++        self.timestamp: float = 0.0
++        self.lifespan = lifespan
++
++    def put(self, jwk_set: Any) -> None:
++        if jwk_set is not None:
++            self.jwk_set = jwk_set
++            self.timestamp = time.monotonic()
++        else:
++            self.jwk_set = None
++            self.timestamp = 0.0
++
++    def get(self) -> Any:
++        if self.jwk_set is None or self.is_expired():
++            return None
++        return self.jwk_set
++
++    def is_expired(self) -> bool:
++        return (
++            self.jwk_set is not None
++            and self.lifespan > -1
++            and time.monotonic() > self.timestamp + self.lifespan
++        )
+--- a/tests/test_jwks_client.py
++++ b/tests/test_jwks_client.py
+@@ -1,6 +1,8 @@
+ import contextlib
+ import json
++import time
+ from unittest import mock
++from urllib.error import URLError
+ 
+ import pytest
+ 
+@@ -28,7 +30,20 @@
+     ]
+ }
+ 
++RESPONSE_DATA_NO_MATCHING_KID = {
++    "keys": [
++        {
++            "alg": "RS256",
++            "kty": "RSA",
++            "use": "sig",
++            "n": "39SJ39VgrQ0qMNK74CaueUBlyYsUyuA7yWlHYZ-jAj6tlFKugEVUTBUVbhGF44uOr99iL_cwmr-srqQDEi-jFHdkS6WFkYyZ03oyyx5dtBMtzrXPieFipSGfQ5EGUGloaKDjL-Ry9tiLnysH2VVWZ5WDDN-DGHxuCOWWjiBNcTmGfnj5_NvRHNUh2iTLuiJpHbGcPzWc5-lc4r-_ehw9EFfp2XsxE9xvtbMZ4SouJCiv9xnrnhe2bdpWuu34hXZCrQwE8DjRY3UR8LjyMxHHPLzX2LWNMHjfN3nAZMteS-Ok11VYDFI-4qCCVGo_WesBCAeqCjPLRyZoV27x1YGsUQ",
++            "e": "AQAB",
++            "kid": "MLYHNMMhwCNXw9roHIILFsK4nLs=",
++        }
++    ]
++}
+ 
++
+ @contextlib.contextmanager
+ def mocked_response(data):
+     with mock.patch("urllib.request.urlopen") as urlopen_mock:
+@@ -40,6 +55,29 @@
+         yield urlopen_mock
+ 
+ 
++@contextlib.contextmanager
++def mocked_failed_response():
++    with mock.patch("urllib.request.urlopen") as urlopen_mock:
++        urlopen_mock.side_effect = URLError("Fail to process the request.")
++        yield urlopen_mock
++
++
++@contextlib.contextmanager
++def mocked_first_call_wrong_kid_second_call_correct_kid(
++    response_data_one, response_data_two
++):
++    with mock.patch("urllib.request.urlopen") as urlopen_mock:
++        response = mock.Mock()
++        response.__enter__ = mock.Mock(return_value=response)
++        response.__exit__ = mock.Mock()
++        response.read.side_effect = [
++            json.dumps(response_data_one),
++            json.dumps(response_data_two),
++        ]
++        urlopen_mock.return_value = response
++        yield urlopen_mock
++
++
+ @crypto_required
+ class TestPyJWKClient:
+     def test_get_jwk_set(self):
+@@ -106,7 +144,7 @@
+         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+         kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+ 
+-        jwks_client = PyJWKClient(url)
++        jwks_client = PyJWKClient(url, cache_keys=True)
+ 
+         with mocked_response(RESPONSE_DATA):
+             jwks_client.get_signing_key(kid)
+@@ -122,7 +160,10 @@
+         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+         kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+ 
+-        jwks_client = PyJWKClient(url, cache_keys=False)
++        # Opt out of BOTH caching layers so a second call triggers a
++        # network fetch. The JWK-Set cache is enabled by default as of
++        # the CVE-2026-48524 fix.
++        jwks_client = PyJWKClient(url, cache_keys=False, cache_jwk_set=False)
+ 
+         with mocked_response(RESPONSE_DATA):
+             jwks_client.get_signing_key(kid)
+@@ -159,3 +200,125 @@
+             "azp": "aW4Cca79xReLWUz0aE2H6kD0O3cXBVtC",
+             "gty": "client-credentials",
+         }
++
++    def test_get_jwk_set_caches_result(self):
++        # CVE-2026-48524: JWK Set cache is enabled by default; two calls
++        # to get_jwk_set should reuse the cached response and only fetch
++        # once from the network.
++        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
++
++        jwks_client = PyJWKClient(url)
++        assert jwks_client.jwk_set_cache is not None
++
++        with mocked_response(RESPONSE_DATA):
++            jwks_client.get_jwk_set()
++
++        with mocked_response(RESPONSE_DATA) as repeated_call:
++            jwks_client.get_jwk_set()
++
++        assert repeated_call.call_count == 0
++
++    def test_get_jwk_set_cache_can_be_disabled(self):
++        # CVE-2026-48524: opting out of the JWK Set cache disables tier 1
++        # entirely so the client refetches on every call.
++        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
++
++        jwks_client = PyJWKClient(url, cache_jwk_set=False)
++        assert jwks_client.jwk_set_cache is None
++
++        with mocked_response(RESPONSE_DATA):
++            jwks_client.get_jwk_set()
++
++        with mocked_response(RESPONSE_DATA) as repeated_call:
++            jwks_client.get_jwk_set()
++
++        assert repeated_call.call_count == 1
++
++    def test_get_jwk_set_lifespan_zero_raises(self):
++        # CVE-2026-48524: reject invalid lifespan values.
++        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
++        with pytest.raises(PyJWKClientError):
++            PyJWKClient(url, lifespan=0)
++
++    def test_get_jwk_set_cache_expires(self):
++        # CVE-2026-48524: cache honors the configured lifespan.
++        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
++
++        jwks_client = PyJWKClient(url, lifespan=1)
++
++        with mocked_response(RESPONSE_DATA):
++            jwks_client.get_jwk_set()
++
++        # Force expiry by rewinding the cached timestamp past the lifespan.
++        jwks_client.jwk_set_cache.timestamp -= 5
++
++        with mocked_response(RESPONSE_DATA) as repeated_call:
++            jwks_client.get_jwk_set()
++
++        assert repeated_call.call_count == 1
++
++    def test_fetch_data_error_preserves_cache(self):
++        # CVE-2026-48524 (GHSA-fhv5-28vv-h8m8) regression: a network
++        # failure MUST NOT wipe the previously-cached JWK Set. The
++        # pre-fix behavior used a `finally` block that wrote None to the
++        # cache on any URLError.
++        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
++
++        jwks_client = PyJWKClient(url)
++
++        with mocked_response(RESPONSE_DATA):
++            jwks_client.get_jwk_set()
++
++        # A subsequent fetch fails with a URLError (transient outage).
++        with mocked_failed_response():
++            with pytest.raises(PyJWKClientError):
++                jwks_client.get_jwk_set(refresh=True)
++
++        # Cache is still populated -- no put(None) on error.
++        assert jwks_client.jwk_set_cache.get() is not None
++
++    def test_get_signing_key_refreshes_only_once_on_unknown_kid(self):
++        # CVE-2026-48524: an unknown kid must trigger AT MOST one refresh
++        # of the JWK Set (not one per token). Prior to the fix, every
++        # call to get_signing_key with an unknown kid triggered an
++        # unbounded fetch because there was no set-level cache.
++        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
++        unknown_kid = "definitely-not-in-the-set"
++
++        jwks_client = PyJWKClient(url)
++
++        with mock.patch("urllib.request.urlopen") as urlopen_mock:
++            response = mock.Mock()
++            response.__enter__ = mock.Mock(return_value=response)
++            response.__exit__ = mock.Mock()
++            # Two responses: initial fetch + one refresh. If the client
++            # tried to refresh a second time, side_effect would be
++            # exhausted and the mock would raise StopIteration.
++            response.read.side_effect = [
++                json.dumps(RESPONSE_DATA),
++                json.dumps(RESPONSE_DATA),
++            ]
++            urlopen_mock.return_value = response
++
++            with pytest.raises(PyJWKClientError):
++                jwks_client.get_signing_key(unknown_kid)
++
++            # Exactly two fetches: initial + one refresh.
++            assert urlopen_mock.call_count == 2
++
++    def test_get_signing_key_refresh_finds_new_kid(self):
++        # CVE-2026-48524: a kid not present in the cached JWK Set should
++        # trigger a single refresh, and the newly-fetched set should be
++        # searched for the kid.
++        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
++        matching_kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
++
++        jwks_client = PyJWKClient(url)
++
++        with mocked_first_call_wrong_kid_second_call_correct_kid(
++            RESPONSE_DATA_NO_MATCHING_KID, RESPONSE_DATA
++        ):
++            signing_key = jwks_client.get_signing_key(matching_kid)
++
++        assert isinstance(signing_key, PyJWK)
++        assert signing_key.key_id == matching_kid
+
 --- a/jwt/algorithms.py
 +++ b/jwt/algorithms.py
 @@ -185,11 +185,34 @@
