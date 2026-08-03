@@ -269,3 +269,168 @@
  
      def test_too_large_field(self) -> None:
          self.p.max_size = 15
+
+diff --git a/python_multipart/multipart.py b/python_multipart/multipart.py
+index 9d53e61..cb7c366 100644
+--- a/python_multipart/multipart.py
++++ b/python_multipart/multipart.py
+@@ -5,7 +5,6 @@ import os
+ import shutil
+ import sys
+ import tempfile
+-from email.message import Message
+ from enum import IntEnum
+ from io import BufferedRandom, BytesIO
+ from numbers import Number
+@@ -148,10 +147,37 @@ DEFAULT_MAX_HEADER_SIZE = 4096 + 128
+ """Default maximum size of a single multipart header line, including syntax overhead."""
+ 
+ 
++def _parseparam(s: str) -> list[str]:
++    # Vendored from the standard library's
++    # [`email.message._parseparam`](https://github.com/python/cpython/blob/v3.14.2/Lib/email/message.py#L73-L96)
++    # to split a header into its `;`-separated parts without treating a `;` inside a double-quoted string as a
++    # separator - and without the RFC 2231 decoding that `email.message.Message.get_params` would apply on top.
++    s = ";" + s
++    plist: list[str] = []
++    start = 0
++    while s.find(";", start) == start:
++        start += 1
++        end = s.find(";", start)
++        ind, diff = start, 0
++        while end > 0:
++            diff += s.count('"', ind, end) - s.count('\"', ind, end)
++            if diff % 2 == 0:
++                break
++            end, ind = ind, s.find(";", end + 1)
++        if end < 0:
++            end = len(s)
++        i = s.find("=", start, end)
++        if i == -1:
++            f = s[start:end]
++        else:
++            f = s[start:i].rstrip().lower() + "=" + s[i + 1 : end].lstrip()
++        plist.append(f.strip())
++        start = end
++    return plist
++
++
+ def parse_options_header(value: str | bytes | None) -> tuple[bytes, dict[bytes, bytes]]:
+     """Parses a Content-Type header into a value in the following format: (content_type, {parameters})."""
+-    # Uses email.message.Message to parse the header as described in PEP 594.
+-    # Ref: https://peps.python.org/pep-0594/#cgi
+     if not value:
+         return (b"", {})
+ 
+@@ -166,29 +192,24 @@ def parse_options_header(value: str | bytes | None) -> tuple[bytes, dict[bytes,
+     if ";" not in value:
+         return (value.lower().strip().encode("latin-1"), {})
+ 
+-    # Split at the first semicolon, to get our value and then options.
+-    # ctype, rest = value.split(b';', 1)
+-    message = Message()
+-    message["content-type"] = value
+-    params = message.get_params()
+-    # If there were no parameters, this would have already returned above
+-    assert params, "At least the content type value should be present"
+-    ctype = params.pop(0)[0].encode("latin-1")
++    ctype, *segments = _parseparam(value)
+     options: dict[bytes, bytes] = {}
+-    for param in params:
+-        key, value = param
+-        # If the value returned from get_params() is a 3-tuple, the last
+-        # element corresponds to the value.
+-        # See: https://docs.python.org/3/library/email.compat32-message.html
+-        if isinstance(value, tuple):
+-            value = value[-1]
+-        # If the value is a filename, we need to fix a bug on IE6 that sends
+-        # the full file path instead of the filename.
+-        if key == "filename":
+-            if value[1:3] == ":\\" or value[:2] == "\\\\":
+-                value = value.split("\\")[-1]
+-        options[key.encode("latin-1")] = value.encode("latin-1")
+-    return ctype, options
++    for segment in segments:
++        key, _, val = segment.partition("=")
++        # [RFC 7578 §4.2](https://datatracker.ietf.org/doc/html/rfc7578#section-4.2)
++        # forbids the RFC 5987/2231 extended syntax (`key*=`, `key*0`, ...) in
++        # multipart/form-data, so we ignore those parameters and keep the plain
++        # `key` authoritative.
++        if "*" in key:
++            continue
++        if len(val) >= 2 and val[0] == '"' and val[-1] == '"':
++            val = val[1:-1].replace("\\\\", "\\").replace('\\"', '"')
++        # Work around an IE6 bug where the full file path is sent instead of
++        # just the filename.
++        if key == "filename" and (val[1:3] == ":\\" or val[:2] == "\\\\"):
++            val = val.split("\\")[-1]
++        options[key.encode("latin-1")] = val.encode("latin-1")
++    return ctype.encode("latin-1"), options
+ 
+ 
+ class Field:
+diff --git a/tests/test_multipart.py b/tests/test_multipart.py
+index 85724ae..7b592b1 100644
+--- a/tests/test_multipart.py
++++ b/tests/test_multipart.py
+@@ -299,10 +299,58 @@ class TestParseOptionsHeader(unittest.TestCase):
+         # If vulnerable, this test wouldn't finish, the line above would hang
+         self.assertIn(b'"\\', p[b"!"])
+ 
+-    def test_handles_rfc_2231(self) -> None:
++    def test_ignores_rfc_2231_extended_param(self) -> None:
++        # RFC 7578 §4.2 forbids the RFC 5987/2231 extended syntax, so the
++        # decoded `param*` value is not exposed under `param`.
+         t, p = parse_options_header(b"text/plain; param*=us-ascii'en-us'encoded%20message")
+ 
+-        self.assertEqual(p[b"param"], b"encoded message")
++        self.assertEqual(t, b"text/plain")
++        self.assertEqual(p, {})
++
++    def test_plain_param_authoritative_over_extended(self) -> None:
++        # When both plain and extended forms are present, the plain one wins
++        # and the extended one is ignored.
++        _, p = parse_options_header(b"form-data; name=\"comment\"; name*=utf-8''other")
++
++        self.assertEqual(p, {b"name": b"comment"})
++
++    def test_ignores_rfc_2231_continuation_filename(self) -> None:
++        _, p = parse_options_header(b'form-data; name="f"; filename*0="a"; filename*1="b.txt"')
++
++        self.assertEqual(p, {b"name": b"f"})
++
++    def test_ignores_oversized_rfc_2231_index(self) -> None:
++        t, p = parse_options_header("text/plain; filename*" + ("1" * 4301) + "*=utf-8''x")
++
++        self.assertEqual(t, b"text/plain")
++        self.assertEqual(p, {})
++
++    def test_ignores_mixed_rfc_2231_continuations(self) -> None:
++        t, p = parse_options_header("text/plain; filename*=utf-8''a; filename*0*=utf-8''b")
++
++        self.assertEqual(t, b"text/plain")
++        self.assertEqual(p, {})
++
++    def test_ignores_extended_param_case_insensitively(self) -> None:
++        _, p = parse_options_header(b"text/plain; UPPER*=utf-8''X")
++
++        self.assertEqual(p, {})
++
++    def test_preserves_quoted_semicolons_and_escapes(self) -> None:
++        _, p = parse_options_header(b'text/plain; a="x;y"; b="esc \\" quote"')
++
++        self.assertEqual(p, {b"a": b"x;y", b"b": b'esc " quote'})
++
++    def test_preserves_content_type_case(self) -> None:
++        t, p = parse_options_header(b"Text/Plain; a=b")
++
++        self.assertEqual(t, b"Text/Plain")
++        self.assertEqual(p, {b"a": b"b"})
++
++    def test_preserves_backslash_unquoting_order(self) -> None:
++        _, p = parse_options_header(b'text/plain; q="a\\\\b"')
++
++        self.assertEqual(p, {b"q": b"a\\b"})
+ 
+ 
+ class TestBaseParser(unittest.TestCase):
