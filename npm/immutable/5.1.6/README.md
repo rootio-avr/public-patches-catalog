@@ -4,6 +4,7 @@ This patch is based on immutable version 5.1.6, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-59880
 - CVE-2026-59879
 
 ## How to Apply:
