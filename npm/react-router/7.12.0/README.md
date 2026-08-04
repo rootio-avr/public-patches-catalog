@@ -9,6 +9,8 @@ unknown
 - CVE-2026-40181
 - CVE-2026-42211
 - CVE-2026-42342
+- CVE-2026-55685
+- GHSA-qwww-vcr4-c8h2
 
 ## How to Apply:
 1. Clone or download the source code for react-router
