@@ -1,12 +1,13 @@
-# util-linux : 2.36.1-8+deb11u2.root.io.2
+# util-linux : 2.36.1-8+deb11u2.aikido.3
 
-This patch is based on util-linux version 2.36.1-8+deb11u2.root.io.2, which is available at:
+This patch is based on util-linux version 2.36.1-8+deb11u2.aikido.3, which is available at:
 https://sources.debian.org/src/util-linux/2.36.1-8+deb11u2/
 
 ## Affected CVEs:
 - CVE-2025-14104
 - CVE-2026-27456
 - CVE-2026-53615
+- CVE-2026-13595
 
 ## How to Apply:
 1. Obtain the source package: `apt source util-linux`
