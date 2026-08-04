@@ -16,6 +16,7 @@ unknown
 - CVE-2025-0716
 - GHSA-5cp4-xmrw-59wf
 - GHSA-28hp-fgcr-2r4h
+- CVE-2026-11998
 
 ## How to Apply:
 1. Clone or download the source code for angular
