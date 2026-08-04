@@ -15,6 +15,7 @@ unknown
 - CVE-2026-44580
 - CVE-2026-44581
 - CVE-2026-45109
+- CVE-2026-64645
 - GHSA-8h8q-6873-q5fj
 
 ## How to Apply:
