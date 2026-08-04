@@ -1,6 +1,6 @@
-# perl : 5.40.1-6.aikido.6
+# perl : 5.40.1-6.aikido.7
 
-This patch is based on perl version 5.40.1-6.aikido.6, which is available at:
+This patch is based on perl version 5.40.1-6.aikido.7, which is available at:
 https://sources.debian.org/src/perl/5.40.1-6/
 
 ## Affected CVEs:
