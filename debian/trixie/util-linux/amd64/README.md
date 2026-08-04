@@ -1,6 +1,6 @@
-# util-linux : 2.41-5.root.io.4
+# util-linux : 2.41-5.aikido.5
 
-This patch is based on util-linux version 2.41-5.root.io.4, which is available at:
+This patch is based on util-linux version 2.41-5.aikido.5, which is available at:
 https://sources.debian.org/src/util-linux/2.41-5/
 
 ## Affected CVEs:
@@ -8,6 +8,7 @@ https://sources.debian.org/src/util-linux/2.41-5/
 - CVE-2026-27456
 - CVE-2026-3184
 - CVE-2026-53615
+- CVE-2026-13595
 
 ## How to Apply:
 1. Obtain the source package: `apt source util-linux`
