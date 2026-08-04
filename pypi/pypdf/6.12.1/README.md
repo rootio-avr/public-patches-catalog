@@ -6,8 +6,10 @@ unknown
 ## Affected CVEs:
 - CVE-2026-49461
 - CVE-2026-54530
-- CVE-2026-59937
 - CVE-2026-54531
+- CVE-2026-59937
+- CVE-2026-59935
+- CVE-2026-59936
 - GHSA-jm82-fx9c-mx94
 
 ## How to Apply:
