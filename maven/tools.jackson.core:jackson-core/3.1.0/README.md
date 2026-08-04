@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-2m67-wjpj-xhg9
+- GHSA-r7wm-3cxj-wff9
 
 ## How to Apply:
 1. Clone or download the source code for tools.jackson.core:jackson-core
