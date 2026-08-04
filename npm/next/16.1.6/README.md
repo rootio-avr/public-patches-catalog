@@ -4,24 +4,25 @@ This patch is based on next version 16.1.6, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-27977
+- CVE-2026-27978
 - CVE-2026-27979
 - CVE-2026-27980
+- CVE-2026-29057
+- CVE-2026-44572
 - CVE-2026-44573
 - CVE-2026-44574
 - CVE-2026-44575
+- CVE-2026-44576
+- CVE-2026-44577
 - CVE-2026-44578
 - CVE-2026-44579
-- CVE-2026-45109
-- GHSA-8h8q-6873-q5fj
-- GHSA-q4gf-8mx6-v5v3
-- CVE-2026-29057
-- CVE-2026-44572
-- CVE-2026-44577
-- CVE-2026-27978
-- CVE-2026-44576
-- CVE-2026-27977
 - CVE-2026-44580
 - CVE-2026-44581
+- CVE-2026-45109
+- CVE-2026-64645
+- GHSA-8h8q-6873-q5fj
+- GHSA-q4gf-8mx6-v5v3
 
 ## How to Apply:
 1. Clone or download the source code for next
