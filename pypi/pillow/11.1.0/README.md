@@ -4,9 +4,12 @@ This patch is based on pillow version 11.1.0, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-42311
 - CVE-2026-25990
 - CVE-2026-40192
+- CVE-2026-42308
+- CVE-2026-42310
+- CVE-2026-42311
+- CVE-2026-54058
 
 ## How to Apply:
 1. Clone or download the source code for pillow
