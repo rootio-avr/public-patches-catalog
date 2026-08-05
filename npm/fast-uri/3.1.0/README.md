@@ -4,9 +4,10 @@ This patch is based on fast-uri version 3.1.0, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-13676
 - CVE-2026-6321
 - CVE-2026-6322
+- CVE-2026-13676
+- CVE-2026-16221
 
 ## How to Apply:
 1. Clone or download the source code for fast-uri
