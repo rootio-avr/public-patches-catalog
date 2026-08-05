@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2025-5889
 - CVE-2026-13149
+- CVE-2026-14257
 - CVE-2026-33750
 
 ## How to Apply:
