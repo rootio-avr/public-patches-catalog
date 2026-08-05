@@ -1,6 +1,6 @@
-# perl : 5.40.1-6.aikido.7
+# perl : 5.40.1-6.aikido.8
 
-This patch is based on perl version 5.40.1-6.aikido.7, which is available at:
+This patch is based on perl version 5.40.1-6.aikido.8, which is available at:
 https://sources.debian.org/src/perl/5.40.1-6/
 
 ## Affected CVEs:
@@ -17,6 +17,7 @@ https://sources.debian.org/src/perl/5.40.1-6/
 - CVE-2026-48961
 - CVE-2026-12087
 - CVE-2026-57433
+- CVE-2026-7017
 
 ## How to Apply:
 1. Obtain the source package: `apt source perl`
