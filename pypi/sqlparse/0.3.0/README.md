@@ -7,6 +7,7 @@ unknown
 - CVE-2023-30608
 - CVE-2024-4340
 - GHSA-27jp-wm6q-gp25
+- GHSA-62qf-jcq8-8gxw
 
 ## How to Apply:
 1. Clone or download the source code for sqlparse
