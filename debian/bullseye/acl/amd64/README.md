@@ -1,10 +1,11 @@
-# acl : 2.2.53-10.root.io.1
+# acl : 2.2.53-10.aikido.2
 
-This patch is based on acl version 2.2.53-10.root.io.1, which is available at:
+This patch is based on acl version 2.2.53-10.aikido.2, which is available at:
 https://sources.debian.org/src/acl/2.2.53-10/
 
 ## Affected CVEs:
 - CVE-2026-54369
+- CVE-2026-54370
 
 ## How to Apply:
 1. Obtain the source package: `apt source acl`
