@@ -4,6 +4,7 @@ This patch is based on knex version 0.95.15, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-10469
 - CVE-2016-20018
 
 ## How to Apply:
