@@ -13,6 +13,9 @@ unknown
 - GHSA-3rp5-jjmw-4wv2
 - GHSA-r9mr-m37c-5fr3
 - GHSA-2f96-g7mh-g2hx
+- GHSA-956x-8gvw-wg5v
+- GHSA-94p4-4cq8-9g67
+- GHSA-rwj8-pgh3-r573
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
