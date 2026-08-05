@@ -1,6 +1,6 @@
-# perl : 5.32.1-4+deb11u5.aikido.6
+# perl : 5.32.1-4+deb11u5.aikido.7
 
-This patch is based on perl version 5.32.1-4+deb11u5.aikido.6, which is available at:
+This patch is based on perl version 5.32.1-4+deb11u5.aikido.7, which is available at:
 https://sources.debian.org/src/perl/5.32.1-4+deb11u5/
 
 ## Affected CVEs:
@@ -18,6 +18,7 @@ https://sources.debian.org/src/perl/5.32.1-4+deb11u5/
 - CVE-2025-15649
 - CVE-2026-12087
 - CVE-2026-57433
+- CVE-2026-7017
 
 ## How to Apply:
 1. Obtain the source package: `apt source perl`
