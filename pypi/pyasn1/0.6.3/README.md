@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-59886
+- CVE-2026-59885
 
 ## How to Apply:
 1. Clone or download the source code for pyasn1
