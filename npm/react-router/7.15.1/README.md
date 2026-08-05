@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-55685
+- GHSA-qwww-vcr4-c8h2
 
 ## How to Apply:
 1. Clone or download the source code for react-router
