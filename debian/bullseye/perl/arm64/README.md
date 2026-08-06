@@ -1,6 +1,6 @@
-# perl : 5.32.1-4+deb11u5.aikido.7
+# perl : 5.32.1-4+deb11u5.aikido.8
 
-This patch is based on perl version 5.32.1-4+deb11u5.aikido.7, which is available at:
+This patch is based on perl version 5.32.1-4+deb11u5.aikido.8, which is available at:
 https://sources.debian.org/src/perl/5.32.1-4+deb11u5/
 
 ## Affected CVEs:
