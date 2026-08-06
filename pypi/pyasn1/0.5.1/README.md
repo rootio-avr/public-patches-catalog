@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-30922
+- CVE-2026-59884
 - CVE-2026-59885
 - CVE-2026-59886
 
