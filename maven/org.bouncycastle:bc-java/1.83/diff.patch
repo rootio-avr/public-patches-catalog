@@ -839,3 +839,619 @@ index 8121a498e..e1af28594 100644
          for (Iterator it = signers.iterator(); it.hasNext(); )
          {
              SignerInformation signer = (SignerInformation)it.next();
+
+Description: Fix CVE-2026-59642 - bind CMS AuthenticatedData content to MAC via messageDigest
+ When authenticated attributes are present, RFC 5652 sec. 9.3 MACs DER(authAttrs)
+ rather than the content. The content is bound only through the messageDigest
+ attribute; RecipientInformation exposed getContentDigest() but never compared it,
+ so callers checking only getMac() accepted content substitution. getMac() now
+ verifies the recovered content digest against messageDigest and throws
+ CMSRuntimeException on mismatch; getContentDigest() caches the digest so it is
+ idempotent.
+Origin: upstream, https://github.com/bcgit/bc-java/commit/2117f316a5a47308f3e569695a6592b16aac0dd7
+Bug: https://github.com/bcgit/bc-java/wiki/CVE%E2%80%902026%E2%80%9059642
+Last-Update: 2026-08-06
+
+--- a/pkix/src/main/java/org/bouncycastle/cms/RecipientInformation.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/RecipientInformation.java
+@@ -5,7 +5,12 @@
+ 
+ import org.bouncycastle.asn1.ASN1Encoding;
+ import org.bouncycastle.asn1.ASN1ObjectIdentifier;
++import org.bouncycastle.asn1.ASN1OctetString;
++import org.bouncycastle.asn1.cms.Attribute;
++import org.bouncycastle.asn1.cms.AttributeTable;
++import org.bouncycastle.asn1.cms.CMSAttributes;
+ import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
++import org.bouncycastle.util.Arrays;
+ import org.bouncycastle.util.io.Streams;
+ 
+ public abstract class RecipientInformation
+@@ -15,6 +20,7 @@
+     protected AlgorithmIdentifier messageAlgorithm;
+     protected CMSSecureReadable secureReadable;
+     private byte[] resultMac;
++    private byte[] contentDigest;
+     private RecipientOperator operator;
+ 
+     RecipientInformation(
+@@ -78,11 +84,16 @@
+      */
+     public byte[] getContentDigest()
+     {
+-        if (secureReadable instanceof CMSEnvelopedHelper.CMSDigestAuthenticatedSecureReadable)
++        // Cache the computed digest: the underlying DigestCalculator.getDigest() finalises (resets)
++        // the digest, so it must be read exactly once. getMac() now also needs this value (to bind
++        // the content to the MAC), so without caching a getMac() call would consume the digest and a
++        // later getContentDigest() would return the digest of an empty input.
++        if (contentDigest == null
++            && secureReadable instanceof CMSEnvelopedHelper.CMSDigestAuthenticatedSecureReadable)
+         {
+-            return ((CMSEnvelopedHelper.CMSDigestAuthenticatedSecureReadable)secureReadable).getDigest();
++            contentDigest = ((CMSEnvelopedHelper.CMSDigestAuthenticatedSecureReadable)secureReadable).getDigest();
+         }
+-        return null;
++        return contentDigest;
+     }
+ 
+     /**
+@@ -97,6 +108,14 @@
+         {
+             if (operator.isMacBased() && secureReadable.hasAdditionalData())
+             {
++                // RFC 5652 sec. 9.3: with authenticated attributes present the MAC is computed over the
++                // attributes, not the content, so the content is bound to the MAC only through the
++                // messageDigest authenticated attribute. Verify that the digest computed over the
++                // content just read matches that attribute before producing the MAC; otherwise an
++                // attacker could replace encapContentInfo.eContent while leaving authAttrs and the MAC
++                // untouched and a recipient comparing only getMac() values would accept the forgery.
++                checkContentDigestMatchesMessageDigestAttribute();
++
+                 try
+                 {
+                     Streams.drain(operator.getInputStream(new ByteArrayInputStream(secureReadable.getAuthAttrSet().getEncoded(ASN1Encoding.DER))));
+@@ -111,6 +130,27 @@
+         return resultMac;
+     }
+ 
++    private void checkContentDigestMatchesMessageDigestAttribute()
++    {
++        byte[] contentDigest = getContentDigest();
++        if (contentDigest == null)
++        {
++            throw new CMSRuntimeException("unable to verify messageDigest attribute: content digest not available");
++        }
++
++        Attribute messageDigestAttr = new AttributeTable(secureReadable.getAuthAttrSet()).get(CMSAttributes.messageDigest);
++        if (messageDigestAttr == null || messageDigestAttr.getAttrValues().size() != 1)
++        {
++            throw new CMSRuntimeException("AuthenticatedData missing or malformed messageDigest authenticated attribute");
++        }
++
++        byte[] expectedDigest = ASN1OctetString.getInstance(messageDigestAttr.getAttrValues().getObjectAt(0)).getOctets();
++        if (!Arrays.constantTimeAreEqual(contentDigest, expectedDigest))
++        {
++            throw new CMSRuntimeException("content digest does not match messageDigest authenticated attribute");
++        }
++    }
++
+     /**
+      * Return the decrypted/encapsulated content in the EnvelopedData after recovering the content
+      * encryption/MAC key using the passed in Recipient.
+--- a/pkix/src/test/java/org/bouncycastle/cms/test/NewAuthenticatedDataTest.java
++++ b/pkix/src/test/java/org/bouncycastle/cms/test/NewAuthenticatedDataTest.java
+@@ -31,6 +31,7 @@
+ import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
+ import org.bouncycastle.cert.X509CertificateHolder;
+ import org.bouncycastle.cms.CMSAlgorithm;
++import org.bouncycastle.cms.CMSRuntimeException;
+ import org.bouncycastle.cms.CMSAuthenticatedData;
+ import org.bouncycastle.cms.CMSAuthenticatedDataGenerator;
+ import org.bouncycastle.cms.CMSException;
+@@ -510,6 +511,64 @@
+         }
+     }
+ 
++    public void testTamperedContentIsRejected()
++        throws Exception
++    {
++        byte[] data = "Eric H. Echidna".getBytes();
++
++        CMSAuthenticatedDataGenerator adGen = new CMSAuthenticatedDataGenerator();
++        DigestCalculatorProvider calcProvider = new JcaDigestCalculatorProviderBuilder().setProvider(BC).build();
++        adGen.addRecipientInfoGenerator(new JceKeyTransRecipientInfoGenerator(_reciCert).setProvider(BC));
++
++        // generate with authenticated attributes (the messageDigest attribute path)
++        CMSAuthenticatedData ad = adGen.generate(
++            new CMSProcessableByteArray(data),
++            new JceCMSMacCalculatorBuilder(CMSAlgorithm.DES_EDE3_CBC).setProvider(BC).build(),
++            calcProvider.get(new AlgorithmIdentifier(OIWObjectIdentifiers.idSHA1)));
++
++        // AuthenticatedData authenticates but does not encrypt the content, so the plaintext is
++        // present in the encoding. Flip one content byte to simulate an in-transit substitution,
++        // leaving authAttrs and the MAC untouched.
++        byte[] encoded = ad.getEncoded();
++        int idx = indexOf(encoded, data);
++        assertTrue("content not located in encoding", idx >= 0);
++        encoded[idx] ^= 0x01;
++
++        CMSAuthenticatedData tampered = new CMSAuthenticatedData(encoded, calcProvider);
++        RecipientInformation recipient =
++            (RecipientInformation)tampered.getRecipientInfos().getRecipients().iterator().next();
++
++        // read the (tampered) content so the content digest is computed
++        recipient.getContent(new JceKeyTransAuthenticatedRecipient(_reciKP.getPrivate()).setProvider(BC));
++
++        try
++        {
++            recipient.getMac();
++            fail("tampered AuthenticatedData content must not yield a valid MAC");
++        }
++        catch (CMSRuntimeException e)
++        {
++            // expected: the recovered content digest no longer matches the messageDigest attribute
++        }
++    }
++
++    private static int indexOf(byte[] haystack, byte[] needle)
++    {
++        for (int i = 0; i <= haystack.length - needle.length; i++)
++        {
++            int j = 0;
++            while (j < needle.length && haystack[i + j] == needle[j])
++            {
++                j++;
++            }
++            if (j == needle.length)
++            {
++                return i;
++            }
++        }
++        return -1;
++    }
++
+     private void tryKeyTransWithDigest(ASN1ObjectIdentifier macAlg)
+         throws Exception
+     {
+
+Description: Fix CVE-2026-12802 - allow CMS recipients to require a minimum AEAD tag size
+ AuthEnvelopedData recipients did not enforce a caller-chosen AEAD authentication
+ tag length floor, so an attacker could downgrade a GCM/CCM ICV to a weaker size.
+ Adds AbstractRecipient (1.83 lacks the later shared base), CMSTagLengthException,
+ and setMinimumTagSize() on JCA/JCE recipients with checkTagSize on extract paths.
+Origin: upstream, https://github.com/bcgit/bc-java/commit/0fefa539e6ac5c66e1daee5a13b23d1d4769cc01
+Bug: https://github.com/bcgit/bc-java/wiki/CVE%E2%80%902026%E2%80%9012802
+Last-Update: 2026-08-06
+
+--- /dev/null
++++ b/pkix/src/main/java/org/bouncycastle/cms/AbstractRecipient.java
+@@ -0,0 +1,66 @@
++package org.bouncycastle.cms;
++
++import org.bouncycastle.asn1.ASN1ObjectIdentifier;
++import org.bouncycastle.asn1.cms.CCMParameters;
++import org.bouncycastle.asn1.cms.GCMParameters;
++import org.bouncycastle.asn1.x509.AlgorithmIdentifier;
++
++/**
++ * Base class for the CMS recipient implementations, carrying the optional restriction on the minimum
++ * AEAD authentication tag size a recipient is willing to accept.
++ */
++public abstract class AbstractRecipient
++{
++    private int minimumTagSizeInBits = 0;
++
++    protected final void setMinimumTagSizeInBits(int tagSizeInBits)
++    {
++        this.minimumTagSizeInBits = tagSizeInBits;
++    }
++
++    /**
++     * Refuse an AEAD content algorithm whose authentication tag is shorter than the configured
++     * minimum. A no-op when no minimum is set or when the content algorithm is not AEAD.
++     *
++     * @param contentAlgorithm the content-encryption AlgorithmIdentifier (carries the AEAD ICV length).
++     * @throws CMSTagLengthException if the tag size is below the configured minimum.
++     */
++    protected final void checkTagSize(AlgorithmIdentifier contentAlgorithm)
++        throws CMSTagLengthException
++    {
++        if (minimumTagSizeInBits > 0)
++        {
++            int macLenOctets = getAEADMacLength(contentAlgorithm);
++
++            if (macLenOctets >= 0 && macLenOctets * 8 < minimumTagSizeInBits)
++            {
++                throw new CMSTagLengthException("AEAD tag size " + (macLenOctets * 8)
++                    + " bits below required minimum " + minimumTagSizeInBits + " bits");
++            }
++        }
++    }
++
++    /**
++     * Return the AEAD authentication tag (ICV) length in octets carried by the given content-encryption
++     * algorithm, or -1 if the algorithm is not a recognised AEAD algorithm.
++     */
++    private static int getAEADMacLength(AlgorithmIdentifier encAlgId)
++    {
++        ASN1ObjectIdentifier algorithm = encAlgId.getAlgorithm();
++
++        if (CMSAlgorithm.AES128_GCM.equals(algorithm)
++            || CMSAlgorithm.AES192_GCM.equals(algorithm)
++            || CMSAlgorithm.AES256_GCM.equals(algorithm))
++        {
++            return GCMParameters.getInstance(encAlgId.getParameters()).getIcvLen();
++        }
++        if (CMSAlgorithm.AES128_CCM.equals(algorithm)
++            || CMSAlgorithm.AES192_CCM.equals(algorithm)
++            || CMSAlgorithm.AES256_CCM.equals(algorithm))
++        {
++            return CCMParameters.getInstance(encAlgId.getParameters()).getIcvLen();
++        }
++
++        return -1;
++    }
++}
+--- /dev/null
++++ b/pkix/src/main/java/org/bouncycastle/cms/CMSTagLengthException.java
+@@ -0,0 +1,23 @@
++package org.bouncycastle.cms;
++
++/**
++ * Exception thrown when a recipient is asked to recover AEAD-protected content whose authentication
++ * tag is shorter than the recipient's configured minimum tag size (see
++ * {@code Jce*Recipient.setMinimumTagSize}).
++ */
++public class CMSTagLengthException
++    extends CMSException
++{
++    public CMSTagLengthException(
++        String msg)
++    {
++        super(msg);
++    }
++
++    public CMSTagLengthException(
++        String msg,
++        Exception e)
++    {
++        super(msg, e);
++    }
++}
+--- a/pkix/src/main/java/org/bouncycastle/cms/bc/BcKEKRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/bc/BcKEKRecipient.java
+@@ -9,6 +9,7 @@
+ import org.bouncycastle.operator.bc.BcSymmetricKeyUnwrapper;
+ 
+ public abstract class BcKEKRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements KEKRecipient
+ {
+     private SymmetricKeyUnwrapper unwrapper;
+@@ -21,6 +22,8 @@
+     protected CipherParameters extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier contentEncryptionAlgorithm, byte[] encryptedContentEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(contentEncryptionAlgorithm);
++
+         try
+         {
+             return CMSUtils.getBcKey(unwrapper.generateUnwrappedKey(contentEncryptionAlgorithm, encryptedContentEncryptionKey));
+--- a/pkix/src/main/java/org/bouncycastle/cms/bc/BcKeyTransRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/bc/BcKeyTransRecipient.java
+@@ -10,6 +10,7 @@
+ import org.bouncycastle.operator.bc.BcRSAAsymmetricKeyUnwrapper;
+ 
+ public abstract class BcKeyTransRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements KeyTransRecipient
+ {
+     private AsymmetricKeyParameter recipientKey;
+@@ -22,6 +23,8 @@
+     protected CipherParameters extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier encryptedKeyAlgorithm, byte[] encryptedEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(encryptedKeyAlgorithm);
++
+         AsymmetricKeyUnwrapper unwrapper = new BcRSAAsymmetricKeyUnwrapper(keyEncryptionAlgorithm, recipientKey);
+ 
+         try
+--- a/pkix/src/main/java/org/bouncycastle/cms/bc/BcPasswordRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/bc/BcPasswordRecipient.java
+@@ -17,6 +17,7 @@
+  * encrypted using a password.
+  */
+ public abstract class BcPasswordRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements PasswordRecipient
+ {
+     private final char[] password;
+@@ -39,6 +40,8 @@
+     protected KeyParameter extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier contentEncryptionAlgorithm, byte[] derivedKey, byte[] encryptedContentEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(contentEncryptionAlgorithm);
++
+         Wrapper keyEncryptionCipher = EnvelopedDataHelper.createRFC3211Wrapper(keyEncryptionAlgorithm.getAlgorithm());
+ 
+         keyEncryptionCipher.init(false, new ParametersWithIV(new KeyParameter(derivedKey), ASN1OctetString.getInstance(keyEncryptionAlgorithm.getParameters()).getOctets()));
+--- a/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKEKRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKEKRecipient.java
+@@ -12,6 +12,7 @@
+ import org.bouncycastle.operator.SymmetricKeyUnwrapper;
+ 
+ public abstract class JceKEKRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements KEKRecipient
+ {
+     private SecretKey recipientKey;
+@@ -95,9 +96,26 @@
+         return this;
+     }
+ 
++    /**
++     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
++     * attempt to recover AuthEnvelopedData whose content algorithm carries a shorter tag is rejected,
++     * mitigating an attacker downgrading the tag to a weaker length.
++     *
++     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
++     * @return this recipient.
++     */
++    public JceKEKRecipient setMinimumTagSize(int tagSizeInBits)
++    {
++        setMinimumTagSizeInBits(tagSizeInBits);
++
++        return this;
++    }
++
+     protected Key extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier encryptedKeyAlgorithm, byte[] encryptedContentEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(encryptedKeyAlgorithm);
++
+         SymmetricKeyUnwrapper unwrapper = helper.createSymmetricUnwrapper(keyEncryptionAlgorithm, recipientKey);
+ 
+         try
+--- a/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKEMRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKEMRecipient.java
+@@ -15,6 +15,7 @@
+ import org.bouncycastle.operator.OperatorException;
+ 
+ public abstract class JceKEMRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements KEMRecipient
+ {
+     private PrivateKey recipientKey;
+@@ -139,9 +140,26 @@
+         return this;
+     }
+ 
++    /**
++     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
++     * attempt to recover AuthEnvelopedData whose content algorithm carries a shorter tag is rejected,
++     * mitigating an attacker downgrading the tag to a weaker length.
++     *
++     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
++     * @return this recipient.
++     */
++    public JceKEMRecipient setMinimumTagSize(int tagSizeInBits)
++    {
++        setMinimumTagSizeInBits(tagSizeInBits);
++
++        return this;
++    }
++
+     protected Key extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier encryptedKeyAlgorithm, byte[] encryptedEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(encryptedKeyAlgorithm);
++
+         // TODO: note there is a move to change the type for KEMs from KeyTrans, expect this to change
+         KEMRecipientInfo gktParams = KEMRecipientInfo.getInstance(keyEncryptionAlgorithm.getParameters());
+ 
+--- a/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKeyAgreeRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKeyAgreeRecipient.java
+@@ -43,6 +43,7 @@
+ import org.bouncycastle.util.Pack;
+ 
+ public abstract class JceKeyAgreeRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements KeyAgreeRecipient
+ {
+     private static final Set possibleOldMessages = new HashSet();
+@@ -163,6 +164,21 @@
+         return this;
+     }
+ 
++    /**
++     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
++     * attempt to recover AuthEnvelopedData whose content algorithm carries a shorter tag is rejected,
++     * mitigating an attacker downgrading the tag to a weaker length.
++     *
++     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
++     * @return this recipient.
++     */
++    public JceKeyAgreeRecipient setMinimumTagSize(int tagSizeInBits)
++    {
++        setMinimumTagSizeInBits(tagSizeInBits);
++
++        return this;
++    }
++
+     private SecretKey calculateAgreedWrapKey(AlgorithmIdentifier keyEncAlg, AlgorithmIdentifier wrapAlg,
+                                              PublicKey senderPublicKey, ASN1OctetString userKeyingMaterial, PrivateKey receiverPrivateKey, KeyMaterialGenerator kmGen)
+         throws CMSException, GeneralSecurityException, IOException
+@@ -251,6 +267,8 @@
+     protected Key extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier contentEncryptionAlgorithm, SubjectPublicKeyInfo senderKey, ASN1OctetString userKeyingMaterial, byte[] encryptedContentEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(contentEncryptionAlgorithm);
++
+         try
+         {
+             AlgorithmIdentifier wrapAlg =
+--- a/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKeyTransRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/jcajce/JceKeyTransRecipient.java
+@@ -31,6 +31,7 @@
+ import org.bouncycastle.util.Arrays;
+ 
+ public abstract class JceKeyTransRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements KeyTransRecipient
+ {
+     private PrivateKey recipientKey;
+@@ -155,9 +156,26 @@
+         return this;
+     }
+ 
++    /**
++     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
++     * attempt to recover AuthEnvelopedData whose content algorithm carries a shorter tag is rejected,
++     * mitigating an attacker downgrading the tag to a weaker length.
++     *
++     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
++     * @return this recipient.
++     */
++    public JceKeyTransRecipient setMinimumTagSize(int tagSizeInBits)
++    {
++        setMinimumTagSizeInBits(tagSizeInBits);
++
++        return this;
++    }
++
+     protected Key extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier encryptedKeyAlgorithm, byte[] encryptedEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(encryptedKeyAlgorithm);
++
+         if (CMSUtils.isGOST(keyEncryptionAlgorithm.getAlgorithm()))
+         {
+             try
+--- a/pkix/src/main/java/org/bouncycastle/cms/jcajce/JcePasswordRecipient.java
++++ b/pkix/src/main/java/org/bouncycastle/cms/jcajce/JcePasswordRecipient.java
+@@ -18,6 +18,7 @@
+  * encrypted using a password.
+  */
+ public abstract class JcePasswordRecipient
++    extends org.bouncycastle.cms.AbstractRecipient
+     implements PasswordRecipient
+ {
+     private int schemeID = PasswordRecipient.PKCS5_SCHEME2_UTF8;
+@@ -51,9 +52,26 @@
+         return this;
+     }
+ 
++    /**
++     * Set the minimum AEAD authentication tag size (in bits) this recipient will accept. When set, an
++     * attempt to recover AuthEnvelopedData whose content algorithm carries a shorter tag is rejected,
++     * mitigating an attacker downgrading the tag to a weaker length.
++     *
++     * @param tagSizeInBits the minimum acceptable AEAD tag size, in bits.
++     * @return this recipient.
++     */
++    public JcePasswordRecipient setMinimumTagSize(int tagSizeInBits)
++    {
++        setMinimumTagSizeInBits(tagSizeInBits);
++
++        return this;
++    }
++
+     protected Key extractSecretKey(AlgorithmIdentifier keyEncryptionAlgorithm, AlgorithmIdentifier contentEncryptionAlgorithm, byte[] derivedKey, byte[] encryptedContentEncryptionKey)
+         throws CMSException
+     {
++        checkTagSize(contentEncryptionAlgorithm);
++
+         Cipher keyEncryptionCipher = helper.createRFC3211Wrapper(keyEncryptionAlgorithm.getAlgorithm());
+ 
+         try
+--- a/pkix/src/test/java/org/bouncycastle/cms/test/AuthEnvelopedDataTest.java
++++ b/pkix/src/test/java/org/bouncycastle/cms/test/AuthEnvelopedDataTest.java
+@@ -1,5 +1,6 @@
+ package org.bouncycastle.cms.test;
+ 
++import java.security.AlgorithmParameters;
+ import java.security.KeyFactory;
+ import java.security.KeyPair;
+ import java.security.PrivateKey;
+@@ -29,6 +30,7 @@
+ import org.bouncycastle.cms.CMSAuthEnvelopedData;
+ import org.bouncycastle.cms.CMSAuthEnvelopedDataGenerator;
+ import org.bouncycastle.cms.CMSProcessableByteArray;
++import org.bouncycastle.cms.CMSTagLengthException;
+ import org.bouncycastle.cms.RecipientInformation;
+ import org.bouncycastle.cms.RecipientInformationStore;
+ import org.bouncycastle.cms.bc.BcCMSContentEncryptorBuilder;
+@@ -36,6 +38,7 @@
+ import org.bouncycastle.cms.jcajce.JceKeyTransAuthEnvelopedRecipient;
+ import org.bouncycastle.cms.jcajce.JceKeyTransEnvelopedRecipient;
+ import org.bouncycastle.cms.jcajce.JceKeyTransRecipientInfoGenerator;
++import org.bouncycastle.jcajce.spec.AEADParameterSpec;
+ import org.bouncycastle.jce.provider.BouncyCastleProvider;
+ import org.bouncycastle.operator.OutputAEADEncryptor;
+ import org.bouncycastle.operator.OutputEncryptor;
+@@ -141,6 +144,65 @@
+         return new CMSTestSetup(new TestSuite(AuthEnvelopedDataTest.class));
+     }
+ 
++    public void testKeyTransMinimumTagSize()
++        throws Exception
++    {
++        if (!CMSTestUtil.isAeadAvailable())
++        {
++            return;
++        }
++
++        byte[] message = Strings.toByteArray("Hello, world!");
++
++        // generate AuthEnvelopedData with a 96-bit (12-octet) GCM tag - valid under RFC 5084
++        AlgorithmParameters algParams = AlgorithmParameters.getInstance("GCM", BC);
++        algParams.init(new AEADParameterSpec(new byte[12], 96));
++
++        OutputEncryptor enc = new JceCMSContentEncryptorBuilder(NISTObjectIdentifiers.id_aes128_GCM)
++            .setProvider(BC).setAlgorithmParameters(algParams).build();
++
++        assertEquals(12, GCMParameters.getInstance(enc.getAlgorithmIdentifier().getParameters()).getIcvLen());
++
++        CMSAuthEnvelopedDataGenerator authGen = new CMSAuthEnvelopedDataGenerator();
++        authGen.addRecipientInfoGenerator(new JceKeyTransRecipientInfoGenerator(_reciCert).setProvider(BC));
++
++        byte[] encoded = authGen.generate(new CMSProcessableByteArray(message), (OutputAEADEncryptor)enc).getEncoded();
++
++        // a minimum at or below the actual tag size recovers as normal
++        RecipientInformation recipient = (RecipientInformation)new CMSAuthEnvelopedData(encoded)
++            .getRecipientInfos().getRecipients().iterator().next();
++        byte[] recData = recipient.getContent(new JceKeyTransAuthEnvelopedRecipient(_reciKP.getPrivate())
++            .setProvider(BC).setMinimumTagSize(96));
++        assertEquals("Hello, world!", Strings.fromByteArray(recData));
++
++        // a minimum above the actual tag size is refused with CMSTagLengthException
++        try
++        {
++            recipient = (RecipientInformation)new CMSAuthEnvelopedData(encoded)
++                .getRecipientInfos().getRecipients().iterator().next();
++            recipient.getContent(new JceKeyTransAuthEnvelopedRecipient(_reciKP.getPrivate())
++                .setProvider(BC).setMinimumTagSize(128));
++
++            fail("content recovered under a tag shorter than the configured minimum");
++        }
++        catch (CMSTagLengthException e)
++        {
++            // expected
++        }
++
++        // a default (128-bit) tag satisfies a 128-bit minimum
++        OutputEncryptor fullEnc = new JceCMSContentEncryptorBuilder(NISTObjectIdentifiers.id_aes128_GCM).setProvider(BC).build();
++        CMSAuthEnvelopedDataGenerator fullGen = new CMSAuthEnvelopedDataGenerator();
++        fullGen.addRecipientInfoGenerator(new JceKeyTransRecipientInfoGenerator(_reciCert).setProvider(BC));
++        byte[] fullEncoded = fullGen.generate(new CMSProcessableByteArray(message), (OutputAEADEncryptor)fullEnc).getEncoded();
++
++        recipient = (RecipientInformation)new CMSAuthEnvelopedData(fullEncoded)
++            .getRecipientInfos().getRecipients().iterator().next();
++        byte[] fullRec = recipient.getContent(new JceKeyTransAuthEnvelopedRecipient(_reciKP.getPrivate())
++            .setProvider(BC).setMinimumTagSize(128));
++        assertEquals("Hello, world!", Strings.fromByteArray(fullRec));
++    }
++
+     public void testSample1()
+         throws Exception
+     {
