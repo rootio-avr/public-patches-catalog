@@ -8,6 +8,7 @@ unknown
 - CVE-2026-0636
 - CVE-2026-5598
 - CVE-BUILD-FIX
+- CVE-2026-59639
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-java
