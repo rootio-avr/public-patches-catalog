@@ -4,6 +4,9 @@ This patch is based on mysql2 version 2.3.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2024-10020
+- AIKIDO-2024-10037
+- AIKIDO-2026-10225
 - CVE-2024-21508
 - CVE-2024-21511
 - CVE-2024-21512
