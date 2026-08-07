@@ -4,8 +4,12 @@ This patch is based on pillow version 12.2.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-54060
 - CVE-2026-59197
+- CVE-2026-59199
+- CVE-2026-59203
 - CVE-2026-59204
+- CVE-2026-59205
 
 ## How to Apply:
 1. Clone or download the source code for pillow
