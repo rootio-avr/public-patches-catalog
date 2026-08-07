@@ -4,6 +4,7 @@ This patch is based on crypto-js version 3.3.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-554041
 - CVE-2023-46233
 
 ## How to Apply:
