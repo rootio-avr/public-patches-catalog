@@ -32,6 +32,7 @@ unknown
 - GHSA-jj6c-8h6c-hppx
 - GHSA-jm82-fx9c-mx94
 - GHSA-x284-j5p8-9c5p
+- CVE-2026-59936
 
 ## How to Apply:
 1. Clone or download the source code for pypdf
