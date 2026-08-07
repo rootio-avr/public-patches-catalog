@@ -1,6 +1,6 @@
-# binutils : 2.43.1-r30071
+# binutils : 2.43.1-r30072
 
-This patch is based on binutils version 2.43.1-r30071, which is available at:
+This patch is based on binutils version 2.43.1-r30072, which is available at:
 unknown
 
 ## Affected CVEs:
@@ -9,6 +9,7 @@ unknown
 - CVE-2025-69649
 - CVE-2026-3441
 - CVE-2026-6846
+- CVE-2026-3442
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source binutils`
