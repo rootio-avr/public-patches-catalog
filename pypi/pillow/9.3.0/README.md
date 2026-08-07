@@ -13,6 +13,9 @@ unknown
 - CVE-2026-54058
 - CVE-2026-54059
 - CVE-2026-59200
+- CVE-2026-55380
+- CVE-2026-59204
+- CVE-2026-59199
 
 ## How to Apply:
 1. Clone or download the source code for pillow
