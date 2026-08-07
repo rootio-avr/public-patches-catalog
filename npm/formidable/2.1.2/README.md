@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-46653
+- CVE-2022-29622
 
 ## How to Apply:
 1. Clone or download the source code for formidable
