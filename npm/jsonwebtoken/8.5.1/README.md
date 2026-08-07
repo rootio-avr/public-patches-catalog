@@ -7,6 +7,7 @@ unknown
 - CVE-2022-23539
 - CVE-2022-23540
 - CVE-2022-23541
+- CVE-2022-23529
 
 ## How to Apply:
 1. Clone or download the source code for jsonwebtoken
