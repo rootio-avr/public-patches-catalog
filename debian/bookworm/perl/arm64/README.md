@@ -1,6 +1,6 @@
-# perl : 5.36.0-7+deb12u3.aikido.15
+# perl : 5.36.0-7+deb12u3.aikido.16
 
-This patch is based on perl version 5.36.0-7+deb12u3.aikido.15, which is available at:
+This patch is based on perl version 5.36.0-7+deb12u3.aikido.16, which is available at:
 https://sources.debian.org/src/perl/5.36.0-7+deb12u3/
 
 ## Affected CVEs:
