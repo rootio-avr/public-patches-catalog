@@ -7,6 +7,7 @@ unknown
 - CVE-2026-42305
 - CVE-2026-42563
 - CVE-2026-47734
+- CVE-2026-52726
 
 ## How to Apply:
 1. Clone or download the source code for dulwich
