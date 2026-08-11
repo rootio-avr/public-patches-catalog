@@ -1,6 +1,6 @@
-# libgcrypt20 : 1.9.4-3ubuntu3.aikido.3
+# libgcrypt20 : 1.9.4-3ubuntu3.aikido.4
 
-This patch is based on libgcrypt20 version 1.9.4-3ubuntu3.aikido.3, which is available at:
+This patch is based on libgcrypt20 version 1.9.4-3ubuntu3.aikido.4, which is available at:
 https://sources.debian.org/src/libgcrypt20/1.9.4-3ubuntu3/
 
 ## Affected CVEs:
