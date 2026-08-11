@@ -4,15 +4,21 @@ This patch is based on pillow version 10.3.0, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-25990
 - CVE-2026-40192
-- CVE-2026-42311
-- CVE-2026-42310
 - CVE-2026-42308
+- CVE-2026-42310
+- CVE-2026-42311
+- CVE-2026-54058
+- CVE-2026-54059
+- CVE-2026-54060
+- CVE-2026-55379
+- CVE-2026-55380
 - CVE-2026-59197
+- CVE-2026-59198
+- CVE-2026-59199
 - CVE-2026-59200
 - CVE-2026-59204
-- CVE-2026-55379
+- CVE-2026-59205
 
 ## How to Apply:
 1. Clone or download the source code for pillow
