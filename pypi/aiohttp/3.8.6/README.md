@@ -40,6 +40,7 @@ unknown
 - CVE-2026-34517
 - CVE-2026-34516
 - CVE-2025-69224
+- CVE-2026-69244
 
 ## How to Apply:
 1. Clone or download the source code for aiohttp
