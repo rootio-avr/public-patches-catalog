@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - GHSA-537c-gmf6-5ccf
+- CVE-2026-69247
+- CVE-2026-69249
 
 ## How to Apply:
 1. Clone or download the source code for cryptography
