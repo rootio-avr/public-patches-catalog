@@ -1,6 +1,6 @@
-# ffmpeg : 7:4.4.2-0ubuntu0.22.04.1.aikido.3
+# ffmpeg : 7:4.4.2-0ubuntu0.22.04.1.aikido.4
 
-This patch is based on ffmpeg version 7:4.4.2-0ubuntu0.22.04.1.aikido.3, which is available at:
+This patch is based on ffmpeg version 7:4.4.2-0ubuntu0.22.04.1.aikido.4, which is available at:
 https://sources.debian.org/src/ffmpeg/7:4.4.2-0ubuntu0.22.04.1/
 
 ## Affected CVEs:
