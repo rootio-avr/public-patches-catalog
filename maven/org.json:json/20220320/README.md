@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2022-45688
 - CVE-2023-5072
+- GHSA-rm7j-f5g5-27vv
 
 ## How to Apply:
 1. Clone or download the source code for org.json:json
