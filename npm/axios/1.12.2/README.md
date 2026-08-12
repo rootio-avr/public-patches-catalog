@@ -4,13 +4,18 @@ This patch is based on axios version 1.12.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2025-62718
 - CVE-2026-25639
 - CVE-2026-40175
 - CVE-2026-42033
+- CVE-2026-42035
+- CVE-2026-42043
+- CVE-2026-42264
 - CVE-2026-44486
 - CVE-2026-44487
 - CVE-2026-44488
 - CVE-2026-44494
+- CVE-2026-44495
 - CVE-2026-44496
 
 ## How to Apply:
