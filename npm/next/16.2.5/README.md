@@ -5,6 +5,9 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-45109
+- CVE-2026-64641
+- CVE-2026-64645
+- CVE-2026-64649
 
 ## How to Apply:
 1. Clone or download the source code for next
