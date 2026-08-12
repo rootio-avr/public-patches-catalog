@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-52304
+- CVE-2025-69227
 
 ## How to Apply:
 1. Clone or download the source code for aiohttp
