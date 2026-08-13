@@ -4,6 +4,7 @@ This patch is based on org.springframework.hateoas:spring-hateoas version 2.3.3,
 unknown
 
 ## Affected CVEs:
+- CVE-2026-41006
 - CVE-2026-41007
 
 ## How to Apply:
