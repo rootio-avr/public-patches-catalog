@@ -4,12 +4,14 @@ This patch is based on org.eclipse.jetty:jetty-project version 12.0.16, which is
 unknown
 
 ## Affected CVEs:
+- CVE-2025-11143
 - CVE-2025-1948
 - CVE-2025-5115
+- CVE-2026-10050
+- CVE-2026-10051
 - CVE-2026-1605
 - CVE-2026-2332
 - CVE-2026-5795
-- CVE-2025-11143
 
 ## How to Apply:
 1. Clone or download the source code for org.eclipse.jetty:jetty-project
