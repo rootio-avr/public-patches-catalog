@@ -4,6 +4,7 @@ This patch is based on next version 16.2.9, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-64645
 - CVE-2026-64649
 
 ## How to Apply:
