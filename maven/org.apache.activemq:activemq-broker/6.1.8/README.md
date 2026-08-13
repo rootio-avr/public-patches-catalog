@@ -9,6 +9,7 @@ unknown
 - CVE-2026-41044
 - CVE-2026-39304
 - CVE-2026-42588
+- CVE-2026-45505
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.activemq:activemq-broker
