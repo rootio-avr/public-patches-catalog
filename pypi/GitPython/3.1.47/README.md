@@ -18,6 +18,11 @@ unknown
 - GHSA-3f7w-8rr8-f37f
 - GHSA-539m-9xh6-q6rr
 - GHSA-p538-c434-8v24
+- GHSA-jm78-9fvv-mhgr
+- GHSA-hmq2-w58f-27jc
+- GHSA-wvpp-8hx9-p66j
+- GHSA-9rj7-rf2p-w77r
+- GHSA-4gmw-gg2m-w46p
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
