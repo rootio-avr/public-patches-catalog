@@ -656,6 +656,139 @@ index 0000000..e21ca97
 +  });
 +});
 
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -704,7 +704,41 @@
+         }
+       });
+ 
+-      data.pipe(req);
++      // Enforce maxBodyLength for streamed uploads on the native http/https
++      // transport (maxRedirects === 0); follow-redirects enforces it on the
++      // other path. See GHSA-5c9x-8gcm-mpgx.
++      let uploadStream = data;
++      if (config.maxBodyLength > -1 && config.maxRedirects === 0) {
++        const limit = config.maxBodyLength;
++        let bytesSent = 0;
++        uploadStream = stream.pipeline(
++          [
++            data,
++            new stream.Transform({
++              transform(chunk, _enc, cb) {
++                bytesSent += chunk.length;
++                if (bytesSent > limit) {
++                  return cb(
++                    new AxiosError(
++                      'Request body larger than maxBodyLength limit',
++                      AxiosError.ERR_BAD_REQUEST,
++                      config,
++                      req
++                    )
++                  );
++                }
++                cb(null, chunk);
++              },
++            }),
++          ],
++          utils.noop
++        );
++        uploadStream.on('error', (err) => {
++          if (!req.destroyed) req.destroy(err);
++        });
++      }
++
++      uploadStream.pipe(req);
+     } else {
+       req.end(data);
+     }
+--- a/test/unit/adapters/http.js
++++ b/test/unit/adapters/http.js
+@@ -852,6 +852,84 @@
+     });
+   });
+ 
++  it('should enforce maxBodyLength for streamed uploads with maxRedirects: 0 (GHSA-5c9x-8gcm-mpgx)', async () => {
++    let bytesReceived = 0;
++    server = await startHTTPServer(
++      (req, res) => {
++        req.on('data', (chunk) => {
++          bytesReceived += chunk.length;
++        });
++        req.on('end', () => {
++          res.setHeader('Content-Type', 'application/json');
++          res.end(JSON.stringify({ received: bytesReceived }));
++        });
++      },
++      { port: 4444 }
++    );
++
++    try {
++      const size = 2 * 1024 * 1024;
++      const buf = Buffer.alloc(size, 0x61);
++      const source = stream.Readable.from([buf]);
++
++      await assert.rejects(
++        axios.post(`http://localhost:4444/`, source, {
++          maxBodyLength: 1024,
++          maxRedirects: 0,
++          headers: { 'Content-Type': 'application/octet-stream' },
++        }),
++        (error) => {
++          assert.strictEqual(error.message, 'Request body larger than maxBodyLength limit');
++          return true;
++        }
++      );
++
++      assert.ok(
++        bytesReceived <= 1024 * 4,
++        `server should not receive full payload; got ${bytesReceived}`
++      );
++    } finally {
++      await stopHTTPServer(server);
++      server = null;
++    }
++  });
++
++  it('should allow streamed uploads under maxBodyLength with maxRedirects: 0', async () => {
++    let bytesReceived = 0;
++    server = await startHTTPServer(
++      (req, res) => {
++        req.on('data', (chunk) => {
++          bytesReceived += chunk.length;
++        });
++        req.on('end', () => {
++          res.setHeader('Content-Type', 'application/json');
++          res.end(JSON.stringify({ received: bytesReceived }));
++        });
++      },
++      { port: 4444 }
++    );
++
++    try {
++      const payload = Buffer.alloc(512, 0x62);
++      const source = stream.Readable.from([payload]);
++
++      const response = await axios.post(
++        `http://localhost:4444/`,
++        source,
++        {
++          maxBodyLength: 1024,
++          maxRedirects: 0,
++          headers: { 'Content-Type': 'application/octet-stream' },
++        }
++      );
++
++      assert.strictEqual(response.data.received, payload.length);
++    } finally {
++      await stopHTTPServer(server);
++      server = null;
++    }
++  });
++
+   it('should properly support default max body length (follow-redirects as well)', function (done) {
+     // taken from https://github.com/follow-redirects/follow-redirects/blob/22e81fc37132941fb83939d1dc4c2282b5c69521/index.js#L461
+     var followRedirectsMaxBodyDefaults = 10 * 1024 *1024;
+
 CVE-2026-42035: Header injection via prototype pollution in axios HTTP adapter.
 When Object.prototype is polluted with getHeaders/append/etc., axios mistakes
 plain object payloads for FormData and invokes attacker-controlled getHeaders(),
@@ -720,6 +853,257 @@ does not exist in 1.7.9 (which uses the legacy test/ layout).
      return charMap[match];
    });
  }
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -559,12 +559,36 @@
+         headers: new AxiosHeaders(res.headers),
+         config,
+         request: lastRequest
+       };
+ 
+       if (responseType === 'stream') {
++        // Enforce maxContentLength on streamed responses; previously this
++        // was applied only to buffered responses. See GHSA-vf2m-468p-8v99.
++        if (config.maxContentLength > -1) {
++          const limit = config.maxContentLength;
++          const source = responseStream;
++          async function* enforceMaxContentLength() {
++            let totalResponseBytes = 0;
++            for await (const chunk of source) {
++              totalResponseBytes += chunk.length;
++              if (totalResponseBytes > limit) {
++                throw new AxiosError(
++                  'maxContentLength size of ' + limit + ' exceeded',
++                  AxiosError.ERR_BAD_RESPONSE,
++                  config,
++                  lastRequest
++                );
++              }
++              yield chunk;
++            }
++          }
++          responseStream = stream.Readable.from(enforceMaxContentLength(), {
++            objectMode: false,
++          });
++        }
+         response.data = responseStream;
+         settle(resolve, reject, response);
+       } else {
+         const responseBuffer = [];
+         let totalResponseBytes = 0;
+ 
+--- a/test/unit/adapters/http.js
++++ b/test/unit/adapters/http.js
+@@ -784,12 +784,68 @@
+         maxContentLength: 2000,
+         maxRedirects: 0
+       })
+     },/maxContentLength size of 2000 exceeded/);
+   });
+ 
++  it('should enforce maxContentLength for streamed responses (GHSA-vf2m-468p-8v99)', async () => {
++    const size = 2 * 1024 * 1024;
++    const body = Buffer.alloc(size, 0x63);
++    server = await startHTTPServer(
++      (req, res) => {
++        res.setHeader('Content-Type', 'application/octet-stream');
++        res.end(body);
++      },
++      { port: 4444 }
++    );
++
++    const response = await axios.get(`http://localhost:${server.address().port}/`, {
++      responseType: 'stream',
++      maxContentLength: 1024,
++    });
++
++    let bytesRead = 0;
++    const err = await new Promise((resolve) => {
++      response.data.on('data', (chunk) => { bytesRead += chunk.length; });
++      response.data.on('error', resolve);
++      response.data.on('end', () => resolve(null));
++    });
++
++    assert.ok(err, 'stream should emit an error');
++    assert.strictEqual(err.message, 'maxContentLength size of 1024 exceeded');
++    assert.ok(
++      bytesRead <= 1024 * 64,
++      `stream should not deliver full payload; got ${bytesRead}`
++    );
++  });
++
++  it('should allow streamed responses under maxContentLength', async () => {
++    const body = Buffer.alloc(512, 0x64);
++    server = await startHTTPServer(
++      (req, res) => {
++        res.setHeader('Content-Type', 'application/octet-stream');
++        res.end(body);
++      },
++      { port: 4444 }
++    );
++
++    const response = await axios.get(`http://localhost:${server.address().port}/`, {
++      responseType: 'stream',
++      maxContentLength: 1024,
++    });
++
++    const chunks = [];
++    await new Promise((resolve, reject) => {
++      response.data.on('data', (chunk) => chunks.push(chunk));
++      response.data.on('error', reject);
++      response.data.on('end', resolve);
++    });
++
++    assert.strictEqual(Buffer.concat(chunks).length, body.length);
++  });
++
+   it('should support max content length for redirected', function (done) {
+     var str = Array(100000).join('ж');
+ 
+     server = http.createServer(function (req, res) {
+       var parsed = url.parse(req.url);
+ 
+
+--- a/lib/helpers/formDataToStream.js
++++ b/lib/helpers/formDataToStream.js
+@@ -23,7 +23,8 @@ class FormDataPart {
+     if (isStringValue) {
+       value = textEncoder.encode(String(value).replace(/\r?\n|\r\n?/g, CRLF));
+     } else {
+-      headers += `Content-Type: ${value.type || "application/octet-stream"}${CRLF}`
++      const safeType = String(value.type || 'application/octet-stream').replace(/[\r\n]/g, '');
++      headers += `Content-Type: ${safeType}${CRLF}`
+     }
+ 
+     this.headers = textEncoder.encode(headers + CRLF);
+--- /dev/null
++++ b/test/unit/helpers/formDataToStream.test.js
+@@ -0,0 +1,124 @@
++import { describe, it, expect } from 'vitest';
++import formDataToStream from '../../../lib/helpers/formDataToStream.js';
++
++class SpecFormData {
++  constructor() {
++    this._entries = [];
++    this[Symbol.toStringTag] = 'FormData';
++  }
++  append(name, value) {
++    this._entries.push([name, value]);
++  }
++  entries() {
++    return this._entries[Symbol.iterator]();
++  }
++  [Symbol.iterator]() {
++    return this._entries[Symbol.iterator]();
++  }
++}
++
++const makeBlobLike = ({ type, name, size, payload }) => ({
++  type,
++  name,
++  size: size ?? payload.byteLength,
++  [Symbol.asyncIterator]: async function* () {
++    yield payload;
++  },
++});
++
++const collect = async (stream) => {
++  const chunks = [];
++  for await (const chunk of stream) {
++    chunks.push(Buffer.from(chunk));
++  }
++  return Buffer.concat(chunks).toString('utf8');
++};
++
++describe('formDataToStream (GHSA-445q-vr5w-6q77 CRLF injection)', () => {
++  it('should strip CRLF sequences from blob.type to prevent multipart header injection', async () => {
++    const fd = new SpecFormData();
++    fd.append('photo', makeBlobLike({
++      type: 'image/jpeg\r\nX-Injected-Header: PWNED\r\nX-Evil: bad',
++      name: 'photo.jpg',
++      payload: Buffer.from('PAYLOAD'),
++    }));
++
++    const body = await collect(formDataToStream(fd, () => {}));
++
++    expect(body).not.toContain('\r\nX-Injected-Header');
++    expect(body).not.toContain('\r\nX-Evil');
++    expect(body).toContain('Content-Type: image/jpegX-Injected-Header: PWNEDX-Evil: bad\r\n');
++  });
++
++  it('should strip bare \\r and bare \\n from blob.type', async () => {
++    const fd = new SpecFormData();
++    fd.append('f', makeBlobLike({
++      type: 'text/plain\rX-A: 1\nX-B: 2',
++      name: 'f.txt',
++      payload: Buffer.from('x'),
++    }));
++
++    const body = await collect(formDataToStream(fd, () => {}));
++
++    expect(body).not.toMatch(/^X-A:/m);
++    expect(body).not.toMatch(/^X-B:/m);
++  });
++
++  it('should preserve legitimate Content-Type values', async () => {
++    const fd = new SpecFormData();
++    fd.append('doc', makeBlobLike({
++      type: 'application/json; charset=utf-8',
++      name: 'doc.json',
++      payload: Buffer.from('{}'),
++    }));
++
++    const body = await collect(formDataToStream(fd, () => {}));
++
++    expect(body).toContain('Content-Type: application/json; charset=utf-8\r\n');
++  });
++
++  it('should default missing blob.type to application/octet-stream', async () => {
++    const fd = new SpecFormData();
++    fd.append('bin', makeBlobLike({
++      type: '',
++      name: 'bin',
++      payload: Buffer.from([0x00, 0x01]),
++    }));
++
++    const body = await collect(formDataToStream(fd, () => {}));
++
++    expect(body).toContain('Content-Type: application/octet-stream\r\n');
++  });
++
++  it('should escape CRLF and quotes in blob.name (Content-Disposition)', async () => {
++    const fd = new SpecFormData();
++    fd.append('up', makeBlobLike({
++      type: 'text/plain',
++      name: 'evil\r\nX-Bad: 1".jpg',
++      payload: Buffer.from('x'),
++    }));
++
++    const body = await collect(formDataToStream(fd, () => {}));
++
++    expect(body).not.toContain('\r\nX-Bad: 1');
++    expect(body).toContain('filename="evil%0D%0AX-Bad: 1%22.jpg"');
++  });
++
++  it('should report stable contentLength that matches emitted bytes', async () => {
++    const fd = new SpecFormData();
++    fd.append('photo', makeBlobLike({
++      type: 'image/jpeg\r\nX-Injected: PWNED',
++      name: 'photo.jpg',
++      payload: Buffer.from('PAYLOAD'),
++    }));
++
++    let reportedLength;
++    const stream = formDataToStream(fd, (h) => {
++      reportedLength = h['Content-Length'];
++    }, { boundary: 'test-boundary-abc' });
++
++    const body = await collect(stream);
++
++    expect(Buffer.byteLength(body, 'utf8')).toBe(reportedLength);
++  });
++});
 
 Description: Fix CVE-2026-42038 - SSRF via no_proxy hostname normalization bypass
  The shouldBypassProxy / proxy-from-env logic only matched literal hostname
@@ -1057,6 +1441,31 @@ Last-Update: 2026-06-19
    });
  });
  
+
+--- a/lib/helpers/resolveConfig.js
++++ b/lib/helpers/resolveConfig.js
+@@ -40,10 +40,18 @@
+   // Specifically not if we're in a web worker, or react-native.
+
+   if (platform.hasStandardBrowserEnv) {
+-    withXSRFToken && utils.isFunction(withXSRFToken) && (withXSRFToken = withXSRFToken(newConfig));
++    if (utils.isFunction(withXSRFToken)) {
++      withXSRFToken = withXSRFToken(newConfig);
++    }
++
++    // Strict boolean check — prevents proto-pollution gadgets (e.g. Object.prototype.withXSRFToken = 1)
++    // and misconfigurations (e.g. "false") from short-circuiting the same-origin check and leaking
++    // the XSRF token cross-origin. See GHSA-xx6v-rp6x-q39c.
++    const shouldSendXSRF =
++      withXSRFToken === true ||
++      (withXSRFToken == null && isURLSameOrigin(newConfig.url));
+
+-    if (withXSRFToken || (withXSRFToken !== false && isURLSameOrigin(newConfig.url))) {
+-      // Add xsrf header
++    if (shouldSendXSRF) {
+       const xsrfValue = xsrfHeaderName && xsrfCookieName && cookies.read(xsrfCookieName);
+
+       if (xsrfValue) {
 
 --- a/lib/adapters/http.js
 +++ b/lib/adapters/http.js
@@ -2142,6 +2551,24 @@ Last-Update: 2026-06-19
 +  }
 +  return bytes;
  }
+
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -319,8 +319,12 @@
+     }
+
+     const targetKey = (caseless && findKey(result, key)) || key;
+-    if (isPlainObject(result[targetKey]) && isPlainObject(val)) {
+-      result[targetKey] = merge(result[targetKey], val);
++    // Read via own-prop only — a bare `result[targetKey]` walks the prototype
++    // chain, so a polluted Object.prototype value could surface here and get
++    // copied into the merged result.
++    const existing = hasOwnProperty(result, targetKey) ? result[targetKey] : undefined;
++    if (isPlainObject(existing) && isPlainObject(val)) {
++      result[targetKey] = merge(existing, val);
+     } else if (isPlainObject(val)) {
+       result[targetKey] = merge({}, val);
+     } else if (isArray(val)) {
 
 --- a/lib/adapters/http.js
 +++ b/lib/adapters/http.js
