@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-10050
+- CVE-2026-10051
 
 ## How to Apply:
 1. Clone or download the source code for org.eclipse.jetty:jetty-project
