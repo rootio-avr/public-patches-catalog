@@ -14,6 +14,7 @@ unknown
 - CVE-2026-54531
 - CVE-2026-59935
 - CVE-2026-59937
+- CVE-2026-59936
 - GHSA-4pxv-j86v-mhcw
 - GHSA-7gw9-cf7v-778f
 - GHSA-jm82-fx9c-mx94
