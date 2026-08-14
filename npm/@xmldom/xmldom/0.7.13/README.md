@@ -9,6 +9,7 @@ unknown
 - CVE-2026-41673
 - CVE-2026-41672
 - CVE-2026-34601
+- GHSA-4w3w-2rp5-g8jm
 
 ## How to Apply:
 1. Clone or download the source code for @xmldom/xmldom
