@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-40983
+- CVE-2026-40984
 
 ## How to Apply:
 1. Clone or download the source code for io.micrometer:micrometer-core
