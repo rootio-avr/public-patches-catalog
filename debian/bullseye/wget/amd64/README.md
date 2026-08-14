@@ -1,6 +1,6 @@
-# wget : 1.21-1+deb11u2.root.io.13
+# wget : 1.21-1+deb11u2.aikido.14
 
-This patch is based on wget version 1.21-1+deb11u2.root.io.13, which is available at:
+This patch is based on wget version 1.21-1+deb11u2.aikido.14, which is available at:
 https://sources.debian.org/src/wget/1.21-1+deb11u2/
 
 ## Affected CVEs:
@@ -8,6 +8,9 @@ https://sources.debian.org/src/wget/1.21-1+deb11u2/
 - CVE-2024-10524
 - CVE-2026-58472
 - CVE-2026-58471
+- CVE-2026-58470
+- CVE-2026-58469
+- CVE-2026-15146
 
 ## How to Apply:
 1. Obtain the source package: `apt source wget`
