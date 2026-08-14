@@ -1,6 +1,6 @@
-# curl : 7.74.0-1.3+deb11u16.root.io.17
+# curl : 7.74.0-1.3+deb11u16.aikido.18
 
-This patch is based on curl version 7.74.0-1.3+deb11u16.root.io.17, which is available at:
+This patch is based on curl version 7.74.0-1.3+deb11u16.aikido.18, which is available at:
 https://sources.debian.org/src/curl/7.74.0-1.3+deb11u16/
 
 ## Affected CVEs:
@@ -26,6 +26,8 @@ https://sources.debian.org/src/curl/7.74.0-1.3+deb11u16/
 - CVE-2026-8927
 - CVE-2026-11856
 - CVE-2026-5545
+- CVE-2026-8924
+- CVE-2026-8458
 
 ## How to Apply:
 1. Obtain the source package: `apt source curl`
