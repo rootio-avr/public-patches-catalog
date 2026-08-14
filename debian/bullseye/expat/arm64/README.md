@@ -1,6 +1,6 @@
-# expat : 2.2.10-2+deb11u7.root.io.16
+# expat : 2.2.10-2+deb11u7.aikido.17
 
-This patch is based on expat version 2.2.10-2+deb11u7.root.io.16, which is available at:
+This patch is based on expat version 2.2.10-2+deb11u7.aikido.17, which is available at:
 https://sources.debian.org/src/expat/2.2.10-2+deb11u7/
 
 ## Affected CVEs:
@@ -12,6 +12,7 @@ https://sources.debian.org/src/expat/2.2.10-2+deb11u7/
 - CVE-2026-32777
 - CVE-2026-32776
 - CVE-2026-45186
+- CVE-2026-56409
 - CVE-2026-56408
 - CVE-2026-50219
 - CVE-2026-56131
