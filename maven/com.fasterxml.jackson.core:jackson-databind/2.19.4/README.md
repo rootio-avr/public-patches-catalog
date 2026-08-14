@@ -4,6 +4,7 @@ This patch is based on com.fasterxml.jackson.core:jackson-databind version 2.19.
 unknown
 
 ## Affected CVEs:
+- CVE-2026-54515
 - CVE-2026-54513
 - CVE-2026-54512
 - CVE-2026-54514
