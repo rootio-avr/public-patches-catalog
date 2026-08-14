@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-67mh-4wv8-2f99
+- GHSA-gv7w-rqvm-qjhr
 
 ## How to Apply:
 1. Clone or download the source code for esbuild

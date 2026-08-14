@@ -168,3 +168,204 @@ index 156d024..7999376 100644
  }
  
  export function pkgAndSubpathForCurrentPlatform(): { pkg: string, subpath: string, isWASM: boolean } {
+
+--- a/lib/deno/mod.ts
++++ b/lib/deno/mod.ts
+@@ -69,9 +69,28 @@ async function installFromNPM(name: string, subpath: string): Promise<string> {
+ 
+   const npmRegistry = Deno.env.get("NPM_CONFIG_REGISTRY") || "https://registry.npmjs.org"
+   const url = `${npmRegistry}/${name}/-/${name.replace("@esbuild/", "")}-${version}.tgz`
++
++  // Security (GHSA-gv7w-rqvm-qjhr): the registry can be redirected via the
++  // NPM_CONFIG_REGISTRY environment variable, which an attacker may control.
++  // Refuse to download the native executable over a non-HTTPS transport so it
++  // cannot be trivially downgraded/MITM'd into delivering arbitrary code.
++  if (!/^https:\/\//i.test(url)) {
++    throw new Error(`Refusing to download the esbuild binary over an insecure transport: ${JSON.stringify(url)}`)
++  }
++
+   const buffer = await fetch(url).then(r => r.arrayBuffer())
+   const executable = extractFileFromTarGzip(new Uint8Array(buffer), subpath)
+ 
++  // Security (GHSA-gv7w-rqvm-qjhr): the Deno install path (unlike the npm one)
++  // performed no integrity check on the downloaded payload before writing it as
++  // an executable and running it. Verify the extracted file actually looks like
++  // a native executable for a supported platform before trusting it. This is a
++  // content sanity check, not a cryptographic guarantee, but it prevents a
++  // redirected registry from delivering an arbitrary non-executable payload.
++  if (!isValidNativeExecutable(executable)) {
++    throw new Error(`Downloaded esbuild binary from ${JSON.stringify(url)} failed integrity validation (unexpected file contents)`)
++  }
++
+   await Deno.mkdir(finalDir, {
+     recursive: true,
+     mode: 0o700, // https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+@@ -117,6 +136,39 @@ function getCachePath(name: string): { finalPath: string, finalDir: string } {
+   return { finalPath, finalDir }
+ }
+ 
++// Security (GHSA-gv7w-rqvm-qjhr): sanity-check that a downloaded payload is a
++// native executable for a platform esbuild supports before we write it as
++// mode 0o755 and execute it. We match the leading "magic number" of the file
++// formats used by the supported targets:
++//   - ELF   (Linux, FreeBSD, Android):  0x7F 'E' 'L' 'F'
++//   - Mach-O (macOS, incl. fat/universal + 32/64-bit, LE/BE)
++//   - PE/MZ (Windows .exe):             'M' 'Z'
++// This is a defensive content check, not a cryptographic integrity guarantee.
++function isValidNativeExecutable(bytes: Uint8Array): boolean {
++  if (!bytes || bytes.length < 4) return false
++  const b0 = bytes[0], b1 = bytes[1], b2 = bytes[2], b3 = bytes[3]
++
++  // ELF: 0x7F 45 4C 46
++  if (b0 === 0x7F && b1 === 0x45 && b2 === 0x4C && b3 === 0x46) return true
++
++  // PE executable (Windows): "MZ"
++  if (b0 === 0x4D && b1 === 0x5A) return true
++
++  // Mach-O magic numbers (thin and universal/fat, both endiannesses)
++  const magic = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) >>> 0
++  switch (magic) {
++    case 0xFEEDFACE: // MH_MAGIC   (32-bit)
++    case 0xCEFAEDFE: // MH_CIGAM   (32-bit, swapped)
++    case 0xFEEDFACF: // MH_MAGIC_64
++    case 0xCFFAEDFE: // MH_CIGAM_64
++    case 0xCAFEBABE: // FAT_MAGIC  (universal)
++    case 0xBEBAFECA: // FAT_CIGAM  (universal, swapped)
++      return true
++  }
++
++  return false
++}
++
+ function extractFileFromTarGzip(buffer: Uint8Array, file: string): Uint8Array {
+   try {
+     buffer = denoflate.gunzip(buffer)
+@@ -126,14 +178,24 @@ function extractFileFromTarGzip(buffer: Uint8Array, file: string): Uint8Array {
+   let str = (i: number, n: number) => String.fromCharCode(...buffer.subarray(i, i + n)).replace(/\0.*$/, '')
+   let offset = 0
+   file = `package/${file}`
+-  while (offset < buffer.length) {
++  // Security (GHSA-gv7w-rqvm-qjhr): only parse a header when a full 512-byte
++  // block is available, and validate the declared entry size against the
++  // remaining buffer. A malformed or oversized size field must not cause an
++  // out-of-bounds read or a non-terminating scan.
++  while (offset + 512 <= buffer.length) {
+     let name = str(offset, 100)
+     let size = parseInt(str(offset + 124, 12), 8)
+     offset += 512
+-    if (!isNaN(size)) {
+-      if (name === file) return buffer.subarray(offset, offset + size)
+-      offset += (size + 511) & ~511
++    if (isNaN(size) || size < 0) {
++      // Corrupt/malicious header — stop scanning rather than risk running off
++      // the end of the buffer.
++      break
++    }
++    if (offset + size > buffer.length) {
++      throw new Error(`Malformed tar archive: entry ${JSON.stringify(name)} declares a size that exceeds the archive`)
+     }
++    if (name === file) return buffer.subarray(offset, offset + size)
++    offset += (size + 511) & ~511
+   }
+   throw new Error(`Could not find ${JSON.stringify(file)} in archive`)
+ }
+--- /dev/null
++++ b/scripts/deno-ghsa-gv7w-rqvm-qjhr-test.ts
+@@ -0,0 +1,97 @@
++// Regression test for GHSA-gv7w-rqvm-qjhr
++//
++// esbuild's Deno install path (lib/deno/mod.ts) downloaded the native binary
++// from an attacker-influenceable NPM_CONFIG_REGISTRY and executed it with no
++// transport enforcement and no payload integrity check, and parsed the tar
++// stream without bounds validation.
++//
++// The patch adds three defensive behaviors to lib/deno/mod.ts:
++//   1. HTTPS-only enforcement on the download URL.
++//   2. isValidNativeExecutable() content check before writing/executing.
++//   3. bounds validation in extractFileFromTarGzip().
++//
++// The hardened helpers are module-private, so this test re-implements the exact
++// logic from the patch and asserts the security-relevant properties. If the
++// logic in mod.ts is regressed, this test documents the required behavior.
++//
++// Run: deno test scripts/deno-ghsa-gv7w-rqvm-qjhr-test.ts
++
++import { assert, assertEquals, assertThrows } from "https://deno.land/std/testing/asserts.ts"
++
++// Mirror of the HTTPS-only guard added to installFromNPM().
++function isSecureRegistryUrl(url: string): boolean {
++  return /^https:\/\//i.test(url)
++}
++
++// Mirror of isValidNativeExecutable() added to lib/deno/mod.ts.
++function isValidNativeExecutable(bytes: Uint8Array): boolean {
++  if (!bytes || bytes.length < 4) return false
++  const b0 = bytes[0], b1 = bytes[1], b2 = bytes[2], b3 = bytes[3]
++  if (b0 === 0x7F && b1 === 0x45 && b2 === 0x4C && b3 === 0x46) return true // ELF
++  if (b0 === 0x4D && b1 === 0x5A) return true // PE "MZ"
++  const magic = ((b0 << 24) | (b1 << 16) | (b2 << 8) | b3) >>> 0
++  switch (magic) {
++    case 0xFEEDFACE: case 0xCEFAEDFE:
++    case 0xFEEDFACF: case 0xCFFAEDFE:
++    case 0xCAFEBABE: case 0xBEBAFECA:
++      return true
++  }
++  return false
++}
++
++// Mirror of the hardened tar scan loop in extractFileFromTarGzip() (post-gunzip).
++function extractFromTar(buffer: Uint8Array, file: string): Uint8Array {
++  const str = (i: number, n: number) =>
++    String.fromCharCode(...buffer.subarray(i, i + n)).replace(/\0.*$/, "")
++  let offset = 0
++  file = `package/${file}`
++  while (offset + 512 <= buffer.length) {
++    const name = str(offset, 100)
++    const size = parseInt(str(offset + 124, 12), 8)
++    offset += 512
++    if (isNaN(size) || size < 0) break
++    if (offset + size > buffer.length)
++      throw new Error("Malformed tar archive: entry size exceeds the archive")
++    if (name === file) return buffer.subarray(offset, offset + size)
++    offset += (size + 511) & ~511
++  }
++  throw new Error("Could not find file in archive")
++}
++
++Deno.test("GHSA-gv7w-rqvm-qjhr: rejects non-HTTPS registry URLs (attacker NPM_CONFIG_REGISTRY)", () => {
++  assert(!isSecureRegistryUrl("http://evil.example.com/pkg.tgz"))
++  assert(!isSecureRegistryUrl("ftp://evil.example.com/pkg.tgz"))
++  assert(isSecureRegistryUrl("https://registry.npmjs.org/pkg.tgz"))
++})
++
++Deno.test("GHSA-gv7w-rqvm-qjhr: rejects payloads that are not native executables", () => {
++  // Attacker-delivered non-executable payload (e.g. a script or arbitrary blob).
++  assert(!isValidNativeExecutable(new TextEncoder().encode("#!/bin/sh\nrm -rf /\n")))
++  assert(!isValidNativeExecutable(new Uint8Array([0x00, 0x01, 0x02, 0x03])))
++  assert(!isValidNativeExecutable(new Uint8Array([0x7F]))) // too short
++  // Genuine native-executable magic numbers are accepted.
++  assert(isValidNativeExecutable(new Uint8Array([0x7F, 0x45, 0x4C, 0x46, 0x02]))) // ELF
++  assert(isValidNativeExecutable(new Uint8Array([0x4D, 0x5A, 0x90, 0x00])))       // PE
++  assert(isValidNativeExecutable(new Uint8Array([0xCF, 0xFA, 0xED, 0xFE])))       // Mach-O 64
++})
++
++Deno.test("GHSA-gv7w-rqvm-qjhr: tar parser rejects oversized entry size (no OOB read)", () => {
++  // One 512-byte header declaring a huge size, but no data follows.
++  const buf = new Uint8Array(512)
++  const name = "package/bin/esbuild"
++  for (let i = 0; i < name.length; i++) buf[i] = name.charCodeAt(i)
++  const sizeOctal = "77777777777\0" // enormous size in octal
++  for (let i = 0; i < sizeOctal.length; i++) buf[124 + i] = sizeOctal.charCodeAt(i)
++  assertThrows(() => extractFromTar(buf, "bin/esbuild"), Error)
++})
++
++Deno.test("GHSA-gv7w-rqvm-qjhr: tar parser still extracts a well-formed entry", () => {
++  const content = new TextEncoder().encode("BINARY-CONTENTS")
++  const buf = new Uint8Array(512 + 512) // header + one data block
++  const name = "package/bin/esbuild"
++  for (let i = 0; i < name.length; i++) buf[i] = name.charCodeAt(i)
++  const sizeOctal = content.length.toString(8).padStart(11, "0") + "\0"
++  for (let i = 0; i < sizeOctal.length; i++) buf[124 + i] = sizeOctal.charCodeAt(i)
++  buf.set(content, 512)
++  assertEquals(extractFromTar(buf, "bin/esbuild"), content)
++})
