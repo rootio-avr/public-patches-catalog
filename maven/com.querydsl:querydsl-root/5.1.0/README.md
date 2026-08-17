@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-49203
+- GHSA-wpvf-5mc3-hv6m
 
 ## How to Apply:
 1. Clone or download the source code for com.querydsl:querydsl-root
