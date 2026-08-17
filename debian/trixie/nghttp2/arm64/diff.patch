@@ -1,71 +1,337 @@
-diff --git a/lib/nghttp2_session.c b/lib/nghttp2_session.c
-index df33a89e..178dc3d7 100644
---- a/lib/nghttp2_session.c
-+++ b/lib/nghttp2_session.c
-@@ -6063,6 +6063,10 @@ nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session,
-           return rv;
-         }
- 
-+        if (iframe->state == NGHTTP2_IB_IGN_ALL) {
-+          return (ssize_t)inlen;
-+        }
+Description: Fix CVE-2026-58055: nghttpx CONNECT and HTTP Upgrade request smuggling
+ nghttpx's HTTP/1.1 handling forwards Upgrade requests that also carry a
+ Content-Length header/body onto reusable keep-alive backend connections,
+ re-adding the Upgrade and Connection headers while passing Content-Length
+ verbatim. A backend that resolves the resulting ambiguous message in the
+ attacker's favor enables HTTP request/response smuggling and cross-client
+ response-queue poisoning.
+ .
+ This backport of upstream commit ab28105 tightens CONNECT and HTTP Upgrade
+ handling in nghttpx: reject Upgrade/CONNECT requests that carry a body
+ (Content-Length or Transfer-Encoding), block forwarding the request body
+ until the upgrade is confirmed by the backend, refuse to reuse the backend
+ connection while a blocked request buffer is pending, and coerce a 2xx
+ response to a CONNECT request that did not upgrade into a 502.
+Origin: upstream, https://github.com/nghttp2/nghttp2/commit/ab28105c4a0197da24f8bfc414bc116055249e1e
+Author: Tatsuhiro Tsujikawa <tatsuhiro.t@gmail.com>
+Bug: https://github.com/nghttp2/nghttp2/security/advisories/GHSA-xrr7-82jr-v58x
+Bug-Debian: https://bugs.debian.org/1140917
+Last-Update: 2026-07-03
+
+--- a/src/shrpx_downstream.cc
++++ b/src/shrpx_downstream.cc
+@@ -1143,7 +1143,8 @@ bool Downstream::can_detach_downstream_connection() const {
+   // state, especially for HTTP/1.1
+   return dconn_ && response_state_ == DownstreamState::MSG_COMPLETE &&
+          request_state_ == DownstreamState::MSG_COMPLETE && !upgraded_ &&
+-         !resp_.connection_close && request_buf_.rleft() == 0;
++         !resp_.connection_close && blocked_request_buf_.rleft() == 0 &&
++         request_buf_.rleft() == 0;
+ }
+
+ DefaultMemchunks Downstream::pop_response_buf() {
+--- a/src/shrpx_downstream.h
++++ b/src/shrpx_downstream.h
+@@ -164,7 +164,8 @@ struct Request {
+       connection_close(false),
+       http2_expect_body(false),
+       no_authority(false),
+-      forwarded_once(false) {}
++      forwarded_once(false),
++      http1_msg_complete(false) {}
+
+   void consume(size_t len) {
+     assert(unconsumed_body_length >= len);
+@@ -231,6 +232,10 @@ struct Request {
+   // orig_authority and orig_path have the authority and path which
+   // are used for the first backend selection.
+   bool forwarded_once;
++  // true if HTTP/1 request message has been completed.  This field is
++  // added because Downstream::get_request_state() might be altered
++  // from DownstreamState::MSG_COMPLETE.
++  bool http1_msg_complete;
+ };
+
+ struct Response {
+--- a/src/shrpx_http2_upstream.cc
++++ b/src/shrpx_http2_upstream.cc
+@@ -359,6 +359,17 @@ int Http2Upstream::on_request_headers(Downstream *downstream,
+     return 0;
+   }
+
++  if (method_token == HTTP_CONNECT && content_length) {
++    if (LOG_ENABLED(INFO)) {
++      ULOG(INFO, this) << "content-length are not allowed in CONNECT request";
++    }
 +
-         on_begin_frame_called = 1;
- 
-         rv = session_process_headers_frame(session);
-@@ -6684,6 +6688,10 @@ nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session,
-           return rv;
-         }
- 
-+        if (iframe->state == NGHTTP2_IB_IGN_ALL) {
-+          return (ssize_t)inlen;
-+        }
++    if (error_reply(downstream, 400) != 0) {
++      return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
++    }
++    return 0;
++  }
 +
-         session_inbound_frame_reset(session);
- 
-         break;
-@@ -6812,6 +6820,11 @@ nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session,
-             return rv;
-           }
-         }
+   auto faddr = handler_->get_upstream_addr();
+
+   // For HTTP/2 proxy, we require :authority.
+--- a/src/shrpx_http3_upstream.cc
++++ b/src/shrpx_http3_upstream.cc
+@@ -2282,6 +2282,17 @@ int Http3Upstream::http_end_request_headers(Downstream *downstream, int fin) {
+     return 0;
+   }
+
++  if (method_token == HTTP_CONNECT && content_length) {
++    if (LOG_ENABLED(INFO)) {
++      ULOG(INFO, this) << "content-length are not allowed in CONNECT request";
++    }
 +
-+        if (iframe->state == NGHTTP2_IB_IGN_ALL) {
-+          return (ssize_t)inlen;
-+        }
++    if (error_reply(downstream, 400) != 0) {
++      return -1;
++    }
++    return 0;
++  }
 +
-         session_inbound_frame_reset(session);
- 
-         session->num_continuations = 0;
-@@ -7171,6 +7184,10 @@ nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session,
-         return rv;
-       }
- 
-+      if (iframe->state == NGHTTP2_IB_IGN_ALL) {
-+        return (ssize_t)inlen;
+   auto faddr = handler_->get_upstream_addr();
+
+   auto config = get_config();
+--- a/src/shrpx_http_downstream_connection.cc
++++ b/src/shrpx_http_downstream_connection.cc
+@@ -227,7 +227,8 @@ HttpDownstreamConnection::HttpDownstreamConnection(
+     response_htp_{0},
+     first_write_done_(false),
+     reusable_(true),
+-    request_header_written_(false) {}
++    request_header_written_(false),
++    blocked_request_buf_processed_(false) {}
+
+ HttpDownstreamConnection::~HttpDownstreamConnection() {
+   if (LOG_ENABLED(INFO)) {
+@@ -465,6 +466,7 @@ int HttpDownstreamConnection::attach_downstream(Downstream *downstream) {
+     on_write_ = &HttpDownstreamConnection::write_first;
+     first_write_done_ = false;
+     request_header_written_ = false;
++    blocked_request_buf_processed_ = false;
+   }
+
+   llhttp_init(&response_htp_, HTTP_RESPONSE, &htp_hooks);
+@@ -735,6 +737,34 @@ int HttpDownstreamConnection::push_request_headers() {
+   return 0;
+ }
+
++bool HttpDownstreamConnection::should_block_request_body() const {
++  const auto &req = downstream_->request();
++
++  return !downstream_->get_request_header_sent() ||
++         (req.upgrade_request && !downstream_->get_upgraded());
++}
++
++bool HttpDownstreamConnection::should_unblock_request_body_before_response()
++  const {
++  const auto &req = downstream_->request();
++
++  return !req.upgrade_request;
++}
++
++void HttpDownstreamConnection::process_blocked_request_buf_on_response() {
++  if (blocked_request_buf_processed_) {
++    return;
++  }
++
++  process_blocked_request_buf();
++
++  auto buf = downstream_->get_blocked_request_buf();
++  buf->reset();
++  blocked_request_buf_processed_ = true;
++
++  signal_write();
++}
++
+ int HttpDownstreamConnection::process_blocked_request_buf() {
+   auto src = downstream_->get_blocked_request_buf();
+
+@@ -763,7 +793,7 @@ int HttpDownstreamConnection::process_blocked_request_buf() {
+
+ int HttpDownstreamConnection::push_upload_data_chunk(const uint8_t *data,
+                                                      size_t datalen) {
+-  if (!downstream_->get_request_header_sent()) {
++  if (should_block_request_body()) {
+     auto output = downstream_->get_blocked_request_buf();
+     auto &req = downstream_->request();
+     output->append(data, datalen);
+@@ -798,7 +828,7 @@ int HttpDownstreamConnection::push_upload_data_chunk(const uint8_t *data,
+ }
+
+ int HttpDownstreamConnection::end_upload_data() {
+-  if (!downstream_->get_request_header_sent()) {
++  if (should_block_request_body()) {
+     downstream_->set_blocked_request_data_eof(true);
+     if (request_header_written_) {
+       signal_write();
+@@ -997,6 +1027,11 @@ int htp_hdrs_completecb(llhttp_t *htp) {
+   // upgrade succeeded, 101 response is treated as final in nghttpx.
+   downstream->check_upgrade_fulfilled_http1();
+
++  if (req.method == HTTP_CONNECT && resp.http_status / 100 == 2 &&
++      !downstream->get_upgraded()) {
++    resp.http_status = 502;
++  }
++
+   if (downstream->get_non_final_response()) {
+     // Reset content-length because we reuse same Downstream for the
+     // next response.
+@@ -1018,7 +1053,7 @@ int htp_hdrs_completecb(llhttp_t *htp) {
+   downstream->set_response_state(DownstreamState::HEADER_COMPLETE);
+   downstream->inspect_http1_response();
+
+-  if (htp->flags & F_CHUNKED) {
++  if (!downstream->get_upgraded() && (htp->flags & F_CHUNKED)) {
+     downstream->set_chunked_response(true);
+   }
+
+@@ -1033,13 +1068,22 @@ int htp_hdrs_completecb(llhttp_t *htp) {
+     resp.connection_close = true;
+     // transfer-encoding not applied to upgraded connection
+     downstream->set_chunked_response(false);
+-  } else if (http2::legacy_http1(req.http_major, req.http_minor)) {
+-    if (resp.fs.content_length == -1) {
++
++    static_cast<HttpDownstreamConnection *>(dconn)
++      ->process_blocked_request_buf_on_response();
++  } else {
++    if (req.upgrade_request) {
+       resp.connection_close = true;
+     }
+-    downstream->set_chunked_response(false);
+-  } else if (!downstream->expect_response_body()) {
+-    downstream->set_chunked_response(false);
++
++    if (http2::legacy_http1(req.http_major, req.http_minor)) {
++      if (resp.fs.content_length == -1) {
++        resp.connection_close = true;
 +      }
++      downstream->set_chunked_response(false);
++    } else if (!downstream->expect_response_body()) {
++      downstream->set_chunked_response(false);
++    }
+   }
+
+   if (loggingconf.access.write_early && downstream->accesslog_ready()) {
+@@ -1211,7 +1255,10 @@ int htp_msg_completecb(llhttp_t *htp) {
+ int HttpDownstreamConnection::write_first() {
+   int rv;
+
+-  process_blocked_request_buf();
++  auto should_unblock_req_body = should_unblock_request_body_before_response();
++  if (should_unblock_req_body) {
++    process_blocked_request_buf();
++  }
+
+   if (conn_.tls.ssl) {
+     rv = write_tls();
+@@ -1232,8 +1279,11 @@ int HttpDownstreamConnection::write_first() {
+   first_write_done_ = true;
+   downstream_->set_request_header_sent(true);
+
+-  auto buf = downstream_->get_blocked_request_buf();
+-  buf->reset();
++  if (should_unblock_req_body) {
++    auto buf = downstream_->get_blocked_request_buf();
++    buf->reset();
++    blocked_request_buf_processed_ = true;
++  }
+
+   // upstream->resume_read() might be called in
+   // write_tls()/write_clear(), but before blocked_request_buf_ is
+--- a/src/shrpx_http_downstream_connection.h
++++ b/src/shrpx_http_downstream_connection.h
+@@ -91,6 +91,9 @@ public:
+   int noop();
+
+   int process_blocked_request_buf();
++  void process_blocked_request_buf_on_response();
++  bool should_unblock_request_body_before_response() const;
++  bool should_block_request_body() const;
+
+ private:
+   Connection conn_;
+@@ -118,6 +121,8 @@ private:
+   bool reusable_;
+   // true if request header is written to request buffer.
+   bool request_header_written_;
++  // true if blocked request buffer has been processed.
++  bool blocked_request_buf_processed_;
+ };
+
+ } // namespace shrpx
+--- a/src/shrpx_https_upstream.cc
++++ b/src/shrpx_https_upstream.cc
+@@ -416,6 +416,17 @@ int htp_hdrs_completecb(llhttp_t *htp) {
+
+   downstream->inspect_http1_request();
+
++  if ((req.upgrade_request || llhttp_get_upgrade(htp)) &&
++      (req.fs.header(http2::HD_TRANSFER_ENCODING) ||
++       req.fs.header(http2::HD_CONTENT_LENGTH))) {
++    if (LOG_ENABLED(INFO)) {
++      ULOG(INFO, upstream) << "transfer-encoding and content-length are not "
++                              "allowed in CONNECT or upgrade request";
++    }
 +
-       session_inbound_frame_reset(session);
- 
-       break;
-@@ -7255,6 +7272,10 @@ nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session,
-         return rv;
-       }
- 
-+      if (iframe->state == NGHTTP2_IB_IGN_ALL) {
-+        return (ssize_t)inlen;
++    return -1;
++  }
++
+   if (htp->flags & F_CHUNKED) {
+     downstream->set_chunked_request(true);
+   }
+@@ -559,6 +570,17 @@ int htp_bodycb(llhttp_t *htp, const char *data, size_t len) {
+   int rv;
+   auto upstream = static_cast<HttpsUpstream *>(htp->data);
+   auto downstream = upstream->get_downstream();
++  const auto &req = downstream->request();
++
++  if (req.upgrade_request || llhttp_get_upgrade(htp)) {
++    if (LOG_ENABLED(INFO)) {
++      ULOG(INFO, upstream) << "Request body for Upgrade request is not allowed";
++    }
++
++    llhttp_set_error_reason(htp, "request body for Upgrade request");
++    return HPE_USER;
++  }
++
+   rv = downstream->push_upload_data_chunk(
+     reinterpret_cast<const uint8_t *>(data), len);
+   if (rv != 0) {
+@@ -594,6 +616,7 @@ int htp_msg_completecb(llhttp_t *htp) {
+   }
+
+   downstream->set_request_state(DownstreamState::MSG_COMPLETE);
++  req.http1_msg_complete = true;
+   rv = downstream->end_upload_data();
+   if (rv != 0) {
+     if (downstream->get_response_state() == DownstreamState::MSG_COMPLETE) {
+@@ -635,7 +658,8 @@ int HttpsUpstream::on_read() {
+
+   // downstream can be nullptr here, because it is initialized in the
+   // callback chain called by llhttp_execute()
+-  if (downstream && downstream->get_upgraded()) {
++  if (downstream && downstream->request().http1_msg_complete &&
++      downstream->get_upgraded()) {
+     auto rv = downstream->push_upload_data_chunk(rb->pos(), rb->rleft());
+
+     if (rv != 0) {
+@@ -707,9 +731,13 @@ int HttpsUpstream::on_read() {
+
+   if (htperr != HPE_OK) {
+     if (LOG_ENABLED(INFO)) {
+-      ULOG(INFO, this) << "HTTP parse failure: "
+-                       << "(" << llhttp_errno_name(htperr) << ") "
+-                       << llhttp_get_error_reason(&htp_);
++      if (htperr == HPE_USER) {
++        ULOG(INFO, this) << "HTTP callback error";
++      } else {
++        ULOG(INFO, this) << "HTTP parse failure: "
++                         << "(" << llhttp_errno_name(htperr) << ") "
++                         << llhttp_get_error_reason(&htp_);
 +      }
-+
-       session_inbound_frame_reset(session);
- 
-       break;
-@@ -7283,6 +7304,10 @@ nghttp2_ssize nghttp2_session_mem_recv2(nghttp2_session *session,
-         return rv;
-       }
- 
-+      if (iframe->state == NGHTTP2_IB_IGN_ALL) {
-+        return (ssize_t)inlen;
-+      }
-+
-       session_inbound_frame_reset(session);
- 
-       break;
+     }
+
+     if (downstream &&
