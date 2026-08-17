@@ -1,10 +1,10 @@
-# nghttp2 : 1.52.0-1+deb12u2.root.io.1
+# nghttp2 : 1.52.0-1+deb12u3.aikido.2
 
-This patch is based on nghttp2 version 1.52.0-1+deb12u2.root.io.1, which is available at:
-https://sources.debian.org/src/nghttp2/1.52.0-1+deb12u2/
+This patch is based on nghttp2 version 1.52.0-1+deb12u3.aikido.2, which is available at:
+https://sources.debian.org/src/nghttp2/1.52.0-1+deb12u3/
 
 ## Affected CVEs:
-- CVE-2026-27135
+- CVE-2026-58055
 
 ## How to Apply:
 1. Obtain the source package: `apt source nghttp2`
