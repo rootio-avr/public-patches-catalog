@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-7783
+- CVE-2026-12143
 
 ## How to Apply:
 1. Clone or download the source code for form-data
