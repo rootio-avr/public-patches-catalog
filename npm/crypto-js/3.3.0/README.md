@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-554041
 - CVE-2023-46233
+- CVE-2026-71851
 
 ## How to Apply:
 1. Clone or download the source code for crypto-js
