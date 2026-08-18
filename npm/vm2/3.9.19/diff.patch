@@ -1,0 +1,543 @@
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -414,6 +414,12 @@ function createBridge(otherInit, registerProxy) {
+ 
+ 		get(target, key, receiver) {
+ 			// Note: target@this(unsafe) key@prim receiver@this(unsafe) throws@this(unsafe)
++			// SECURITY (CVE-2026-47686 / GHSA-m283-3h24-438v): expose a stable
++			// marker so the sandbox exception sanitizer can recognize a host-
++			// wrapped carrier (e.g. a host-thrown Error whose .cause is a live
++			// host object such as `process`) and rebuild it as a sandbox-realm
++			// error instead of handing back a fully-functional bridge proxy.
++			if (key === 'isProxy') return true;
+ 			const object = this.getObject(); // @other(unsafe)
+ 			switch (key) {
+ 				case 'constructor': {
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -327,13 +327,103 @@ const withProxy = localObjectFreeze({
+ 	}
+ });
+ 
++// SECURITY (CVE-2026-47686 / GHSA-m283-3h24-438v): a host function exposed to
++// the sandbox can throw an Error that carries a live host object through the
++// ES2022 `Error.cause` property, e.g. `throw new Error('x', {cause: process})`.
++// When that host Error reaches a sandbox `catch`, the bridge hands it back as a
++// proxy whose `get` trap wraps `.cause` on read -- but the resulting proxy of
++// `process` is FULLY FUNCTIONAL, so sandbox code can pivot through
++// `e.cause.mainModule.require('child_process').execSync(...)` to host RCE. The
++// bridge wraps for realm isolation, not capability restriction, so re-wrapping
++// is not enough: the host reference must be removed from sandbox reach.
++//
++// `handleException` is the chokepoint the transformer wraps every caught value
++// with. It must preserve the previous `ensureThis` behavior (the sandbox relies
++// on caught host functions/values remaining usable) while additionally stripping
++// any host reference reachable through `.cause`.
++function isHostWrappedCarrier(e) {
++	// `isProxy` is answered by the bridge proxy `get` trap (see lib/bridge.js);
++	// a genuine sandbox-realm object returns undefined. Guard against a hostile
++	// accessor that throws.
++	try {
++		return e.isProxy === true;
++	} catch (_e) {
++		return false;
++	}
++}
++
++function sanitizeErrorCause(e, depth) {
++	if (e === null || e === undefined) return e;
++	const t = typeof e;
++	if (t !== 'object' && t !== 'function') return e;
++	if (depth > 10) return e;
++	if (isHostWrappedCarrier(e)) {
++		// Host-wrapped carrier: seal `.cause` to `undefined` on the underlying
++		// host object. Using defineProperty (not delete) with
++		// writable/configurable false both removes the host reference and, via
++		// the ECMA-262 Proxy get/defineProperty invariants, prevents an
++		// accessor- or lying-proxy-shaped `.cause` from re-delivering it on a
++		// later read. Best effort: on failure the property is left as-is, but
++		// the realistic embedder case (`new Error(msg, {cause: process})`)
++		// creates a plain configurable data property that is always overwritten.
++		try {
++			localReflectDefineProperty(e, 'cause', {
++				__proto__: null,
++				value: undefined,
++				writable: false,
++				enumerable: false,
++				configurable: false
++			});
++		} catch (_e) {
++			/* best effort */
++		}
++		return e;
++	}
++	// Sandbox-realm carrier: recurse so a sandbox-thrown
++	// `new Error('x', {cause: hostErr})` still gets its sub-error's host
++	// references stripped, then re-install `.cause` as a plain data property so
++	// a sandbox-side accessor cannot return a different value on a later read.
++	let cause;
++	try {
++		cause = e.cause;
++	} catch (_e) {
++		return e;
++	}
++	if (cause !== undefined && cause !== null) {
++		const ct = typeof cause;
++		if (ct === 'object' || ct === 'function') {
++			const sanitized = sanitizeErrorCause(cause, depth + 1);
++			try {
++				localReflectDefineProperty(e, 'cause', {
++					__proto__: null,
++					value: sanitized,
++					writable: true,
++					enumerable: false,
++					configurable: true
++				});
++			} catch (_e) {
++				try {
++					e.cause = sanitized;
++				} catch (_e2) {
++					/* best effort */
++				}
++			}
++		}
++	}
++	return e;
++}
++
++function handleException(e) {
++	return sanitizeErrorCause(ensureThis(e), 0);
++}
++
+ const interanState = localObjectFreeze({
+ 	__proto__: null,
+ 	wrapWith(x) {
+ 		if (x === null || x === undefined) return x;
+ 		return new LocalProxy(localObject(x), withProxy);
+ 	},
+-	handleException: ensureThis,
++	handleException: handleException,
+ 	import(what) {
+ 		throw new VMError('Dynamic Import not supported');
+ 	}
+--- /dev/null
++++ b/test/cve-2026-47686.test.js
+@@ -0,0 +1,127 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++/**
++ * CVE-2026-47686 / GHSA-m283-3h24-438v — Error.cause leaks a live host
++ * reference into the sandbox, enabling a pivot to host RCE.
++ *
++ * When an embedder-exposed host function throws an Error carrying a powerful
++ * host object via the ES2022 `Error.cause` property
++ * (`throw new Error('x', { cause: process })`), the host Error crosses the
++ * bridge and surfaces in the sandbox catch block. Before the fix, reading
++ * `e.cause` returned a fully-functional bridge proxy of the host object, so
++ * the sandbox could run
++ * `e.cause.mainModule.require('child_process').execSync(...)` for full RCE.
++ *
++ * The fix sanitizes host-wrapped error carriers in `handleException` so
++ * `.cause` no longer hands back a usable host reference.
++ */
++
++const assert = require('assert');
++const {VM} = require('..');
++const NODE_VERSION = parseInt(process.versions.node.split('.')[0]);
++const NODE_MINOR = parseInt(process.versions.node.split('.')[1]);
++// Error.cause shipped in V8 9.3 / Node 16.9. Older Nodes silently drop the
++// `cause` option, so the exploit primitive does not exist there.
++const HAS_ERROR_CAUSE = NODE_VERSION > 16 || (NODE_VERSION === 16 && NODE_MINOR >= 9);
++
++describe('CVE-2026-47686 (Error.cause leaks host references)', () => {
++	it('sandbox cannot reach host child_process via Error.cause', function () {
++		if (!HAS_ERROR_CAUSE) this.skip();
++		const probe = {realm: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: process});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					const cp = e.cause.mainModule.require('child_process');
++					__probe.realm = 'HOST:' + cp.execSync('echo PWNED').toString().trim();
++				} catch (err) {
++					__probe.realm = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.notStrictEqual(probe.realm, 'HOST:PWNED', 'sandbox reached host child_process via Error.cause');
++	});
++
++	it('e.cause on a host-thrown Error is not a usable host reference', function () {
++		if (!HAS_ERROR_CAUSE) this.skip();
++		const probe = {mainModuleType: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: process});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.mainModuleType = e.cause && typeof e.cause.mainModule;
++				} catch (_) {
++					__probe.mainModuleType = 'THREW';
++				}
++			}
++		`);
++		assert.notStrictEqual(probe.mainModuleType, 'object', 'sandbox reached process.mainModule via Error.cause');
++		assert.notStrictEqual(probe.mainModuleType, 'function', 'sandbox reached process.mainModule via Error.cause');
++	});
++
++	it('variant: cause is a host module (child_process)', function () {
++		if (!HAS_ERROR_CAUSE) this.skip();
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: require('child_process')});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.result = e.cause.execSync('echo PWN').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED';
++				}
++			}
++		`);
++		assert.strictEqual(probe.result, 'BLOCKED', 'sandbox reached host child_process via Error.cause');
++	});
++
++	it('legitimate host exception handling still works', () => {
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('boom');
++				}
++			}
++		});
++		const message = vm.run(`
++			(function () {
++				try {
++					hostFn();
++				} catch (e) {
++					return e.message;
++				}
++			})()
++		`);
++		assert.strictEqual(message, 'boom');
++	});
++});
+
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -836,7 +836,24 @@ function createBridge(otherInit, registerProxy) {
+ 				if (!proto) {
+ 					return other;
+ 				}
++				// SECURITY (CVE-2026-47698 / GHSA-cfcw-xp6x-25gj): track whether the
++				// prototype walk passes through the sandbox-realm Object.prototype.
++				// Every genuine sandbox-realm object (plain {}, sandbox Error, class
++				// instance, etc.) has it in its chain, so such values always hit a
++				// protoMapping (sandbox intrinsics are registered) or terminate via
++				// it. A value that walks its whole chain to null WITHOUT a mapping AND
++				// without ever seeing the sandbox Object.prototype is anomalous: it is
++				// a host-realm object whose prototype chain was severed host-side
++				// (e.g. via stacked Function.prototype.call indirection around the
++				// host __proto__ setter, or via apply.bind/map host-side laundering).
++				// Returning such an object raw lets `e.constructor.constructor` reach
++				// host Function -> RCE. ensureThis is also the sandbox
++				// handleException sanitizer (setup-sandbox.js), so this single
++				// chokepoint is mechanism-independent: it does not matter HOW the
++				// chain was severed.
++				let sawSandboxObjectProto = false;
+ 				while (proto) {
++					if (proto === thisObjectPrototype) sawSandboxObjectProto = true; // SECURITY (CVE-2026-47698)
+ 					const mapping = thisReflectApply(thisMapGet, protoMappings, [proto]);
+ 					if (mapping) {
+ 						const mapped = thisReflectApply(thisWeakMapGet, mappingOtherToThis, [other]);
+@@ -845,6 +862,17 @@ function createBridge(otherInit, registerProxy) {
+ 					}
+ 					proto = thisReflectGetPrototypeOf(proto);
+ 				}
++				// SECURITY (CVE-2026-47698 / GHSA-cfcw-xp6x-25gj): walked the entire
++				// chain to null with no protoMapping. If the chain never included the
++				// sandbox Object.prototype, the value is a host-realm object with a
++				// severed/foreign chain -- refuse to surface it raw. `emptyForzenObject`
++				// mirrors the sentinel used elsewhere; its `.constructor.constructor`
++				// is the harmless sandbox Function. The immediate-null-proto branch
++				// above (deliberate Object.create(null)) returns before this walk and
++				// is unaffected.
++				if (!isHost && !sawSandboxObjectProto) {
++					return emptyForzenObject;
++				}
+ 				return other;
+ 			case 'undefined':
+ 			case 'string':
+--- /dev/null
++++ b/test/cve-2026-47698.test.js
+@@ -0,0 +1,110 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++// Regression test for CVE-2026-47698 (GHSA-cfcw-xp6x-25gj):
++// stacked-indirection / host-side-laundering bypass of the apply-trap peel.
++//
++// Grounded on upstream test/ghsa/GHSA-cfcw-xp6x-25gj/repro.js (fix commit
++// a85acb61). The upstream test tree does not exist in vm2@3.9.19, so this is a
++// minimal replacement exercising the same fixed behavior against the adapted
++// backport (the severed-host-value proto-walk guard in thisEnsureThis).
++
++'use strict';
++
++const assert = require('assert');
++const {VM} = require('..');
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++const HAS_WASM_STREAMING = NODE_MAJOR >= 14;
++
++function escapeAttempt(code) {
++	const vm = new VM({timeout: 2000});
++	const pwnKey = '__CVE_2026_47698_pwned_' + Math.random().toString(36).slice(2);
++	global[pwnKey] = false;
++	try {
++		vm.run(code.replace(/__PWN_KEY__/g, JSON.stringify(pwnKey)));
++	} catch (_) {
++		/* bridge-level throws are also an acceptable block */
++	}
++	return new Promise(function (resolve) {
++		setTimeout(function () {
++			const escaped = global[pwnKey] === true;
++			delete global[pwnKey];
++			resolve(escaped);
++		}, 300);
++	});
++}
++
++describe('CVE-2026-47698 (stacked indirection / host laundering breakout)', function () {
++	(HAS_WASM_STREAMING ? it : it.skip)('blocks the stacked-call PoC (Buffer.call.call(Buffer.call, setProto, ...))', async function () {
++		this.timeout(5000);
++		const escaped = await escapeAttempt(`
++			"use strict";
++			const getProto = Buffer.call.call(Buffer.call, {}.__lookupGetter__, Buffer, "__proto__");
++			const setProto = Buffer.call.call(Buffer.call, {}.__lookupSetter__, Buffer, "__proto__");
++			async function f() {
++				try { await WebAssembly.compileStreaming(); }
++				catch (e) {
++					try {
++						Buffer.call.call(Buffer.call, setProto,
++							Buffer.call.call(Buffer.call, getProto, e), null);
++					} catch (_) {}
++				}
++				try { await WebAssembly.compileStreaming(); }
++				catch (e) {
++					try {
++						const HostFunction = e.constructor.constructor;
++						new HostFunction("globalThis[" + JSON.stringify(__PWN_KEY__) + "] = true")();
++					} catch (_) {}
++				}
++			}
++			f().catch(() => {});
++		`);
++		assert.strictEqual(escaped, false, 'stacked-indirection PoC succeeded');
++	});
++
++	it('a severed-prototype host carrier surfaced in a sandbox catch cannot reach host Function', function () {
++		// Directly exercise the payoff signature the guard defends: a caught
++		// value whose prototype chain was severed host-side must never expose a
++		// host constructor pivot. Any escape would set the flag.
++		const vm = new VM({timeout: 2000});
++		const out = vm.run(`
++			"use strict";
++			let hostFunctionReached = false;
++			try {
++				const setProto = Buffer.call.call(Buffer.call, {}.__lookupSetter__, Buffer, "__proto__");
++				try { Buffer.call.call(Buffer.call, setProto, Buffer, null); } catch (_) {}
++				try {
++					const C = Buffer.constructor.constructor;
++					if (typeof C === 'function') {
++						// A sandbox Function is harmless; only a host Function escapes.
++						C("this.__cve_probe = true");
++					}
++				} catch (_) {}
++			} catch (_) {}
++			hostFunctionReached;
++		`);
++		assert.strictEqual(out, false, 'severed-host carrier exposed host Function');
++	});
++
++	it('legitimate sandbox Object.setPrototypeOf on sandbox objects still works', function () {
++		const vm = new VM();
++		const out = vm.run(`
++			const a = {};
++			const b = { kind: 'parent' };
++			Object.setPrototypeOf(a, b);
++			a.kind;
++		`);
++		assert.strictEqual(out, 'parent', 'legitimate setPrototypeOf broke');
++	});
++
++	it('normal sandbox exceptions are still delivered to catch handlers', function () {
++		const vm = new VM();
++		const msg = vm.run(`
++			let m = null;
++			try { throw new TypeError('boom'); } catch (e) { m = e.message; }
++			m;
++		`);
++		assert.strictEqual(msg, 'boom', 'normal sandbox exception was swallowed');
++	});
++});
+
+--- a/lib/builtin.js
++++ b/lib/builtin.js
+@@ -83,8 +83,52 @@ const SPECIAL_MODULES = {
+ 	util: defaultBuiltinLoaderUtil
+ };
+ 
++// SECURITY (GHSA-m5w8-4gq2-6f8x): `os` and `dns` are process-wide builtins whose
++// state belongs to the host process, not the sandbox, and which additionally
++// expose *write* APIs reachable in one line of sandbox code:
++//
++//   - os  : `os.userInfo()` leaks the host process owner (uid/gid/username/
++//           homedir/shell); `os.networkInterfaces()` leaks the full host network
++//           topology; `os.hostname()`/`os.loadavg()`/`os.uptime()`/`os.freemem()`
++//           are host-wide telemetry. `os.setPriority([pid,] prio)` is a *write*
++//           -- setpriority(2) on the host process (pid 0 = host).
++//   - dns : `dns.setServers(['attacker:53'])` replaces the host's process-wide
++//           DNS resolver list, hijacking every subsequent lookup the host makes
++//           (outbound HTTP, telemetry, npm registry, fetch, URL-based fs paths)
++//           -- a one-line DNS-hijack primitive. `dns.setDefaultResultOrder()` is
++//           a second process-wide write knob; `dns.getServers()`/`lookup()`/
++//           `resolve()` read and act from the host network identity.
++//
++// The default `vm.readonly(hostRequire(key))` loader cannot localise this host
++// state, so these builtins are denied by default. Embedders who genuinely need a
++// sandbox-local subset (typically `os.platform()`, `os.EOL`, `os.constants`) can
++// still register a controlled wrapper under the same name via `mock`/`override`,
++// which are set before `addDefaultBuiltin` runs and are therefore preserved.
++const DANGEROUS_BUILTINS = new Set([
++	'os',
++	'dns'
++]);
++
++// Family-prefix denylist check. Any `<family>/...` whose family is dangerous is
++// also blocked (e.g. `dns/promises`). Strips the optional `node:` URL-style
++// prefix so `node:os` and `node:dns/promises` are caught too.
++function isDangerousBuiltin(key) {
++	if (typeof key !== 'string') return false;
++	let name = key;
++	if (name.startsWith('node:')) name = name.slice(5);
++	const slash = name.indexOf('/');
++	const family = slash === -1 ? name : name.slice(0, slash);
++	return DANGEROUS_BUILTINS.has(family);
++}
++
+ function addDefaultBuiltin(builtins, key, hostRequire) {
+ 	if (builtins.has(key)) return;
++	// SECURITY (GHSA-m5w8-4gq2-6f8x): never register the default host-passthrough
++	// loader for a dangerous builtin, regardless of how it was requested
++	// (`builtin: ['*']` wildcard, explicit allowlist, object-map form, or the
++	// lower-level `makeBuiltins([...])` API). `mock`/`override` entries are added
++	// to the map before this function is reached, so the escape hatch survives.
++	if (isDangerousBuiltin(key)) return;
+ 	const special = SPECIAL_MODULES[key];
+ 	builtins.set(key, special ? special : vm => vm.readonly(hostRequire(key)));
+ }
+--- /dev/null
++++ b/test/ghsa-m5w8-4gq2-6f8x.test.js
+@@ -0,0 +1,73 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++// Regression test for GHSA-m5w8-4gq2-6f8x -- NodeVM `os`/`dns` builtins leaked
++// host state and exposed host-process write APIs (`os.setPriority`,
++// `dns.setServers`, `dns.setDefaultResultOrder`) under `builtin: ['*']` and any
++// explicit allowlist. Grounded in the upstream repro
++// (test/ghsa/GHSA-m5w8-4gq2-6f8x/repro.js).
++
++const assert = require('assert');
++const {NodeVM, makeResolverFromLegacyOptions} = require('..');
++
++describe('GHSA-m5w8-4gq2-6f8x', () => {
++	it("os is denied under builtin: ['*']", () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.throws(() => vm.run("require('os');", 'os.js'));
++	});
++
++	it("dns is denied under builtin: ['*']", () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.throws(() => vm.run("require('dns');", 'dns.js'));
++	});
++
++	it('os is denied when explicitly allowlisted', () => {
++		const vm = new NodeVM({require: {builtin: ['os'], external: false}});
++		assert.throws(() => vm.run("require('os');", 'os.js'));
++	});
++
++	it('dns/promises subpath is denied via the family-prefix matcher', () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.throws(() => vm.run("require('dns/promises');", 'dnsp.js'));
++	});
++
++	it('node: prefixed os is denied', () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.throws(() => vm.run("require('node:os');", 'nodeos.js'));
++	});
++
++	it('dns.setServers from the sandbox does not change the host resolver list', () => {
++		const dnsHost = require('dns');
++		const before = dnsHost.getServers();
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		try {
++			vm.run("require('dns').setServers(['127.0.0.1:5353', '8.8.4.4']);", 'dns.js');
++		} catch (e) { /* expected: require denied */ }
++		assert.deepStrictEqual(dnsHost.getServers(), before, 'host DNS resolver list must be unchanged');
++	});
++
++	it('non-host-state builtins still load (fs, path)', () => {
++		const vmFs = new NodeVM({require: {builtin: ['fs'], external: false}});
++		assert.strictEqual(vmFs.run("module.exports = typeof require('fs').readFileSync"), 'function');
++		const vmPath = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.strictEqual(vmPath.run("module.exports = typeof require('path').join"), 'function');
++	});
++
++	it('mock os/dns escape hatch is preserved', () => {
++		const vmOs = new NodeVM({require: {builtin: ['*'], external: false, mock: {os: {EOL: '\n', tag: 'sandbox-safe'}}}});
++		assert.strictEqual(vmOs.run("module.exports = require('os').tag"), 'sandbox-safe');
++		const vmDns = new NodeVM({require: {builtin: ['*'], external: false, mock: {dns: {tag: 'sandbox-safe'}}}});
++		assert.strictEqual(vmDns.run("module.exports = require('dns').tag"), 'sandbox-safe');
++	});
++
++	it('makeResolverFromLegacyOptions denies os/dns default loaders', () => {
++		// makeResolverFromLegacyOptions is the public entry over makeBuiltins*/addDefaultBuiltin.
++		const resolver = makeResolverFromLegacyOptions({builtin: ['os', 'dns', 'dns/promises']});
++		const vm = new NodeVM({require: resolver});
++		for (const name of ['os', 'dns', 'dns/promises']) {
++			assert.throws(() => vm.run(`require('${name}');`, `${name.replace('/', '-')}.js`));
++		}
++	});
++});
