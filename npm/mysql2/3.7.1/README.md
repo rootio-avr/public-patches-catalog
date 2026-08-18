@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-21508
+- CVE-2024-21511
 - CVE-2024-21512
 
 ## How to Apply:
