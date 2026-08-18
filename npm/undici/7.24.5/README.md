@@ -9,6 +9,7 @@ unknown
 - CVE-2026-9678
 - CVE-2026-9679
 - CVE-2026-12151
+- CVE-2026-13697
 
 ## How to Apply:
 1. Clone or download the source code for undici
