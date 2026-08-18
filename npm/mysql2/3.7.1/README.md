@@ -4,6 +4,7 @@ This patch is based on mysql2 version 3.7.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2024-21508
 - CVE-2024-21512
 
 ## How to Apply:
