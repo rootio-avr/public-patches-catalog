@@ -6,6 +6,13 @@ unknown
 ## Affected CVEs:
 - CVE-2026-39835
 - CVE-2026-46598
+- CVE-2026-42508
+- CVE-2025-47913
+- CVE-2026-39832
+- CVE-2026-39833
+- CVE-2026-39834
+- CVE-2026-39830
+- CVE-2026-46597
 
 ## How to Apply:
 1. Clone or download the source code for golang.org/x/crypto
