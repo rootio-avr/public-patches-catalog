@@ -1,6 +1,6 @@
-# libde265 : 1.0.11-0+deb11u3.aikido.9
+# libde265 : 1.0.11-0+deb11u3.aikido.10
 
-This patch is based on libde265 version 1.0.11-0+deb11u3.aikido.9, which is available at:
+This patch is based on libde265 version 1.0.11-0+deb11u3.aikido.10, which is available at:
 https://sources.debian.org/src/libde265/1.0.11-0+deb11u3/
 
 ## Affected CVEs:
@@ -9,8 +9,10 @@ https://sources.debian.org/src/libde265/1.0.11-0+deb11u3/
 - CVE-2026-49337
 - CVE-2026-49346
 - CVE-2026-49295
+- CVE-2026-45382
 - CVE-2026-45383
 - CVE-2026-54240
+- CVE-2026-54241
 
 ## How to Apply:
 1. Obtain the source package: `apt source libde265`
