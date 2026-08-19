@@ -8,6 +8,7 @@ unknown
 - CVE-2026-41305
 - CVE-2026-45623
 - GHSA-r28c-9q8g-f849
+- CVE-2026-73646
 
 ## How to Apply:
 1. Clone or download the source code for postcss
