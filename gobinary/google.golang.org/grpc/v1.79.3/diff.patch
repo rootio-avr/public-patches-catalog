@@ -1,0 +1,612 @@
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -104,6 +104,17 @@
+ 	// A future release will remove this environment variable, enabling strict
+ 	// path checking behavior unconditionally.
+ 	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
++
++	// ControlBufferThrottleLimit is the maximum number of control frames that can
++	// be queued in the control buffer before throttling is applied. The value
++	// must be between 1 and 10,000, and is set to 100 by default.
++	//
++	// This environment variable serves as an escape hatch to increase the
++	// throttling limit if unforeseen issues arise, and it will be removed in a
++	// future release.
++	//
++	// TODO: Remove this env var once v1.83.0 is release.
++	ControlBufferThrottleLimit = uint64FromEnv("GRPC_GO_EXPERIMENTAL_CONTROL_BUFFER_THROTTLE_LIMIT", 100, 1, 10000)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+--- a/internal/transport/controlbuf.go
++++ b/internal/transport/controlbuf.go
+@@ -29,6 +29,7 @@
+ 
+ 	"golang.org/x/net/http2"
+ 	"golang.org/x/net/http2/hpack"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpclog"
+ 	"google.golang.org/grpc/mem"
+ )
+@@ -100,14 +101,15 @@
+ // the control buffer of transport. They represent different aspects of
+ // control tasks, e.g., flow control, settings, streaming resetting, etc.
+ 
+-// maxQueuedTransportResponseFrames is the most queued "transport response"
+-// frames we will buffer before preventing new reads from occurring on the
+-// transport.  These are control frames sent in response to client requests,
+-// such as RST_STREAM due to bad headers or settings acks.
+-const maxQueuedTransportResponseFrames = 50
++// maxQueuedControlBufferItems is the maximum number of frames (other than
++// HEADERS and DATA) that we will buffer before preventing new reads from
++// occurring on the transport.  These are control frames sent in response to
++// client requests, or frames that result in work being scheduled, such as
++// RST_STREAM due to bad headers or settings acks.
++var maxQueuedControlBufferItems = int(envconfig.ControlBufferThrottleLimit)
+ 
+ type cbItem interface {
+-	isTransportResponseFrame() bool
++	isThrottled() bool
+ }
+ 
+ // registerStream is used to register an incoming stream with loopy writer.
+@@ -116,7 +118,7 @@
+ 	wq       *writeQuota
+ }
+ 
+-func (*registerStream) isTransportResponseFrame() bool { return false }
++func (*registerStream) isThrottled() bool { return true }
+ 
+ // headerFrame is also used to register stream on the client-side.
+ type headerFrame struct {
+@@ -130,9 +132,10 @@
+ 	onOrphaned func(error)    // Valid on client-side
+ }
+ 
+-func (h *headerFrame) isTransportResponseFrame() bool {
+-	return h.cleanup != nil && h.cleanup.rst // Results in a RST_STREAM
+-}
++// isThrottled reports false for headerFrame: outgoing HEADERS frames (both
++// client-originated stream headers and server response/trailing headers) are
++// never counted against the control buffer throttling limit.
++func (*headerFrame) isThrottled() bool { return false }
+ 
+ type cleanupStream struct {
+ 	streamID uint32
+@@ -141,7 +144,7 @@
+ 	onWrite  func()
+ }
+ 
+-func (c *cleanupStream) isTransportResponseFrame() bool { return c.rst } // Results in a RST_STREAM
++func (*cleanupStream) isThrottled() bool { return true }
+ 
+ type earlyAbortStream struct {
+ 	streamID uint32
+@@ -149,7 +152,7 @@
+ 	hf       []hpack.HeaderField // Pre-built header fields
+ }
+ 
+-func (*earlyAbortStream) isTransportResponseFrame() bool { return false }
++func (*earlyAbortStream) isThrottled() bool { return true }
+ 
+ type dataFrame struct {
+ 	streamID   uint32
+@@ -162,40 +165,38 @@
+ 	onEachWrite func()
+ }
+ 
+-func (*dataFrame) isTransportResponseFrame() bool { return false }
++func (*dataFrame) isThrottled() bool { return false }
+ 
+ type incomingWindowUpdate struct {
+ 	streamID  uint32
+ 	increment uint32
+ }
+ 
+-func (*incomingWindowUpdate) isTransportResponseFrame() bool { return false }
++func (*incomingWindowUpdate) isThrottled() bool { return true }
+ 
+ type outgoingWindowUpdate struct {
+ 	streamID  uint32
+ 	increment uint32
+ }
+ 
+-func (*outgoingWindowUpdate) isTransportResponseFrame() bool {
+-	return false // window updates are throttled by thresholds
+-}
++func (*outgoingWindowUpdate) isThrottled() bool { return true }
+ 
+ type incomingSettings struct {
+ 	ss []http2.Setting
+ }
+ 
+-func (*incomingSettings) isTransportResponseFrame() bool { return true } // Results in a settings ACK
++func (*incomingSettings) isThrottled() bool { return true } // Results in a settings ACK
+ 
+ type outgoingSettings struct {
+ 	ss []http2.Setting
+ }
+ 
+-func (*outgoingSettings) isTransportResponseFrame() bool { return false }
++func (*outgoingSettings) isThrottled() bool { return true }
+ 
+ type incomingGoAway struct {
+ }
+ 
+-func (*incomingGoAway) isTransportResponseFrame() bool { return false }
++func (*incomingGoAway) isThrottled() bool { return true }
+ 
+ type goAway struct {
+ 	code      http2.ErrCode
+@@ -204,20 +205,20 @@
+ 	closeConn error // if set, loopyWriter will exit with this error
+ }
+ 
+-func (*goAway) isTransportResponseFrame() bool { return false }
++func (*goAway) isThrottled() bool { return true }
+ 
+ type ping struct {
+ 	ack  bool
+ 	data [8]byte
+ }
+ 
+-func (*ping) isTransportResponseFrame() bool { return true }
++func (*ping) isThrottled() bool { return true }
+ 
+ type outFlowControlSizeRequest struct {
+ 	resp chan uint32
+ }
+ 
+-func (*outFlowControlSizeRequest) isTransportResponseFrame() bool { return false }
++func (*outFlowControlSizeRequest) isThrottled() bool { return true }
+ 
+ // closeConnection is an instruction to tell the loopy writer to flush the
+ // framer and exit, which will cause the transport's connection to be closed
+@@ -225,7 +226,7 @@
+ // encounters the EOF caused by the connection closure.
+ type closeConnection struct{}
+ 
+-func (closeConnection) isTransportResponseFrame() bool { return false }
++func (closeConnection) isThrottled() bool { return true }
+ 
+ type outStreamState int
+ 
+@@ -315,11 +316,12 @@
+ 	closed          bool      // True when the controlbuf is finished.
+ 	list            *itemList // List of queued control frames.
+ 
+-	// transportResponseFrames counts the number of queued items that represent
+-	// the response of an action initiated by the peer.  trfChan is created
+-	// when transportResponseFrames >= maxQueuedTransportResponseFrames and is
+-	// closed and nilled when transportResponseFrames drops below the
+-	// threshold.  Both fields are protected by mu.
++	// transportResponseFrames counts the number of queued items that count
++	// against the control buffer throttling limit (every item other than
++	// outgoing HEADERS and DATA frames).  trfChan is created when
++	// transportResponseFrames >= maxQueuedControlBufferItems and is closed and
++	// nilled when transportResponseFrames drops below the threshold.  Both
++	// fields are protected by mu.
+ 	transportResponseFrames int
+ 	trfChan                 atomic.Pointer[chan struct{}]
+ }
+@@ -379,9 +381,9 @@
+ 		c.consumerWaiting = false
+ 	}
+ 	c.list.enqueue(it)
+-	if it.isTransportResponseFrame() {
++	if it.isThrottled() {
+ 		c.transportResponseFrames++
+-		if c.transportResponseFrames == maxQueuedTransportResponseFrames {
++		if c.transportResponseFrames == maxQueuedControlBufferItems {
+ 			// We are adding the frame that puts us over the threshold; create
+ 			// a throttling channel.
+ 			ch := make(chan struct{})
+@@ -436,8 +438,8 @@
+ 		return nil, nil
+ 	}
+ 	h := c.list.dequeue().(cbItem)
+-	if h.isTransportResponseFrame() {
+-		if c.transportResponseFrames == maxQueuedTransportResponseFrames {
++	if h.isThrottled() {
++		if c.transportResponseFrames == maxQueuedControlBufferItems {
+ 			// We are removing the frame that put us over the
+ 			// threshold; close and clear the throttling channel.
+ 			ch := c.trfChan.Swap(nil)
+--- a/internal/xds/rbac/matchers.go
++++ b/internal/xds/rbac/matchers.go
+@@ -79,7 +79,7 @@
+ func matchersFromPermissions(permissions []*v3rbacpb.Permission) ([]matcher, error) {
+ 	var matchers []matcher
+ 	for _, permission := range permissions {
+-		switch permission.GetRule().(type) {
++		switch p := permission.GetRule().(type) {
+ 		case *v3rbacpb.Permission_AndRules:
+ 			mList, err := matchersFromPermissions(permission.GetAndRules().Rules)
+ 			if err != nil {
+@@ -121,16 +121,24 @@
+ 			if err != nil {
+ 				return nil, err
+ 			}
++			if len(mList) != 1 {
++				return nil, fmt.Errorf("NotRule must contain exactly one rule")
++			}
+ 			matchers = append(matchers, &notMatcher{matcherToNot: mList[0]})
+ 		case *v3rbacpb.Permission_Metadata:
+-			// Never matches - so no-op if not inverted, always match if
+-			// inverted.
+-			if permission.GetMetadata().GetInvert() { // Test metadata being no-op and also metadata with invert always matching
++			if permission.GetMetadata().GetInvert() {
+ 				matchers = append(matchers, &alwaysMatcher{})
++			} else {
++				matchers = append(matchers, &neverMatcher{})
+ 			}
+ 		case *v3rbacpb.Permission_RequestedServerName:
+-			// Not supported in gRPC RBAC currently - a permission typed as
+-			// requested server name in the initial config will be a no-op.
++			m, err := newRequestedServerNameMatcher(permission.GetRequestedServerName())
++			if err != nil {
++				return nil, err
++			}
++			matchers = append(matchers, m)
++		default:
++			return nil, fmt.Errorf("unsupported permission rule type: %T", p)
+ 		}
+ 	}
+ 	return matchers, nil
+@@ -139,7 +147,7 @@
+ func matchersFromPrincipals(principals []*v3rbacpb.Principal) ([]matcher, error) {
+ 	var matchers []matcher
+ 	for _, principal := range principals {
+-		switch principal.GetIdentifier().(type) {
++		switch p := principal.GetIdentifier().(type) {
+ 		case *v3rbacpb.Principal_AndIds:
+ 			mList, err := matchersFromPrincipals(principal.GetAndIds().Ids)
+ 			if err != nil {
+@@ -179,16 +187,29 @@
+ 				return nil, err
+ 			}
+ 			matchers = append(matchers, m)
++		case *v3rbacpb.Principal_Metadata:
++			if principal.GetMetadata().GetInvert() {
++				matchers = append(matchers, &alwaysMatcher{})
++			} else {
++				matchers = append(matchers, &neverMatcher{})
++			}
+ 		case *v3rbacpb.Principal_NotId:
+ 			mList, err := matchersFromPrincipals([]*v3rbacpb.Principal{{Identifier: principal.GetNotId().Identifier}})
+ 			if err != nil {
+ 				return nil, err
+ 			}
++			if len(mList) != 1 {
++				return nil, fmt.Errorf("NotId must contain exactly one identifier")
++			}
+ 			matchers = append(matchers, &notMatcher{matcherToNot: mList[0]})
+ 		case *v3rbacpb.Principal_SourceIp:
+-			// The source ip principal identifier is deprecated. Thus, a
+-			// principal typed as a source ip in the identifier will be a no-op.
+-			// The config should use DirectRemoteIp instead.
++			// The source ip principal identifier is deprecated, but gRPC RBAC
++			// treats it as equivalent to direct_remote_ip as per A41.
++			m, err := newRemoteIPMatcher(principal.GetSourceIp())
++			if err != nil {
++				return nil, err
++			}
++			matchers = append(matchers, m)
+ 		case *v3rbacpb.Principal_RemoteIp:
+ 			// RBAC in gRPC treats direct_remote_ip and remote_ip as logically
+ 			// equivalent, as per A41.
+@@ -197,9 +218,8 @@
+ 				return nil, err
+ 			}
+ 			matchers = append(matchers, m)
+-		case *v3rbacpb.Principal_Metadata:
+-			// Not supported in gRPC RBAC currently - a principal typed as
+-			// Metadata in the initial config will be a no-op.
++		default:
++			return nil, fmt.Errorf("unsupported principal identifier type: %T", p)
+ 		}
+ 	}
+ 	return matchers, nil
+@@ -249,6 +269,16 @@
+ 	return true
+ }
+ 
++// neverMatcher is a matcher that will never match. This logically represents a
++// permission or principal that is unsupported in gRPC. neverMatcher implements
++// the matcher interface.
++type neverMatcher struct {
++}
++
++func (nm *neverMatcher) match(*rpcData) bool {
++	return false
++}
++
+ // notMatcher is a matcher that nots an underlying matcher. notMatcher
+ // implements the matcher interface.
+ type notMatcher struct {
+@@ -380,6 +410,25 @@
+ 
+ func (pm *portMatcher) match(data *rpcData) bool {
+ 	return data.destinationPort == pm.destinationPort
++}
++
++// requestedServerNameMatcher matches on if the given string matcher matches
++// on "", as per A41-xds-rbac.md. requestedServerNameMatcher implements
++// the matcher interface.
++type requestedServerNameMatcher struct {
++	stringMatcher internalmatcher.StringMatcher
++}
++
++func newRequestedServerNameMatcher(stringMatcherProto *v3matcherpb.StringMatcher) (*requestedServerNameMatcher, error) {
++	stringMatcher, err := internalmatcher.StringMatcherFromProto(stringMatcherProto)
++	if err != nil {
++		return nil, err
++	}
++	return &requestedServerNameMatcher{stringMatcher: stringMatcher}, nil
++}
++
++func (r *requestedServerNameMatcher) match(*rpcData) bool {
++	return r.stringMatcher.Match("")
+ }
+ 
+ // authenticatedMatcher matches on the name of the Principal. If set, the URI
+--- /dev/null
++++ b/internal/transport/controlbuf_test.go
+@@ -0,0 +1,85 @@
++/*
++ *
++ * Copyright 2026 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package transport
++
++import (
++	"testing"
++	"time"
++)
++
++func (s) TestControlBuffer_Throttle(t *testing.T) {
++	done := make(chan struct{})
++	defer close(done)
++	cb := newControlBuffer(done)
++
++	// Fill the control buffer up to the limit with throttled items.
++	for i := 0; i < maxQueuedControlBufferItems; i++ {
++		cb.put(&ping{})
++	}
++
++	// The next call to throttle should block.
++	throttleDone := make(chan struct{})
++	go func() {
++		cb.throttle()
++		close(throttleDone)
++	}()
++
++	select {
++	case <-throttleDone:
++		t.Fatal("throttle() did not block when the buffer was full")
++	case <-time.After(defaultTestShortTimeout):
++	}
++
++	// Consume one item from the control buffer.
++	if _, err := cb.get(true); err != nil {
++		t.Fatalf("cb.get(true) failed: %v", err)
++	}
++
++	// Now throttle() should unblock.
++	select {
++	case <-throttleDone:
++	case <-time.After(time.Second):
++		t.Fatal("throttle() did not unblock after an item was consumed")
++	}
++}
++
++func (s) TestControlBuffer_NoThrottleForNonThrottledItems(t *testing.T) {
++	done := make(chan struct{})
++	defer close(done)
++	cb := newControlBuffer(done)
++
++	// Fill the control buffer with many more than limit number of non-throttled
++	// items.
++	for i := 0; i < maxQueuedControlBufferItems+10; i++ {
++		cb.put(&dataFrame{})
++	}
++
++	// throttle() should not block.
++	throttled := make(chan struct{})
++	go func() {
++		cb.throttle()
++		close(throttled)
++	}()
++
++	select {
++	case <-throttled:
++	case <-time.After(defaultTestShortTimeout):
++		t.Fatal("throttle() blocked for non-throttled items")
++	}
++}
+--- /dev/null
++++ b/internal/xds/rbac/matchers_cve_test.go
+@@ -0,0 +1,169 @@
++/*
++ *
++ * Copyright 2026 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package rbac
++
++import (
++	"testing"
++
++	v3rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
++	v3matcherpb "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
++)
++
++// TestMatchersFromPermissions_Metadata verifies the fix for the xDS RBAC
++// authorization bypass / fail-open behavior (GHSA-hrxh-6v49-42gf). Prior to the
++// fix, a non-inverted Metadata permission was silently dropped (a no-op),
++// which removed the restriction entirely and could turn a deny into an allow.
++// After the fix, a non-inverted Metadata permission must translate to a
++// neverMatcher (fail-closed), and an inverted one to an alwaysMatcher.
++func (s) TestMatchersFromPermissions_Metadata(t *testing.T) {
++	tests := []struct {
++		name       string
++		invert     bool
++		wantNever  bool
++		wantAlways bool
++	}{
++		{name: "non-inverted metadata is fail-closed", invert: false, wantNever: true},
++		{name: "inverted metadata always matches", invert: true, wantAlways: true},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			perms := []*v3rbacpb.Permission{
++				{Rule: &v3rbacpb.Permission_Metadata{Metadata: &v3matcherpb.MetadataMatcher{Invert: test.invert}}},
++			}
++			matchers, err := matchersFromPermissions(perms)
++			if err != nil {
++				t.Fatalf("matchersFromPermissions() failed: %v", err)
++			}
++			if len(matchers) != 1 {
++				t.Fatalf("matchersFromPermissions() returned %d matchers, want 1", len(matchers))
++			}
++			if test.wantNever {
++				if _, ok := matchers[0].(*neverMatcher); !ok {
++					t.Fatalf("matchersFromPermissions() returned %T, want *neverMatcher", matchers[0])
++				}
++				if matchers[0].match(&rpcData{}) {
++					t.Fatal("neverMatcher.match() = true, want false")
++				}
++			}
++			if test.wantAlways {
++				if _, ok := matchers[0].(*alwaysMatcher); !ok {
++					t.Fatalf("matchersFromPermissions() returned %T, want *alwaysMatcher", matchers[0])
++				}
++			}
++		})
++	}
++}
++
++// TestMatchersFromPrincipals_Metadata verifies the same fail-closed behavior
++// for Metadata principals, which were also previously treated as a silent
++// no-op.
++func (s) TestMatchersFromPrincipals_Metadata(t *testing.T) {
++	principals := []*v3rbacpb.Principal{
++		{Identifier: &v3rbacpb.Principal_Metadata{Metadata: &v3matcherpb.MetadataMatcher{Invert: false}}},
++	}
++	matchers, err := matchersFromPrincipals(principals)
++	if err != nil {
++		t.Fatalf("matchersFromPrincipals() failed: %v", err)
++	}
++	if len(matchers) != 1 {
++		t.Fatalf("matchersFromPrincipals() returned %d matchers, want 1", len(matchers))
++	}
++	if _, ok := matchers[0].(*neverMatcher); !ok {
++		t.Fatalf("matchersFromPrincipals() returned %T, want *neverMatcher", matchers[0])
++	}
++}
++
++// TestMatchersFromPermissions_RequestedServerName verifies that a
++// RequestedServerName permission is now translated into a real matcher (that
++// matches against "") rather than being dropped as an unsupported no-op.
++func (s) TestMatchersFromPermissions_RequestedServerName(t *testing.T) {
++	tests := []struct {
++		name  string
++		exact string
++		want  bool
++	}{
++		{name: "matches empty string", exact: "", want: true},
++		{name: "does not match non-empty string", exact: "foo", want: false},
++	}
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			perms := []*v3rbacpb.Permission{
++				{Rule: &v3rbacpb.Permission_RequestedServerName{
++					RequestedServerName: &v3matcherpb.StringMatcher{
++						MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: test.exact},
++					},
++				}},
++			}
++			matchers, err := matchersFromPermissions(perms)
++			if err != nil {
++				t.Fatalf("matchersFromPermissions() failed: %v", err)
++			}
++			if len(matchers) != 1 {
++				t.Fatalf("matchersFromPermissions() returned %d matchers, want 1", len(matchers))
++			}
++			if _, ok := matchers[0].(*requestedServerNameMatcher); !ok {
++				t.Fatalf("matchersFromPermissions() returned %T, want *requestedServerNameMatcher", matchers[0])
++			}
++			if got := matchers[0].match(&rpcData{}); got != test.want {
++				t.Fatalf("requestedServerNameMatcher.match() = %v, want %v", got, test.want)
++			}
++		})
++	}
++}
++
++// TestMatchersFromPermissions_NotRuleUnsupported verifies the panic fix
++// (GHSA-hrxh-6v49-42gf): a NotRule wrapping an unsupported field previously
++// produced an empty matcher list and then indexed mList[0], causing an
++// out-of-range panic. After the fix, the unsupported inner rule returns an
++// error which propagates safely instead of panicking.
++func (s) TestMatchersFromPermissions_NotRuleUnsupported(t *testing.T) {
++	perms := []*v3rbacpb.Permission{
++		{Rule: &v3rbacpb.Permission_NotRule{
++			// An empty inner Permission has no recognized rule set, which used
++			// to yield an empty matcher list.
++			NotRule: &v3rbacpb.Permission{},
++		}},
++	}
++	defer func() {
++		if r := recover(); r != nil {
++			t.Fatalf("matchersFromPermissions() panicked on unsupported NotRule: %v", r)
++		}
++	}()
++	if _, err := matchersFromPermissions(perms); err == nil {
++		t.Fatal("matchersFromPermissions() succeeded on unsupported NotRule, want error")
++	}
++}
++
++// TestMatchersFromPrincipals_NotIdUnsupported verifies the analogous panic fix
++// for NotId principals wrapping an unsupported identifier.
++func (s) TestMatchersFromPrincipals_NotIdUnsupported(t *testing.T) {
++	principals := []*v3rbacpb.Principal{
++		{Identifier: &v3rbacpb.Principal_NotId{
++			NotId: &v3rbacpb.Principal{},
++		}},
++	}
++	defer func() {
++		if r := recover(); r != nil {
++			t.Fatalf("matchersFromPrincipals() panicked on unsupported NotId: %v", r)
++		}
++	}()
++	if _, err := matchersFromPrincipals(principals); err == nil {
++		t.Fatal("matchersFromPrincipals() succeeded on unsupported NotId, want error")
++	}
++}
