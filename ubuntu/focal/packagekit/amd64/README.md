@@ -1,6 +1,6 @@
-# packagekit : 1.1.13-2ubuntu1.1.aikido.1
+# packagekit : 1.1.13-2ubuntu1.1.aikido.2
 
-This patch is based on packagekit version 1.1.13-2ubuntu1.1.aikido.1, which is available at:
+This patch is based on packagekit version 1.1.13-2ubuntu1.1.aikido.2, which is available at:
 https://sources.debian.org/src/packagekit/1.1.13-2ubuntu1.1/
 
 ## Affected CVEs:
