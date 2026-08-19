@@ -1,6 +1,6 @@
-# gnupg2 : 2.2.19-3ubuntu2.5.aikido.1
+# gnupg2 : 2.2.19-3ubuntu2.5.aikido.2
 
-This patch is based on gnupg2 version 2.2.19-3ubuntu2.5.aikido.1, which is available at:
+This patch is based on gnupg2 version 2.2.19-3ubuntu2.5.aikido.2, which is available at:
 https://sources.debian.org/src/gnupg2/2.2.19-3ubuntu2.5/
 
 ## Affected CVEs:
