@@ -4,6 +4,7 @@ This patch is based on ws version 7.5.5, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2024-37890
 - CVE-2026-48779
 
 ## How to Apply:
