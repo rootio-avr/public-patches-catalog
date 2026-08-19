@@ -1,6 +1,6 @@
-# libde265 : 1.0.15-1.root.io.4
+# libde265 : 1.0.15-1.aikido.5
 
-This patch is based on libde265 version 1.0.15-1.root.io.4, which is available at:
+This patch is based on libde265 version 1.0.15-1.aikido.5, which is available at:
 https://sources.debian.org/src/libde265/1.0.15-1/
 
 ## Affected CVEs:
