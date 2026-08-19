@@ -1,6 +1,6 @@
-# util-linux : 2.41-5.aikido.5
+# util-linux : 2.41-5.aikido.6
 
-This patch is based on util-linux version 2.41-5.aikido.5, which is available at:
+This patch is based on util-linux version 2.41-5.aikido.6, which is available at:
 https://sources.debian.org/src/util-linux/2.41-5/
 
 ## Affected CVEs:
