@@ -1,6 +1,6 @@
-# sudo : 1.8.31-1ubuntu1.5.aikido.1
+# sudo : 1.8.31-1ubuntu1.5.aikido.2
 
-This patch is based on sudo version 1.8.31-1ubuntu1.5.aikido.1, which is available at:
+This patch is based on sudo version 1.8.31-1ubuntu1.5.aikido.2, which is available at:
 https://sources.debian.org/src/sudo/1.8.31-1ubuntu1.5/
 
 ## Affected CVEs:
