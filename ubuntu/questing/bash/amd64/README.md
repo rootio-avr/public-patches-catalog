@@ -1,6 +1,6 @@
-# bash : 5.2.37-2ubuntu5.root.io.1
+# bash : 5.2.37-2ubuntu5.aikido.2
 
-This patch is based on bash version 5.2.37-2ubuntu5.root.io.1, which is available at:
+This patch is based on bash version 5.2.37-2ubuntu5.aikido.2, which is available at:
 https://sources.debian.org/src/bash/5.2.37-2ubuntu5/
 
 ## Affected CVEs:
