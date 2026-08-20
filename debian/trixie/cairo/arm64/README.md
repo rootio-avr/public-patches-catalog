@@ -1,6 +1,6 @@
-# cairo : 1.18.4-1.aikido.5
+# cairo : 1.18.4-1.aikido.6
 
-This patch is based on cairo version 1.18.4-1.aikido.5, which is available at:
+This patch is based on cairo version 1.18.4-1.aikido.6, which is available at:
 https://sources.debian.org/src/cairo/1.18.4-1/
 
 ## Affected CVEs:
