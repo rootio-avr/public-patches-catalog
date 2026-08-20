@@ -1,0 +1,335 @@
+sumdb: ignore unrelated hashes in Lookup
+
+A malicious sumdb server could return a validly signed record for an
+unrelated module containing an extra hash line in the tree head's
+extension area. Client.Lookup validated only a portion of the returned
+record (via tlog.ParseRecord) but then searched for matching lines
+across the full, unvalidated record text, allowing an attacker-supplied
+hash to slip through unverified. The fix caches only the hash lines
+returned by tlog.ParseRecord (the validated set) instead of the raw
+record data, so lookups can no longer match unauthenticated lines.
+
+Fixes CVE-2026-56864 (golang/go#80745).
+
+--- a/sumdb/client.go
++++ b/sumdb/client.go
+@@ -274,7 +274,7 @@
+ 			c.ops.WriteCache(file, data)
+ 		}
+
+-		return cached{data, nil}
++		return cached{text, nil}
+ 	}).(cached)
+ 	if result.err != nil {
+ 		return nil, result.err
+--- a/sumdb/client_test.go
++++ b/sumdb/client_test.go
+@@ -189,6 +189,55 @@
+ 	}
+ }
+
++func TestRejectUnauthenticatedLines(t *testing.T) {
++	tc := newTestClient(t)
++
++	data := "golang.org/x/good v1.0.0 h1:7uVkIFmeBqHfdjD+gZwtXXI+RODJ2Wc4O7MPEh/QiW4=\n"
++	id := tc.treeSize
++	tc.treeSize++
++	rec, err := tlog.FormatRecord(id, []byte(data))
++	if err != nil {
++		t.Fatal(err)
++	}
++	hashes, err := tlog.StoredHashesForRecordHash(id, tlog.RecordHash([]byte(data)), tc)
++	if err != nil {
++		t.Fatal(err)
++	}
++	tc.hashes = append(tc.hashes, hashes...)
++
++	// Create lookup result.
++	h, err := tlog.TreeHash(tc.treeSize, tc)
++	if err != nil {
++		t.Fatal(err)
++	}
++	text := append(tlog.FormatTree(tlog.Tree{N: tc.treeSize, Hash: h}), []byte("golang.org/x/bad v1.0.0 h1:7uVkIFmeBqHfdjD+gZwtXXI+RODJ2Wc4O7MPEh/QiW4=\n")...)
++	signed, err := note.Sign(&note.Note{Text: string(text)}, tc.signer)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	lookupRes := append(rec, signed...)
++	tc.remote["/lookup/golang.org/x/bad@v1.0.0"] = lookupRes
++
++	// Create new tiles.
++	tiles := tlog.NewTiles(tc.tileHeight, id, tc.treeSize)
++	for _, tile := range tiles {
++		data, err := tlog.ReadTileData(tile, tc)
++		if err != nil {
++			t.Fatal(err)
++		}
++		tc.remote["/"+tile.Path()] = data
++	}
++
++	lines, err := tc.client.Lookup("golang.org/x/bad", "v1.0.0")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(lines) != 0 {
++		t.Errorf("Lookup(%q): expected no hashes, got %q", "golang.org/x/bad", strings.Join(lines, "\n"))
++	}
++}
++
+ // A testClient is a self-contained client-side testing environment.
+ type testClient struct {
+ 	t          *testing.T // active test
+
+sumdb/tlog: fix transparency log tile verification bypass
+
+A malicious GOPROXY was previously capable of forging up to two sumdb
+tiles that allow a requested module to bypass the GOSUMDB check and
+persist attacker-controlled module content. All tiles are now correctly
+verified against their parents.
+
+Fixes CVE-2026-56865 (golang/go#80744).
+
+--- a/sumdb/tlog/tile.go
++++ b/sumdb/tlog/tile.go
+@@ -300,13 +300,13 @@ func tileParent(t Tile, k int, n int64) Tile {
+ func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
+ 	h := r.tr.Height()
+ 
+-	tileOrder := make(map[Tile]int) // tileOrder[tileKey(tiles[i])] = i
++	tileOrder := make(map[Tile]int) // tileOrder[tiles[i]] = i
+ 	var tiles []Tile
+ 
+ 	// Plan to fetch tiles necessary to recompute tree hash.
+ 	// If it matches, those tiles are authenticated.
+ 	stx := subTreeIndex(0, r.tree.N, nil)
+-	stxTileOrder := make([]int, len(stx))
++	stxTileOrder := make([]int, len(stx)) // stx[i] is in tiles[stxTileOrder[i]]
+ 	for i, x := range stx {
+ 		tile, _, _ := tileForIndex(h, x)
+ 		tile = tileParent(tile, 0, r.tree.N)
+@@ -323,7 +323,7 @@ func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
+ 	// along with any parent tiles needed
+ 	// for authentication. For most calls,
+ 	// the parents are being fetched anyway.
+-	indexTileOrder := make([]int, len(indexes))
++	indexTileOrder := make([]int, len(indexes)) // indexes[i] is in tiles[indexTileOrder[i]]
+ 	for i, x := range indexes {
+ 		if x >= StoredHashIndex(0, r.tree.N) {
+ 			return nil, fmt.Errorf("indexes not in tree")
+@@ -377,19 +377,38 @@ func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
+ 		}
+ 	}
+ 
++	// At this point, for example if h = 2, N = 15, indexes = [(0, 01)]:
++	//
++	//                 s3
++	//           ┌───────┴───────┐
++	//           ∘               ∘              s2        <- 1/000.p/3
++	//       ┌───┴───┐       ┌───┴───┐       ┌───┴───┐
++	//       ∘       ∘       ∘       ∘       ∘       ∘      s1     s0
++	//     ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐   ┌─┴─┐    |
++	//     00  01  02  03  04  05  06  07  08  09  10  11  12  13  14
++	//
++	//     └── 0/000 ───┘  └── 0/001 ───┘  └── 0/002 ───┘ └ 0/003.p/3 ┘
++	//
++	// stx = [s3, s2, s1, s0]
++	//
++	// tiles = [1/000.p/3, 0/003.p/3, 0/000]
++	//                                  ┬
++	//          └──── for stx ─────┘ for idx
++
+ 	// Authenticate the initial tiles against the tree hash.
+ 	// They are arranged so that parents are authenticated before children.
+ 	// First the tiles needed for the tree hash.
+-	th, err := HashFromTile(tiles[stxTileOrder[len(stx)-1]], data[stxTileOrder[len(stx)-1]], stx[len(stx)-1])
+-	if err != nil {
+-		return nil, err
+-	}
+-	for i := len(stx) - 2; i >= 0; i-- {
++	var th Hash
++	for i := len(stx) - 1; i >= 0; i-- {
+ 		h, err := HashFromTile(tiles[stxTileOrder[i]], data[stxTileOrder[i]], stx[i])
+ 		if err != nil {
+ 			return nil, err
+ 		}
+-		th = NodeHash(h, th)
++		if i == len(stx)-1 {
++			th = h
++		} else {
++			th = NodeHash(h, th)
++		}
+ 	}
+ 	if th != r.tree.Hash {
+ 		// The tiles do not support the tree hash.
+@@ -397,8 +416,8 @@ func (r *tileHashReader) ReadHashes(indexes []int64) ([]Hash, error) {
+ 		return nil, fmt.Errorf("downloaded inconsistent tile")
+ 	}
+ 
+-	// Authenticate full tiles against their parents.
+-	for i := len(stx); i < len(tiles); i++ {
++	// Authenticate remaining full tiles against their parents.
++	for i := stxTileOrder[len(stx)-1] + 1; i < len(tiles); i++ {
+ 		tile := tiles[i]
+ 		p := tileParent(tile, 1, r.tree.N)
+ 		j, ok := tileOrder[p]
+--- a/sumdb/tlog/tile_test.go
++++ b/sumdb/tlog/tile_test.go
+@@ -5,10 +5,157 @@
+ package tlog
+ 
+ import (
++	"bytes"
+ 	"fmt"
+ 	"testing"
+ )
+ 
++type testTree struct {
++	t      *testing.T
++	h      int
++	n      int64
++	hashes testHashStorage
++}
++
++func newTestTree(t *testing.T, height int) *testTree {
++	return &testTree{t: t, h: height}
++}
++
++// Add appends a record with the given data to the tree.
++func (tt *testTree) Add(data []byte) {
++	tt.t.Helper()
++	hashes, err := StoredHashes(tt.n, data, tt.hashes)
++	if err != nil {
++		tt.t.Fatal(err)
++	}
++	tt.hashes = append(tt.hashes, hashes...)
++	tt.n++
++}
++
++func (tt *testTree) Tree() Tree {
++	tt.t.Helper()
++	th, err := TreeHash(tt.n, tt.hashes)
++	if err != nil {
++		tt.t.Fatal(err)
++	}
++	return Tree{N: tt.n, Hash: th}
++}
++
++func (tt *testTree) Height() int { return tt.h }
++
++func (tt *testTree) ReadTiles(tiles []Tile) ([][]byte, error) {
++	out := make([][]byte, len(tiles))
++	for i, tile := range tiles {
++		data, err := ReadTileData(tile, tt.hashes)
++		if err != nil {
++			return nil, err
++		}
++		out[i] = data
++	}
++	return out, nil
++}
++
++func (tt *testTree) SaveTiles(tiles []Tile, data [][]byte) {
++	tt.t.Helper()
++	if len(data) != len(tiles) {
++		tt.t.Errorf("SaveTiles: got %d data for %d tiles", len(data), len(tiles))
++		return
++	}
++	for i, tile := range tiles {
++		want, err := ReadTileData(tile, tt.hashes)
++		if err != nil {
++			tt.t.Errorf("SaveTiles(%v): %v", tile.Path(), err)
++			continue
++		}
++		if !bytes.Equal(data[i], want) {
++			tt.t.Errorf("SaveTiles(%v): saved data does not match tree", tile.Path())
++		}
++	}
++}
++
++// zeroIndex returns a TileReader that serves the same tiles as tr,
++// except that the hash at the given stored index is replaced with an
++// all-zeroes hash. If the index is not in the bottom row of its tile,
++// the bottom-row hashes it is computed from are zeroed instead.
++func zeroIndex(tr TileReader, index int64) TileReader {
++	return &zeroIndexReader{tr, index}
++}
++
++type zeroIndexReader struct {
++	TileReader
++	index int64
++}
++
++func (r *zeroIndexReader) ReadTiles(tiles []Tile) ([][]byte, error) {
++	data, err := r.TileReader.ReadTiles(tiles)
++	if err != nil {
++		return nil, err
++	}
++	t, start, end := tileForIndex(r.Height(), r.index)
++	for i, tile := range tiles {
++		if tile.H == t.H && tile.L == t.L && tile.N == t.N && end <= len(data[i]) {
++			data[i] = bytes.Clone(data[i])
++			clear(data[i][start:end])
++		}
++	}
++	return data, nil
++}
++
++func TestTileHashReader(t *testing.T) {
++	tt := newTestTree(t, 2)
++	for range int64(100) {
++		tt.Add(fmt.Appendf(nil, "leaf %d", tt.n))
++		t.Run(fmt.Sprintf("N=%d", tt.n), func(t *testing.T) {
++			th := TileHashReader(tt.Tree(), tt)
++			for i := range StoredHashIndex(0, tt.n) {
++				hashes, err := th.ReadHashes([]int64{i})
++				if err != nil {
++					t.Fatal(err)
++				}
++				if len(hashes) != 1 {
++					t.Fatalf("ReadHashes(%d) = %d hashes, want 1", i, len(hashes))
++				}
++				if hashes[0] != tt.hashes[i] {
++					t.Errorf("ReadHashes(%d) = %x, want %x", i, hashes[0], tt.hashes[i])
++				}
++			}
++
++			var indexes []int64
++			for j := range StoredHashIndex(0, tt.n) {
++				indexes = append(indexes, j)
++			}
++			all, err := th.ReadHashes(indexes)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if len(all) != len(tt.hashes) {
++				t.Fatalf("ReadHashes(%d) = %d hashes, want %d", tt.n, len(all), len(tt.hashes))
++			}
++			for j, h := range all {
++				if h != tt.hashes[j] {
++					t.Errorf("ReadHashes(%d)[%d] = %v, want %v", tt.n, j, h, tt.hashes[j])
++				}
++			}
++
++			for i := range StoredHashIndex(0, tt.n) {
++				t.Run(fmt.Sprintf("tampered=%d", i), func(t *testing.T) {
++					thz := TileHashReader(tt.Tree(), zeroIndex(tt, i))
++
++					hashes, err := thz.ReadHashes([]int64{i})
++					if err == nil {
++						t.Errorf("ReadHashes(%d) = %v, want error", i, hashes[0])
++					}
++
++					all, err := thz.ReadHashes(indexes)
++					if err == nil {
++						t.Errorf("ReadHashes(%d) = %d hashes, want error", tt.n, len(all))
++					}
++				})
++			}
++		})
++	}
++}
++
+ // FuzzParseTilePath tests that ParseTilePath never crashes
+ func FuzzParseTilePath(f *testing.F) {
+ 	f.Add("tile/4/0/001")
