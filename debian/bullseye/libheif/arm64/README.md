@@ -1,6 +1,6 @@
-# libheif : 1.11.0-1+deb11u2.root.io.4
+# libheif : 1.11.0-1+deb11u2.aikido.5
 
-This patch is based on libheif version 1.11.0-1+deb11u2.root.io.4, which is available at:
+This patch is based on libheif version 1.11.0-1+deb11u2.aikido.5, which is available at:
 https://sources.debian.org/src/libheif/1.11.0-1+deb11u2/
 
 ## Affected CVEs:
