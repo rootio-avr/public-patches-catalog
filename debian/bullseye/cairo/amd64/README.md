@@ -1,6 +1,6 @@
-# cairo : 1.16.0-5.root.io.1
+# cairo : 1.16.0-5.aikido.2
 
-This patch is based on cairo version 1.16.0-5.root.io.1, which is available at:
+This patch is based on cairo version 1.16.0-5.aikido.2, which is available at:
 https://sources.debian.org/src/cairo/1.16.0-5/
 
 ## Affected CVEs:
