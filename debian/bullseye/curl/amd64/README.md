@@ -1,6 +1,6 @@
-# curl : 7.74.0-1.3+deb11u16.aikido.18
+# curl : 7.74.0-1.3+deb11u16.aikido.19
 
-This patch is based on curl version 7.74.0-1.3+deb11u16.aikido.18, which is available at:
+This patch is based on curl version 7.74.0-1.3+deb11u16.aikido.19, which is available at:
 https://sources.debian.org/src/curl/7.74.0-1.3+deb11u16/
 
 ## Affected CVEs:
