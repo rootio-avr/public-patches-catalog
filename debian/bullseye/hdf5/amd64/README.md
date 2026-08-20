@@ -1,10 +1,16 @@
-# hdf5 : 1.10.6+repack-4+deb11u1.root.io.1
+# hdf5 : 1.10.6+repack-4+deb11u1.aikido.12
 
-This patch is based on hdf5 version 1.10.6+repack-4+deb11u1.root.io.1, which is available at:
+This patch is based on hdf5 version 1.10.6+repack-4+deb11u1.aikido.12, which is available at:
 https://sources.debian.org/src/hdf5/1.10.6+repack-4+deb11u1/
 
 ## Affected CVEs:
+- CVE-2024-29157
 - CVE-2022-25942
+- CVE-2024-29164
+- CVE-2024-32621
+- CVE-2024-32622
+- CVE-2024-29161
+- CVE-2025-2153
 
 ## How to Apply:
 1. Obtain the source package: `apt source hdf5`
