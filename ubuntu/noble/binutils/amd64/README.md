@@ -1,6 +1,6 @@
-# binutils : 2.42-4ubuntu2.8.aikido.4
+# binutils : 2.42-4ubuntu2.8.aikido.5
 
-This patch is based on binutils version 2.42-4ubuntu2.8.aikido.4, which is available at:
+This patch is based on binutils version 2.42-4ubuntu2.8.aikido.5, which is available at:
 https://sources.debian.org/src/binutils/2.42-4ubuntu2.8/
 
 ## Affected CVEs:
