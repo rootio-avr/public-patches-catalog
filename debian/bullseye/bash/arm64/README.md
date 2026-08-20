@@ -1,6 +1,6 @@
-# bash : 5.1-2+deb11u1.root.io.1
+# bash : 5.1-2+deb11u1.aikido.10
 
-This patch is based on bash version 5.1-2+deb11u1.root.io.1, which is available at:
+This patch is based on bash version 5.1-2+deb11u1.aikido.10, which is available at:
 https://sources.debian.org/src/bash/5.1-2+deb11u1/
 
 ## Affected CVEs:
