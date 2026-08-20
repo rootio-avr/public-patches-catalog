@@ -1,6 +1,6 @@
-# expat : 2.2.10-2+deb11u7.aikido.17
+# expat : 2.2.10-2+deb11u7.aikido.18
 
-This patch is based on expat version 2.2.10-2+deb11u7.aikido.17, which is available at:
+This patch is based on expat version 2.2.10-2+deb11u7.aikido.18, which is available at:
 https://sources.debian.org/src/expat/2.2.10-2+deb11u7/
 
 ## Affected CVEs:
