@@ -1,6 +1,6 @@
-# imagemagick : 8:6.9.11.60+dfsg-1.3+deb11u16.aikido.33
+# imagemagick : 8:6.9.11.60+dfsg-1.3+deb11u16.aikido.34
 
-This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.3+deb11u16.aikido.33, which is available at:
+This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.3+deb11u16.aikido.34, which is available at:
 https://sources.debian.org/src/imagemagick/8:6.9.11.60+dfsg-1.3+deb11u16/
 
 ## Affected CVEs:
