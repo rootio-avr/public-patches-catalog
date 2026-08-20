@@ -1,6 +1,6 @@
-# gzip : 1.10-4+deb11u1.aikido.2
+# gzip : 1.10-4+deb11u1.aikido.3
 
-This patch is based on gzip version 1.10-4+deb11u1.aikido.2, which is available at:
+This patch is based on gzip version 1.10-4+deb11u1.aikido.3, which is available at:
 https://sources.debian.org/src/gzip/1.10-4+deb11u1/
 
 ## Affected CVEs:
