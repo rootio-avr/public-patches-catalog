@@ -1,6 +1,6 @@
-# db5.3 : 5.3.28+dfsg1-0.8.root.io.1
+# db5.3 : 5.3.28+dfsg1-0.8.aikido.6
 
-This patch is based on db5.3 version 5.3.28+dfsg1-0.8.root.io.1, which is available at:
+This patch is based on db5.3 version 5.3.28+dfsg1-0.8.aikido.6, which is available at:
 https://sources.debian.org/src/db5.3/5.3.28+dfsg1-0.8/
 
 ## Affected CVEs:
