@@ -1,6 +1,6 @@
-# gnupg2 : 2.2.27-2+deb11u2.root.io.2
+# gnupg2 : 2.2.27-2+deb11u2.aikido.3
 
-This patch is based on gnupg2 version 2.2.27-2+deb11u2.root.io.2, which is available at:
+This patch is based on gnupg2 version 2.2.27-2+deb11u2.aikido.3, which is available at:
 https://sources.debian.org/src/gnupg2/2.2.27-2+deb11u2/
 
 ## Affected CVEs:
