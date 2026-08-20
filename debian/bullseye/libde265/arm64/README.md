@@ -1,6 +1,6 @@
-# libde265 : 1.0.11-0+deb11u3.aikido.10
+# libde265 : 1.0.11-0+deb11u3.aikido.11
 
-This patch is based on libde265 version 1.0.11-0+deb11u3.aikido.10, which is available at:
+This patch is based on libde265 version 1.0.11-0+deb11u3.aikido.11, which is available at:
 https://sources.debian.org/src/libde265/1.0.11-0+deb11u3/
 
 ## Affected CVEs:
