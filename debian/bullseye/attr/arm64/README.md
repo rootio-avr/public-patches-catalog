@@ -1,6 +1,6 @@
-# attr : 1:2.4.48-6.root.io.1
+# attr : 1:2.4.48-6.aikido.2
 
-This patch is based on attr version 1:2.4.48-6.root.io.1, which is available at:
+This patch is based on attr version 1:2.4.48-6.aikido.2, which is available at:
 https://sources.debian.org/src/attr/1:2.4.48-6/
 
 ## Affected CVEs:
