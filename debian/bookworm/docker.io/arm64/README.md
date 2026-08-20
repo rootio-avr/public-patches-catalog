@@ -1,6 +1,6 @@
-# docker.io : 20.10.24+dfsg1-1+deb12u1.aikido.3
+# docker.io : 20.10.24+dfsg1-1+deb12u1.aikido.4
 
-This patch is based on docker.io version 20.10.24+dfsg1-1+deb12u1.aikido.3, which is available at:
+This patch is based on docker.io version 20.10.24+dfsg1-1+deb12u1.aikido.4, which is available at:
 https://sources.debian.org/src/docker.io/20.10.24+dfsg1-1+deb12u1/
 
 ## Affected CVEs:
