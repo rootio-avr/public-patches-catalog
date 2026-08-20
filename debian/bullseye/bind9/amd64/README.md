@@ -1,13 +1,11 @@
-# bind9 : 1:9.16.50-1~deb11u5.root.io.7
+# bind9 : 1:9.16.50-1~deb11u6.aikido.8
 
-This patch is based on bind9 version 1:9.16.50-1~deb11u5.root.io.7, which is available at:
-https://sources.debian.org/src/bind9/1:9.16.50-1~deb11u5/
+This patch is based on bind9 version 1:9.16.50-1~deb11u6.aikido.8, which is available at:
+https://sources.debian.org/src/bind9/1:9.16.50-1~deb11u6/
 
 ## Affected CVEs:
 - CVE-2025-40777
 - CVE-2022-2881
-- CVE-2026-3039
-- CVE-2026-5946
 
 ## How to Apply:
 1. Obtain the source package: `apt source bind9`
