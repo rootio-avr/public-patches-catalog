@@ -1,6 +1,6 @@
-# gnupg2 : 2.4.4-2ubuntu17.aikido.7
+# gnupg2 : 2.4.4-2ubuntu17.aikido.8
 
-This patch is based on gnupg2 version 2.4.4-2ubuntu17.aikido.7, which is available at:
+This patch is based on gnupg2 version 2.4.4-2ubuntu17.aikido.8, which is available at:
 https://sources.debian.org/src/gnupg2/2.4.4-2ubuntu17/
 
 ## Affected CVEs:
