@@ -1,6 +1,6 @@
-# libxslt : 1.1.34-4+deb11u3.root.io.8
+# libxslt : 1.1.34-4+deb11u3.aikido.9
 
-This patch is based on libxslt version 1.1.34-4+deb11u3.root.io.8, which is available at:
+This patch is based on libxslt version 1.1.34-4+deb11u3.aikido.9, which is available at:
 https://sources.debian.org/src/libxslt/1.1.34-4+deb11u3/
 
 ## Affected CVEs:
