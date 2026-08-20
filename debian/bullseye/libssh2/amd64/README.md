@@ -1,6 +1,6 @@
-# libssh2 : 1.9.0-2+deb11u1.aikido.4
+# libssh2 : 1.9.0-2+deb11u1.aikido.5
 
-This patch is based on libssh2 version 1.9.0-2+deb11u1.aikido.4, which is available at:
+This patch is based on libssh2 version 1.9.0-2+deb11u1.aikido.5, which is available at:
 https://sources.debian.org/src/libssh2/1.9.0-2+deb11u1/
 
 ## Affected CVEs:
