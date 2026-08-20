@@ -1,6 +1,6 @@
-# harfbuzz : 2.7.4-1.root.io.7
+# harfbuzz : 2.7.4-1.aikido.8
 
-This patch is based on harfbuzz version 2.7.4-1.root.io.7, which is available at:
+This patch is based on harfbuzz version 2.7.4-1.aikido.8, which is available at:
 https://sources.debian.org/src/harfbuzz/2.7.4-1/
 
 ## Affected CVEs:
