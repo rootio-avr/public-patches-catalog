@@ -1,6 +1,6 @@
-# glibc : 2.31-13+deb11u14.root.io.14
+# glibc : 2.31-13+deb11u14.aikido.15
 
-This patch is based on glibc version 2.31-13+deb11u14.root.io.14, which is available at:
+This patch is based on glibc version 2.31-13+deb11u14.aikido.15, which is available at:
 https://sources.debian.org/src/glibc/2.31-13+deb11u14/
 
 ## Affected CVEs:
