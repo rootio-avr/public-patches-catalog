@@ -1,6 +1,6 @@
-# apr : 1.7.0-6+deb11u2.root.io.1
+# apr : 1.7.0-6+deb11u2.aikido.7
 
-This patch is based on apr version 1.7.0-6+deb11u2.root.io.1, which is available at:
+This patch is based on apr version 1.7.0-6+deb11u2.aikido.7, which is available at:
 https://sources.debian.org/src/apr/1.7.0-6+deb11u2/
 
 ## Affected CVEs:
