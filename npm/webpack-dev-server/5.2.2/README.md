@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - CVE-2026-6402
 - CVE-2026-9595
+- CVE-2026-14620
+- CVE-2026-14631
 
 ## How to Apply:
 1. Clone or download the source code for webpack-dev-server
