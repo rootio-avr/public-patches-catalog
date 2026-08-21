@@ -4,6 +4,7 @@ This patch is based on org.springframework:spring version 6.1.21, which is avail
 unknown
 
 ## Affected CVEs:
+- CVE-2026-41845
 - CVE-2026-41850
 
 ## How to Apply:
