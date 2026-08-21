@@ -4,6 +4,7 @@ This patch is based on nanoid version 3.3.7, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-67213
 - CVE-2026-67214
 
 ## How to Apply:
