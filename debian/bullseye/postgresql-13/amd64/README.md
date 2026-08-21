@@ -1,15 +1,25 @@
-# postgresql-13 : 13.23-0+deb11u3.root.io.5
+# postgresql-13 : 13.23-0+deb11u4.aikido.6
 
-This patch is based on postgresql-13 version 13.23-0+deb11u3.root.io.5, which is available at:
-https://sources.debian.org/src/postgresql-13/13.23-0+deb11u3/
+This patch is based on postgresql-13 version 13.23-0+deb11u4.aikido.6, which is available at:
+https://sources.debian.org/src/postgresql-13/13.23-0+deb11u4/
 
 ## Affected CVEs:
-- CVE-2026-2004
-- CVE-2026-2005
-- CVE-2026-2006
-- CVE-2026-6479
-- CVE-2026-6473
-- CVE-2026-6477
+- CVE-2026-14679
+- CVE-2026-14677
+- CVE-2026-18408
+- CVE-2026-14669
+- CVE-2026-15742
+- CVE-2026-6471
+- CVE-2026-16239
+- CVE-2026-6464
+- CVE-2026-19385
+- CVE-2026-15741
+- CVE-2026-14662
+- CVE-2026-14670
+- CVE-2026-14671
+- CVE-2026-14664
+- CVE-2026-14680
+- CVE-2026-14668
 
 ## How to Apply:
 1. Obtain the source package: `apt source postgresql-13`
