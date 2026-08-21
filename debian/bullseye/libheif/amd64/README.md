@@ -1,6 +1,6 @@
-# libheif : 1.11.0-1+deb11u2.aikido.5
+# libheif : 1.11.0-1+deb11u2.aikido.6
 
-This patch is based on libheif version 1.11.0-1+deb11u2.aikido.5, which is available at:
+This patch is based on libheif version 1.11.0-1+deb11u2.aikido.6, which is available at:
 https://sources.debian.org/src/libheif/1.11.0-1+deb11u2/
 
 ## Affected CVEs:
@@ -14,6 +14,7 @@ https://sources.debian.org/src/libheif/1.11.0-1+deb11u2/
 - CVE-2026-32739
 - CVE-2026-47178
 - CVE-2026-49271
+- CVE-2026-62292
 
 ## How to Apply:
 1. Obtain the source package: `apt source libheif`
