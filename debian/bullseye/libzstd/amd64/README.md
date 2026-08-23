@@ -1,10 +1,10 @@
-# libzstd : 1.4.8+dfsg-2.1.root.io.1
+# libzstd : 1.4.8+dfsg-2.1.aikido.6
 
-This patch is based on libzstd version 1.4.8+dfsg-2.1.root.io.1, which is available at:
-https://sources.debian.org/src/libzstd/1.4.8+dfsg-2.1/
+This patch is based on libzstd version 1.4.8+dfsg-2.1.aikido.6, which is available at:
+
 
 ## Affected CVEs:
-- CVE-2022-4899
+- No CVEs listed
 
 ## How to Apply:
 1. Obtain the source package: `apt source libzstd`
