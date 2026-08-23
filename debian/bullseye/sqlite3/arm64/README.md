@@ -1,6 +1,6 @@
-# sqlite3 : 3.34.1-3+deb11u1.root.io.10
+# sqlite3 : 3.34.1-3+deb11u1.aikido.11
 
-This patch is based on sqlite3 version 3.34.1-3+deb11u1.root.io.10, which is available at:
+This patch is based on sqlite3 version 3.34.1-3+deb11u1.aikido.11, which is available at:
 https://sources.debian.org/src/sqlite3/3.34.1-3+deb11u1/
 
 ## Affected CVEs:
