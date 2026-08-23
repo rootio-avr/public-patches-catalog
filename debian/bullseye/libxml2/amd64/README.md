@@ -1,6 +1,6 @@
-# libxml2 : 2.9.10+dfsg-6.7+deb11u4.aikido.7
+# libxml2 : 2.9.10+dfsg-6.7+deb11u4.aikido.8
 
-This patch is based on libxml2 version 2.9.10+dfsg-6.7+deb11u4.aikido.7, which is available at:
+This patch is based on libxml2 version 2.9.10+dfsg-6.7+deb11u4.aikido.8, which is available at:
 https://sources.debian.org/src/libxml2/2.9.10+dfsg-6.7+deb11u9/
 
 ## Affected CVEs:
