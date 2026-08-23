@@ -1,6 +1,6 @@
-# libxpm : 1:3.5.12-1.1+deb11u1.aikido.3
+# libxpm : 1:3.5.12-1.1+deb11u1.aikido.4
 
-This patch is based on libxpm version 1:3.5.12-1.1+deb11u1.aikido.3, which is available at:
+This patch is based on libxpm version 1:3.5.12-1.1+deb11u1.aikido.4, which is available at:
 https://sources.debian.org/src/libxpm/1:3.5.12-1.1+deb11u1/
 
 ## Affected CVEs:
