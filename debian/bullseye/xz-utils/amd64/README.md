@@ -1,6 +1,6 @@
-# xz-utils : 5.2.5-2.1~deb11u1.root.io.1
+# xz-utils : 5.2.5-2.1~deb11u1.aikido.2
 
-This patch is based on xz-utils version 5.2.5-2.1~deb11u1.root.io.1, which is available at:
+This patch is based on xz-utils version 5.2.5-2.1~deb11u1.aikido.2, which is available at:
 https://sources.debian.org/src/xz-utils/5.2.5-2.1~deb11u1/
 
 ## Affected CVEs:
