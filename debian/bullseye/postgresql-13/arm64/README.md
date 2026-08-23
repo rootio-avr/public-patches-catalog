@@ -1,6 +1,6 @@
-# postgresql-13 : 13.23-0+deb11u4.aikido.6
+# postgresql-13 : 13.23-0+deb11u4.aikido.7
 
-This patch is based on postgresql-13 version 13.23-0+deb11u4.aikido.6, which is available at:
+This patch is based on postgresql-13 version 13.23-0+deb11u4.aikido.7, which is available at:
 https://sources.debian.org/src/postgresql-13/13.23-0+deb11u4/
 
 ## Affected CVEs:
