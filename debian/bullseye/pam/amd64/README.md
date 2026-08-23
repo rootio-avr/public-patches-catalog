@@ -1,6 +1,6 @@
-# pam : 1.4.0-9+deb11u2.root.io.8
+# pam : 1.4.0-9+deb11u2.aikido.9
 
-This patch is based on pam version 1.4.0-9+deb11u2.root.io.8, which is available at:
+This patch is based on pam version 1.4.0-9+deb11u2.aikido.9, which is available at:
 https://sources.debian.org/src/pam/1.4.0-9+deb11u2/
 
 ## Affected CVEs:
