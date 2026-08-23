@@ -1,6 +1,6 @@
-# apache2 : 2.4.67-1~deb13u3.aikido.4
+# apache2 : 2.4.67-1~deb13u3.aikido.5
 
-This patch is based on apache2 version 2.4.67-1~deb13u3.aikido.4, which is available at:
+This patch is based on apache2 version 2.4.67-1~deb13u3.aikido.5, which is available at:
 https://sources.debian.org/src/apache2/2.4.67-1~deb13u3/
 
 ## Affected CVEs:
