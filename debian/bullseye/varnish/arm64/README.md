@@ -1,6 +1,6 @@
-# varnish : 6.5.1-1+deb11u5.root.io.2
+# varnish : 6.5.1-1+deb11u5.aikido.3
 
-This patch is based on varnish version 6.5.1-1+deb11u5.root.io.2, which is available at:
+This patch is based on varnish version 6.5.1-1+deb11u5.aikido.3, which is available at:
 https://sources.debian.org/src/varnish/6.5.1-1+deb11u5/
 
 ## Affected CVEs:
