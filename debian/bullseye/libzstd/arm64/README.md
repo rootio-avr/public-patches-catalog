@@ -1,6 +1,6 @@
-# libzstd : 1.4.8+dfsg-2.1.root.io.1
+# libzstd : 1.4.8+dfsg-2.1.aikido.6
 
-This patch is based on libzstd version 1.4.8+dfsg-2.1.root.io.1, which is available at:
+This patch is based on libzstd version 1.4.8+dfsg-2.1.aikido.6, which is available at:
 https://sources.debian.org/src/libzstd/1.4.8+dfsg-2.1/
 
 ## Affected CVEs:
