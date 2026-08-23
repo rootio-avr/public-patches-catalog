@@ -1,6 +1,6 @@
-# wget : 1.21-1+deb11u2.aikido.14
+# wget : 1.21-1+deb11u2.aikido.15
 
-This patch is based on wget version 1.21-1+deb11u2.aikido.14, which is available at:
+This patch is based on wget version 1.21-1+deb11u2.aikido.15, which is available at:
 https://sources.debian.org/src/wget/1.21-1+deb11u2/
 
 ## Affected CVEs:
