@@ -1,6 +1,6 @@
-# libpng1.6 : 1.6.37-3+deb11u4.root.io.6
+# libpng1.6 : 1.6.37-3+deb11u4.aikido.8
 
-This patch is based on libpng1.6 version 1.6.37-3+deb11u4.root.io.6, which is available at:
+This patch is based on libpng1.6 version 1.6.37-3+deb11u4.aikido.8, which is available at:
 https://sources.debian.org/src/libpng1.6/1.6.37-3+deb11u4/
 
 ## Affected CVEs:
