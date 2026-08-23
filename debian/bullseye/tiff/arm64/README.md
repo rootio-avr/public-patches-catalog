@@ -1,6 +1,6 @@
-# tiff : 4.2.0-1+deb11u8.aikido.17
+# tiff : 4.2.0-1+deb11u8.aikido.19
 
-This patch is based on tiff version 4.2.0-1+deb11u8.aikido.17, which is available at:
+This patch is based on tiff version 4.2.0-1+deb11u8.aikido.19, which is available at:
 https://sources.debian.org/src/tiff/4.2.0-1+deb11u8/
 
 ## Affected CVEs:
