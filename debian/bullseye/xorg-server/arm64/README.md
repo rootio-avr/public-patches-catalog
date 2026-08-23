@@ -1,6 +1,6 @@
-# xorg-server : 2:1.20.11-1+deb11u17.root.io.9
+# xorg-server : 2:1.20.11-1+deb11u13.aikido.10
 
-This patch is based on xorg-server version 2:1.20.11-1+deb11u17.root.io.9, which is available at:
+This patch is based on xorg-server version 2:1.20.11-1+deb11u13.aikido.10, which is available at:
 https://sources.debian.org/src/xorg-server/2:1.20.11-1+deb11u17/
 
 ## Affected CVEs:
