@@ -1,6 +1,6 @@
-# openldap : 2.4.57+dfsg-3+deb11u1.root.io.1
+# openldap : 2.4.57+dfsg-3+deb11u1.aikido.7
 
-This patch is based on openldap version 2.4.57+dfsg-3+deb11u1.root.io.1, which is available at:
+This patch is based on openldap version 2.4.57+dfsg-3+deb11u1.aikido.7, which is available at:
 https://sources.debian.org/src/openldap/2.4.57+dfsg-3+deb11u1/
 
 ## Affected CVEs:
