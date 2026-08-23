@@ -1,6 +1,6 @@
-# openexr : 2.5.4-2+deb11u1.aikido.16
+# openexr : 2.5.4-2+deb11u1.aikido.17
 
-This patch is based on openexr version 2.5.4-2+deb11u1.aikido.16, which is available at:
+This patch is based on openexr version 2.5.4-2+deb11u1.aikido.17, which is available at:
 https://sources.debian.org/src/openexr/2.5.4-2+deb11u1/
 
 ## Affected CVEs:
