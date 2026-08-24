@@ -1,6 +1,6 @@
-# wget : 1.25.0-2.aikido.4
+# wget : 1.25.0-2.aikido.6
 
-This patch is based on wget version 1.25.0-2.aikido.4, which is available at:
+This patch is based on wget version 1.25.0-2.aikido.6, which is available at:
 https://sources.debian.org/src/wget/1.25.0-2/
 
 ## Affected CVEs:
