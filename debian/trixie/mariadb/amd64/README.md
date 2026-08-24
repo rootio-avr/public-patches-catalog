@@ -1,6 +1,6 @@
-# mariadb : 1:11.8.6-0+deb13u1.aikido.7
+# mariadb : 1:11.8.6-0+deb13u1.aikido.8
 
-This patch is based on mariadb version 1:11.8.6-0+deb13u1.aikido.7, which is available at:
+This patch is based on mariadb version 1:11.8.6-0+deb13u1.aikido.8, which is available at:
 https://sources.debian.org/src/mariadb/1:11.8.6-0+deb13u1/
 
 ## Affected CVEs:
