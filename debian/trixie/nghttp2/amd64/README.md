@@ -1,6 +1,6 @@
-# nghttp2 : 1.64.0-1.1+deb13u1.aikido.2
+# nghttp2 : 1.64.0-1.1+deb13u1.aikido.3
 
-This patch is based on nghttp2 version 1.64.0-1.1+deb13u1.aikido.2, which is available at:
+This patch is based on nghttp2 version 1.64.0-1.1+deb13u1.aikido.3, which is available at:
 https://sources.debian.org/src/nghttp2/1.64.0-1.1+deb13u1/
 
 ## Affected CVEs:
