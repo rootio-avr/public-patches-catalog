@@ -1,6 +1,6 @@
-# pam : 1.7.0-5.root.io.1
+# pam : 1.7.0-5.aikido.2
 
-This patch is based on pam version 1.7.0-5.root.io.1, which is available at:
+This patch is based on pam version 1.7.0-5.aikido.2, which is available at:
 https://sources.debian.org/src/pam/1.7.0-5/
 
 ## Affected CVEs:
