@@ -1,6 +1,6 @@
-# krb5 : 1.21.3-5+deb13u1.root.io.2
+# krb5 : 1.21.3-5+deb13u1.aikido.3
 
-This patch is based on krb5 version 1.21.3-5+deb13u1.root.io.2, which is available at:
+This patch is based on krb5 version 1.21.3-5+deb13u1.aikido.3, which is available at:
 https://sources.debian.org/src/krb5/1.21.3-5+deb13u1/
 
 ## Affected CVEs:
