@@ -11,6 +11,7 @@ unknown
 - CVE-2018-14718
 - CVE-2018-14719
 - CVE-2018-19362
+- CVE-2018-5968
 - CVE-2018-7489
 - CVE-2018-12022
 - CVE-2019-12086
@@ -46,6 +47,7 @@ unknown
 - CVE-2020-36180
 - CVE-2020-36518
 - CVE-2020-36188
+- CVE-2020-24616
 
 ## How to Apply:
 1. Clone or download the source code for com.fasterxml.jackson.core:jackson-databind
