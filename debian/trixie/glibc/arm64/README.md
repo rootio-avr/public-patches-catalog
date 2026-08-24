@@ -1,6 +1,6 @@
-# glibc : 2.41-12+deb13u3.aikido.11
+# glibc : 2.41-12+deb13u3.aikido.12
 
-This patch is based on glibc version 2.41-12+deb13u3.aikido.11, which is available at:
+This patch is based on glibc version 2.41-12+deb13u3.aikido.12, which is available at:
 https://sources.debian.org/src/glibc/2.41-12+deb13u3/
 
 ## Affected CVEs:
