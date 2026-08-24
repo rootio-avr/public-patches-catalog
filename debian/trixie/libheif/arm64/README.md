@@ -1,6 +1,6 @@
-# libheif : 1.19.8-1.aikido.7
+# libheif : 1.19.8-1.aikido.8
 
-This patch is based on libheif version 1.19.8-1.aikido.7, which is available at:
+This patch is based on libheif version 1.19.8-1.aikido.8, which is available at:
 https://sources.debian.org/src/libheif/1.19.8-1/
 
 ## Affected CVEs:
