@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-13221
+- CVE-2026-8376
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source perl`
