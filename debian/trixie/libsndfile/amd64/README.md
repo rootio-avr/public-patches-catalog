@@ -1,6 +1,6 @@
-# libsndfile : 1.2.2-2+deb13u1.root.io.1
+# libsndfile : 1.2.2-2+deb13u1.aikido.2
 
-This patch is based on libsndfile version 1.2.2-2+deb13u1.root.io.1, which is available at:
+This patch is based on libsndfile version 1.2.2-2+deb13u1.aikido.2, which is available at:
 https://sources.debian.org/src/libsndfile/1.2.2-2+deb13u1/
 
 ## Affected CVEs:
