@@ -1,6 +1,6 @@
-# unbound : 1.22.0-2+deb13u3.aikido.1
+# unbound : 1.22.0-2+deb13u3.aikido.2
 
-This patch is based on unbound version 1.22.0-2+deb13u3.aikido.1, which is available at:
+This patch is based on unbound version 1.22.0-2+deb13u3.aikido.2, which is available at:
 https://sources.debian.org/src/unbound/1.22.0-2+deb13u3/
 
 ## Affected CVEs:
