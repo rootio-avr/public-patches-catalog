@@ -1,6 +1,6 @@
-# libde265 : 1.0.11-1+deb12u2.aikido.12
+# libde265 : 1.0.11-1+deb12u2.aikido.13
 
-This patch is based on libde265 version 1.0.11-1+deb12u2.aikido.12, which is available at:
+This patch is based on libde265 version 1.0.11-1+deb12u2.aikido.13, which is available at:
 https://sources.debian.org/src/libde265/1.0.11-1+deb12u2/
 
 ## Affected CVEs:
