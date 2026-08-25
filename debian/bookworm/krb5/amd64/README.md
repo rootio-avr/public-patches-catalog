@@ -1,6 +1,6 @@
-# krb5 : 1.20.1-2+deb12u5.aikido.10
+# krb5 : 1.20.1-2+deb12u5.aikido.11
 
-This patch is based on krb5 version 1.20.1-2+deb12u5.aikido.10, which is available at:
+This patch is based on krb5 version 1.20.1-2+deb12u5.aikido.11, which is available at:
 https://sources.debian.org/src/krb5/1.20.1-2+deb12u5/
 
 ## Affected CVEs:
