@@ -1,6 +1,6 @@
-# jbig2dec : 0.19-3.root.io.1
+# jbig2dec : 0.19-3.aikido.3
 
-This patch is based on jbig2dec version 0.19-3.root.io.1, which is available at:
+This patch is based on jbig2dec version 0.19-3.aikido.3, which is available at:
 https://sources.debian.org/src/jbig2dec/0.19-3/
 
 ## Affected CVEs:
