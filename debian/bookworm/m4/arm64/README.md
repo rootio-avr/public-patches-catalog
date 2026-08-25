@@ -1,6 +1,6 @@
-# m4 : 1.4.19-3.root.io.3
+# m4 : 1.4.19-3.aikido.5
 
-This patch is based on m4 version 1.4.19-3.root.io.3, which is available at:
+This patch is based on m4 version 1.4.19-3.aikido.5, which is available at:
 https://sources.debian.org/src/m4/1.4.19-3/
 
 ## Affected CVEs:
