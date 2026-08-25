@@ -1,6 +1,6 @@
-# mariadb : 1:10.11.18-0+deb12u1.aikido.9
+# mariadb : 1:10.11.18-0+deb12u1.aikido.10
 
-This patch is based on mariadb version 1:10.11.18-0+deb12u1.aikido.9, which is available at:
+This patch is based on mariadb version 1:10.11.18-0+deb12u1.aikido.10, which is available at:
 https://sources.debian.org/src/mariadb/1:10.11.18-0+deb12u1/
 
 ## Affected CVEs:
