@@ -1,6 +1,6 @@
-# apache2 : 2.4.67-1~deb12u3.root.io.11
+# apache2 : 2.4.67-1~deb12u3.aikido.12
 
-This patch is based on apache2 version 2.4.67-1~deb12u3.root.io.11, which is available at:
+This patch is based on apache2 version 2.4.67-1~deb12u3.aikido.12, which is available at:
 https://sources.debian.org/src/apache2/2.4.67-1~deb12u3/
 
 ## Affected CVEs:
