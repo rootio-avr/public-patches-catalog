@@ -1,6 +1,6 @@
-# binutils : 2.40-2.root.io.24
+# binutils : 2.40-2.aikido.25
 
-This patch is based on binutils version 2.40-2.root.io.24, which is available at:
+This patch is based on binutils version 2.40-2.aikido.25, which is available at:
 https://sources.debian.org/src/binutils/2.40-2/
 
 ## Affected CVEs:
