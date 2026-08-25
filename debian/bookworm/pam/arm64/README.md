@@ -1,6 +1,6 @@
-# pam : 1.5.2-6+deb12u2.root.io.16
+# pam : 1.5.2-6+deb12u2.aikido.17
 
-This patch is based on pam version 1.5.2-6+deb12u2.root.io.16, which is available at:
+This patch is based on pam version 1.5.2-6+deb12u2.aikido.17, which is available at:
 https://sources.debian.org/src/pam/1.5.2-6+deb12u2/
 
 ## Affected CVEs:
