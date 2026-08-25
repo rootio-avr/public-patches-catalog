@@ -1,6 +1,6 @@
-# glibc : 2.36-9+deb12u14.root.io.19
+# glibc : 2.36-9+deb12u14.aikido.20
 
-This patch is based on glibc version 2.36-9+deb12u14.root.io.19, which is available at:
+This patch is based on glibc version 2.36-9+deb12u14.aikido.20, which is available at:
 https://sources.debian.org/src/glibc/2.36-9+deb12u14/
 
 ## Affected CVEs:
