@@ -1,10 +1,13 @@
-# libwmf : 0.2.12-5.1.root.io.1
+# libwmf : 0.2.12-5.1.aikido.7
 
-This patch is based on libwmf version 0.2.12-5.1.root.io.1, which is available at:
+This patch is based on libwmf version 0.2.12-5.1.aikido.7, which is available at:
 https://sources.debian.org/src/libwmf/0.2.12-5.1/
 
 ## Affected CVEs:
 - CVE-2009-3546
+- CVE-2007-3477
+- CVE-2007-3996
+- CVE-2007-3476
 
 ## How to Apply:
 1. Obtain the source package: `apt source libwmf`
