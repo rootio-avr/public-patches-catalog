@@ -1,6 +1,6 @@
-# varnish : 7.1.1-2+deb12u1.root.io.7
+# varnish : 7.1.1-2+deb12u1.aikido.8
 
-This patch is based on varnish version 7.1.1-2+deb12u1.root.io.7, which is available at:
+This patch is based on varnish version 7.1.1-2+deb12u1.aikido.8, which is available at:
 https://sources.debian.org/src/varnish/7.1.1-2+deb12u1/
 
 ## Affected CVEs:
