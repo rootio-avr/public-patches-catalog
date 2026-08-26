@@ -1,6 +1,6 @@
-# uriparser : 0.9.7+dfsg-2.root.io.4
+# uriparser : 0.9.7+dfsg-2.aikido.5
 
-This patch is based on uriparser version 0.9.7+dfsg-2.root.io.4, which is available at:
+This patch is based on uriparser version 0.9.7+dfsg-2.aikido.5, which is available at:
 https://sources.debian.org/src/uriparser/0.9.7+dfsg-2/
 
 ## Affected CVEs:
