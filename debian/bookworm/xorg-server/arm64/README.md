@@ -1,6 +1,6 @@
-# xorg-server : 2:21.1.7-3+deb12u12.root.io.7
+# xorg-server : 2:21.1.7-3+deb12u12.aikido.8
 
-This patch is based on xorg-server version 2:21.1.7-3+deb12u12.root.io.7, which is available at:
+This patch is based on xorg-server version 2:21.1.7-3+deb12u12.aikido.8, which is available at:
 https://sources.debian.org/src/xorg-server/2:21.1.7-3+deb12u12/
 
 ## Affected CVEs:
