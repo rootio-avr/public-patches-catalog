@@ -1,6 +1,6 @@
-# wget : 1.21.3-1+deb12u1.root.io.4
+# wget : 1.21.3-1+deb12u1.aikido.5
 
-This patch is based on wget version 1.21.3-1+deb12u1.root.io.4, which is available at:
+This patch is based on wget version 1.21.3-1+deb12u1.aikido.5, which is available at:
 https://sources.debian.org/src/wget/1.21.3-1+deb12u1/
 
 ## Affected CVEs:
