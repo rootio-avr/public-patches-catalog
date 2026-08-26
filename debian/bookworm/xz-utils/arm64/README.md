@@ -1,6 +1,6 @@
-# xz-utils : 5.4.1-1.root.io.1
+# xz-utils : 5.4.1-1.aikido.2
 
-This patch is based on xz-utils version 5.4.1-1.root.io.1, which is available at:
+This patch is based on xz-utils version 5.4.1-1.aikido.2, which is available at:
 https://sources.debian.org/src/xz-utils/5.4.1-1/
 
 ## Affected CVEs:
