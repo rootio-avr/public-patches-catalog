@@ -1,0 +1,672 @@
+--- a/src/compose.ts
++++ b/src/compose.ts
+@@ -11,6 +11,15 @@
+   SubtypingRule,
+   assert,
+   Supergraph,
++  Subgraph,
++  FieldDefinition,
++  NamedType,
++  SchemaElement,
++  baseType,
++  isInterfaceType,
++  addSubgraphToError,
++  ErrorCodeDefinition,
++  sourceASTs,
+ } from "@apollo/federation-internals";
+ import { GraphQLError } from "graphql";
+ import { buildFederatedQueryGraph, buildSupergraphAPIQueryGraph } from "@apollo/query-graphs";
+@@ -39,6 +48,86 @@
+   allowedFieldTypeMergingSubtypingRules?: SubtypingRule[];
+ }
+ 
++// CVE-2025-64530: The GraphQL spec does not define directive inheritance from interfaces to the
++// object types that implement them. As a result, access control directives (@authenticated,
++// @requiresScopes and @policy) placed on an interface type, an interface field or an
++// `@interfaceObject` type are silently ignored when the corresponding fields are queried directly
++// on an implementing object type, allowing the intended access control to be bypassed. To avoid
++// this, composition rejects applying these directives on interface types, interface fields and
++// interface objects, and requires them to be specified on the concrete object types/fields
++// instead. Applying them on `@interfaceObject` *fields* remains allowed, as those resolve on
++// concrete entities and therefore do enforce the access control.
++//
++// This error code mirrors the `AUTHENTICATION_APPLIED_ON_INTERFACE` definition that upstream added
++// to `@apollo/federation-internals`. It is defined locally here because the version of that package
++// shipped with this release of `@apollo/composition` does not expose it.
++const AUTHENTICATION_APPLIED_ON_INTERFACE: ErrorCodeDefinition = {
++  code: 'AUTHENTICATION_APPLIED_ON_INTERFACE',
++  description: 'The @authenticated, @requiresScopes and @policy directives cannot be applied on interfaces, interface fields and interface objects',
++  metadata: { addedIn: '2.6.3' },
++  err: (message: string, options?: any) => new GraphQLError(
++    message,
++    {
++      ...options,
++      extensions: {
++        ...options?.extensions,
++        code: 'AUTHENTICATION_APPLIED_ON_INTERFACE',
++      },
++    },
++  ),
++};
++
++function validateNoAccessControlOnInterfaces(subgraph: Subgraph, errorCollector: GraphQLError[]) {
++  const metadata = subgraph.metadata();
++  const directives = [
++    metadata.authenticatedDirective(),
++    metadata.requiresScopesDirective(),
++    metadata.policyDirective(),
++  ];
++
++  const isAppliedOnInterface = (type: NamedType): boolean =>
++    isInterfaceType(type) || metadata.isInterfaceObjectType(baseType(type));
++
++  const isAppliedOnInterfaceField = (elem: SchemaElement<any, any>): boolean =>
++    elem instanceof FieldDefinition && isInterfaceType(elem.parent);
++
++  for (const directive of directives) {
++    for (const application of directive.applications()) {
++      const element = application.parent as SchemaElement<any, any>;
++      if (isAppliedOnInterface(element as unknown as NamedType) || isAppliedOnInterfaceField(element)) {
++        let kind = '';
++        switch (element.kind) {
++          case 'FieldDefinition':
++            kind = 'field';
++            break;
++          case 'InterfaceType':
++            kind = 'interface';
++            break;
++          case 'ObjectType':
++            kind = 'interface object';
++            break;
++        }
++        errorCollector.push(AUTHENTICATION_APPLIED_ON_INTERFACE.err(
++          `Invalid use of @${directive.name} on ${kind} "${element.coordinate}": @${directive.name} cannot be applied on interfaces, interface fields and interface objects`,
++          { nodes: sourceASTs(application, (element as any).parent) },
++        ));
++      }
++    }
++  }
++}
++
++function validateAccessControlDirectivesUsage(subgraphs: Subgraphs): GraphQLError[] | undefined {
++  const errors: GraphQLError[] = [];
++  for (const subgraph of subgraphs.values()) {
++    const subgraphErrors: GraphQLError[] = [];
++    validateNoAccessControlOnInterfaces(subgraph, subgraphErrors);
++    for (const e of subgraphErrors) {
++      errors.push(addSubgraphToError(e, subgraph.name, AUTHENTICATION_APPLIED_ON_INTERFACE));
++    }
++  }
++  return errors.length === 0 ? undefined : errors;
++}
++
+ function validateCompositionOptions(options: CompositionOptions) {
+   // TODO: we currently cannot allow "list upgrades", meaning a subgraph returning `String` and another returning `[String]`. To support it, we would need the execution code to
+   // recognize situation and "coerce" results from the first subgraph (the one returning `String`) into singleton lists.
+@@ -57,6 +146,11 @@
+   const validationErrors = toMerge.validate();
+   if (validationErrors) {
+     return { errors: validationErrors };
++  }
++
++  const accessControlErrors = validateAccessControlDirectivesUsage(toMerge);
++  if (accessControlErrors) {
++    return { errors: accessControlErrors };
+   }
+ 
+   const mergeResult = mergeSubgraphs(toMerge);
+--- /dev/null
++++ b/src/__tests__/cve-2025-64530.test.ts
+@@ -0,0 +1,86 @@
++import { CompositionResult } from '../compose';
++import gql from 'graphql-tag';
++import './matchers';
++import { composeAsFed2Subgraphs } from './testHelper';
++
++function errors(r: CompositionResult): [string, string][] {
++  return r.errors?.map(e => [e.extensions.code as string, e.message]) ?? [];
++}
++
++// Regression test for CVE-2025-64530: access control directives (@authenticated,
++// @requiresScopes, @policy) applied on interface types, interface fields or interface
++// object *types* are silently ignored when the corresponding fields are queried directly on
++// the implementing object types (GraphQL does not inherit directives from interfaces), letting
++// a query bypass the intended access control. Composition must reject such usage so the access
++// control is instead specified on the concrete object types/fields. Applying these directives on
++// `@interfaceObject` *fields* remains allowed (they resolve on concrete entities and therefore do
++// enforce the access control).
++describe('CVE-2025-64530: access control directives on interfaces', () => {
++  it.each([
++    { directiveName: '@authenticated', directiveString: '@authenticated' },
++    { directiveName: '@requiresScopes', directiveString: '@requiresScopes(scopes: [["scope1"]])' },
++    { directiveName: '@policy', directiveString: '@policy(policies: [["policy1"]])' },
++  ])(
++    'rejects $directiveName applications on interfaces, interface fields and interface objects',
++    ({ directiveName, directiveString }) => {
++      const subgraph = {
++        name: 'S',
++        typeDefs: gql`
++          type Query {
++            i: I
++            o: O
++          }
++
++          interface I ${directiveString} {
++            x: Int ${directiveString}
++          }
++
++          type T implements I {
++            x: Int
++          }
++
++          type O @key(fields: "id") @interfaceObject ${directiveString} {
++            id: ID!
++            y: Int
++          }
++        `,
++      };
++
++      const result = composeAsFed2Subgraphs([subgraph]);
++      expect(result.errors).toBeDefined();
++      expect(errors(result)).toStrictEqual([
++        [
++          'AUTHENTICATION_APPLIED_ON_INTERFACE',
++          `[S] Invalid use of ${directiveName} on field "I.x": ${directiveName} cannot be applied on interfaces, interface fields and interface objects`,
++        ],
++        [
++          'AUTHENTICATION_APPLIED_ON_INTERFACE',
++          `[S] Invalid use of ${directiveName} on interface "I": ${directiveName} cannot be applied on interfaces, interface fields and interface objects`,
++        ],
++        [
++          'AUTHENTICATION_APPLIED_ON_INTERFACE',
++          `[S] Invalid use of ${directiveName} on interface object "O": ${directiveName} cannot be applied on interfaces, interface fields and interface objects`,
++        ],
++      ]);
++    },
++  );
++
++  it('allows access control directives on @interfaceObject fields', () => {
++    const subgraph = {
++      name: 'S',
++      typeDefs: gql`
++        type Query {
++          o: O
++        }
++
++        type O @key(fields: "id") @interfaceObject {
++          id: ID!
++          y: Int @authenticated
++        }
++      `,
++    };
++
++    const result = composeAsFed2Subgraphs([subgraph]);
++    expect(errors(result)).toStrictEqual([]);
++  });
++});
+
+--- a/src/__tests__/compose.auth.test.ts
++++ b/src/__tests__/compose.auth.test.ts
+@@ -0,0 +1,112 @@
++import gql from 'graphql-tag';
++import './matchers';
++import {
++  assertCompositionSuccess,
++  errors,
++  composeAsFed2Subgraphs,
++} from "./testHelper";
++
++/**
++ * Regression tests for GHSA-m8jr-fxqx-8xx6.
++ *
++ * A field annotated with `@requires` pulls in ("requires") data from other fields before it can be
++ * resolved. If that depended-on data is protected by an access control directive (`@authenticated`,
++ * `@requiresScopes`, `@policy`) but the requesting field does not itself carry at least equivalent
++ * access control requirements, then querying the `@requires` field would expose the protected data
++ * while bypassing its access control. Composition must reject such supergraphs with a
++ * `MISSING_TRANSITIVE_AUTH_REQUIREMENTS` error.
++ */
++describe('@requires access control enforcement (GHSA-m8jr-fxqx-8xx6)', () => {
++  it('errors when a @requires field pulls in @authenticated data without matching auth', () => {
++    const subgraphA = {
++      name: 'subgraphA',
++      typeDefs: gql`
++        type Query {
++          t: T
++        }
++
++        type T @key(fields: "id") {
++          id: ID!
++          protected: Int! @authenticated
++        }
++      `,
++    };
++
++    const subgraphB = {
++      name: 'subgraphB',
++      typeDefs: gql`
++        type T @key(fields: "id") {
++          id: ID!
++          protected: Int! @external
++          # BUG: this field can read the @authenticated "protected" field without requiring auth.
++          leaked: Int! @requires(fields: "protected")
++        }
++      `,
++    };
++
++    const result = composeAsFed2Subgraphs([subgraphA, subgraphB]);
++    expect(result.errors).toBeDefined();
++    expect(errors(result).map(([code]) => code)).toContain('MISSING_TRANSITIVE_AUTH_REQUIREMENTS');
++  });
++
++  it('composes cleanly when the @requires field carries matching @authenticated', () => {
++    const subgraphA = {
++      name: 'subgraphA',
++      typeDefs: gql`
++        type Query {
++          t: T
++        }
++
++        type T @key(fields: "id") {
++          id: ID!
++          protected: Int! @authenticated
++        }
++      `,
++    };
++
++    const subgraphB = {
++      name: 'subgraphB',
++      typeDefs: gql`
++        type T @key(fields: "id") {
++          id: ID!
++          protected: Int! @external
++          # This field now carries matching auth, so accessing the protected data is allowed.
++          derived: Int! @requires(fields: "protected") @authenticated
++        }
++      `,
++    };
++
++    const result = composeAsFed2Subgraphs([subgraphA, subgraphB]);
++    assertCompositionSuccess(result);
++  });
++
++  it('composes cleanly when the required data is not access controlled', () => {
++    const subgraphA = {
++      name: 'subgraphA',
++      typeDefs: gql`
++        type Query {
++          t: T
++        }
++
++        type T @key(fields: "id") {
++          id: ID!
++          plain: Int!
++        }
++      `,
++    };
++
++    const subgraphB = {
++      name: 'subgraphB',
++      typeDefs: gql`
++        type T @key(fields: "id") {
++          id: ID!
++          plain: Int! @external
++          derived: Int! @requires(fields: "plain")
++        }
++      `,
++    };
++
++    const result = composeAsFed2Subgraphs([subgraphA, subgraphB]);
++    assertCompositionSuccess(result);
++  });
++});
+--- a/src/merging/merge.ts
++++ b/src/merging/merge.ts
+@@ -71,6 +71,14 @@ import {
+   FeatureVersion,
+   FEDERATION_VERSIONS,
+   InaccessibleSpecDefinition,
++  isFederationDirectiveDefinedInSchema,
++  JoinFieldDirectiveArguments,
++  parseSelectionSet,
++  SelectionSet,
++  FieldSelection,
++  AuthenticatedSpecDefinition,
++  RequiresScopesSpecDefinition,
++  PolicySpecDefinition,
+ } from "@apollo/federation-internals";
+ import { ASTNode, GraphQLError, DirectiveLocation } from "graphql";
+ import {
+@@ -279,6 +287,8 @@ class Merger {
+   private linkSpec: CoreSpecDefinition;
+   private inaccessibleSpec: InaccessibleSpecDefinition;
+   private latestFedVersionUsed: FeatureVersion;
++  private authEnabled: boolean = false;
++  private fieldsWithRequires: Set<string> = new Set();
+ 
+   constructor(readonly subgraphs: Subgraphs, readonly options: CompositionOptions) {
+     this.latestFedVersionUsed = this.getLatestFederationVersionUsed();
+@@ -300,6 +310,47 @@ class Merger {
+     this.subgraphsSchema = subgraphs.values().map(subgraph => subgraph.schema);
+     this.subgraphNamesToJoinSpecName = this.prepareSupergraph();
+     this.appliedDirectivesToMerge = [];
++    this.authEnabled = this.getAuthEnabled();
++    this.fieldsWithRequires = this.getFieldsWithRequiresDirective();
++  }
++
++  // Determine whether any subgraph makes use of the access control directives
++  // (@authenticated, @requiresScopes, @policy). These directives are the only
++  // thing that make the post-merge auth verification meaningful, so we skip the
++  // (potentially expensive) validation entirely when none are in use.
++  private getAuthEnabled(): boolean {
++    for (const subgraph of this.subgraphs) {
++      const metadata = subgraph.metadata();
++      for (const authDirective of [metadata.authenticatedDirective(), metadata.requiresScopesDirective(), metadata.policyDirective()]) {
++        const applications = authDirective.applications();
++        const applicationCount = (applications && (applications as any).size != null)
++          ? (applications as any).size
++          : (applications as any).length;
++        if (isFederationDirectiveDefinedInSchema(authDirective) && applicationCount > 0) {
++          return true;
++        }
++      }
++    }
++    return false;
++  }
++
++  // Collect the set of field coordinates (e.g. `Type.field`) that declare a
++  // `@requires` directive in any subgraph. These fields pull in data from other
++  // fields at runtime and are therefore subject to transitive auth verification.
++  private getFieldsWithRequiresDirective(): Set<string> {
++    const fields = new Set<string>();
++    for (const subgraph of this.subgraphs) {
++      const directive = subgraph.metadata().requiresDirective();
++      if (isFederationDirectiveDefinedInSchema(directive)) {
++        for (const application of directive.applications()) {
++          const field = application.parent;
++          if (field instanceof FieldDefinition) {
++            fields.add(field.coordinate);
++          }
++        }
++      }
++    }
++    return fields;
+   }
+ 
+   private getLatestFederationVersionUsed(): FeatureVersion {
+@@ -2739,6 +2786,22 @@ class Merger {
+       }
+     }
+ 
++    // Auth verification on the supergraph.
++    //
++    // `@requires` lets a field pull in ("require") data from other fields that may live in other
++    // subgraphs. If those depended-on fields (or their parent types) carry access control
++    // requirements (@authenticated / @requiresScopes / @policy) but the field declaring the
++    // `@requires` does not carry at least equivalent requirements, then querying the `@requires`
++    // field would surface the protected data while bypassing its access control. We must therefore
++    // verify that every field with `@requires` specifies auth requirements that satisfy the auth
++    // requirements of everything it transitively selects.
++    if (this.authEnabled) {
++      const authValidator = new AuthValidator(this.merged, this.joinSpec, this.subgraphNamesToJoinSpecName);
++      for (const coordinate of this.fieldsWithRequires) {
++        const errors = authValidator.validateRequiresFieldSet(coordinate);
++        this.errors.push(...errors);
++      }
++    }
+   }
+ 
+   private updateInaccessibleErrorsWithLinkToSubgraphs(
+@@ -2880,3 +2943,252 @@ class Merger {
+     }
+   }
+ }
++
++/**
++ * Verifies that fields relying on `@requires` cannot be used to bypass the access control
++ * directives (`@authenticated`, `@requiresScopes`, `@policy`) applied to the data they pull in.
++ *
++ * A `@requires` directive requests additional data (its "field set") to be resolved before the
++ * annotated field can be resolved. If any of the data reachable through that field set is protected
++ * by access control, the requesting field must specify auth requirements that are at least as
++ * strong; otherwise composition surfaces a `MISSING_TRANSITIVE_AUTH_REQUIREMENTS` error.
++ *
++ * GHSA-m8jr-fxqx-8xx6: the error code is defined locally within composition-js so the fix is
++ * self-contained. The shared error registry lives in the separately-published
++ * @apollo/federation-internals package (a different npm tarball), and consumers only ever read
++ * the code off `error.extensions.code`.
++ */
++const MISSING_TRANSITIVE_AUTH_REQUIREMENTS_CODE = 'MISSING_TRANSITIVE_AUTH_REQUIREMENTS';
++const missingTransitiveAuthRequirementsError = (message: string): GraphQLError =>
++  new GraphQLError(message, { extensions: { code: MISSING_TRANSITIVE_AUTH_REQUIREMENTS_CODE } });
++
++export class AuthValidator {
++  schema: Schema;
++  joinSpecNamesToSubgraphNames: Map<string, string>;
++  joinFieldDirective: DirectiveDefinition<JoinFieldDirectiveArguments>;
++  authenticatedDirective?: DirectiveDefinition;
++  requiresScopesDirective?: DirectiveDefinition<{ scopes: string[][] }>;
++  policyDirective?: DirectiveDefinition<{ policies: string[][] }>;
++
++  constructor(schema: Schema, joinSpec: JoinSpecDefinition, subgraphNamesToJoinSpecName: Map<string, string>) {
++    this.schema = schema;
++    this.joinFieldDirective = joinSpec.fieldDirective(this.schema);
++    this.joinSpecNamesToSubgraphNames = new Map(Array.from(
++        subgraphNamesToJoinSpecName, entry => entry.reverse() as [string, string])
++    );
++
++    this.authenticatedDirective = this.accessControlDirectiveInSchema(
++      AuthenticatedSpecDefinition.identity,
++      AuthenticatedSpecDefinition.directiveName,
++    );
++    this.requiresScopesDirective = this.accessControlDirectiveInSchema<{ scopes: string[][] }>(
++      RequiresScopesSpecDefinition.identity,
++      RequiresScopesSpecDefinition.directiveName,
++    );
++    this.policyDirective = this.accessControlDirectiveInSchema<{ policies: string[][] }>(
++      PolicySpecDefinition.identity,
++      PolicySpecDefinition.directiveName,
++    );
++  }
++
++  // Resolve the merged (supergraph) directive definition for a given access control spec, taking
++  // into account any renaming performed by `@link`/`@core` imports.
++  private accessControlDirectiveInSchema<TApplicationArgs extends { [key: string]: any } = {}>(
++    identity: string,
++    directiveName: string,
++  ): DirectiveDefinition<TApplicationArgs> | undefined {
++    const feature = this.schema.coreFeatures?.getByIdentity(identity);
++    if (!feature) {
++      return undefined;
++    }
++    const nameInSchema = feature.directiveNameInSchema(directiveName);
++    return nameInSchema ? this.schema.directive(nameInSchema) as DirectiveDefinition<TApplicationArgs> | undefined : undefined;
++  }
++
++  validateRequiresFieldSet(coordinate: string): GraphQLError[] {
++    const fieldCoordinate = coordinate.split('.');
++    assert(fieldCoordinate && fieldCoordinate.length == 2, `Valid coordinate for field "${coordinate}" with @requires`);
++    const type = this.schema.type(fieldCoordinate[0]);
++    if (!(type instanceof ObjectType || type instanceof InterfaceType)) {
++      // The type declaring the @requires may not be part of the merged supergraph (e.g. it belongs
++      // to a core feature we don't merge). In that case there is nothing to verify.
++      return [];
++    }
++    const field = type.field(fieldCoordinate[1]);
++    if (!(field instanceof FieldDefinition)) {
++      return [];
++    }
++
++    const authRequirementOnRequires = new AuthRequirements(coordinate, '@requires');
++    authRequirementOnRequires.type = this.authRequirementsOnElement(type);
++    authRequirementOnRequires.field = this.authRequirementsOnElement(field);
++
++    const errors: GraphQLError[] = [];
++    const joinDirectivesOnRequires = field.appliedDirectivesOf(this.joinFieldDirective);
++    for (const joinDirectiveOnRequires of joinDirectivesOnRequires) {
++      const requiresFieldSet = joinDirectiveOnRequires.arguments().requires;
++      if (requiresFieldSet) {
++        // only verify @requires selections if it is defined on @join__field
++        const requiresSelectionSet = parseSelectionSet({ parentType: type, source: requiresFieldSet });
++        try {
++          this.verifyAuthRequirementsOnSelectionSet(authRequirementOnRequires, requiresSelectionSet);
++        } catch (e) {
++          if (!(e instanceof GraphQLError)) {
++            throw e;
++          }
++          // target subgraph info should always be provided but just in case
++          const enumSubgraphValue = joinDirectiveOnRequires.arguments().graph;
++          const subgraph = enumSubgraphValue ? this.joinSpecNamesToSubgraphNames.get(enumSubgraphValue) : undefined;
++          if (subgraph) {
++            errors.push(addSubgraphToError(e, subgraph));
++          } else {
++            errors.push(e);
++          }
++        }
++      }
++    }
++
++    return errors;
++  }
++
++  private authRequirementsOnElement(element: NamedType | FieldDefinition<any>): AuthRequirementsOnElement | undefined {
++    const requirements = new AuthRequirementsOnElement();
++    if (this.authenticatedDirective) {
++      const appliedDirective = element.appliedDirectivesOf(this.authenticatedDirective)?.[0];
++      if (appliedDirective) {
++        requirements.isAuthenticated = true;
++      }
++    }
++
++    if (this.requiresScopesDirective) {
++      const appliedDirective = element.appliedDirectivesOf(this.requiresScopesDirective)?.[0];
++      if (appliedDirective) {
++        const { scopes } = appliedDirective.arguments();
++        requirements.scopes = scopes;
++      }
++    }
++
++    if (this.policyDirective) {
++      const appliedDirective = element.appliedDirectivesOf(this.policyDirective)?.[0];
++      if (appliedDirective) {
++        const { policies } = appliedDirective.arguments();
++        requirements.policies = policies;
++      }
++    }
++
++    if (requirements.isAuthenticated || requirements.scopes || requirements.policies) {
++      return requirements;
++    } else {
++      return undefined;
++    }
++  }
++
++  private verifyAuthRequirementsOnSelectionSet(authRequirements: AuthRequirements, selectionSet: SelectionSet) {
++    const parentType = this.schema.type(selectionSet.parentType.name);
++    for (const selection of selectionSet.selections()) {
++      if (selection instanceof FieldSelection) {
++        if (parentType instanceof InterfaceType) {
++          // if we are referencing an interface field we need to check against all implementations
++          for (const implType of parentType.possibleRuntimeTypes()) {
++            const requirementsOnImplType = this.authRequirementsOnElement(implType);
++            if (!authRequirements.satisfies(requirementsOnImplType)) {
++              const msg = `Field "${authRequirements.fieldCoordinate}" does not specify necessary @authenticated, @requiresScopes `
++                  + `and/or @policy auth requirements to access the transitive interface "${parentType}" data from ${authRequirements.directive} selection set.`;
++              throw missingTransitiveAuthRequirementsError(msg);
++            }
++            // re-check the implementation auth condition
++            this.verifyAuthOnFieldSelection(implType, selection, authRequirements);
++          }
++        }
++
++        if (parentType instanceof ObjectType) {
++          this.verifyAuthOnFieldSelection(parentType, selection, authRequirements);
++        }
++
++        if (selection.selectionSet) {
++          this.verifyAuthRequirementsOnSelectionSet(authRequirements, selection.selectionSet);
++        }
++      } else {
++        const condition = selection.element.typeCondition;
++        if (condition) {
++          const requirementsOnCondition = this.authRequirementsOnElement(condition);
++          if (!authRequirements.satisfies(requirementsOnCondition)) {
++            const msg = `Field "${authRequirements.fieldCoordinate}" does not specify necessary @authenticated, @requiresScopes `
++                + `and/or @policy auth requirements to access the transitive data in inline fragment type condition "${condition}" from ${authRequirements.directive} selection set.`;
++            throw missingTransitiveAuthRequirementsError(msg);
++          }
++        }
++        this.verifyAuthRequirementsOnSelectionSet(authRequirements, selection.selectionSet);
++      }
++    }
++  }
++
++  private verifyAuthOnFieldSelection(parentType: ObjectType, selection: FieldSelection, authRequirements: AuthRequirements) {
++    const field = parentType.field(selection.element.name);
++    assert(field, () => `field "${selection.element.name}" exists in the schema`);
++    const fieldAuthReqs = this.authRequirementsOnElement(field);
++    const returnType = baseType(field.type!);
++    const fieldReturnAuthReqs = this.authRequirementsOnElement(returnType);
++
++    if (!authRequirements.satisfies(fieldAuthReqs) || !authRequirements.satisfies(fieldReturnAuthReqs)) {
++      const msg = `Field "${authRequirements.fieldCoordinate}" does not specify necessary @authenticated, @requiresScopes `
++          + `and/or @policy auth requirements to access the transitive field "${field.coordinate}" data from ${authRequirements.directive} selection set.`;
++      throw missingTransitiveAuthRequirementsError(msg);
++    }
++  }
++}
++
++class AuthRequirements {
++  fieldCoordinate: string;
++  directive: string;
++  type?: AuthRequirementsOnElement;
++  field?: AuthRequirementsOnElement;
++
++  constructor(coordinate: string, directive: string) {
++    this.fieldCoordinate = coordinate;
++    this.directive = directive;
++  }
++
++  satisfies(authOnElement: AuthRequirementsOnElement | undefined): boolean {
++    if (authOnElement) {
++      const typeSatisfiesRequirements = this.type && this.type.satisfies(authOnElement);
++      const fieldSatisfiesRequirements = this.field && this.field.satisfies(authOnElement);
++      if (!typeSatisfiesRequirements && !fieldSatisfiesRequirements) {
++        return false;
++      }
++    }
++    return true;
++  }
++}
++
++class AuthRequirementsOnElement {
++  isAuthenticated: boolean = false;
++  scopes?: string[][];
++  policies?: string[][];
++
++  satisfies(other: AuthRequirementsOnElement): boolean {
++    const authenticatedSatisfied = this.isAuthenticated || !other.isAuthenticated;
++    const scopesSatisfied = this.isSubset(this.scopes, other.scopes);
++    const policiesSatisfied = this.isSubset(this.policies, other.policies);
++    return authenticatedSatisfied && scopesSatisfied && policiesSatisfied;
++  }
++
++  isSubset(first: string[][] | undefined, second: string[][] | undefined): boolean {
++    if (second) {
++      if (first) {
++        // outer elements follow OR rules so we just need one element to match
++        // inner elements follow AND rules so ALL has to match
++        return first.some((firstInner) => second.some((secondInner) => {
++          const s = new Set(secondInner);
++          return firstInner.length == secondInner.length && firstInner.every((elem) => s.has(elem));
++        }));
++      } else {
++        // we don't specify any auth requirements but second one requires it
++        return false;
++      }
++    } else {
++      // second one does not specify any auth requirements so we are good
++      return true;
++    }
++  }
++}
