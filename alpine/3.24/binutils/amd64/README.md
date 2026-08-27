@@ -1,10 +1,11 @@
-# binutils : 2.45.1-r10072
+# binutils : 2.45.1-r10073
 
-This patch is based on binutils version 2.45.1-r10072, which is available at:
+This patch is based on binutils version 2.45.1-r10073, which is available at:
 unknown
 
 ## Affected CVEs:
 - CVE-2026-6846
+- CVE-2026-3441
 - CVE-2026-3442
 - CVE-2025-69649
 - CVE-2025-69650
