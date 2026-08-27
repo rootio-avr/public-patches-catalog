@@ -1,26 +1,17 @@
-# ffmpeg : 7:5.1.6-0+deb12u1
+# ffmpeg : 7:5.1.9-0+deb12u1.aikido.11
 
-This patch is based on ffmpeg version 7:5.1.6-0+deb12u1, which is available at:
-unknown
+This patch is based on ffmpeg version 7:5.1.9-0+deb12u1.aikido.11, which is available at:
+https://sources.debian.org/src/ffmpeg/7:5.1.9-0+deb12u1/
 
 ## Affected CVEs:
 - CVE-2025-22921
-- CVE-2025-25473
-- CVE-2024-36618
-- CVE-2025-0518
-- CVE-2025-1594
-- CVE-2024-31582
-- CVE-2025-22919
 - CVE-2023-49528
-- CVE-2023-50007
-- CVE-2024-35368
 - CVE-2024-31578
-- CVE-2023-50008
 
 ## How to Apply:
-1. Download the original Debian source package: `apt source ffmpeg`
+1. Obtain the source package: `apt source ffmpeg`
 2. Apply the patch: `patch -p1 < diff.patch`
-3. Build the package: `dpkg-buildpackage -b`
+3. Build the package: `dpkg-buildpackage -us -uc`
 
 ## License:
 This patch is provided under GPLv3, in compliance with the original license of the package.
