@@ -7,6 +7,7 @@ unknown
 - CVE-2023-30608
 - CVE-2024-4340
 - CVE-2026-71491
+- CVE-2026-54284
 - GHSA-27jp-wm6q-gp25
 - GHSA-62qf-jcq8-8gxw
 
