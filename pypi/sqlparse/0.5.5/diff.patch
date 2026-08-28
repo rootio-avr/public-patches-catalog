@@ -1,0 +1,214 @@
+--- a/sqlparse/sql.py
++++ b/sqlparse/sql.py
+@@ -159,7 +159,7 @@ class TokenList(Token):
+     def __init__(self, tokens=None):
+         self.tokens = tokens or []
+         [setattr(token, 'parent', self) for token in self.tokens]
+-        super().__init__(None, str(self))
++        super().__init__(None, ''.join(token.value for token in self.tokens))
+         self.is_group = True
+
+     def __str__(self):
+@@ -322,7 +322,7 @@ class TokenList(Token):
+             grp = start
+             grp.tokens.extend(subtokens)
+             del self.tokens[start_idx + 1:end_idx]
+-            grp.value = str(start)
++            grp.value += ''.join(token.value for token in subtokens)
+         else:
+             subtokens = self.tokens[start_idx:end_idx]
+             grp = grp_cls(subtokens)
+
+Fix quadratic DoS in group_comments (CVE-2026-71491, GHSA-f2ff-p2ww-7p4p)
+
+A comment-only statement ('-- c\n' repeated) made group_comments rescan
+the whole remaining token tail once per comment token, costing O(n^2).
+Because group_comments runs before the MAX_GROUPING_TOKENS guard, the
+cost was paid even on oversized input.
+
+Stop as soon as token_not_matching finds no terminator in the remaining
+tokens: from that point on nothing can group, so re-scanning the tail is
+wasted work. This makes the pass O(n) while preserving grouping output.
+
+Adds benchmarks/validate_group_comments_dos.py and a regression test.
+
+--- a/sqlparse/engine/grouping.py
++++ b/sqlparse/engine/grouping.py
+@@ -339,9 +339,14 @@ def group_comments(tlist):
+     while token:
+         eidx, end = tlist.token_not_matching(
+             lambda tk: imt(tk, t=T.Comment) or tk.is_newline, idx=tidx)
+-        if end is not None:
+-            eidx, end = tlist.token_prev(eidx, skip_ws=False)
+-            tlist.group_tokens(sql.Comment, tidx, eidx)
++        if end is None:
++            # From tidx onward everything is comment/newline: there is no
++            # terminator to group against, and every later start would hit
++            # the same dead end. Stop instead of re-scanning the tail once
++            # per remaining comment token (which is O(n**2)).
++            break
++        eidx, end = tlist.token_prev(eidx, skip_ws=False)
++        tlist.group_tokens(sql.Comment, tidx, eidx)
+
+         tidx, token = tlist.token_next_by(t=T.Comment, idx=tidx)
+
+--- /dev/null
++++ b/benchmarks/validate_group_comments_dos.py
+@@ -0,0 +1,85 @@
++"""Validate that ``group_comments`` scales linearly on comment-only input.
++
++Regression check for the quadratic O(n^2) DoS in ``group_comments``
++(sqlparse/engine/grouping.py), reported as GHSA-f2ff-p2ww-7p4p.
++
++A statement made only of single-line comments (``'-- c\\n'`` repeated n times)
++lexes in O(n) but ``group_comments`` rescans the O(n) remaining tokens for every
++comment token, giving O(n^2) total work. ``group_comments`` runs first in
++``group()``, before the ``MAX_GROUPING_TOKENS`` guard, so the token cap does not
++protect this vector. The path is reachable via ``sqlparse.parse()`` and
++``sqlparse.format(sql, strip_comments=True)``.
++
++This script measures the scaling of the vulnerable path and reports whether the
++observed growth is quadratic (vulnerable) or roughly linear (patched).
++
++Run with:  python benchmarks/validate_group_comments_dos.py
++
++Exit code 0 => behaviour looks linear (advisory mitigated).
++Exit code 1 => behaviour looks quadratic (advisory reproduced).
++"""
++
++import sys
++import time
++
++import sqlparse
++
++
++def payload(n):
++    """A comment-only statement of n single-line comments."""
++    return '-- c\n' * n
++
++
++def measure(fn, sql):
++    t0 = time.perf_counter()
++    fn(sql)
++    return (time.perf_counter() - t0) * 1000
++
++
++def run(label, fn):
++    print(f'{label}:')
++    sizes = (1000, 2000, 4000, 8000)
++    timings = []
++    for n in sizes:
++        dt = measure(fn, payload(n))
++        timings.append(dt)
++        print(f'  n={n:5d}  {dt:8.1f} ms  ({len(payload(n))} B)')
++
++    # For each doubling of the input, quadratic growth ~4x, linear ~2x.
++    ratios = [b / a for a, b in zip(timings, timings[1:]) if a > 0]
++    print(f'  doubling ratios: {", ".join(f"{r:.2f}x" for r in ratios)}')
++    return ratios
++
++
++def classify(ratios):
++    """Quadratic if the average per-doubling ratio is closer to 4x than 2x."""
++    if not ratios:
++        return 'inconclusive', 0.0
++    avg = sum(ratios) / len(ratios)
++    # Midpoint between linear (2x) and quadratic (4x) is 3x.
++    return ('quadratic' if avg >= 3.0 else 'linear'), avg
++
++
++def main():
++    print('GHSA-f2ff-p2ww-7p4p: quadratic DoS in group_comments\n')
++
++    all_ratios = []
++    all_ratios += run('sqlparse.parse', sqlparse.parse)
++    print()
++    all_ratios += run(
++        'sqlparse.format(strip_comments=True)',
++        lambda s: sqlparse.format(s, strip_comments=True),
++    )
++    print()
++
++    verdict, avg = classify(all_ratios)
++    print(f'Average doubling ratio: {avg:.2f}x  =>  {verdict}')
++    if verdict == 'quadratic':
++        print('VULNERABLE: growth is quadratic, advisory reproduced.')
++        return 1
++    print('OK: growth is roughly linear, advisory mitigated.')
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
+--- a/tests/test_dos_prevention.py
++++ b/tests/test_dos_prevention.py
+@@ -88,4 +88,44 @@ class TestDoSPrevention:
+         assert "WHERE" in result
+         assert "IN" in result
+         assert "1," in result  # First tuple should be there
+         assert "200" in result  # Last tuple should be there
++
++    def test_comment_only_group_comments_linear_cve_2026_71491(self):
++        """Comment-only input must not scale quadratically in group_comments.
++
++        Regression test for CVE-2026-71491 / GHSA-f2ff-p2ww-7p4p. A statement
++        built from many single-line comments ('-- c\\n' repeated) used to make
++        group_comments re-scan the whole remaining token tail once per comment
++        token, giving O(n**2) CPU. group_comments runs before the
++        MAX_GROUPING_TOKENS guard, so the token cap did not protect this path.
++        """
++        def payload(n):
++            return '-- c\n' * n
++
++        def measure(fn, sql):
++            t0 = time.perf_counter()
++            fn(sql)
++            return time.perf_counter() - t0
++
++        # Warm up so import/JIT-like one-off costs do not skew the first sample.
++        sqlparse.parse(payload(500))
++
++        small = measure(sqlparse.parse, payload(2000))
++        large = measure(sqlparse.parse, payload(8000))
++
++        # Input grew 4x. Linear work grows ~4x; quadratic work grows ~16x.
++        # Use a generous threshold (10x) plus a small floor to tolerate timer
++        # noise on tiny durations while still catching quadratic blow-up.
++        assert large <= small * 10 + 0.05, (
++            f"group_comments appears quadratic: "
++            f"n=2000 took {small:.4f}s, n=8000 took {large:.4f}s"
++        )
++
++    def test_comment_only_parses_correctly(self):
++        """Comment-only input still parses after the DoS fix."""
++        sql = '-- c\n' * 5
++        parsed = sqlparse.parse(sql)
++        assert len(parsed) == 1
++        # strip_comments must remain reachable and functional.
++        stripped = sqlparse.format(sql, strip_comments=True)
++        assert stripped.strip() == ""
+
+Subject: [PATCH] BUILD-FIX pin hatchling floor for stable metadata version
+
+sqlparse 0.5.5 declares `requires = ["hatchling"]` with no version floor.
+Without a pin, build isolation resolves whatever hatchling release is
+newest at build time. A newer hatchling stamps `Metadata-Version: 2.5` on
+the built artifacts, which is not a valid core metadata version (the spec
+currently tops out at 2.4), causing twine to reject the upload:
+
+    InvalidDistribution: Invalid distribution metadata:
+    '2.5' is not a valid metadata version
+
+Pinning to hatchling>=1.27,<1.28 keeps the emitted metadata at the known-good
+Metadata-Version 2.4. Same fix as filelock 3.12.2, python-multipart
+0.0.27/0.0.29, and sqlparse 0.5.3.
+
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,5 +1,5 @@
+ [build-system]
+-requires = ["hatchling"]
++requires = ["hatchling>=1.27,<1.28"]
+ build-backend = "hatchling.build"
+
+ [project]
