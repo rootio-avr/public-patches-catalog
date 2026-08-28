@@ -4,6 +4,9 @@ This patch is based on ca.uhn.hapi.fhir:org.hl7.fhir.core version 6.9.4.1, which
 unknown
 
 ## Affected CVEs:
+- CVE-2026-45367
+- CVE-2026-49485
+- CVE-2026-55470
 - CVE-2026-55471
 
 ## How to Apply:
