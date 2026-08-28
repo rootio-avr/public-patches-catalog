@@ -4,6 +4,8 @@ This patch is based on sqlparse version 0.5.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-54284
+- CVE-2026-71491
 - GHSA-27jp-wm6q-gp25
 
 ## How to Apply:
