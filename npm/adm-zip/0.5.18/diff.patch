@@ -1,0 +1,149 @@
+--- a/zipEntry.js
++++ b/zipEntry.js
+@@ -100,10 +100,16 @@ module.exports = function (/** object */ options, /*Buffer*/ input) {
+             compressedData = Methods.ZipCrypto.decrypt(compressedData, _centralHeader, pass);
+         }
+
+-        var data = Buffer.alloc(_centralHeader.size);
++        var data;
+
+         switch (_centralHeader.method) {
+             case Utils.Constants.STORED:
++                // STORED entries are not compressed, so the uncompressed output is
++                // exactly the bytes present in the archive. Allocate from the real
++                // data length rather than the attacker-declared central-directory
++                // size, otherwise a tiny archive can declare a huge size and force a
++                // multi-gigabyte allocation before any validation (CVE-2026-39244).
++                data = Buffer.alloc(compressedData.length);
+                 compressedData.copy(data);
+                 if (!crc32OK(data)) {
+                     if (async && callback) callback(data, Utils.Errors.BAD_CRC()); //si added error
+@@ -114,17 +120,19 @@ module.exports = function (/** object */ options, /*Buffer*/ input) {
+                     return data;
+                 }
+             case Utils.Constants.DEFLATED:
++                // Do not pre-allocate the declared uncompressed size. The inflater
++                // grows its output buffer as zlib emits data and caps the total at
++                // the declared size (maxOutputLength), so a bogus size can no longer
++                // trigger an eager allocation before the data is read (CVE-2026-39244).
+                 var inflater = new Methods.Inflater(compressedData, _centralHeader.size);
+                 if (!async) {
+-                    const result = inflater.inflate(data);
+-                    result.copy(data, 0);
++                    data = inflater.inflate();
+                     if (!crc32OK(data)) {
+                         throw Utils.Errors.BAD_CRC(`"${decoder.decode(_entryName)}"`);
+                     }
+                     return data;
+                 } else {
+                     inflater.inflateAsync(function (result) {
+-                        result.copy(result, 0);
+                         if (callback) {
+                             if (!crc32OK(result)) {
+                                 callback(result, Utils.Errors.BAD_CRC()); //si added error
+--- /dev/null
++++ b/test/decompress_bomb.test.js
+@@ -0,0 +1,103 @@
++"use strict";
++
++const { expect } = require("chai");
++const Zip = require("../adm-zip");
++
++// Regression test for CVE-2026-39244:
++// adm-zip allocated the entry output buffer from the attacker-declared
++// uncompressed size (central-directory / local-header size field) before any
++// validation. A tiny crafted archive could declare a ~4 GB size and force a
++// matching Buffer.alloc, OOM-killing the process. The allocation must be bound
++// by the data actually present in the archive, not by the declared size.
++
++const u16 = (n) => {
++    const b = Buffer.alloc(2);
++    b.writeUInt16LE(n >>> 0);
++    return b;
++};
++const u32 = (n) => {
++    const b = Buffer.alloc(4);
++    b.writeUInt32LE(n >>> 0);
++    return b;
++};
++
++// Build a single-entry zip that declares `declaredSize` uncompressed bytes while
++// only carrying `content` bytes of (crc-invalid) payload.
++function craftBomb(declaredSize, method, content) {
++    const name = Buffer.from("a");
++    const crc = 0; // deliberately wrong: alloc used to happen before the crc check
++    const lfh = Buffer.concat([
++        u32(0x04034b50),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(crc),
++        u32(content.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        name,
++        content
++    ]);
++    const cd = Buffer.concat([
++        u32(0x02014b50),
++        u16(20),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(crc),
++        u32(content.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        u16(0),
++        u16(0),
++        u16(0),
++        u32(0),
++        u32(0),
++        name
++    ]);
++    const eocd = Buffer.concat([u32(0x06054b50), u16(0), u16(0), u16(1), u16(1), u32(cd.length), u32(lfh.length), u16(0)]);
++    return Buffer.concat([lfh, cd, eocd]);
++}
++
++describe("decompression bomb (declared size) - CVE-2026-39244", () => {
++    const DECLARED = 3 * 1024 * 1024 * 1024; // ~3 GB, far above any plausible RSS budget
++
++    it("does not allocate the declared size for a STORED entry", () => {
++        const zip = new Zip(craftBomb(DECLARED, 0 /* STORED */, Buffer.from("A")));
++        const before = process.memoryUsage().rss;
++        // invalid crc -> must throw, but crucially without committing gigabytes
++        expect(() => zip.getEntries()[0].getData()).to.throw(/CRC32/);
++        const grewMB = (process.memoryUsage().rss - before) / (1024 * 1024);
++        expect(grewMB, "RSS growth must stay bounded by real data, not declared size").to.be.below(256);
++    });
++
++    it("does not allocate the declared size for a DEFLATED entry", () => {
++        const zip = new Zip(craftBomb(DECLARED, 8 /* DEFLATED */, Buffer.from([0x00])));
++        const before = process.memoryUsage().rss;
++        // bogus deflate stream / crc -> must throw without a huge eager allocation
++        expect(() => zip.getEntries()[0].getData()).to.throw();
++        const grewMB = (process.memoryUsage().rss - before) / (1024 * 1024);
++        expect(grewMB, "RSS growth must stay bounded by real data, not declared size").to.be.below(256);
++    });
++
++    it("still reads a legitimate STORED entry", () => {
++        const zip = new Zip();
++        zip.addFile("s.bin", Buffer.from([1, 2, 3, 4, 5]));
++        const round = new Zip(zip.toBuffer());
++        expect([...round.readFile("s.bin")]).to.eql([1, 2, 3, 4, 5]);
++    });
++
++    it("still reads a legitimate DEFLATED entry", () => {
++        const zip = new Zip();
++        const payload = Buffer.from("hello world ".repeat(5000));
++        zip.addFile("d.txt", payload);
++        const round = new Zip(zip.toBuffer());
++        expect(round.readFile("d.txt").equals(payload)).to.equal(true);
++    });
++});
