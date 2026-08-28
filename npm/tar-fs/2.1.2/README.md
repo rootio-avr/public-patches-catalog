@@ -4,6 +4,7 @@ This patch is based on tar-fs version 2.1.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2025-48387
 - CVE-2025-59343
 
 ## How to Apply:
