@@ -1,13 +1,12 @@
-# ghostscript : 10.0.0~dfsg-11+deb12u7.root.io.2
+# ghostscript : 10.0.0~dfsg-11+deb12u8.aikido.6
 
-This patch is based on ghostscript version 10.0.0~dfsg-11+deb12u7.root.io.2, which is available at:
-https://sources.debian.org/src/ghostscript/10.0.0~dfsg-11+deb12u7/
+This patch is based on ghostscript version 10.0.0~dfsg-11+deb12u8.aikido.6, which is available at:
+https://sources.debian.org/src/ghostscript/10.0.0~dfsg-11+deb12u8/
 
 ## Affected CVEs:
 - CVE-2025-48708
 - CVE-2024-29511
 - CVE-2023-38560
-- CVE-2025-7462
 
 ## How to Apply:
 1. Obtain the source package: `apt source ghostscript`
