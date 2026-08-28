@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2022-24999
+- CVE-2025-15284
 
 ## How to Apply:
 1. Clone or download the source code for qs
