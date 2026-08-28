@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-32621
+- CVE-2024-43414
 
 ## How to Apply:
 1. Clone or download the source code for @apollo/query-planner
