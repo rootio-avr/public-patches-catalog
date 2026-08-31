@@ -1,10 +1,11 @@
-# unbound : 1.13.1-1+deb11u7.aikido.1
+# unbound : 1.13.1-1+deb11u7.aikido.2
 
-This patch is based on unbound version 1.13.1-1+deb11u7.aikido.1, which is available at:
+This patch is based on unbound version 1.13.1-1+deb11u7.aikido.2, which is available at:
 https://sources.debian.org/src/unbound/1.13.1-1+deb11u7/
 
 ## Affected CVEs:
 - CVE-2026-33278
+- CVE-2026-42959
 - CVE-2026-42960
 - CVE-2026-50252
 
