@@ -4,7 +4,10 @@ This patch is based on tar version 6.1.13, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-23950
 - CVE-2026-26960
+- CVE-2026-23745
+- CVE-2026-24842
 - CVE-2026-29786
 - CVE-2026-59873
 - CVE-2026-59874
