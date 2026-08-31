@@ -5,6 +5,15 @@ unknown
 
 ## Affected CVEs:
 - GHSA-gcfj-64vw-6mp9
+- GHSA-xj6q-8x83-jv6g
+- GHSA-f4gw-2p7v-4548
+- GHSA-42h9-826w-cgv3
+- GHSA-mwf2-3pr3-8698
+- GHSA-hcpx-6fm6-wx23
+- GHSA-pmv8-rq9r-6j72
+- GHSA-mmx7-hfxf-jppx
+- GHSA-jqh4-m9w3-8hp9
+- GHSA-7q8q-rj6j-mhjq
 
 ## How to Apply:
 1. Clone or download the source code for axios
