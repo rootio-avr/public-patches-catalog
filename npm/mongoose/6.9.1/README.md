@@ -4,6 +4,7 @@ This patch is based on mongoose version 6.9.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2025-23061
 - CVE-2023-3696
 
 ## How to Apply:
