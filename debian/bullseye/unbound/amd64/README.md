@@ -5,6 +5,7 @@ https://sources.debian.org/src/unbound/1.13.1-1+deb11u7/
 
 ## Affected CVEs:
 - CVE-2026-33278
+- CVE-2026-41292
 - CVE-2026-42959
 - CVE-2026-42960
 - CVE-2026-50252
