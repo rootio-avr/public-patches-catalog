@@ -4,6 +4,7 @@ This patch is based on protobufjs version 7.2.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-41242
 - CVE-2023-36665
 
 ## How to Apply:
