@@ -1,0 +1,1705 @@
+Description: CVE-2026-53791 - daemon argument-list bound + proxy-protocol peer/length hardening
+ Backport of the upstream fix (rsync 3.2.7 line) to rsync 3.2.3 (Debian 11).
+ The 3.2.3 daemon lacks the proxy_protocol_hosts trusted-peer plumbing, so the
+ loadparm parameter, the access.c matcher, and the clientserver.c gating are
+ added alongside the upstream length/argument-count hardening.
+ .
+ The patch:
+  * io.c: bounds a malicious daemon client's argument list so argv cannot be
+    grown without limit (memory-exhaustion DoS).
+  * socket.c: bounds the outgoing PROXY CONNECT request and the incoming proxy
+    response header lines, fixing an off-by-one stack out-of-bounds write when a
+    hostile/MITM proxy returns an over-long, newline-less response line.
+  * access.c / daemon-parm.txt / clientserver.c: adds a new global
+    "proxy protocol hosts" parameter and requires the direct socket peer to
+    match it before an inbound "proxy protocol = true" header is trusted
+    (reject untrusted proxy peers, fail-closed); warns at startup when the
+    trusted-proxy list is unset so the fail-closed behaviour is not silent.
+ .
+ A regression test (testsuite/proxy-response-line-too-long.test) exercises the
+ over-long proxy response line and asserts rsync rejects it cleanly without
+ crashing.
+Origin: upstream, https://github.com/RsyncProject/rsync/commit/e9b22cd40446bb34d005ecb44519e11795d4be53
+Bug: https://security-tracker.debian.org/tracker/CVE-2026-53791
+Author: Andrew Tridgell <andrew@tridgell.net>
+Last-Update: 2026-08-14
+---
+--- a/access.c
++++ b/access.c
+@@ -287,3 +287,11 @@
+ 	/* Allow all other access. */
+ 	return 1;
+ }
++
++int allow_proxy_protocol_peer(const char *list, const char *addr, const char **host_ptr)
++{
++	if (!list || !*list)
++		return 0;
++	allow_forward_dns = 0;
++	return access_match(list, addr, host_ptr);
++}
+--- a/clientserver.c
++++ b/clientserver.c
+@@ -1185,6 +1185,18 @@
+ 		io_printf(fd,"@RSYNCD: EXIT\n");
+ }
+ 
++static int proxy_peer_allowed(int fd)
++{
++	const char *host = undetermined_hostname;
++	const char *addr = client_addr(fd);
++
++	if (!allow_proxy_protocol_peer(lp_proxy_protocol_hosts(), addr, &host)) {
++		rprintf(FLOG, "proxy protocol rejected from untrusted peer %s (%s)\n", host, addr);
++		return 0;
++	}
++	return 1;
++}
++
+ static int load_config(int globals_only)
+ {
+ 	if (!config_file) {
+@@ -1222,8 +1234,10 @@
+ 	if (!load_config(0))
+ 		exit_cleanup(RERR_SYNTAX);
+ 
+-	if (lp_proxy_protocol() && !read_proxy_protocol_header(f_in))
+-		return -1;
++	if (lp_proxy_protocol()) {
++		if (!proxy_peer_allowed(f_in) || !read_proxy_protocol_header(f_in))
++			return -1;
++	}
+ 
+ 	p = lp_daemon_chroot();
+ 	if (*p) {
+@@ -1437,6 +1451,17 @@
+ 		exit_cleanup(RERR_SYNTAX);
+ 	}
+ 	set_dparams(0);
++
++	/* "proxy protocol = true" with no trusted-proxy list rejects every
++	 * connection as an untrusted proxy peer (fail-closed).  That is intended,
++	 * but silent at startup, so warn the operator while stderr is still open. */
++	if (lp_proxy_protocol()
++	 && (!lp_proxy_protocol_hosts() || !*lp_proxy_protocol_hosts())) {
++		rprintf(FWARNING,
++			"\"proxy protocol = true\" but \"proxy protocol hosts\" is unset:"
++			" all connections will be rejected as untrusted proxy peers."
++			"  Set \"proxy protocol hosts\" to your trusted proxy's address.\n");
++	}
+ 
+ 	if (no_detach)
+ 		create_pid_file();
+--- a/daemon-parm.txt
++++ b/daemon-parm.txt
+@@ -6,6 +6,7 @@
+ STRING	daemon_uid		NULL
+ STRING	motd_file		NULL
+ STRING	pid_file		NULL
++STRING	proxy_protocol_hosts	NULL
+ STRING	socket_options		NULL
+ 
+ INTEGER	listen_backlog		5
+--- a/io.c
++++ b/io.c
+@@ -1237,6 +1237,8 @@
+ 	return s - buf;
+ }
+ 
++#define MAX_DAEMON_ARGS (MAX_ARGS * 16)
++
+ void read_args(int f_in, char *mod_name, char *buf, size_t bufsiz, int rl_nulls,
+ 	       char ***argv_p, int *argc_p, char **request_p)
+ {
+@@ -1259,6 +1261,11 @@
+ 	while (1) {
+ 		if (read_line(f_in, buf, bufsiz, rl_flags) == 0)
+ 			break;
++
++		if (mod_name && argc >= MAX_DAEMON_ARGS - 1) {
++			rprintf(FERROR, "too many daemon arguments\n");
++			exit_cleanup(RERR_PROTOCOL);
++		}
+ 
+ 		if (argc == maxargs-1) {
+ 			maxargs += MAX_ARGS;
+--- a/rsyncd.conf.5.md
++++ b/rsyncd.conf.5.md
+@@ -255,6 +255,13 @@
+     others, then you will need to setup multiple rsync daemon processes on
+     different ports.
+ 
++0.  `proxy protocol hosts`
++
++    This global parameter lists the socket peer IP addresses that are allowed
++    to supply a `proxy protocol` header.  The syntax is the same token format
++    used by `hosts allow`.  When `proxy protocol = true`, this list must match
++    the direct peer before rsync trusts the forwarded client address.
++
+ 0.  `name converter`
+ 
+     This parameter lets you specify a program that will be run by the rsync
+--- a/socket.c
++++ b/socket.c
+@@ -75,7 +75,10 @@
+ 	}
+ 
+ 	len = snprintf(buffer, sizeof buffer, "CONNECT %s:%d HTTP/1.0%s%s\r\n\r\n", host, port, authhdr, authbuf);
+-	assert(len > 0 && len < (int)sizeof buffer);
++	if (len <= 0 || len >= (int)sizeof buffer) {
++		rprintf(FERROR, "proxy CONNECT request too long\n");
++		return -1;
++	}
+ 	if (write(fd, buffer, len) != len) {
+ 		rsyserr(FERROR, errno, "failed to write to proxy");
+ 		return -1;
+@@ -90,11 +93,13 @@
+ 			break;
+ 	}
+ 
+-	if (*cp != '\n')
+-		cp++;
+-	*cp-- = '\0';
+-	if (*cp == '\r')
+-		*cp = '\0';
++	if (cp == &buffer[sizeof buffer - 1]) {
++		rprintf(FERROR, "proxy response line too long\n");
++		return -1;
++	}
++	*cp = '\0';
++	if (cp > buffer && cp[-1] == '\r')
++		cp[-1] = '\0';
+ 	if (strncmp(buffer, "HTTP/", 5) != 0) {
+ 		rprintf(FERROR, "bad response from proxy -- %s\n",
+ 			buffer);
+@@ -118,6 +123,10 @@
+ 			}
+ 			if (*cp == '\n')
+ 				break;
++		}
++		if (cp == &buffer[sizeof buffer - 1]) {
++			rprintf(FERROR, "proxy response header line too long\n");
++			return -1;
+ 		}
+ 		if (cp > buffer && *cp == '\n')
+ 			cp--;
+--- /dev/null
++++ b/testsuite/proxy-response-line-too-long.test
+@@ -0,0 +1,128 @@
++#!/bin/sh
++
++# Copyright (C) 2026 by Andrew Tridgell
++
++# This program is distributable under the terms of the GNU GPL (see
++# COPYING).
++
++# Regression test for CVE-2026-53791: the off-by-one stack OOB write in
++# establish_proxy_connection() in socket.c when a malicious or
++# man-in-the-middle HTTP proxy returns a first response line of
++# 1023+ bytes without a '\n' terminator.
++#
++# Pre-fix: the read loop walked buffer[0..sizeof-2] one byte at a
++# time, then post-loop logic did "if (*cp != '\n') cp++; *cp-- =
++# '\0';".  If no newline arrived before the loop filled the buffer,
++# cp was left at &buffer[sizeof-1] (never written by the loop),
++# *cp held stale stack bytes, and cp++ pushed cp one past the array.
++# The null-termination then wrote one byte out of bounds on the
++# stack.  AddressSanitizer reports stack-buffer-overflow at the
++# null-termination site.
++#
++# Post-fix: the bound-exhaustion case is detected by position and
++# rejected with a "proxy response line too long" message, so no
++# OOB write occurs and rsync exits with a non-signal status.
++
++. "$suitedir/rsync.fns"
++
++command -v python3 >/dev/null 2>&1 || test_skipped "python3 not available"
++
++workdir="$scratchdir/workdir"
++mkdir -p "$workdir"
++cd "$workdir"
++
++port_file="$workdir/port"
++proxy_log="$workdir/proxy.log"
++
++# A minimal TCP listener: binds to an ephemeral port on 127.0.0.1,
++# writes the chosen port to $port_file *before* accept() so the test
++# can synchronise without a sleep, accepts one connection, reads
++# until end-of-headers or 64 KiB, sends exactly 1023 bytes of 'X'
++# with no '\n', then closes.
++python3 - "$port_file" >"$proxy_log" 2>&1 <<'PYEOF' &
++import socket, sys, os
++port_file = sys.argv[1]
++s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
++s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
++s.bind(("127.0.0.1", 0))
++port = s.getsockname()[1]
++tmp = port_file + ".tmp"
++with open(tmp, "w") as fp:
++    fp.write("%d\n" % port)
++os.rename(tmp, port_file)   # atomic visibility to the shell side
++s.listen(1)
++conn, _ = s.accept()
++conn.settimeout(5)
++try:
++    data = b""
++    while b"\r\n\r\n" not in data and len(data) < 65536:
++        chunk = conn.recv(8192)
++        if not chunk:
++            break
++        data += chunk
++except socket.timeout:
++    pass
++conn.sendall(b"X" * 1023)    # exactly the buffer-1 trigger size
++try:
++    conn.shutdown(socket.SHUT_RDWR)
++except OSError:
++    pass
++conn.close()
++s.close()
++PYEOF
++proxy_pid=$!
++
++# Wait up to ~10s for the listener to publish its port.
++i=0
++while [ ! -s "$port_file" ] && [ $i -lt 10 ]; do
++    sleep 1
++    i=$((i + 1))
++done
++
++if [ ! -s "$port_file" ]; then
++    kill "$proxy_pid" 2>/dev/null
++    cat "$proxy_log" >&2 2>/dev/null
++    test_fail "proxy listener never published a port"
++fi
++
++port=`cat "$port_file"`
++case "$port" in
++    *[!0-9]*|"") kill "$proxy_pid" 2>/dev/null; test_fail "bogus port from listener: '$port'" ;;
++esac
++
++# Run rsync through the malicious proxy.  Any rsync:// URL works:
++# the proxy intercepts the CONNECT and never forwards anywhere.
++rsync_err="$workdir/rsync.err"
++
++# rsync MUST exit non-zero here (the proxy is misbehaving).
++# Use `|| status=$?` so we capture the real exit code under `sh -e`;
++# `if ! cmd; then status=$?` would only ever see 0 because the `!`
++# is the last command before `$?`.
++status=0
++RSYNC_PROXY="127.0.0.1:$port" \
++    $RSYNC rsync://example.invalid:873/whatever/ "$workdir/out/" \
++    >/dev/null 2>"$rsync_err" || status=$?
++
++# Reap the listener.
++wait "$proxy_pid" 2>/dev/null || true
++
++# 1. rsync must not have crashed (SIGSEGV/SIGABRT report >= 128).
++if [ "$status" -ge 128 ]; then
++    cat "$rsync_err" >&2
++    test_fail "rsync killed by signal (status=$status) -- possible stack OOB regression"
++fi
++
++# 2. rsync must have actually exited non-zero (i.e. saw the bad proxy).
++if [ "$status" -eq 0 ]; then
++    cat "$rsync_err" >&2
++    test_fail "rsync returned success despite malformed proxy response"
++fi
++
++# 3. The new error message must appear.
++if ! grep -q "proxy response line too long" "$rsync_err"; then
++    cat "$rsync_err" >&2
++    test_fail "expected 'proxy response line too long' in rsync stderr"
++fi
++
++echo "OK: over-long proxy response line rejected cleanly without crashing"
++exit 0
+Description: CVE-2026-70453 - bound the hash_search() chain walk (issue #217)
+ A weak (rolling) checksum that collides on a very long hash-table chain --
+ common in disk/VM images, which contain large runs of identical blocks --
+ made hash_search()'s inner loop walk the entire chain for every file offset.
+ This is an O(file_size * chain_length) scan that pegs a CPU at 100% for hours
+ with no visible progress (a denial of service against the sender).
+ .
+ This backport caps the number of same-weak-checksum candidates examined per
+ offset at MAX_CHAIN_LEN (1024) in match.c. When the cap is reached the offset
+ is treated as a non-match and the data is sent literally, so the transfer
+ stays byte-for-byte correct. The change is sender-side only: it alters no
+ checksum, emitted byte, or protocol field, so a capped sender interoperates
+ with any receiver.
+ .
+ A shell regression test (testsuite/hashsearch-chain.test) is added in place of
+ the upstream Python test (testsuite/hashsearch-chain_test.py), which targets a
+ newer testsuite harness not present in this rsync version. It builds a
+ pathological long-chain basis and asserts, via the --debug=deltasum1
+ false_alarms/hash_hits ratio, that the per-offset chain walk stays bounded,
+ while verifying the transferred file is identical to the source.
+Origin: backport, https://github.com/RsyncProject/rsync/commit/e6956e0a30cb360b413ce2ad8df89204a1951059
+Bug: https://github.com/RsyncProject/rsync/issues/217
+Author: Wayne Davison <wayne@opencoder.net>
+Last-Update: 2026-08-14
+---
+--- a/match.c
++++ b/match.c
+@@ -42,6 +42,22 @@
+ 
+ #define TRADITIONAL_TABLESIZE (1<<16)
+ 
++/* The maximum number of same-weak-checksum candidates we will compare
++ * against at a single file offset before giving up and rolling forward a
++ * byte.  A weak checksum that collides thousands of times (very common in
++ * disk/VM images, which contain large runs of identical blocks) would
++ * otherwise turn hash_search()'s inner loop into an O(file_size *
++ * chain_length) scan, pegging a CPU at 100% for hours with no apparent
++ * progress (issue #217).  Capping the per-offset work keeps the search
++ * bounded; any block we skip over is simply sent as literal data, so the
++ * result is always correct -- only the transfer size is (slightly) affected.
++ * This is purely a sender-side search limit: it changes no checksum, emitted
++ * byte, or protocol field, so a capped sender interoperates with any
++ * receiver. */
++#ifndef MAX_CHAIN_LEN
++#define MAX_CHAIN_LEN 1024
++#endif
++
+ static uint32 tablesize;
+ static int32 *hash_table;
+ 
+@@ -177,6 +193,7 @@
+ 		int done_csum2 = 0;
+ 		uint32 hash_entry;
+ 		int32 i, *prev;
++		int32 chain_len = 0;
+ 
+ 		if (DEBUG_GTE(DELTASUM, 4)) {
+ 			rprintf(FINFO, "offset=%s sum=%04x%04x\n",
+@@ -212,6 +229,14 @@
+ 
+ 			if (sum != s->sums[i].sum1)
+ 				continue;
++
++			/* Bound the work spent on a single pathological hash
++			 * bucket.  If this weak checksum matches more than
++			 * MAX_CHAIN_LEN records, stop scanning and treat this
++			 * offset as a non-match (issue #217).  The skipped data
++			 * is sent literally, never corrupted. */
++			if (++chain_len > MAX_CHAIN_LEN)
++				break;
+ 
+ 			/* also make sure the two blocks are the same length */
+ 			l = (int32)MIN((OFF_T)s->blength, len-offset);
+--- /dev/null
++++ b/testsuite/hashsearch-chain.test
+@@ -0,0 +1,91 @@
++#! /bin/sh
++
++# Regression test for CVE-2026-70453 / issue #217: hash_search() must not
++# blow up to O(N^2) when a weak (rolling) checksum collides on a very long
++# hash-table chain.
++#
++# A disk/VM image can contain a huge number of blocks that share the same
++# weak rolling checksum (e.g. long runs of identical bytes).  All such blocks
++# land on a single hash-table chain.  When the sender then rolls across a
++# region whose weak checksum keeps landing on that chain but never produces a
++# strong-checksum match, the inner loop of hash_search() used to walk the
++# *entire* chain for every single byte offset, pegging one CPU at 100% for
++# hours with no visible progress ("rsync hangs at 100% CPU").
++#
++# We reproduce a small, deterministic version of that pathology and count the
++# work directly.  rsync's `false_alarms` counter -- shown by
++# `--debug=deltasum1` -- is incremented once per strong-checksum comparison
++# that fails, i.e. exactly once per chain entry examined and rejected.  With
++# the per-offset cap in match.c the sender examines at most MAX_CHAIN_LEN
++# entries per hash hit, so false_alarms / hash_hits stays bounded no matter
++# how long the chain is; without the cap that ratio equals the full chain
++# length.  We assert the bound, which is the same integer on every machine.
++#
++# The fix is sender-only (it changes no checksum, byte, or protocol field), so
++# the transferred result must also still be byte-for-byte correct.
++
++. "$suitedir/rsync.fns"
++
++perl -e 'print "hi"' >/dev/null 2>&1 || test_skipped "perl is required for this test"
++
++BLOCK=256
++NBLOCKS=8000    # chain length -- much longer than match.c's cap (1024)
++RUN=3000        # length of the constant-byte region in the source
++C=100           # the constant source byte
++
++# A correct fix bounds the per-hash-hit chain walk to match.c's MAX_CHAIN_LEN
++# (1024).  Pick an assertion bound comfortably between that cap and the full
++# chain length so the test is insensitive to modest cap retuning but still
++# fails hard for the unbounded (pre-fix) walk of NBLOCKS per hit.
++MAX_FALSE_ALARMS_PER_HIT=`expr $NBLOCKS / 4`   # 2000: > cap(1024), << chain(8000)
++
++mkdir -p "$fromdir" "$todir"
++src="$fromdir/image.bin"
++dst="$todir/image.bin"
++
++# Basis: NBLOCKS identical decoy blocks -> one giant weak-checksum chain.
++# Each decoy is an all-C block whose first three bytes are perturbed by
++# (+1,-2,+1).  That perturbation leaves rsync's weak checksum (get_checksum1)
++# unchanged but changes the strong checksum, so every decoy shares one weak
++# checksum yet never strong-matches the source.
++# Source: a constant-byte run (constant weak checksum, no strong match).
++BLOCK=$BLOCK NBLOCKS=$NBLOCKS RUN=$RUN C=$C perl -e '
++    my $block = $ENV{BLOCK}; my $n = $ENV{NBLOCKS};
++    my $run = $ENV{RUN};     my $c = $ENV{C};
++    my $decoy = chr($c) x $block;
++    substr($decoy, 0, 3) = chr($c + 1) . chr($c - 2) . chr($c + 1);
++    open(my $d, ">", $ARGV[0]) or die "dst: $!";
++    binmode $d; print $d $decoy for (1 .. $n); close $d;
++    open(my $s, ">", $ARGV[1]) or die "src: $!";
++    binmode $s; print $s chr($c) x $run; close $s;
++' "$dst" "$src" || test_fail "could not build test images"
++
++out="$tmpdir/rsync.out"
++$RSYNC -a --no-whole-file --block-size=$BLOCK --no-compress \
++    --debug=deltasum1 "$src" "$dst" >"$out" 2>&1 \
++    || test_fail "rsync transfer failed: `cat "$out"`"
++
++stats=`grep -o 'hash_hits=[0-9]*  *false_alarms=[0-9]*' "$out" | tail -1`
++[ -n "$stats" ] || test_fail "could not find deltasum stats in rsync output: `cat "$out"`"
++
++hash_hits=`echo "$stats" | sed -e 's/.*hash_hits=\([0-9]*\).*/\1/'`
++false_alarms=`echo "$stats" | sed -e 's/.*false_alarms=\([0-9]*\).*/\1/'`
++
++[ "$hash_hits" -gt 0 ] 2>/dev/null \
++    || test_fail "expected the source to hit the decoy chain but hash_hits=$hash_hits"
++
++# ratio = false_alarms / hash_hits, must stay under the bound.
++ratio=`expr $false_alarms / $hash_hits`
++if [ "$ratio" -gt "$MAX_FALSE_ALARMS_PER_HIT" ]; then
++    test_fail "hash_search() walked ~$ratio chain entries per hash hit \
++(false_alarms=$false_alarms, hash_hits=$hash_hits); the chain of $NBLOCKS \
++entries is not being capped -- CVE-2026-70453 / issue #217 regression"
++fi
++
++# Correctness is non-negotiable: the cap only skips matches, never data.
++cmp "$src" "$dst" || test_fail "transferred file differs from source (data corruption)"
++
++echo "CVE-2026-70453: bounded at $ratio false alarms/hit (chain=$NBLOCKS, cap keeps it under $MAX_FALSE_ALARMS_PER_HIT)"
++
++# The script would have aborted on error, so getting here means we've won.
++exit 0
+Description: CVE-2026-53803 - reject attacker-controlled symlinks on ancillary file writes
+ rsync before 3.5.0 fails to reject symlinks during ancillary file writes
+ (--log-file, --write-batch/--read-batch, and daemon-mode motd / early-input
+ paths). A local attacker who can plant a symlink at a predictable output path
+ (or a parent component) can redirect rsync's writes to overwrite arbitrary
+ files (e.g. appending the log to /root/.ssh/authorized_keys), enabling local
+ privilege escalation where rsync runs with elevated privileges. For
+ --read-batch a planted symlink/FIFO/device can also feed chosen bytes to the
+ protocol parser.
+ .
+ This backport routes the vulnerable opens through the
+ open_no_attacker_symlinks() helper (a minimal backport of upstream's helper
+ that walks the path component-by-component with fstatat(AT_SYMLINK_NOFOLLOW)
+ + openat(O_NOFOLLOW), refusing to traverse any symlink not owned by uid 0 or
+ the effective uid, while still following a trusted symlink) already added to
+ syscall.c by the CVE-2026-53802 patch, which must be applied alongside this
+ one: log.c logfile_open(), batch.c open_batch_files() (plus an S_ISREG guard
+ rejecting a non-regular --read-batch file), and clientserver.c motd /
+ early-input opens. The upstream v3.5.0 fix depends on a large new dirfd-stack
+ resolver and an unrelated module-confinement framework that do not exist in
+ 3.2.3; only the CVE-relevant open() call sites are converted here, matching
+ upstream semantics for these vectors without the rest of that framework.
+ .
+ A replacement regression test (testsuite/cve-2026-53803.test) is added because
+ the upstream .py regression tests are not present in the 3.2.3 shell-based
+ testsuite: it verifies the --read-batch non-regular-file rejection and (when
+ run as root) that --log-file refuses an attacker-owned symlink.
+Origin: backport, https://github.com/RsyncProject/rsync/commit/3eeedf8d08178ff2f354c09be64eb0f56fa8454f
+Origin: backport, https://github.com/RsyncProject/rsync/commit/16048903011ba5dcb0cdb7215b41557cea8dae76
+Origin: backport, https://github.com/RsyncProject/rsync/commit/defd7110ac9bd60529b3d39cfd5cafe8cc5716de
+Bug: https://github.com/RsyncProject/rsync/security/advisories/GHSA-g9f4-7q66-9582
+Author: Patch Platoon <security@example.com>
+Last-Update: 2026-08-15
+Forwarded: not-needed
+---
+--- a/batch.c
++++ b/batch.c
+@@ -224,26 +224,44 @@
+ /* This sets batch_fd and (for --write-batch) batch_sh_fd. */
+ void open_batch_files(void)
+ {
++	/* --write-batch/--read-batch are operator-supplied; a planted symlink
++	 * could truncate+overwrite an arbitrary file (write side) or stream
++	 * attacker bytes into the protocol parser (read side).  Refuse symlinks
++	 * not owned by uid 0 or our euid anywhere in the path. */
+ 	if (write_batch) {
+ 		char filename[MAXPATHLEN];
+ 
+ 		stringjoin(filename, sizeof filename, batch_name, ".sh", NULL);
+ 
+-		batch_sh_fd = do_open(filename, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IXUSR);
++		batch_sh_fd = open_no_attacker_symlinks(filename, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IRUSR | S_IWUSR | S_IXUSR);
+ 		if (batch_sh_fd < 0) {
+ 			rsyserr(FERROR, errno, "Batch file %s open error", full_fname(filename));
+ 			exit_cleanup(RERR_FILESELECT);
+ 		}
+ 
+-		batch_fd = do_open(batch_name, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
++		/* O_BINARY: the batch stream is binary protocol data; without it
++		 * Cygwin et al apply CRLF translation and corrupt it.  Unlike
++		 * do_open(), open_no_attacker_symlinks passes flags verbatim. */
++		batch_fd = open_no_attacker_symlinks(batch_name, O_WRONLY | O_CREAT | O_TRUNC | O_BINARY, S_IRUSR | S_IWUSR);
+ 	} else if (strcmp(batch_name, "-") == 0)
+ 		batch_fd = STDIN_FILENO;
+ 	else
+-		batch_fd = do_open(batch_name, O_RDONLY, S_IRUSR | S_IWUSR);
++		batch_fd = open_no_attacker_symlinks(batch_name, O_RDONLY | O_BINARY, S_IRUSR | S_IWUSR);
+ 
+ 	if (batch_fd < 0) {
+ 		rsyserr(FERROR, errno, "Batch file %s open error", full_fname(batch_name));
+ 		exit_cleanup(RERR_FILEIO);
++	}
++
++	/* --read-batch: the file's bytes drive the protocol parser, so refuse
++	 * non-regular files (FIFO, device, socket) at the batch path. */
++	if (!write_batch && batch_fd != STDIN_FILENO) {
++		STRUCT_STAT st;
++		if (do_fstat(batch_fd, &st) == 0 && !S_ISREG(st.st_mode)) {
++			rprintf(FERROR, "Batch file %s is not a regular file\n",
++				full_fname(batch_name));
++			exit_cleanup(RERR_FILEIO);
++		}
+ 	}
+ }
+ 
+--- a/clientserver.c
++++ b/clientserver.c
+@@ -158,7 +158,13 @@
+ 	if (!am_client) {
+ 		char *motd = lp_motd_file();
+ 		if (motd && *motd) {
+-			FILE *f = fopen(motd, "r");
++			/* 'motd file = PATH': motd content is sent to every client, so
++			 * a planted symlink would leak the target's bytes.  Refuse
++			 * symlinks not owned by uid 0 or our euid. */
++			int motd_fd = open_no_attacker_symlinks(motd, O_RDONLY, 0);
++			FILE *f = motd_fd >= 0 ? fdopen(motd_fd, "r") : NULL;
++			if (!f && motd_fd >= 0)
++				close(motd_fd);
+ 			while (f && !feof(f)) {
+ 				int len = fread(buf, 1, bufsiz - 1, f);
+ 				if (len > 0)
+@@ -253,7 +259,12 @@
+ 
+ 	if (early_input_file) {
+ 		STRUCT_STAT st;
+-		FILE *f = fopen(early_input_file, "rb");
++		/* --early-input-file=PATH: refuse symlinks not owned by uid 0 or
++		 * our euid anywhere in the path. */
++		int ei_fd = open_no_attacker_symlinks(early_input_file, O_RDONLY, 0);
++		FILE *f = ei_fd >= 0 ? fdopen(ei_fd, "rb") : NULL;
++		if (!f && ei_fd >= 0)
++			close(ei_fd);
+ 		if (!f || do_fstat(fileno(f), &st) < 0) {
+ 			rsyserr(FERROR, errno, "failed to open %s", early_input_file);
+ 			return -1;
+--- a/log.c
++++ b/log.c
+@@ -153,7 +153,15 @@
+ static void logfile_open(void)
+ {
+ 	mode_t old_umask = umask(022 | orig_umask);
+-	logfile_fp = fopen(logfile_name, "a");
++	/* --log-file/`log file =` are operator-supplied paths that may transit
++	 * attacker-writable dirs; a planted symlink could redirect root's log
++	 * into e.g. /root/.ssh/authorized_keys.  Refuse symlinks not owned by
++	 * uid 0 or our euid. */
++	int fd = open_no_attacker_symlinks(logfile_name,
++					   O_WRONLY | O_APPEND | O_CREAT, 0644);
++	logfile_fp = fd >= 0 ? fdopen(fd, "a") : NULL;
++	if (!logfile_fp && fd >= 0)
++		close(fd);
+ 	umask(old_umask);
+ 	if (!logfile_fp) {
+ 		int fopen_errno = errno;
+--- /dev/null
++++ b/testsuite/cve-2026-53803.test
+@@ -0,0 +1,74 @@
++#! /bin/sh
++
++# Regression test for CVE-2026-53803 (CWE-59, symlink following on ancillary
++# file writes).  rsync before the fix opened operator-supplied ancillary paths
++# (--log-file, --write-batch/--read-batch, daemon motd/early-input) with a plain
++# open()/fopen(), so an attacker who could plant a symlink at a predictable
++# output path (or a parent component) could redirect rsync's writes to overwrite
++# arbitrary files, or feed chosen bytes to the protocol parser via --read-batch.
++#
++# The fix routes these opens through open_no_attacker_symlinks(), which refuses
++# to traverse any symlink not owned by uid 0 or our euid, and rejects a
++# non-regular --read-batch file.  This test exercises the two behaviors that are
++# deterministic without a second uid: the --read-batch non-regular-file
++# rejection (always), and the untrusted-symlink refusal (when run as root, where
++# a symlink owned by a non-root uid is genuinely "untrusted").
++
++. "$suitedir/rsync.fns"
++
++hands_setup
++
++# --- Part 1: --read-batch must reject a non-regular file (FIFO/device). -------
++# A planted FIFO or device at the batch path would otherwise stream
++# attacker-chosen bytes into the protocol parser.
++
++if mkfifo "$scratchdir/batch.fifo" 2>/dev/null || mknod "$scratchdir/batch.fifo" p 2>/dev/null; then
++    # Pump some bytes in the background so the open() doesn't block, then confirm
++    # rsync refuses the non-regular file rather than parsing its contents.
++    ( : > "$scratchdir/batch.fifo" & ) 2>/dev/null
++    if $RSYNC -av --read-batch="$scratchdir/batch.fifo" "$todir" >"$scratchdir/rb.out" 2>&1; then
++	test_fail "CVE-2026-53803: --read-batch accepted a non-regular (FIFO) batch file"
++    fi
++    rm -f "$scratchdir/batch.fifo"
++    echo "ok: --read-batch rejected a non-regular file"
++else
++    echo "note: could not create a FIFO; skipping the --read-batch non-regular-file check"
++fi
++
++# --- Part 2: --log-file must not follow an untrusted (foreign-owned) symlink. --
++# The refusal is keyed on symlink ownership (uid 0 or our euid is trusted), so a
++# meaningful negative test needs the planted symlink to be owned by a different
++# uid than ours.  That is only reproducible when we are root, so gate on that.
++
++myuid=`get_testuid`
++if [ "x$myuid" != "x0" ]; then
++    echo "note: not running as root; skipping the foreign-owned-symlink log-file check"
++    exit 0
++fi
++
++# Pick a non-root uid to own the planted symlink.
++victim="$scratchdir/victim.txt"
++echo "PRECIOUS" > "$victim"
++plant="$scratchdir/attacker/log"
++mkdir -p "$scratchdir/attacker"
++ln -s "$victim" "$plant"
++
++# Make the symlink owned by a non-root uid (untrusted from root's point of view).
++if chown -h 1 "$plant" 2>/dev/null; then
++    :
++else
++    echo "note: cannot chown the symlink to a non-root uid; skipping"
++    exit 0
++fi
++
++# Any trivial transfer will trigger the log-file open.
++$RSYNC -av --log-file="$plant" "$fromdir/" "$todir/" >/dev/null 2>&1
++
++# The victim file must be untouched: the symlink must NOT have been followed.
++if grep -q "PRECIOUS" "$victim"; then
++    echo "ok: --log-file refused to follow the attacker-owned symlink"
++else
++    test_fail "CVE-2026-53803: --log-file followed an attacker-owned symlink and clobbered the target"
++fi
++
++exit 0
+Description: CVE-2026-70458 - rsync hard-link protocol robustness against malicious peers
+ A malicious rsync sender can drive out-of-bounds heap access on the
+ receiver through the hard-link handling of the file-list protocol:
+ .
+  * recv_file_entry() (flist.c) set FLAG_HLINKED straight from the peer's
+    XMIT_HLINKED xflag, even when the receiver was not invoked with -H
+    (preserve_hard_links off) and even for directory entries. Because the
+    hard-link extra slots (including F_SUM) are only reserved when
+    preserve_hard_links is set, HLINK_BUMP() then offsets F_SUM() past the
+    start of the pool_alloc()'d region and the subsequent checksum read/write
+    corrupts the heap below the allocation. Gate FLAG_HLINKED on
+    preserve_hard_links and exclude directory entries.
+ .
+  * match_gnums() (hlink.c) asserted that a hard-link generation number was
+    not before the current flist's ndx_start. A peer sending an out-of-range
+    back-reference on the first flist could trip the assert (or, without
+    assertions, index out of bounds). Replace the assert with a controlled
+    protocol error that exits cleanly with RERR_PROTOCOL.
+ .
+  * hard_link_check() (hlink.c) called the content-based basis match
+    (unchanged_file(), FT_REG semantics) which reads F_SUM() for any
+    hard-linked entry, including symlinks/devices/specials that never had
+    SUM_EXTRA_CNT space allocated. Guard the call with S_ISREG(file->mode).
+ .
+ This is a hand-extracted, CVE-scoped backport of the upstream v3.5.0
+ hardening; the unrelated performance/atfd/filter refactoring from the same
+ upstream commits is intentionally omitted.
+Origin: upstream, https://github.com/RsyncProject/rsync/commit/3eeedf8d08178ff2f354c09be64eb0f56fa8454f
+Origin: upstream, https://github.com/RsyncProject/rsync/commit/aed7714325383abc501a0613879bb031368daa92
+Bug: GHSA-gg3m-4m9m-268h
+Author: Security Patch Team <security@example.com>
+Last-Update: 2026-08-14
+---
+--- a/flist.c
++++ b/flist.c
+@@ -997,7 +997,8 @@ static struct file_struct *recv_file_ent
+ 	memcpy(bp, basename, basename_len);
+
+ #ifdef SUPPORT_HARD_LINKS
+-	if (xflags & XMIT_HLINKED
++	if (preserve_hard_links && xflags & XMIT_HLINKED
++	 && !S_ISDIR(mode)
+ #ifndef CAN_HARDLINK_SYMLINK
+ 	 && !S_ISLNK(mode)
+ #endif
+--- a/hlink.c
++++ b/hlink.c
+@@ -125,8 +125,22 @@ static void match_gnums(int32 *ndx_list,
+ 		if (inc_recurse) {
+ 			node = hashtable_find(prior_hlinks, gnum, data_when_new);
+ 			if (node->data == data_when_new) {
++				if (gnum < hlink_flist->ndx_start) {
++					/* A non-first hard-link entry whose
++					 * gnum points before this flist's
++					 * ndx_start should already have been
++					 * recorded in prior_hlinks by an
++					 * earlier flist.  A peer that sends
++					 * such a back-reference on the first
++					 * flist (or to a gnum that was never
++					 * declared XMIT_HLINK_FIRST) is
++					 * misbehaving. */
++					rprintf(FERROR,
++					    "hard-link gnum %d precedes flist start %d\n",
++					    (int)gnum, (int)hlink_flist->ndx_start);
++					exit_cleanup(RERR_PROTOCOL);
++				}
+ 				node->data = new_array0(char, 5);
+-				assert(gnum >= hlink_flist->ndx_start);
+ 				file->flags |= FLAG_HLINK_FIRST;
+ 				prev = -1;
+ 			} else if (CVAL(node->data, 0) == 0) {
+@@ -406,7 +420,14 @@ int hard_link_check(struct file_struct *
+ 				}
+ 				break;
+ 			}
+-			if (!unchanged_file(cmpbuf, file, &alt_sx.st))
++			/* Content-based basis match only applies to regular
++			 * files: for a hard-linked symlink/device/special the
++			 * exact-inode check above is the only meaningful test,
++			 * and unchanged_file() would read F_SUM() on a
++			 * file_struct that has no SUM_EXTRA_CNT space
++			 * (recv_file_entry only allocates it for S_ISREG). */
++			if (!S_ISREG(file->mode)
++			 || !unchanged_file(cmpbuf, file, &alt_sx.st))
+ 				continue;
+ 			statret = 1;
+ 			if (unchanged_attrs(cmpbuf, file, &alt_sx))
+Description: CVE-2026-70463 - fix authorization bypass in daemon "auth users" parsing
+ auth_server() tokenised the "auth users" module setting on commas AND
+ whitespace, ignoring the documented comma-only form (a value that begins with
+ a comma splits on commas alone). An entry containing a space -- such as a
+ group name written as "@group Name:deny" -- was therefore torn in two, so the
+ deny rule the administrator wrote never matched and a later ":rw" entry could
+ match instead. This is an authorization bypass (CWE-863) for a member of the
+ denied group. conf_strtok() already implements the documented behaviour and
+ the daemon's gid field already uses it (clientserver.c); this consumer was
+ missed when that one was fixed. Reported by Andres Berbescu.
+Origin: upstream, https://github.com/RsyncProject/rsync/commit/e7986502cb38e8a6f02f4bc393e697b9f6a7a359
+Author: Andrew Tridgell <andrew@tridgell.net>
+Last-Update: 2026-08-14
+---
+--- a/authenticate.c
++++ b/authenticate.c
+@@ -253,7 +253,13 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
+
+ 	users = strdup(users);
+
+-	for (tok = strtok(users, " ,\t"); tok; tok = strtok(NULL, " ,\t")) {
++	/* conf_strtok() honours the documented leading-comma form: a value that
++	 * starts with a comma splits on commas ALONE, so an entry may contain
++	 * spaces -- which is how a group name with a space is written.  Splitting
++	 * on whitespace here tore such an entry apart, so the rule the admin wrote
++	 * never matched and a rule they never wrote appeared from its tail.  The
++	 * daemon's gid field already uses this parser (clientserver.c). */
++	for (tok = conf_strtok(users); tok; tok = conf_strtok(NULL)) {
+ 		char *opts;
+ 		/* See if the user appended :deny, :ro, or :rw. */
+ 		if ((opts = strchr(tok, ':')) != NULL) {
+--- /dev/null
++++ b/testsuite/daemon-auth-users-comma-only.test
+@@ -0,0 +1,106 @@
++#!/bin/sh
++
++# Regression test for CVE-2026-70463: a leading comma in the daemon
++# "auth users" setting must make splitting happen on commas ALONE, so that an
++# entry may legitimately contain spaces.  auth_server() used to tokenise on
++# commas AND whitespace (strtok(users, " ,\t")), which tore a spaced entry in
++# two: the rule the administrator wrote never matched, and a rule they never
++# wrote appeared out of its tail -- an authorization bypass (CWE-863).
++#
++# This test drives the "spaced" direction, which needs no NSS group whose name
++# contains a space (a test cannot create one):
++#
++#     auth users = ,@nosuchgroup authuser:deny, authuser:rw
++#
++#   * parsed as documented -- one entry "@nosuchgroup authuser:deny" naming a
++#     group that does not exist, so no match, then "authuser:rw" grants access.
++#   * parsed by the buggy whitespace split -- "@nosuchgroup", then
++#     "authuser:deny", which matches the username and refuses the transfer that
++#     should succeed.
++#
++# A "plain" control module (auth users = authuser:rw) proves the credential and
++# transfer machinery themselves are sound, so a "spaced" failure can only be the
++# parsing defect.
++
++. "$suitedir/rsync.fns"
++
++# rsync must be built with an md-digest daemon-auth (SHA) or plain auth support;
++# every supported build has this, but guard just in case the helper is missing.
++case "x$RSYNC" in
++x) test_skipped "RSYNC is not set" ;;
++esac
++
++USER=authuser
++PASSWORD=known-password
++DATA='AUTH-USERS-PARSE'
++
++conf="$scratchdir/comma-only-rsyncd.conf"
++pidfile="$scratchdir/comma-only-rsyncd.pid"
++logfile="$scratchdir/comma-only-rsyncd.log"
++secrets="$scratchdir/comma-only.secrets"
++pwfile="$scratchdir/comma-only.password"
++
++srcdir2="$scratchdir/src"
++spaceddir="$scratchdir/spaced"
++plaindir="$scratchdir/plain"
++makepath "$srcdir2" "$spaceddir" "$plaindir"
++echo "$DATA" >"$srcdir2/f1"
++
++echo "$USER:$PASSWORD" >"$secrets"
++chmod 600 "$secrets"
++echo "$PASSWORD" >"$pwfile"
++chmod 600 "$pwfile"
++
++my_uid=`get_testuid`
++root_uid=`get_rootuid`
++root_gid=`get_rootgid`
++uid_setting="uid = $root_uid"
++gid_setting="gid = $root_gid"
++if test x"$my_uid" != x"$root_uid"; then
++    uid_setting="#$uid_setting"
++    gid_setting="#$gid_setting"
++fi
++
++cat >"$conf" <<EOF
++pid file = $pidfile
++use chroot = no
++log file = $logfile
++$uid_setting
++$gid_setting
++
++[plain]
++	path = $plaindir
++	read only = no
++	auth users = $USER:rw
++	secrets file = $secrets
++
++[spaced]
++	path = $spaceddir
++	read only = no
++	auth users = ,@nosuchgroup $USER:deny, $USER:rw
++	secrets file = $secrets
++EOF
++
++RSYNC_CONNECT_PROG="$RSYNC --config=$conf --daemon"
++export RSYNC_CONNECT_PROG
++
++# Positive control: a plain "auth users" must admit the credential and land the
++# file.  If this fails, nothing below is meaningful.
++$RSYNC -r "--password-file=$pwfile" "$srcdir2/" "$USER@localhost::plain/" 2>&1 | tee "$scratchdir/out.plain"
++if test ! -f "$plaindir/f1"; then
++    test_fail "positive control failed: the credential could not push to a module with a plain \"auth users\""
++fi
++
++# The fix: a comma-led "auth users" whose first entry names a nonexistent group
++# and contains a space must be parsed comma-only, so "$USER:rw" grants access.
++# The pre-fix whitespace split reads "$USER:deny" out of the tail and refuses.
++$RSYNC -r "--password-file=$pwfile" "$srcdir2/" "$USER@localhost::spaced/" 2>&1 | tee "$scratchdir/out.spaced"
++if test ! -f "$spaceddir/f1"; then
++    test_fail "\"auth users\" starting with a comma was split on whitespace: the entry \"@nosuchgroup $USER:deny\" names a group that does not exist and must not match, but its tail was read as a separate \"$USER:deny\" rule and the transfer was refused (CVE-2026-70463)"
++fi
++if test "`cat "$spaceddir/f1"`" != "$DATA"; then
++    test_fail "transfer to spaced module was allowed but delivered the wrong content"
++fi
++
++echo "a leading comma in \"auth users\" splits on commas alone"
++exit 0
+Description: CVE-2026-53784 - confine the daemon module-root chdir to the served module
+ A daemon module configured with "use chroot = no" changes directory into the
+ operator-configured module path (module_chdir) with a plain chdir() that
+ follows symlinks at every path component. If any component of that path is a
+ symlink planted by an untrusted local user (for example an admin path such as
+ /home/$user/share, or any /srv-style path under a non-root-owned parent), the
+ planted symlink redirects the daemon's CWD out of the configured module
+ before any transfer begins, letting a client read from and write to files
+ outside the served module (a symlink-race / TOCTOU module escape).
+ .
+ The upstream fix (defd7110) relies on a large dirfd-stack secure-resolver
+ subsystem (util1.c, the *_atfd wrappers, owner_walk_parent,
+ secure_relative_open, PID_* macros) that does not exist in the 3.2.3 target
+ tree. This is a scoped, target-native equivalent: for a non-chrooted daemon
+ module the absolute module path is resolved one component at a time, refusing
+ any symlink component not owned by uid 0 or our euid (the trusted operator
+ identity) and descending with O_NOFOLLOW so a component cannot be swapped for
+ a symlink between the ownership check and the descent, then the daemon
+ fchdir()s into the safely-resolved directory. A symlink owned by a trusted
+ uid is still followed, so legitimate operator-created links keep working. A
+ chrooted module is left on its existing chdir path because chroot() has
+ already confined its outer path.
+ .
+ A regression test (testsuite/daemon-module-chdir-symlink.test) is added,
+ translating the upstream daemon-module-chdir-symlink threat model into the
+ project's shell test idiom.
+Origin: backport, https://github.com/RsyncProject/rsync/commit/defd7110ac9bd60529b3d39cfd5cafe8cc5716de
+Author: Patch Platoon <security@example.com>
+Last-Update: 2026-08-14
+---
+--- a/clientserver.c
++++ b/clientserver.c
+@@ -618,6 +618,143 @@ static struct passwd *want_all_groups(int f_out, uid_t uid)
+ }
+ #endif
+ 
++#if defined AT_FDCWD && defined O_NOFOLLOW && defined O_DIRECTORY
++#ifndef O_CLOEXEC
++#define O_CLOEXEC 0
++#endif
++/* CVE-2026-53784: When a daemon module is configured with "use chroot = no",
++ * the daemon chdir()s into the operator-configured module path (module_chdir)
++ * with a plain chdir() that follows symlinks at every path component.  If any
++ * component of that path is a symlink planted by an untrusted local user (for
++ * example an admin path such as /home/$user/share, or any /srv-style path
++ * under a non-root-owned parent), the planted symlink redirects the daemon's
++ * CWD out of the configured module before any transfer begins, letting the
++ * client read from and write to files outside the served module.
++ *
++ * Resolve the absolute module path one component at a time, refusing any
++ * symlink component that is NOT owned by uid 0 or our euid (the trusted
++ * operator identity), and descending with O_NOFOLLOW so a component cannot be
++ * swapped for a symlink between the ownership check and the descent (the
++ * TOCTOU race).  A symlink owned by a trusted uid is followed, so legitimate
++ * operator-created links (e.g. /var/run -> /run) keep working.  Returns an
++ * open O_DIRECTORY fd on the safely-resolved module root (the caller fchdir()s
++ * into it and closes it), or -1 with errno set on refusal or error. */
++static int daemon_secure_module_dirfd(const char *path)
++{
++	const uid_t trusted_uid = geteuid();
++	char remaining[MAXPATHLEN * 2];
++	char *p;
++	int dfd, loops = 40;
++
++	if (!path || *path != '/') {
++		errno = EINVAL;
++		return -1;
++	}
++	if (strlcpy(remaining, path, sizeof remaining) >= sizeof remaining) {
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++	if ((dfd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
++		return -1;
++
++	for (p = remaining; *p == '/'; p++) {}
++	memmove(remaining, p, strlen(p) + 1);
++
++	while (*remaining) {
++		char *slash = strchr(remaining, '/');
++		size_t comp_len = slash ? (size_t)(slash - remaining) : strlen(remaining);
++		char comp[MAXPATHLEN];
++		STRUCT_STAT lst;
++		int next, save_errno;
++
++		if (comp_len == 0) { /* collapse repeated slashes */
++			memmove(remaining, remaining + 1, strlen(remaining));
++			continue;
++		}
++		if (comp_len >= sizeof comp) {
++			close(dfd);
++			errno = ENAMETOOLONG;
++			return -1;
++		}
++		memcpy(comp, remaining, comp_len);
++		comp[comp_len] = '\0';
++
++		if (fstatat(dfd, comp, &lst, AT_SYMLINK_NOFOLLOW) < 0) {
++			save_errno = errno;
++			close(dfd);
++			errno = save_errno;
++			return -1;
++		}
++
++		if (S_ISLNK(lst.st_mode)) {
++			char target[MAXPATHLEN], rebuilt[MAXPATHLEN * 2], tail[MAXPATHLEN];
++			ssize_t n;
++
++			/* An untrusted-owner symlink is the attack; refuse it. */
++			if (lst.st_uid != 0 && lst.st_uid != trusted_uid) {
++				close(dfd);
++				errno = ELOOP;
++				return -1;
++			}
++			if (--loops < 0) { /* break symlink cycles */
++				close(dfd);
++				errno = ELOOP;
++				return -1;
++			}
++			n = readlinkat(dfd, comp, target, sizeof target - 1);
++			if (n < 0) {
++				save_errno = errno;
++				close(dfd);
++				errno = save_errno;
++				return -1;
++			}
++			target[n] = '\0';
++			tail[0] = '\0';
++			if (slash)
++				strlcpy(tail, slash, sizeof tail);
++			if ((size_t)snprintf(rebuilt, sizeof rebuilt, "%s%s", target, tail) >= sizeof rebuilt) {
++				close(dfd);
++				errno = ENAMETOOLONG;
++				return -1;
++			}
++			if (target[0] == '/') { /* absolute target: restart from "/" */
++				close(dfd);
++				if ((dfd = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0)
++					return -1;
++				for (p = rebuilt; *p == '/'; p++) {}
++				strlcpy(remaining, p, sizeof remaining);
++			} else
++				strlcpy(remaining, rebuilt, sizeof remaining);
++			continue;
++		}
++
++		if (!S_ISDIR(lst.st_mode)) {
++			close(dfd);
++			errno = ENOTDIR;
++			return -1;
++		}
++
++		next = openat(dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++		if (next < 0) {
++			save_errno = errno;
++			close(dfd);
++			errno = save_errno;
++			return -1;
++		}
++		close(dfd);
++		dfd = next;
++
++		if (slash) {
++			for (p = slash; *p == '/'; p++) {}
++			memmove(remaining, p, strlen(p) + 1);
++		} else
++			remaining[0] = '\0';
++	}
++
++	return dfd; /* fd on the safely-resolved module root */
++}
++#endif
++
+ static int rsync_module(int f_in, int f_out, int i, const char *addr, const char *host)
+ {
+ 	int argc;
+@@ -911,6 +1048,28 @@ static int rsync_module(int f_in, int f_out, int i, const char *addr, const char
+ 		module_chdir = module_dir;
+ 	}
+ 
++#if defined AT_FDCWD && defined O_NOFOLLOW && defined O_DIRECTORY
++	/* CVE-2026-53784: for a non-chrooted daemon module the chdir target is an
++	 * operator-configured absolute path whose components may be attacker
++	 * controlled; resolve it with a symlink-race-safe, owned-by-trusted-uid
++	 * walk and fchdir() into the result so a planted symlink cannot redirect
++	 * the daemon's CWD out of the served module.  (A chrooted module has
++	 * already had its outer path confined by chroot(), so keep its existing
++	 * chdir path.) */
++	if (!use_chroot && module_chdir && *module_chdir == '/') {
++		int mfd = daemon_secure_module_dirfd(module_chdir);
++		if (mfd < 0 || fchdir(mfd) < 0) {
++			if (mfd >= 0)
++				close(mfd);
++			return path_failure(f_out, module_chdir, True);
++		}
++		close(mfd);
++		/* Keep change_dir()'s curr_dir bookkeeping in sync without a second
++		 * (racy) chdir: record the path only. */
++		if (!change_dir(module_chdir, CD_SKIP_CHDIR))
++			return path_failure(f_out, module_chdir, True);
++	} else
++#endif
+ 	if (!change_dir(module_chdir, CD_NORMAL))
+ 		return path_failure(f_out, module_chdir, True);
+ 	if (module_dirlen || (!use_chroot && !*lp_daemon_chroot()))
+--- /dev/null
++++ b/testsuite/daemon-module-chdir-symlink.test
+@@ -0,0 +1,92 @@
++#!/bin/sh
++
++# Regression test for CVE-2026-53784.
++#
++# A daemon module configured with `use chroot = no` calls change_dir() into the
++# operator-configured `path =`.  Historically that chdir followed symlinks at
++# every path component with a plain chdir().  If any component of the configured
++# path is a symlink planted by an untrusted local user, the planted symlink
++# redirects the daemon's CWD out of the served module before any transfer
++# begins, so the client is served files from the escape target instead.
++#
++# This is a shell translation of the upstream daemon-module-chdir-symlink_test.py
++# threat model: configure `path = $plant`, where $plant is a symlink (owned by an
++# untrusted uid) pointing at an escape directory that holds a unique canary file
++# the real module never has.  List the module; if the canary appears the daemon
++# followed the planted symlink (VULNERABLE).  With the fix the owned-by-trusted-
++# uid path walk refuses the untrusted symlink and the module listing fails.
++#
++# Requires root, so the plant can be owned by a different (untrusted) uid.
++
++. "$suitedir/rsync.fns"
++
++CANARY="audit_escape_canary"
++
++my_uid=`get_testuid`
++root_uid=`get_rootuid`
++
++if test x"$my_uid" != x"$root_uid"; then
++    test_skipped "requires root to plant a symlink owned by an untrusted uid"
++fi
++
++# Find an untrusted uid (not 0, not us) to own the planted symlink.
++untrusted_uid=''
++for name in nobody nfsnobody daemon bin; do
++    u=`id -u "$name" 2>/dev/null || true`
++    case "$u" in
++	[0-9]*)
++	    if test x"$u" != x0 && test x"$u" != x"$my_uid"; then
++		untrusted_uid="$u"
++		break
++	    fi
++	    ;;
++    esac
++done
++if test x"$untrusted_uid" = x; then
++    test_skipped "no untrusted-uid user available for the cross-uid plant"
++fi
++
++base="$scratchdir/modchdir"
++rm -rf "$base"
++mkdir -p "$base" || test_fail "mkdir $base failed"
++
++# The "escape" directory the attacker wants the daemon to serve from.  Owned by
++# us, with a canary file that the legitimate module does not have.
++escape_target="$base/escape_target"
++mkdir -p "$escape_target" || test_fail "mkdir $escape_target failed"
++echo "you-should-not-see-this" >"$escape_target/$CANARY"
++
++# The planted symlink: it appears at the daemon-configured 'path =' and
++# redirects to the escape target.  The link itself is owned by an untrusted
++# uid, so the fix's owned-by-trusted-uid path walk must refuse to follow it.
++plant="$base/plant"
++ln -s "$escape_target" "$plant" || test_fail "could not create planted symlink"
++chown -h "$untrusted_uid" "$plant" || test_skipped "cannot chown the plant to an untrusted uid"
++
++conf="$scratchdir/test-rsyncd.conf"
++pidfile="$scratchdir/rsyncd.pid"
++logfile="$scratchdir/rsyncd.log"
++cat >"$conf" <<EOF
++pid file = $pidfile
++use chroot = no
++log file = $logfile
++[mod]
++	path = $plant
++	read only = yes
++EOF
++
++RSYNC_CONNECT_PROG="$RSYNC --config=$conf --daemon"
++export RSYNC_CONNECT_PROG
++
++outfile="$scratchdir/rsync.out"
++# List the module contents; capture output but never fail the test on rsync's
++# own non-zero exit (a refused chdir legitimately fails the connection).
++$RSYNC localhost::mod/ >"$outfile" 2>&1 || true
++
++if grep "$CANARY" "$outfile" >/dev/null 2>&1; then
++    test_fail "daemon module-root chdir followed a planted untrusted symlink ($plant -> $escape_target); the escape-target canary '$CANARY' appeared in the module listing (CVE-2026-53784)"
++fi
++
++# Passed: the canary was NOT served, so the planted symlink did not redirect the
++# daemon out of the configured module.
++exit 0
+Description: CVE-2026-53802 - refuse attacker-planted symlinks in operator-supplied input file paths
+ rsync before 3.5.0 followed attacker-planted symlinks in operator-supplied
+ input file paths -- --filter merge files (including per-directory merges and
+ -C .cvsignore), --files-from/--include-from/--exclude-from, the client
+ --password-file, and the daemon "secrets file".  A local user who controls a
+ path component (or, for the daemon files-from variant, a remote client) can
+ plant a symlink so a privileged rsync reads an arbitrary file, either silently
+ shaping the transfer (disclosed under verbose/debug) or leaking the target
+ file's content as the daemon/client authentication response.
+ .
+ This is a targeted backport of the upstream v3.5.0 hardening series
+ (commits 3eeedf8d, d199b431, defd7110). Rather than porting the full
+ fd-relative openat confinement subsystem -- which does not exist in 3.2.3 --
+ it adds a self-contained open_no_attacker_symlinks() helper in syscall.c that
+ walks the path one component at a time with fstatat(AT_SYMLINK_NOFOLLOW) and
+ openat(O_NOFOLLOW), refusing any symlink (leaf or parent component) whose owner
+ is neither uid 0 nor our effective uid, and follows trusted-owner symlinks.
+ The vulnerable opens are routed through this helper:
+ exclude.c parse_filter_file() (plus a MAX_MERGE_DEPTH recursion cap),
+ authenticate.c check_secret()/getpassf() (fstat'ing the opened fd), and
+ options.c --files-from. A backported shell regression test is added.
+Origin: upstream, https://github.com/RsyncProject/rsync/commit/3eeedf8d08178ff2f354c09be64eb0f56fa8454f
+Origin: upstream, https://github.com/RsyncProject/rsync/commit/d199b43149ef8850382e72d6145a5826db216f66
+Origin: upstream, https://github.com/RsyncProject/rsync/commit/defd7110ac9bd60529b3d39cfd5cafe8cc5716de
+Bug: https://github.com/RsyncProject/rsync/security/advisories/GHSA-4mfr-8jrv-49x4
+Author: Patch Platoon <security@rootio>
+Last-Update: 2026-08-14
+---
+--- a/syscall.c
++++ b/syscall.c
+@@ -652,3 +652,192 @@
+ 
+ 	return fd;
+ }
++
++/* Open a path that may transit attacker-controlled directory components
++ * (operator-supplied --exclude-from/--include-from/--filter merge files,
++ * per-directory .cvsignore-style merges, --files-from, the client
++ * --password-file, and the daemon "secrets file").  A privileged rsync must
++ * not be tricked into reading an arbitrary file because some component of the
++ * path -- the leaf OR any parent directory -- was replaced by a symlink owned
++ * by an untrusted user.
++ *
++ * We walk the path one component at a time with fstatat(AT_SYMLINK_NOFOLLOW)
++ * and openat(O_NOFOLLOW), refusing any symlink whose owner is neither uid 0
++ * nor our effective uid.  A symlink owned by a trusted uid (root or us) is
++ * followed by re-opening its resolved target with the same rules, so ordinary
++ * admin-managed symlinks keep working.  This is a narrower, self-contained
++ * backport of the upstream open_no_attacker_symlinks() confinement helper
++ * (rsync 3.5.0) that does not require the full fd-relative openat subsystem.
++ *
++ * On systems lacking openat()/O_NOFOLLOW this degrades to a plain open(). */
++int open_no_attacker_symlinks(const char *path, int flags, mode_t mode)
++{
++#if defined AT_FDCWD && defined O_NOFOLLOW
++	const uid_t trusted_uid = geteuid();
++	char remaining[MAXPATHLEN * 2];
++	int dfd = AT_FDCWD;
++	int dfd_owns = 0;
++	int loops = 40;		/* cap symlink-follow chains (SYMLOOP_MAX-ish) */
++	int retfd = -1;
++	int saved_errno = 0;
++
++	if (!path || !*path) {
++		errno = ENOENT;
++		return -1;
++	}
++	if (strlcpy(remaining, path, sizeof remaining) >= sizeof remaining) {
++		errno = ENAMETOOLONG;
++		return -1;
++	}
++
++	/* Absolute path: pin "/" as the starting dfd. */
++	if (remaining[0] == '/') {
++		dfd = open("/", O_RDONLY | O_DIRECTORY
++#ifdef O_CLOEXEC
++			   | O_CLOEXEC
++#endif
++			   );
++		if (dfd < 0)
++			return -1;
++		dfd_owns = 1;
++		char *s = remaining;
++		while (*s == '/') s++;
++		memmove(remaining, s, strlen(s) + 1);
++	}
++
++	while (*remaining) {
++		char *slash = strchr(remaining, '/');
++		size_t comp_len = slash ? (size_t)(slash - remaining) : strlen(remaining);
++		char comp[MAXPATHLEN];
++		int is_last;
++		STRUCT_STAT lst;
++
++		if (comp_len == 0) {
++			/* collapse an empty component ("//") */
++			memmove(remaining, remaining + 1, strlen(remaining + 1) + 1);
++			continue;
++		}
++		if (comp_len >= sizeof comp) {
++			saved_errno = ENAMETOOLONG;
++			goto out;
++		}
++		memcpy(comp, remaining, comp_len);
++		comp[comp_len] = '\0';
++		is_last = (slash == NULL);
++
++		if (fstatat(dfd, comp, &lst, AT_SYMLINK_NOFOLLOW) < 0) {
++			/* Leaf may legitimately not exist yet (O_CREAT). */
++			if (is_last && errno == ENOENT && (flags & O_CREAT)) {
++				retfd = openat(dfd, comp, flags | O_NOFOLLOW, mode);
++				saved_errno = errno;
++				goto out;
++			}
++			saved_errno = errno;
++			goto out;
++		}
++
++		if (S_ISLNK(lst.st_mode)) {
++			char target[MAXPATHLEN];
++			char tail[MAXPATHLEN];
++			char rebuilt[MAXPATHLEN * 2];
++			ssize_t n;
++
++			/* Refuse a symlink owned by an untrusted user. */
++			if (lst.st_uid != 0 && lst.st_uid != trusted_uid) {
++				saved_errno = ELOOP;
++				goto out;
++			}
++			if (--loops < 0) {
++				saved_errno = ELOOP;
++				goto out;
++			}
++			n = readlinkat(dfd, comp, target, sizeof target - 1);
++			if (n < 0) {
++				saved_errno = errno;
++				goto out;
++			}
++			target[n] = '\0';
++
++			tail[0] = '\0';
++			if (slash)
++				strlcpy(tail, slash, sizeof tail);
++			if ((size_t)snprintf(rebuilt, sizeof rebuilt, "%s%s",
++					     target, tail) >= sizeof rebuilt) {
++				saved_errno = ENAMETOOLONG;
++				goto out;
++			}
++
++			if (target[0] == '/') {
++				int rootfd = open("/", O_RDONLY | O_DIRECTORY
++#ifdef O_CLOEXEC
++						  | O_CLOEXEC
++#endif
++						  );
++				if (rootfd < 0) {
++					saved_errno = errno;
++					goto out;
++				}
++				if (dfd_owns)
++					close(dfd);
++				dfd = rootfd;
++				dfd_owns = 1;
++				{
++					char *s = rebuilt;
++					while (*s == '/') s++;
++					strlcpy(remaining, s, sizeof remaining);
++				}
++			} else
++				strlcpy(remaining, rebuilt, sizeof remaining);
++			continue;
++		}
++
++		if (is_last) {
++			retfd = openat(dfd, comp, flags | O_NOFOLLOW, mode);
++			saved_errno = errno;
++			goto out;
++		}
++
++		if (!S_ISDIR(lst.st_mode)) {
++			saved_errno = ENOTDIR;
++			goto out;
++		}
++		{
++			int next = openat(dfd, comp, O_RDONLY | O_DIRECTORY | O_NOFOLLOW
++#ifdef O_CLOEXEC
++					  | O_CLOEXEC
++#endif
++					  );
++			if (next < 0) {
++				saved_errno = errno;
++				goto out;
++			}
++			if (dfd_owns)
++				close(dfd);
++			dfd = next;
++			dfd_owns = 1;
++		}
++
++		{
++			char *s = slash;
++			while (*s == '/') s++;
++			memmove(remaining, s, strlen(s) + 1);
++		}
++	}
++
++	/* Path resolved entirely to a directory with no leaf left. */
++	saved_errno = (flags & O_DIRECTORY) ? 0 : EISDIR;
++	if ((flags & O_DIRECTORY) && dfd_owns) {
++		retfd = dfd;
++		dfd_owns = 0;
++	}
++
++out:
++	if (dfd_owns)
++		close(dfd);
++	errno = saved_errno;
++	return retfd;
++#else
++	/* Pre-openat / no-O_NOFOLLOW systems: best-effort fallback. */
++	return open(path, flags, mode);
++#endif
++}
+--- a/exclude.c
++++ b/exclude.c
+@@ -63,6 +63,11 @@
+ /* This is True when we're scanning parent dirs for per-dir merge-files. */
+ static BOOL parent_dirscan = False;
+ 
++/* Cap on how deeply merge files may include other merge files, to bound
++ * malicious-peer recursion (CVE-2026-53802). */
++#define MAX_MERGE_DEPTH 32
++static int merge_depth = 0;
++
+ /* This array contains a list of all the currently active per-dir merge
+  * files.  This makes it easier to save the appropriate values when we
+  * "push" down into each subdirectory. */
+@@ -1160,16 +1165,40 @@
+ 	if (!fname || !*fname)
+ 		return;
+ 
++	if (merge_depth >= MAX_MERGE_DEPTH) {
++		rprintf(FERROR,
++			"[%s] merge-file include depth limit (%d) exceeded at %s\n",
++			who_am_i(), MAX_MERGE_DEPTH, fname);
++		/* Match the failed-open path below: abort under a fatal
++		 * (operator-supplied) merge, otherwise drop the rule. */
++		if (xflags & XFLG_FATAL_ERRORS)
++			exit_cleanup(RERR_FILEIO);
++		return;
++	}
++	merge_depth++;
++
+ 	if (*fname != '-' || fname[1] || am_server) {
++		/* This path is operator- and (via per-directory merge files like
++		 * .cvsignore) sender-controlled: a planted symlink could leak a
++		 * root-readable file through the filter parser, or redirect an
++		 * --exclude-from open via a planted parent.  Refuse symlinks not
++		 * owned by uid 0 or our euid (CVE-2026-53802). */
++		const char *open_path = fname;
++		int fd;
+ 		if (daemon_filter_list.head) {
+ 			strlcpy(line, fname, sizeof line);
+ 			clean_fname(line, CFN_COLLAPSE_DOT_DOT_DIRS);
+-			if (check_filter(&daemon_filter_list, FLOG, line, 0) < 0)
+-				fp = NULL;
+-			else
+-				fp = fopen(line, "rb");
+-		} else
+-			fp = fopen(fname, "rb");
++			if (check_filter(&daemon_filter_list, FLOG, line, 0) < 0) {
++				merge_depth--;
++				return;
++			}
++			open_path = line;
++		}
++		fd = open_no_attacker_symlinks(open_path, O_RDONLY, 0);
++		if (fd < 0)
++			fp = NULL;
++		else if (!(fp = fdopen(fd, "rb")))
++			close(fd);
+ 	} else
+ 		fp = stdin;
+ 
+@@ -1187,6 +1216,7 @@
+ 				fname);
+ 			exit_cleanup(RERR_FILEIO);
+ 		}
++		merge_depth--;
+ 		return;
+ 	}
+ 	dirbuf[dirbuf_len] = '\0';
+@@ -1223,6 +1253,7 @@
+ 			break;
+ 	}
+ 	fclose(fp);
++	merge_depth--;
+ }
+ 
+ /* If the "for_xfer" flag is set, the prefix is made compatible with the
+--- a/authenticate.c
++++ b/authenticate.c
+@@ -109,8 +109,22 @@
+ 	char *err;
+ 	FILE *fh;
+ 
+-	if (!fname || !*fname || (fh = fopen(fname, "r")) == NULL)
++	/* Daemon 'secrets file = PATH' open.  A planted symlink would be
++	 * followed and the strict-modes fstat() check below runs on the target
++	 * inode, so a symlink to /etc/shadow (0640 root:shadow) would pass and
++	 * the daemon would auth against shadow hashes.  Refuse symlinks not
++	 * owned by uid 0 or our euid (CVE-2026-53802). */
++	if (!fname || !*fname)
+ 		return "no secrets file";
++	{
++		int fd = open_no_attacker_symlinks(fname, O_RDONLY, 0);
++		if (fd < 0)
++			return "no secrets file";
++		if ((fh = fdopen(fd, "r")) == NULL) {
++			close(fd);
++			return "no secrets file";
++		}
++	}
+ 
+ 	if (do_fstat(fileno(fh), &st) == -1) {
+ 		rsyserr(FLOG, errno, "fstat(%s)", fname);
+@@ -183,13 +197,23 @@
+ 	} else {
+ 		int fd;
+ 
+-		if ((fd = open(filename,O_RDONLY)) < 0) {
++		/* --password-file=PATH client open.  Its first line is sent as the
++		 * auth response, so a planted symlink leaks the target's content
++		 * (e.g. shadow hashes) to a malicious daemon; the do_stat()
++		 * other-access check runs on the target mode and passes 0640
++		 * root:shadow.  Refuse symlinks not owned by uid 0 or our euid
++		 * (CVE-2026-53802). */
++		if ((fd = open_no_attacker_symlinks(filename, O_RDONLY, 0)) < 0) {
+ 			rsyserr(FERROR, errno, "could not open password file %s", filename);
+ 			exit_cleanup(RERR_SYNTAX);
+ 		}
+ 
+-		if (do_stat(filename, &st) == -1) {
+-			rsyserr(FERROR, errno, "stat(%s)", filename);
++		/* fstat the opened fd, not the pathname: a same-object check so an
++		 * attacker who swaps the path between open and check can't make the
++		 * owner/mode test validate a different inode than the one we read
++		 * the password from. */
++		if (do_fstat(fd, &st) == -1) {
++			rsyserr(FERROR, errno, "fstat(%s)", filename);
+ 			exit_cleanup(RERR_SYNTAX);
+ 		}
+ 		if ((st.st_mode & 06) != 0) {
+--- a/options.c
++++ b/options.c
+@@ -2426,7 +2426,11 @@
+ 				if (check_filter(&daemon_filter_list, FLOG, dir, 0) < 0)
+ 					goto options_rejected;
+ 			}
+-			filesfrom_fd = open(files_from, O_RDONLY|O_BINARY);
++			/* Operator-supplied path that may transit attacker-writable
++			 * parents; refuse symlinks not owned by uid 0 or our euid,
++			 * as for --exclude-from/--include-from/--filter in exclude.c
++			 * (CVE-2026-53802). */
++			filesfrom_fd = open_no_attacker_symlinks(files_from, O_RDONLY|O_BINARY, 0);
+ 			if (filesfrom_fd < 0) {
+ 				snprintf(err_buf, sizeof err_buf,
+ 					"failed to open files-from file %s: %s\n",
+--- /dev/null
++++ b/testsuite/CVE-2026-53802-symlink.test
+@@ -0,0 +1,112 @@
++#!/bin/sh
++
++# Regression test for CVE-2026-53802 (symlink following in operator-supplied
++# input file paths).  Backport of the upstream v3.5.0 regression tests
++# excludefrom-symlink_test.py / files-from-leak_test.py, rewritten for this
++# tree's shell-based test harness (the pytest harness those tests use does not
++# exist in 3.2.3).
++#
++# Threat: a privileged rsync opens an operator-supplied path
++# (--exclude-from / --files-from / --filter merge file / --password-file /
++# daemon secrets file) whose leaf -- OR a parent directory component -- has
++# been replaced by a symlink owned by an untrusted (attacker) user.  Before
++# the fix rsync follows the planted symlink and reads its target as filter
++# rules / a file list, silently shaping the transfer or leaking file content.
++# After the fix open_no_attacker_symlinks() refuses any symlink not owned by
++# uid 0 or our effective uid, at every path component, so the open fails.
++#
++# This test must plant a symlink owned by a *different* uid to simulate the
++# attacker, which requires root; it skips otherwise.
++
++. "$suitedir/rsync.fns"
++
++if test x"`id -u`" != x0; then
++    test_skipped "must be root to plant a symlink owned by a non-self uid (the attacker simulation)"
++fi
++
++# Find an untrusted uid to own the planted symlinks (not root, not us).
++UNTRUSTED_UID=''
++for name in nobody nfsnobody daemon bin; do
++    u=`id -u "$name" 2>/dev/null`
++    if test -n "$u" && test x"$u" != x0; then
++	UNTRUSTED_UID="$u"
++	break
++    fi
++done
++if test -z "$UNTRUSTED_UID"; then
++    test_skipped "no untrusted-uid user available for the cross-uid symlink plant"
++fi
++
++base="$scratchdir/cve"
++src="$base/src"
++dest="$base/dest"
++outside="$base/outside"
++plants="$base/plants"
++
++rm -rf "$base"
++mkdir -p "$src" "$dest" "$outside" "$plants"
++
++# A canary we expect to be transferred unless a leaked exclude rule drops it.
++echo "would-be-transferred" >"$src/canary_file"
++echo "noise" >"$src/other_file"
++
++# Attacker-readable content: a filter/exclude pattern that matches the canary.
++echo "canary_file" >"$outside/exclude_list"
++
++# ---------------------------------------------------------------------------
++# 1. --exclude-from, LEAF plant: the exclude-from path itself is a symlink
++#    owned by the attacker pointing at attacker-controlled rules.
++# ---------------------------------------------------------------------------
++leaf_plant="$plants/exclude_leaf"
++ln -s "$outside/exclude_list" "$leaf_plant"
++lchown "$UNTRUSTED_UID" "$leaf_plant" 2>/dev/null || chown -h "$UNTRUSTED_UID" "$leaf_plant"
++
++rm -rf "$dest"; mkdir -p "$dest"
++$RSYNC -a --exclude-from="$leaf_plant" "$src/" "$dest/" 2>/dev/null
++rc=$?
++if test $rc = 0 && test ! -f "$dest/canary_file"; then
++    test_fail "--exclude-from followed a planted LEAF symlink owned by uid $UNTRUSTED_UID: rsync read the symlink target as filter rules and dropped src/canary_file. CVE-2026-53802 not fixed."
++fi
++
++# ---------------------------------------------------------------------------
++# 2. --exclude-from, PARENT-component plant: an intermediate directory of the
++#    path is an attacker-owned symlink.  Plain O_NOFOLLOW on the leaf does NOT
++#    defend against this; the fix walks every component.
++# ---------------------------------------------------------------------------
++real_target="$plants/parent_real_target"
++mkdir -p "$real_target"
++echo "canary_file" >"$real_target/exclude_list"
++parent_plant="$plants/parent_link"
++ln -s "$real_target" "$parent_plant"
++lchown "$UNTRUSTED_UID" "$parent_plant" 2>/dev/null || chown -h "$UNTRUSTED_UID" "$parent_plant"
++
++rm -rf "$dest"; mkdir -p "$dest"
++$RSYNC -a --exclude-from="$parent_plant/exclude_list" "$src/" "$dest/" 2>/dev/null
++rc=$?
++if test $rc = 0 && test ! -f "$dest/canary_file"; then
++    test_fail "--exclude-from followed a planted PARENT-component symlink ($parent_plant -> $real_target) owned by uid $UNTRUSTED_UID: the leaked exclude_list dropped canary_file. CVE-2026-53802 not fixed."
++fi
++
++# ---------------------------------------------------------------------------
++# 3. --files-from, LEAF plant: the file list is a symlink owned by the
++#    attacker.  With the leak rsync reads the planted list; the fix refuses
++#    the open and exits non-zero.
++# ---------------------------------------------------------------------------
++echo "other_file" >"$outside/file_list"
++ff_plant="$plants/filesfrom_leaf"
++ln -s "$outside/file_list" "$ff_plant"
++lchown "$UNTRUSTED_UID" "$ff_plant" 2>/dev/null || chown -h "$UNTRUSTED_UID" "$ff_plant"
++
++rm -rf "$dest"; mkdir -p "$dest"
++$RSYNC -a --files-from="$ff_plant" "$src/" "$dest/" 2>/dev/null
++rc=$?
++# The honest failure mode with the fix is a non-zero exit (open refused).
++# A leak would exit 0 having transferred exactly the attacker-listed file
++# (other_file) while never having been told to.  Detect that combination.
++if test $rc = 0 && test -f "$dest/other_file" && test ! -f "$dest/canary_file"; then
++    test_fail "--files-from followed a planted LEAF symlink owned by uid $UNTRUSTED_UID: rsync used the attacker's file list. CVE-2026-53802 not fixed."
++fi
++
++# The script aborts (via test_fail) on any detected leak, so reaching here
++# means the planted symlinks were refused: the fix is in place.
++exit 0
