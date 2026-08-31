@@ -1,3 +1,145 @@
+Description: CVE-2026-63383 - Fix out-of-bounds read in decode_tag_internal
+ The evrpc tag decoder pulled up at most sizeof(number)+1 bytes from the
+ evbuffer but then iterated the decode loop up to the untrusted declared
+ length "len". When "len" exceeded the number of bytes actually pulled up,
+ decode_tag_internal() read past the end of the pulled-up buffer, allowing
+ an attacker to cause an evrpc client or server to read out of bounds when
+ decoding a tag. Cap the read loop at the pulled-up buffer length
+ (pullup_len) instead of the declared length. Fixes GHSA-fj29-64w6-73h6.
+Origin: upstream, https://github.com/libevent/libevent/commit/91ed8745eebabdd27592a83d350338a8c4626321
+Author: libevent maintainers
+Last-Update: 2026-08-24
+---
+--- a/event_tagging.c
++++ b/event_tagging.c
+@@ -210,12 +210,13 @@ decode_tag_internal(ev_uint32_t *ptag, struct evbuffer *evbuf, int dodrain)
+ 	 * the encoding of a number is at most one byte more than its
+ 	 * storage size.  however, it may also be much smaller.
+ 	 */
++	size_t pullup_len = len < sizeof(number) + 1 ? len : sizeof(number) + 1;
+ 	data = evbuffer_pullup(
+-		evbuf, len < sizeof(number) + 1 ? len : sizeof(number) + 1);
++		evbuf, pullup_len);
+ 	if (!data)
+ 		return (-1);
+ 
+-	while (count++ < len) {
++	while (count++ < pullup_len) {
+ 		ev_uint8_t lower = *data++;
+ 		if (shift >= 28) {
+ 			/* Make sure it fits into 32 bits */
+Description: CVE-2026-63388 - Fix heap out-of-bounds write in bufferevent via AF_UNIX+http+NDEBUG
+ bufferevent stored the saved connection address in a union of
+ struct sockaddr_in6 / struct sockaddr_in, which is too small to hold a
+ struct sockaddr_un. When an AF_UNIX address was passed (notably through the
+ http code path), bufferevent_socket_set_conn_address_() memcpy'd more bytes
+ than the destination could hold, causing a heap out-of-bounds write. The
+ oversized-addrlen case was only guarded by EVUTIL_ASSERT(), which is compiled
+ out under -DNDEBUG, so release builds performed the overflowing copy silently.
+ .
+ This backports upstream commit 52057cb33d0c20c0a0453fbabe6c0c96854931b9
+ (release-2.1.13-stable): the conn_address union is replaced with a
+ struct sockaddr_storage large enough for any supported address family, and
+ bufferevent_socket_set_conn_address_() now returns an error code instead of
+ asserting when addrlen is too large. Both call sites
+ (bufferevent_connect_getaddrinfo_cb() in bufferevent_sock.c and
+ evhttp_get_request_connection() in http.c) are updated to check the return
+ value and fail the connection cleanly.
+Origin: upstream, https://github.com/libevent/libevent/commit/52057cb33d0c20c0a0453fbabe6c0c96854931b9
+Author: Azat Khuzhin <azat@libevent.org>
+Last-Update: 2026-08-24
+---
+--- a/bufferevent-internal.h
++++ b/bufferevent-internal.h
+@@ -34,6 +34,7 @@
+ #include "event2/event_struct.h"
+ #include "evconfig-private.h"
+ #include "event2/util.h"
++#include "util-internal.h"
+ #include "defer-internal.h"
+ #include "evthread-internal.h"
+ #include "event2/thread.h"
+@@ -224,10 +225,10 @@
+ 	 * So we need to save it, just after we connected to remote server, or
+ 	 * after resolving (to avoid extra dns requests during retrying, since UDP
+ 	 * is slow) */
+-	union {
+-		struct sockaddr_in6 in6;
+-		struct sockaddr_in in;
+-	} conn_address;
++	/* NOTE: it might be nice to use fewer bytes here, but we need to store
++	 * sockaddr_un sometimes in order to make AF_UNIX sockets work as expected
++	 * with http.c. */
++	struct sockaddr_storage conn_address;
+ 
+ 	struct evdns_getaddrinfo_request *dns_request;
+ };
+@@ -449,7 +450,7 @@
+ bufferevent_socket_set_conn_address_fd_(struct bufferevent *bev, evutil_socket_t fd);
+ 
+ EVENT2_EXPORT_SYMBOL
+-void
++int
+ bufferevent_socket_set_conn_address_(struct bufferevent *bev, struct sockaddr *addr, size_t addrlen);
+ 
+ 
+--- a/bufferevent_sock.c
++++ b/bufferevent_sock.c
+@@ -116,13 +116,17 @@
+ 		getpeername(fd, addr, &len);
+ }
+ 
+-void
++int
+ bufferevent_socket_set_conn_address_(struct bufferevent *bev,
+ 	struct sockaddr *addr, size_t addrlen)
+ {
+ 	struct bufferevent_private *bev_p = BEV_UPCAST(bev);
+-	EVUTIL_ASSERT(addrlen <= sizeof(bev_p->conn_address));
+-	memcpy(&bev_p->conn_address, addr, addrlen);
++	if (addrlen <= sizeof(bev_p->conn_address)) {
++		memcpy(&bev_p->conn_address, addr, addrlen);
++		return 0;
++	} else {
++		return EVUTIL_EAI_FAIL;
++	}
+ }
+ 
+ static void
+@@ -472,6 +476,11 @@
+ 		bufferevent_decref_and_unlock_(bev);
+ 		return;
+ 	}
++	if (result == 0) {
++		/* XXX use the other addrinfos? */
++		result = bufferevent_socket_set_conn_address_(
++			bev, ai->ai_addr, (int)ai->ai_addrlen);
++	}
+ 	if (result != 0) {
+ 		bev_p->dns_error = result;
+ 		bufferevent_run_eventcb_(bev, BEV_EVENT_ERROR, 0);
+@@ -481,8 +490,6 @@
+ 		return;
+ 	}
+ 
+-	/* XXX use the other addrinfos? */
+-	bufferevent_socket_set_conn_address_(bev, ai->ai_addr, (int)ai->ai_addrlen);
+ 	r = bufferevent_socket_connect(bev, ai->ai_addr, (int)ai->ai_addrlen);
+ 	if (r < 0)
+ 		bufferevent_run_eventcb_(bev, BEV_EVENT_ERROR, 0);
+--- a/http.c
++++ b/http.c
+@@ -4273,7 +4273,9 @@
+ 		goto err;
+ 	if (bufferevent_disable(evcon->bufev, EV_WRITE))
+ 		goto err;
+-	bufferevent_socket_set_conn_address_(evcon->bufev, sa, salen);
++	if (bufferevent_socket_set_conn_address_(evcon->bufev, sa, salen)) {
++		goto err;
++	}
+ 
+ 	return (evcon);
+ 
 Description: CVE-2026-63382 - Fix HTTP request smuggling in evhttp.
  Two related hardening changes for the evhttp HTTP parser (GHSA-q39v-w2g7-gr8j):
  .
@@ -312,6 +454,32 @@ Last-Update: 2026-08-23
  	HTTP(negative_content_length),
  	HTTP(chunk_out),
  	HTTP(stream_out),
+Description: CVE-2026-63387 - Fix out-of-bounds write in dnsname_to_labels
+ dnsname_to_labels() in evdns.c could write one byte past the end of the
+ destination buffer when writing the terminating zero label. When a DNS
+ response reaches exactly 2^16+1 bytes and ends with a name, the offset j
+ could equal buf_len, and "buf[j++] = 0" then performed a one-byte
+ out-of-bounds (stack) write. This adds a bounds check that returns -2
+ (error) when j has reached buf_len before writing the terminating zero.
+Origin: upstream, https://github.com/libevent/libevent/commit/377b9022c3ac61aa4540b5dc4b70c60bf74c663d
+Author: libevent developers
+Bug: GHSA-58rx-7448-jw47
+Last-Update: 2026-08-23
+---
+--- a/evdns.c
++++ b/evdns.c
+@@ -1671,7 +1671,10 @@ dnsname_to_labels(u8 *const buf, size_t buf_len, off_t j,
+ 	/* the labels must be terminated by a 0. */
+ 	/* It's possible that the name ended in a . */
+ 	/* in which case the zero is already there */
+-	if (!j || buf[j-1]) buf[j++] = 0;
++	if ((size_t)j >= buf_len)
++		return -2;
++	if (!j || buf[j-1])
++		buf[j++] = 0;
+ 	return j;
+  overflow:
+ 	return (-2);
 Description: CVE-2026-63385 - http: Reject headers containing CRLF (HTTP header injection)
  evhttp_header_is_valid_value() previously permitted header values that
  contained CR/LF sequences as long as they were followed by a space or tab,
@@ -364,3 +532,38 @@ Last-Update: 2026-08-23
  	tt_want(evhttp_add_header(&headers, "One\r", "Two") == -1);
  	tt_want(evhttp_add_header(&headers, "One\n", "Two") == -1);
  	tt_want(evhttp_add_header(&headers, "One", "Two\r") == -1);
+Description: CVE-2026-63384 - Fix integer overflow in evtag_unmarshal_header
+ evrpc: Fix integer overflow in evtag_unmarshal_header (CWE-190).
+ On platforms where int is 32-bit, decoding a tag header whose payload
+ length exceeds INT_MAX could cause evtag_unmarshal_header() to return a
+ negative value (the ev_uint32_t length is returned via an int result),
+ leading to bad/oversized allocations or denial of service in code that
+ consumes the returned length. The fix rejects payload lengths larger
+ than INT_MAX by returning -1 before the length is used.
+ Fixes GHSA-45c6-qx49-89m8.
+Origin: upstream, https://github.com/libevent/libevent/commit/109c16499282959d70f56ec3baf4c8b1e6646bda
+Author: libevent maintainers
+Last-Update: 2026-08-23
+---
+--- a/event_tagging.c
++++ b/event_tagging.c
+@@ -445,7 +445,7 @@ evtag_unmarshal_header(struct evbuffer *evbuf, ev_uint32_t *ptag)
+
+ 	if (decode_tag_internal(ptag, evbuf, 1 /* dodrain */) == -1)
+ 		return (-1);
+-	if (evtag_decode_int(&len, evbuf) == -1)
++	if (evtag_decode_int(&len, evbuf) == -1 || len > INT_MAX)
+ 		return (-1);
+
+ 	if (evbuffer_get_length(evbuf) < len)
+--- a/include/event2/tag.h
++++ b/include/event2/tag.h
+@@ -64,6 +64,8 @@ void evtag_init(void);
+ /**
+    Unmarshals the header and returns the length of the payload
+
++   Returns an error if the payload length is above INT_MAX.
++
+    @param evbuf the buffer from which to unmarshal data
+    @param ptag a pointer in which the tag id is being stored
+    @returns -1 on failure or the number of bytes in the remaining payload.
