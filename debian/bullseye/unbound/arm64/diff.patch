@@ -1,830 +1,3 @@
-Description: CVE-2026-44690 - Fix cross-zone wildcard cache poisoning via RRSIG.labels manipulation
- An attacker could poison the aggressive NSEC cache with wildcard-expanded
- records whose RRSIG signer is outside the authoritative zone, by manipulating
- the RRSIG labels field. This allowed cross-zone cache poisoning (CWE-345).
- .
- The fix hardens three places:
- .
-  * validator/val_sigcrypt.c: reject an RRSIG whose labels count is lower than
-    the label count of the signer name (an impossible-to-be-valid wildcard).
-  * validator/validator.c: postpone the aggressive-NSEC wildcard cache update
-    until the positive wildcard proof has actually succeeded, instead of
-    caching the expansion eagerly.
-  * services/cache/rrset.c: before caching a wildcard expansion, verify that
-    the wildcard canonical parent falls within the authority of every RRSIG
-    signer of the rrset (dname_subdomain_rrsig_signers), otherwise drop it.
- .
- The internal helper rrsig_get_signer() is exported from validator/val_utils.c
- for reuse by the rrset cache. A regression test (testdata/rrsig_agr_wild.rpl)
- from the upstream fix is included; testbound auto-discovers testdata/*.rpl.
- .
- This is a backport of the upstream fix to 1.13.x: the target predates the
- EDE/reason_bogus parameter of dnskey_verify_rrset_sig(), so the *reason_bogus
- assignments from the upstream hunk are omitted while the security check is
- preserved.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f7637a4f1811f4a9331707d8a95cf0af65a97c0f
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/3d5e6c06923eff9eac2f5e31a69c43a15ca9d3c2
-Bug: CVE-2026-44690
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/services/cache/rrset.c
-+++ b/services/cache/rrset.c
-@@ -46,9 +46,11 @@
- #include "util/data/packed_rrset.h"
- #include "util/data/msgreply.h"
- #include "util/data/msgparse.h"
-+#include "util/data/dname.h"
- #include "util/regional.h"
- #include "util/alloc.h"
- #include "util/net_help.h"
-+#include "validator/val_utils.h"
- 
- void
- rrset_markdel(void* key)
-@@ -239,12 +241,43 @@
- 	return 0;
- }
- 
--void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache, 
-+/** See if the name is a within signer authority */
-+static int
-+dname_subdomain_rrsig_signers(uint8_t* dname,
-+	struct ub_packed_rrset_key* rrset)
-+{
-+	struct packed_rrset_data* d = (struct packed_rrset_data*)
-+		rrset->entry.data;
-+	size_t i;
-+	if(!d || !d->rrsig_count)
-+		return 0;
-+	for(i=0; i<d->rrsig_count; i++) {
-+		uint8_t* sname = NULL;
-+		size_t slen = 0;
-+		rrsig_get_signer(d->rr_data[d->count+i], d->rr_len[d->count+i],
-+			&sname, &slen);
-+		if(!sname || !slen)
-+			return 0; /* malformed */
-+		if(!dname_subdomain_c(dname, sname))
-+			return 0; /* not a subdomain */
-+	}
-+	return 1;
-+}
-+
-+void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache,
- 	struct ub_packed_rrset_key* rrset, uint8_t* ce, size_t ce_len,
- 	struct alloc_cache* alloc, time_t timenow)
- {
- 	struct rrset_ref ref;
- 	uint8_t wc_dname[LDNS_MAX_DOMAINLEN+3];
-+
-+	/* See if the RRSIG signer name allows this wildcard,
-+	 * the new rrset should fall within the zone of the RRSIG signer(s). */
-+	if(!dname_subdomain_rrsig_signers(ce, rrset)) {
-+		verbose(VERB_ALGO, "wildcard canonical parent outside signer authority");
-+		return;
-+	}
-+
- 	rrset = packed_rrset_copy_alloc(rrset, alloc, timenow);
- 	if(!rrset) {
- 		log_err("malloc failure in rrset_cache_update_wildcard");
---- a/validator/val_sigcrypt.c
-+++ b/validator/val_sigcrypt.c
-@@ -1470,6 +1470,11 @@
- 		*reason = "signature labelcount out of range";
- 		return sec_status_bogus;
- 	}
-+	if((int)sig[2+3] < dname_signame_label_count(signer)) {
-+		verbose(VERB_QUERY, "verify: RRSIG label count too low for signer");
-+		*reason = "signature labelcount lower than signature signer";
-+		return sec_status_bogus;
-+	}
- 
- 	/* original ttl, always ok */
- 
---- a/validator/val_utils.c
-+++ b/validator/val_utils.c
-@@ -130,7 +130,7 @@
- }
- 
- /** Get signer name from RRSIG */
--static void
-+void
- rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname, size_t* slen)
- {
- 	/* RRSIG rdata is not allowed to be compressed, it is stored
---- a/validator/val_utils.h
-+++ b/validator/val_utils.h
-@@ -424,4 +424,8 @@
- struct dns_msg* val_find_DS(struct module_env* env, uint8_t* nm, size_t nmlen,
- 	uint16_t c, struct regional* region, uint8_t* topname);
- 
-+/** Get signer name from RRSIG, sname is NULL if malformed. */
-+void rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname,
-+	size_t* slen);
-+
- #endif /* VALIDATOR_VAL_UTILS_H */
---- a/validator/validator.c
-+++ b/validator/validator.c
-@@ -786,6 +786,10 @@
- 	uint8_t* wc = NULL;
- 	size_t wl;
- 	int wc_cached = 0;
-+	int wc_to_cache = 0;
-+	uint8_t* cache_wc = NULL;
-+	size_t cache_wl = 0;
-+	struct ub_packed_rrset_key* cache_s = NULL;
- 	int wc_NSEC_ok = 0;
- 	int nsec3s_seen = 0;
- 	size_t i;
-@@ -806,8 +810,11 @@
- 			return;
- 		}
- 		if(wc && !wc_cached && env->cfg->aggressive_nsec) {
--			rrset_cache_update_wildcard(env->rrset_cache, s, wc, wl,
--				env->alloc, *env->now);
-+			/* Postpone cache adjust until proof has succeeded. */
-+			wc_to_cache = 1;
-+			cache_wc = wc;
-+			cache_wl = wl;
-+			cache_s = s;
- 			wc_cached = 1;
- 		}
- 
-@@ -861,6 +868,10 @@
- 			"did not exist");
- 		chase_reply->security = sec_status_bogus;
- 		return;
-+	}
-+	if(wc_to_cache) {
-+		rrset_cache_update_wildcard(env->rrset_cache, cache_s,
-+			cache_wc, cache_wl, env->alloc, *env->now);
- 	}
- 
- 	verbose(VERB_ALGO, "Successfully validated positive response");
---- /dev/null
-+++ b/testdata/rrsig_agr_wild.rpl
-@@ -0,0 +1,374 @@
-+; config options
-+; The island of trust is at com.
-+server:
-+	trust-anchor: "test. DS 1444 8 2 8a87d067fd09a5965244fe2e317dd26d182c468e0a7f26ecc4c7b479bf89db9b"
-+	val-override-date: "20201020135527"
-+	target-fetch-policy: "0 0 0 0 0"
-+	qname-minimisation: "no"
-+	fake-sha1: yes
-+	trust-anchor-signaling: no
-+	minimal-responses: no
-+	iter-scrub-promiscuous: no
-+	aggressive-nsec: yes
-+	local-zone: test. nodefault
-+	log-servfail: yes
-+
-+stub-zone:
-+	name: "."
-+	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
-+CONFIG_END
-+
-+SCENARIO_BEGIN Test with RRSIG labels for wildcard with aggressive cache.
-+
-+; K.ROOT-SERVERS.NET.
-+RANGE_BEGIN 0 100
-+	ADDRESS 193.0.14.129 
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+. IN NS
-+SECTION ANSWER
-+. IN NS	K.ROOT-SERVERS.NET.
-+SECTION ADDITIONAL
-+K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+test. IN NS
-+SECTION AUTHORITY
-+test.	IN NS	ns.test.
-+SECTION ADDITIONAL
-+ns.test. IN A 1.2.3.5
-+ENTRY_END
-+RANGE_END
-+
-+; ns.test
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.5
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+test. IN NS
-+SECTION ANSWER
-+test.    IN NS   ns.test
-+test.	3600	IN	RRSIG	NS 8 1 3600 20201116135527 20201019135527 1444 test. RGCxIO32TbbLTk6xZmTr+fjYPH50hntBxeOQ2DIj2pDsmjALcHYtVkOfpfk2EhOhHZd+9PLuoJPbJh6a9NqLSFeBvr0XZoCZoQ2g0tCHUNHcH5EVjA2TuYBQem6DVYnPLJ3914aRx0uA1j42b8dC2xsam/XkOo7U+dLbUW2Os1s=
-+SECTION ADDITIONAL
-+ns.test. IN A 1.2.3.5
-+ns.test.	3600	IN	RRSIG	A 8 2 3600 20201116135527 20201019135527 1444 test. GskCc4/k6GjH9V9Jz2V5L2XLiizbOeWkB0feSbf+aN859S3vxVvtuqkvIgwY4LafUO1QAn/pUcv9zA7rcFO++rlg+8t6gvZTo9p3v0bfeIv2uJDsfSBD5jDh0WXlxjekfnrKrQp7zE+GiA93tWwKUWKPvxXDgP+n886e6WcbHJw=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.test. IN A
-+SECTION ANSWER
-+ns.test. IN A 1.2.3.5
-+ns.test.	3600	IN	RRSIG	A 8 2 3600 20201116135527 20201019135527 1444 test. GskCc4/k6GjH9V9Jz2V5L2XLiizbOeWkB0feSbf+aN859S3vxVvtuqkvIgwY4LafUO1QAn/pUcv9zA7rcFO++rlg+8t6gvZTo9p3v0bfeIv2uJDsfSBD5jDh0WXlxjekfnrKrQp7zE+GiA93tWwKUWKPvxXDgP+n886e6WcbHJw=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.test. IN AAAA
-+SECTION AUTHORITY
-+test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
-+test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
-+ns.test. 3600 IN NSEC nz.test. A RRSIG
-+ns.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. PElArVB3KPg8KHAP7lzcNbhFuXNxTsHNTn1dZVncB5qmWRdIaeKpaXDjpH0JSXMaelGFS+/QhuQ6Hmw9+4VyZFRqMzGhw4agUR/2bxABHcDIG4ZpUwyeSP61ATTfHUkQVxaH2wjCWI/tfmesdP2xVE4GXyUvCIBxU914MkZbULU=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+test. IN DNSKEY
-+SECTION ANSWER
-+test.    3600    IN      DNSKEY  257 3 8 AwEAAbd9WqjzE2Pynz21OG5doSf9hFzMr5dhzz2waZ3vTa+0o5r7AjTAqmA1yH/B3+aAMihUm5ucZSfVqo7+kOaRE8yFj9aivOmA1n1+JLevJq/oyvQyjxQN2Qb89LyaNUT5oKZIiL+uyyhNW3KDR3SSbQ/GBwQNDHVcZi+JDR3RC0r7 ;{id = 1444 (ksk), size = 1024b}
-+test.	3600	IN	RRSIG	DNSKEY 8 1 3600 20201116135527 20201019135527 1444 test. UmRMS4iG9NBBHZYOtpwFFcJgbEb5SfHSgHd9XRe/8pTWM31WSDayn5ViPOBMqI1T5TXg2amc13dDI574xIM2oKMus3b5cBW72jJLW13jprBtslO6P8BMWb4HNnvLrJtQjwf3ErRirtTxinLmywQtmyr1cdthyG3Gp4N7i90fHSc=
-+SECTION ADDITIONAL
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qname qtype
-+ADJUST copy_id
-+REPLY QR AA NXDOMAIN
-+SECTION QUESTION
-+domain1.test. IN A
-+SECTION ANSWER
-+SECTION AUTHORITY
-+test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
-+test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
-+test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
-+test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
-+cee.test. 3600 IN NSEC erts.test. RRSIG DS
-+cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qname qtype
-+ADJUST copy_id
-+REPLY QR AA NXDOMAIN
-+SECTION QUESTION
-+domain2.test. IN DS
-+SECTION ANSWER
-+SECTION AUTHORITY
-+test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
-+test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
-+test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
-+test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
-+cee.test. 3600 IN NSEC erts.test. RRSIG DS
-+cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qname qtype
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+example.test. IN DS
-+SECTION ANSWER
-+example.test.	3600	IN	DS	55567 8 2 a2d578906330a10a57d40462257b6ce038bad3f7bf4a45c46c46086e20a94b39
-+example.test.	3600	IN	RRSIG	DS 8 2 3600 20201116135527 20201019135527 1444 test. P7+FTYW2qHuJ4I1YbuvseEz5X1lOYAraGEHB3C5y0OOCQFmhmSiFRdquNi2NlpcS6FXLdsE0EU+Bo1+0atTG4EkMWXbpF21lrtbB51BdsnlX4Mzc/o375fvjiOMwmF6wPCUaOUN62jrVrhsE/hedaVyDphDToqL17ETohwgUO2I=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+example.test. IN NS
-+SECTION AUTHORITY
-+example.test.    IN NS   ns.example.test.
-+example.test.	3600	IN	DS	55567 8 2 a2d578906330a10a57d40462257b6ce038bad3f7bf4a45c46c46086e20a94b39
-+example.test.	3600	IN	RRSIG	DS 8 2 3600 20201116135527 20201019135527 1444 test. P7+FTYW2qHuJ4I1YbuvseEz5X1lOYAraGEHB3C5y0OOCQFmhmSiFRdquNi2NlpcS6FXLdsE0EU+Bo1+0atTG4EkMWXbpF21lrtbB51BdsnlX4Mzc/o375fvjiOMwmF6wPCUaOUN62jrVrhsE/hedaVyDphDToqL17ETohwgUO2I=
-+SECTION ADDITIONAL
-+ns.example.test. IN A 1.2.3.4
-+ENTRY_END
-+
-+RANGE_END
-+
-+; ns.example.test.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.4
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+example.test. IN NS
-+SECTION ANSWER
-+example.test.    IN NS   ns.example.test.
-+example.test.	3600	IN	RRSIG	NS 8 2 3600 20201116135527 20201019135527 55567 example.test. l1JT0wMlK0YI7/CWHzexf/k0iafUhCgN+BdgjBXIRXmSQNf4HDTiAkbcWL2/15qtnp12nQy9JeiTdSQ3vtPoHAJX4C5uTWaze4ms+Wrrf+n92sLCjacP9x50uuicH3URT6cKb1QCAPwlvlWxIlZjAMYFScSns7+C441NMJT8aE4=
-+SECTION ADDITIONAL
-+ns.example.test.         IN      A       1.2.3.4
-+ns.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. 2PWaVaccZFQgfPKXNsdEGYUVaashCAj1ZhBo9XRt5eQKUFvZcauBjMnXIuxZFyWeootn1fZGw6GuPI5W48Y0FDx38H6adprkFgQikso2Y64jDdDMWznSo38Z/XqP+U0+kq4vmwonvmEMpm7hKnNEXvhqGKyGzyBwb+CZVJ2L8Eo=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.example.test. IN A
-+SECTION ANSWER
-+ns.example.test.         IN      A       1.2.3.4
-+ns.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. 2PWaVaccZFQgfPKXNsdEGYUVaashCAj1ZhBo9XRt5eQKUFvZcauBjMnXIuxZFyWeootn1fZGw6GuPI5W48Y0FDx38H6adprkFgQikso2Y64jDdDMWznSo38Z/XqP+U0+kq4vmwonvmEMpm7hKnNEXvhqGKyGzyBwb+CZVJ2L8Eo=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.example.test. IN AAAA
-+SECTION AUTHORITY
-+example.test. 3600 IN SOA ns.example.test. host.example.test. 20301 3600 1800 604800 3600
-+example.test.	3600	IN	RRSIG	SOA 8 2 3600 20201116135527 20201019135527 55567 example.test. 2UUkScBAN37fJpSrelhE8DotKvmOzj3q9wicaanCIaCv95DE4nQnePih5B+ek3FIRjB/Uv2+z4Ro5Uxy94XAnlK0rCkDLSa0U9U7KP0ytc88sevO0x1SCPAMoZoJO6JqHkv42pdh54WSz+Zb/D8npY0j/tksHe/uX+VQnMymgb8=
-+ns.example.test. 3600 IN NSEC nz.example.test. A RRSIG
-+example.test.	3600	IN	SOA	ns.example.test. host.example.test. 20301 3600 1800 604800 3600
-+ENTRY_END
-+
-+; response to DNSKEY priming query
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+example.test. IN DNSKEY
-+SECTION ANSWER
-+example.test.	3600	IN	DNSKEY	257 3 8 AwEAAdug/L739i0mgN2nuK/bhxu3wFn5Ud9nK2+XUmZQlPUEZUC5YZvm1rfMmEWTGBn87fFxEu/kjFZHJ55JLzqsbbpVHLbmKCTT2gYR2FV2WDKROGKuYbVkJIXdKAjJ0ONuK507NinYvlWXIoxHn22KAWOd9wKgSTNHBlmGkX+ts3hh ;{id = 55567 (ksk), size = 1024b}
-+example.test.	3600	IN	RRSIG	DNSKEY 8 2 3600 20201116135527 20201019135527 55567 example.test. IbWMC6quOuZFNPAVxQLqCJ9nLhindBo826rnLcg5yMgs9dGUSPOCXAfHTmbgJAUNs9HTFfrJWNvasnETs0UOpmEuifGwWdH1OlME7Gny4RL2QmITUFeMW81Jz1tiVQxFXl6yxT0jxOxvz+bqMHlrz+8IeWQXcO+GZTPu8ueq30g=
-+ENTRY_END
-+
-+; response to query of interest
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+wild.example.test. IN A
-+SECTION ANSWER
-+wild.example.test. IN A 10.20.30.40
-+; normal RRSIG:
-+;wild.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. RzIsliJeEcLIHQGJqr5U2tfgxjzyxvwpqWYMdF2qOmb5a5erx3AFwRLbHhl7383Kdpdi+KxVKIWmkG6YCta0sWE42UeDXAVtZnFK/VeADRWpzWljQaTdIG8eN6FdB/X3gSPXnxMhsd9OoAWHPJYrwXtoFbciH6Hy0gl4Cosc+7Q=
-+; with labelcount lower, 2 lower.
-+; like it is : *.test. IN A 10.20.30.40
-+wild.example.test.	3600	IN	RRSIG	A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA=
-+SECTION AUTHORITY
-+un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
-+un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+wild2.example.test. IN DS
-+SECTION ANSWER
-+wild2.example.test. IN DS 12345 250 2 00000000
-+; normal RRSIG
-+; wild2.example.test.	3600	IN	RRSIG	DS 8 3 3600 20201116135527 20201019135527 55567 example.test. GdSaD9J3c2QwsAPRbzY7lbuqguaBNEu/19jnZIrdMx4nmRRaMOS1MqMGZyOJdYvupVA0zg32bhCbmZdHSQLwzybjIgixGeiPC9MnfHdSqZKG7QG/AlUR2A/Mhmedp7RngROgIf6c7de88zsX+60xSfvBgNtg55YmODHqOICvTLs=
-+; with labelcount lower, 2 lower.
-+; for *.test. IN DS 12345 250 2 00000000
-+wild2.example.test.	3600	IN	RRSIG	DS 8 1 3600 20201116135527 20201019135527 55567 example.test. qZQ/bfTCVuGISm6Pkq6OYDnyZMx8/uQQE3vq402UVWyy7ZrDBVI/CAErEIqz7Xl4cGgFUoezL2LCBIS7BMERCbQ0cVm3YTpnSzCgiDNJsu9W778SLOTcWlqJaiJn9EieFGkiFo2k3c1iuW++yufdhQmuXGk+DdLzE87tgvIkQm0=
-+SECTION AUTHORITY
-+un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
-+un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
-+ENTRY_END
-+RANGE_END
-+
-+STEP 1 QUERY
-+ENTRY_BEGIN
-+REPLY RD DO
-+SECTION QUESTION
-+domain1.test. IN A
-+ENTRY_END
-+
-+; Picks up NSECs for aggressive negative cache.
-+STEP 10 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA AD DO NXDOMAIN
-+SECTION QUESTION
-+domain1.test. IN A
-+SECTION AUTHORITY
-+test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
-+test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
-+test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
-+test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
-+cee.test. 3600 IN NSEC erts.test. RRSIG DS
-+cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
-+ENTRY_END
-+
-+STEP 20 QUERY
-+ENTRY_BEGIN
-+REPLY RD DO
-+SECTION QUESTION
-+wild.example.test. IN A
-+ENTRY_END
-+
-+; query for the wildcard record.
-+STEP 30 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA DO SERVFAIL
-+SECTION QUESTION
-+wild.example.test. IN A
-+ENTRY_END
-+;REPLY QR RD RA AD DO NXDOMAIN
-+;SECTION QUESTION
-+;domain1.test. IN A
-+;SECTION ANSWER
-+;wild.example.test. IN A 10.20.30.40
-+;wild.example.test.	3600	IN	RRSIG	A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA=
-+;SECTION AUTHORITY
-+;un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
-+;un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
-+;ENTRY_END
-+
-+;STEP 40 QUERY
-+;ENTRY_BEGIN
-+;REPLY RD DO
-+;SECTION QUESTION
-+;domain2.test. IN A
-+;ENTRY_END
-+;
-+;; aggressive cache synthesis, the '*.test' from the wildcard lookup.
-+;STEP 50 CHECK_ANSWER
-+;ENTRY_BEGIN
-+;MATCH all
-+;REPLY QR RD RA DO SERVFAIL
-+;SECTION QUESTION
-+;domain2.test. IN A
-+;SECTION ANSWER
-+;ENTRY_END
-+
-+STEP 60 QUERY
-+ENTRY_BEGIN
-+REPLY RD DO
-+SECTION QUESTION
-+wild2.example.test. IN DS
-+ENTRY_END
-+
-+; wild2 is for *.test DS
-+STEP 70 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA DO SERVFAIL
-+SECTION QUESTION
-+wild2.example.test. IN DS
-+SECTION ANSWER
-+ENTRY_END
-+
-+STEP 80 QUERY
-+ENTRY_BEGIN
-+REPLY RD DO
-+SECTION QUESTION
-+domain3.test. IN A
-+ENTRY_END
-+
-+; aggressive cache synthesis, the '*.test' from the wildcard lookup.
-+; with '*.test' DS record.
-+STEP 90 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+
-+; The bad answer
-+;REPLY QR RD RA DO NOERROR
-+;SECTION QUESTION
-+;domain3.test. IN A
-+;SECTION ANSWER
-+;domain3.test.   0       IN      A       10.20.30.40
-+;domain3.test.   0       IN      RRSIG   A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA= ;{id = 55567}
-+;SECTION AUTHORITY
-+;cee.test.       0       IN      NSEC    erts.test. DS RRSIG
-+;cee.test.       0       IN      RRSIG   NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA= ;{id = 1444}
-+
-+; The correct answer
-+REPLY QR RD RA AD DO NXDOMAIN
-+SECTION QUESTION
-+domain3.test. IN A
-+SECTION AUTHORITY
-+test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
-+test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
-+cee.test. 3600 IN NSEC erts.test. RRSIG DS
-+cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
-+test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
-+test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
-+ENTRY_END
-+
-+SCENARIO_END
-Description: CVE-2026-42960 - Fix possible cache poisoning while following delegation
- In scrub_normalize() (iterator/iter_scrub.c) address records in the
- additional section were unconditionally marked as allowed glue for any
- RRset in the authority section. A malicious authoritative server could
- therefore attach address records as glue for non-delegation RR types
- (e.g. MX) in the authority section and have them cached as a side effect
- of the query, enabling a cache poisoning attack while following a
- delegation.
- .
- This patch only marks additional address records as allowed glue when the
- authority-section RRset is of type NS, matching the delegation semantics.
- It complements the earlier fix for CVE-2025-11411.
- .
- A regression test (testdata/iter_scrub_mx.rpl) is added; it is discovered
- automatically by the testbound replay runner (testdata/03-testbound.tdir)
- which globs testdata/*.rpl.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/8ae4b4545dccaaabd30b597b0dcb0d9640c8cc39
-Author: NLnet Labs <unbound@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/iterator/iter_scrub.c
-+++ b/iterator/iter_scrub.c
-@@ -566,7 +566,13 @@ scrub_normalize(sldns_buffer* pkt, struct msg_parse* msg,
- 			rrset->rrset_all_next = NULL;
- 			return 1;
- 		}
--		mark_additional_rrset(pkt, msg, rrset);
-+		/* Only mark glue as allowed for type NS in the authority
-+		 * section. Other RR types do not get glue for them, it
-+		 * is allowed from the answer section, but not authority
-+		 * so that a message can not have address records cached
-+		 * as a side effect to the query. */
-+		if(rrset->type==LDNS_RR_TYPE_NS)
-+			mark_additional_rrset(pkt, msg, rrset);
- 		prev = rrset;
- 		rrset = rrset->rrset_all_next;
- 	}
---- /dev/null
-+++ b/testdata/iter_scrub_mx.rpl
-@@ -0,0 +1,107 @@
-+; config options
-+server:
-+	target-fetch-policy: "0 0 0 0 0"
-+
-+stub-zone:
-+	name: "."
-+	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
-+
-+stub-zone:
-+	name: "example.com"
-+	stub-addr: 1.2.3.4
-+CONFIG_END
-+
-+SCENARIO_BEGIN Test scrubber does not cache glue for authority MX (CVE-2026-42960)
-+
-+; K.ROOT-SERVERS.NET.
-+RANGE_BEGIN 0 100
-+	ADDRESS 193.0.14.129
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+. IN NS
-+SECTION ANSWER
-+. IN NS	K.ROOT-SERVERS.NET.
-+SECTION ADDITIONAL
-+K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
-+ENTRY_END
-+RANGE_END
-+
-+; ns.example.com.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.4
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+www.example.com. IN A
-+SECTION ANSWER
-+www.example.com. IN A	10.20.30.40
-+SECTION AUTHORITY
-+; MX in the authority section: its additional address glue must not be
-+; kept and must not be cached as a side effect of this query.
-+example.com.	IN MX	10 mail.attacker.com.
-+SECTION ADDITIONAL
-+mail.attacker.com.	IN 	A	6.6.6.6
-+ENTRY_END
-+
-+; a follow-up query for the attacker glue name; if the scrubber wrongly
-+; cached the additional A record above, this would be answered from cache.
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+mail.attacker.com. IN A
-+SECTION ANSWER
-+mail.attacker.com.	IN A	1.2.3.4
-+ENTRY_END
-+
-+RANGE_END
-+
-+STEP 1 QUERY
-+ENTRY_BEGIN
-+REPLY RD
-+SECTION QUESTION
-+www.example.com. IN A
-+ENTRY_END
-+
-+; recursion happens here.
-+STEP 10 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+www.example.com. IN A
-+SECTION ANSWER
-+www.example.com. IN A	10.20.30.40
-+SECTION AUTHORITY
-+SECTION ADDITIONAL
-+ENTRY_END
-+
-+; the attacker glue must have been scrubbed and NOT cached, so this query
-+; must be resolved from the authoritative server (returning 1.2.3.4), not
-+; from the poisoned additional-section value (6.6.6.6).
-+STEP 20 QUERY
-+ENTRY_BEGIN
-+REPLY RD
-+SECTION QUESTION
-+mail.attacker.com. IN A
-+ENTRY_END
-+
-+STEP 30 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+mail.attacker.com. IN A
-+SECTION ANSWER
-+mail.attacker.com.	IN A	1.2.3.4
-+SECTION AUTHORITY
-+SECTION ADDITIONAL
-+ENTRY_END
-+
-+SCENARIO_END
-Description: CVE-2026-32665 - not applicable to unbound 1.13.1 (Debian 11 bullseye)
- CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial of service caused by a
- quic-size budget bypass. The upstream fix (commit 01dfd2f) modifies the DoQ
- stream-handling functions in services/listen_dnsport.c (doq_stream_open_cb,
- doq_stream_datalen_complete, doq_stream_pickup_answer, doq_stream_recv_data).
- .
- The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
- 3.5 years and nine minor releases after 1.13.1 (the version shipped in Debian
- 11 "bullseye"). In the 1.13.1 source tree none of the affected code exists:
- services/listen_dnsport.c has no doq_stream_* functions, there is no
- ngtcp2/QUIC transport code, and configure.ac has no DoQ build support. The
- vulnerable code path therefore cannot be reached and the upstream fix can be
- neither applied nor back-ported.
- .
- This is a no-op documentation patch: it records the NOT-AFFECTED analysis and
- makes no code change, because no code change is required or possible for this
- version.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/01dfd2f466d383370405d8ecf939570947f3523e
-Author: Aikido Security <security@aikido.dev>
-Last-Update: 2026-08-18
-Forwarded: not-needed
----
---- /dev/null
-+++ b/doc/CVE-2026-32665.NOT-AFFECTED
-@@ -0,0 +1,37 @@
-+CVE-2026-32665 — Not applicable to unbound 1.13.1 (Debian 11 "bullseye")
-+========================================================================
-+
-+Summary
-+-------
-+CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial-of-service caused by a
-+`quic-size` budget bypass. The upstream fix (NLnetLabs/unbound commit
-+01dfd2f466d383370405d8ecf939570947f3523e) modifies the DoQ stream-handling
-+code in services/listen_dnsport.c:
-+
-+  - doq_stream_open_cb()        : removes the unconditional budget bypass for
-+                                  stream_id 0 and 4
-+  - doq_stream_datalen_complete(): adds a quic-size availability check
-+  - doq_stream_pickup_answer()  : adds a quic-size availability check
-+  - doq_stream_recv_data()      : threads the doq_conn pointer through
-+
-+Why this version is not affected
-+--------------------------------
-+The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
-+3.5 years and nine minor releases after 1.13.1 (released February 2021, the
-+version shipped in Debian 11 "bullseye" as 1.13.1-1+deb11u7).
-+
-+In this source tree (release-1.13.1) none of the affected code exists:
-+
-+  * services/listen_dnsport.c contains no doq_stream_* functions.
-+  * There is no ngtcp2 / QUIC transport code anywhere in the tree.
-+  * configure.ac has no --with-libngtcp2 option and no DoQ build support.
-+
-+Because there is no DNS-over-QUIC listener and no `quic-size` budget in this
-+version, the vulnerable code path cannot be reached. The vulnerability does
-+not apply to unbound 1.13.1.
-+
-+Conclusion
-+----------
-+No code change is required or possible for this version: the upstream fix
-+touches functions that do not exist here, so it can be neither applied nor
-+back-ported. This package version is NOT AFFECTED by CVE-2026-32665.
-Description: CVE-2026-41292 - Limit number of parsed incoming EDNS options
- Parsing a long list of incoming EDNS options degrades performance,
- allowing a remote attacker to cause a denial of service by sending a
- packet whose OPT record RDATA contains a very large number of EDNS
- options. Each option triggers per-option processing (allocation and
- append), so an attacker-controlled long list results in excessive CPU
- and memory use.
- .
- This patch caps the number of EDNS options parsed from a single message
- at MAX_PARSED_EDNS_OPTIONS (100) by adding a counter to the option
- parsing loop. In unbound 1.13.1 the single parse_edns_options() helper
- is used for both the query and the response parse paths (the upstream
- fix later split it into parse_edns_options_from_query() and
- parse_extract_edns_from_response_msg()), so guarding this one loop
- covers both vulnerable paths.
-Origin: backport, https://github.com/NLnetLabs/unbound/commit/ef5ca84360934fa1e857ebc371d4b093aea6355d
-Author: Wouter Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/util/data/msgparse.c
-+++ b/util/data/msgparse.c
-@@ -48,6 +48,8 @@
- #include "sldns/parseutil.h"
- #include "sldns/wire2str.h"
- 
-+#define MAX_PARSED_EDNS_OPTIONS 100
-+
- /** smart comparison of (compressed, valid) dnames from packet */
- static int
- smart_compare(sldns_buffer* pkt, uint8_t* dnow, 
-@@ -943,9 +945,10 @@
- parse_edns_options(uint8_t* rdata_ptr, size_t rdata_len,
- 	struct edns_data* edns, struct regional* region)
- {
-+	int i = 0;
- 	/* while still more options, and have code+len to read */
- 	/* ignores partial content (i.e. rdata len 3) */
--	while(rdata_len >= 4) {
-+	while(rdata_len >= 4 && i < MAX_PARSED_EDNS_OPTIONS) {
- 		uint16_t opt_code = sldns_read_uint16(rdata_ptr);
- 		uint16_t opt_len = sldns_read_uint16(rdata_ptr+2);
- 		rdata_ptr += 4;
-@@ -959,6 +962,7 @@
- 		}
- 		rdata_ptr += opt_len;
- 		rdata_len -= opt_len;
-+		i++;
- 	}
- 	return 1;
- }
-Description: CVE-2026-42959 - Fix crash during DNSSEC validation of malicious content.
- val_fill_reply() in validator/val_utils.c computed the write offsets for the
- ADDITIONAL section using orig->ns_numrrsets instead of chase->ns_numrrsets.
- Because chase is the reply being (re)built and its ns_numrrsets can differ
- from the original reply, this could index chase->rrsets[] beyond the slots
- that have actually been initialized, dereferencing an uninitialized rrset
- pointer and crashing the validator when processing malicious content.
- The fix uses chase->ns_numrrsets for both ADDITIONAL-section write offsets,
- matching the counters used to fill the answer and authority sections.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/94d5babaee22a016e376bdcfee2b9bb40360367c
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/validator/val_utils.c
-+++ b/validator/val_utils.c
-@@ -900,10 +900,10 @@ val_fill_reply(struct reply_info* chase, struct reply_info* orig,
- 			if(query_dname_compare(name, 
- 				orig->rrsets[i]->rk.dname) == 0)
- 			    chase->rrsets[chase->an_numrrsets
--				+orig->ns_numrrsets+chase->ar_numrrsets++] 
-+				+chase->ns_numrrsets+chase->ar_numrrsets++]
- 				= orig->rrsets[i];
- 		} else if(rrset_has_signer(orig->rrsets[i], name, len)) {
--			chase->rrsets[chase->an_numrrsets+orig->ns_numrrsets+
-+			chase->rrsets[chase->an_numrrsets+chase->ns_numrrsets+
- 				chase->ar_numrrsets++] = orig->rrsets[i];
- 		}
- 	}
 Description: Fix CVE-2026-33278 - use-after-free / RCE during DNSSEC validation.
  Upstream CVE-2026-33278 is a use-after-free in dns_msg_deepcopy_region()
  reached through the NSEC3 computational-budget suspend/resume path, both of
@@ -956,346 +129,6 @@ Last-Update: 2026-08-18
  	if(nsec3_iteration_count_high(ve, &flt, kkey))
  		return sec_status_insecure; /* iteration count too high */
  
-Description: CVE-2026-40622 - Fix "Ghost domain name" variant
- Ghost-domain attacks let an attacker keep a revoked/expiring domain name
- resolvable indefinitely by repeatedly re-injecting NS RRsets whose TTL is
- larger than the one already cached. When a more-trustworthy NS RRset is
- stored (newd->trust > cached->trust) unbound accepted the attacker-supplied
- TTL verbatim, extending the lifetime of the delegation past the entry it
- replaces. This clamps the new NS RRset TTL (and its per-RR TTLs) to that of
- the non-expired cached entry it overwrites, so an NS refresh can never
- extend a delegation's lifetime.
- .
- The upstream fix uses the TTL_IS_EXPIRED() macro, which is not present in
- this version; it is hand-translated here to the equivalent raw ttl vs
- timenow comparison already used by the sibling same-trust NS clamp in this
- function.
-Origin: upstream, https://github.com/nlnetlabs/unbound/commit/8d8fa4226613138f5a244a9f1a2506704e049180
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/services/cache/rrset.c
-+++ b/services/cache/rrset.c
-@@ -143,6 +143,16 @@ need_to_update_rrset(void* nd, void* cd, time_t timenow, int equal, int ns)
- 		if(equal && cached->ttl >= timenow && 
- 			cached->security == sec_status_bogus)
- 			return 0;
-+		/* ghost-domain: never let an NS overwrite extend lifetime
-+		 * past the entry it replaces, regardless of trust. */
-+		if(ns && cached->ttl >= timenow &&
-+			newd->ttl > cached->ttl) {
-+			size_t i;
-+			newd->ttl = cached->ttl;
-+			for(i=0; i<(newd->count+newd->rrsig_count); i++)
-+				if(newd->rr_ttl[i] > newd->ttl)
-+					newd->rr_ttl[i] = newd->ttl;
-+		}
-                 return 1;
- 	}
- 	/*	o item in cache has expired */
-new file mode 100644
---- /dev/null
-+++ b/testdata/iter_ghost_ns_childapex.rpl
-@@ -0,0 +1,299 @@
-+; config options
-+server:
-+	target-fetch-policy: "0 0 0 0 0"
-+	qname-minimisation: no
-+	minimal-responses: yes
-+	log-servfail: yes
-+	module-config: "iterator"
-+
-+stub-zone:
-+	name: "."
-+	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
-+CONFIG_END
-+
-+SCENARIO_BEGIN Test for ghost domain with a child apex NS query.
-+
-+; K.ROOT-SERVERS.NET.
-+RANGE_BEGIN 0 100
-+	ADDRESS 193.0.14.129 
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+. IN NS
-+SECTION ANSWER
-+. IN NS	K.ROOT-SERVERS.NET.
-+SECTION ADDITIONAL
-+K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+tld. IN NS
-+SECTION AUTHORITY
-+tld.	IN NS	ns.tld.
-+SECTION ADDITIONAL
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+RANGE_END
-+
-+; ns.tld
-+RANGE_BEGIN 0 15
-+	ADDRESS 1.2.3.5
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+tld. IN NS
-+SECTION ANSWER
-+tld.    IN NS   ns.tld
-+SECTION ADDITIONAL
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN A
-+SECTION ANSWER
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN AAAA
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION AUTHORITY
-+mid.tld.    5 IN NS   ns.mid.tld.
-+SECTION ADDITIONAL
-+ns.mid.tld. 5 IN A 1.2.3.4
-+ENTRY_END
-+RANGE_END
-+
-+; ns.tld
-+RANGE_BEGIN 20 100
-+	ADDRESS 1.2.3.5
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+tld. IN NS
-+SECTION ANSWER
-+tld.    IN NS   ns.tld
-+SECTION ADDITIONAL
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN A
-+SECTION ANSWER
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN AAAA
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR AA NXDOMAIN
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+RANGE_END
-+
-+; ns.mid.tld.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.4
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION ANSWER
-+mid.tld. 86400 IN NS ns.mid.tld.
-+SECTION ADDITIONAL
-+ns.mid.tld. 86400 IN A 1.2.3.4
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.mid.tld. IN A
-+SECTION ANSWER
-+ns.mid.tld.         IN      A       1.2.3.4
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.mid.tld. IN AAAA
-+SECTION AUTHORITY
-+mid.tld. 3600 IN SOA ns.mid.tld. host.mid.tld. 20301 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+sub.mid.tld. IN NS
-+SECTION AUTHORITY
-+sub.mid.tld. 3600 IN NS ns.sub.mid.tld.
-+SECTION ADDITIONAL
-+ns.sub.mid.tld. 3600 IN A 1.2.3.6
-+ENTRY_END
-+RANGE_END
-+
-+; ns.sub.mid.tld.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.6
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+sub.mid.tld. IN NS
-+SECTION ANSWER
-+sub.mid.tld.    IN NS   ns.sub.mid.tld.
-+SECTION ADDITIONAL
-+ns.sub.mid.tld.         IN      A       1.2.3.6
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.sub.mid.tld. IN A
-+SECTION ANSWER
-+ns.sub.mid.tld.         IN      A       1.2.3.6
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.sub.mid.tld. IN AAAA
-+SECTION AUTHORITY
-+sub.mid.tld. 3600 IN SOA ns.sub.mid.tld. host.sub.mid.tld. 20301 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+a.sub.mid.tld. IN A
-+SECTION ANSWER
-+a.sub.mid.tld. 3600 IN A 10.20.30.40
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+b.sub.mid.tld. IN A
-+SECTION ANSWER
-+b.sub.mid.tld. 3600 IN A 10.20.30.41
-+ENTRY_END
-+RANGE_END
-+
-+STEP 1 QUERY
-+ENTRY_BEGIN
-+REPLY RD NOERROR
-+SECTION QUESTION
-+a.sub.mid.tld. IN A
-+ENTRY_END
-+
-+STEP 2 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+a.sub.mid.tld. IN A
-+SECTION ANSWER
-+a.sub.mid.tld. 3600 IN A 10.20.30.40
-+ENTRY_END
-+
-+STEP 10 QUERY
-+ENTRY_BEGIN
-+REPLY RD NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+ENTRY_END
-+
-+STEP 11 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION ANSWER
-+mid.tld. 86400 IN NS ns.mid.tld.
-+SECTION ADDITIONAL
-+ns.mid.tld. 86400 IN A 1.2.3.4
-+ENTRY_END
-+
-+STEP 20 TIME_PASSES ELAPSE 10
-+; The authority for .tld switches to NXDOMAIN for mid.tld.
-+
-+STEP 30 QUERY
-+ENTRY_BEGIN
-+REPLY RD NOERROR
-+SECTION QUESTION
-+b.sub.mid.tld. IN A
-+ENTRY_END
-+
-+STEP 31 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NXDOMAIN
-+SECTION QUESTION
-+b.sub.mid.tld. IN A
-+SECTION ANSWER
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+
-+SCENARIO_END
 Description: CVE-2026-50252 - Fix possible cache poisoning attack by mapping
  source port population per thread.
  .
@@ -2504,3 +1337,1302 @@ Last-Update: 2026-08-18
  #ifdef CLIENT_SUBNET
  	ecs_test();
  #endif /* CLIENT_SUBNET */
+Description: CVE-2026-32665 - not applicable to unbound 1.13.1 (Debian 11 bullseye)
+ CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial of service caused by a
+ quic-size budget bypass. The upstream fix (commit 01dfd2f) modifies the DoQ
+ stream-handling functions in services/listen_dnsport.c (doq_stream_open_cb,
+ doq_stream_datalen_complete, doq_stream_pickup_answer, doq_stream_recv_data).
+ .
+ The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
+ 3.5 years and nine minor releases after 1.13.1 (the version shipped in Debian
+ 11 "bullseye"). In the 1.13.1 source tree none of the affected code exists:
+ services/listen_dnsport.c has no doq_stream_* functions, there is no
+ ngtcp2/QUIC transport code, and configure.ac has no DoQ build support. The
+ vulnerable code path therefore cannot be reached and the upstream fix can be
+ neither applied nor back-ported.
+ .
+ This is a no-op documentation patch: it records the NOT-AFFECTED analysis and
+ makes no code change, because no code change is required or possible for this
+ version.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/01dfd2f466d383370405d8ecf939570947f3523e
+Author: Aikido Security <security@aikido.dev>
+Last-Update: 2026-08-18
+Forwarded: not-needed
+---
+--- /dev/null
++++ b/doc/CVE-2026-32665.NOT-AFFECTED
+@@ -0,0 +1,37 @@
++CVE-2026-32665 — Not applicable to unbound 1.13.1 (Debian 11 "bullseye")
++========================================================================
++
++Summary
++-------
++CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial-of-service caused by a
++`quic-size` budget bypass. The upstream fix (NLnetLabs/unbound commit
++01dfd2f466d383370405d8ecf939570947f3523e) modifies the DoQ stream-handling
++code in services/listen_dnsport.c:
++
++  - doq_stream_open_cb()        : removes the unconditional budget bypass for
++                                  stream_id 0 and 4
++  - doq_stream_datalen_complete(): adds a quic-size availability check
++  - doq_stream_pickup_answer()  : adds a quic-size availability check
++  - doq_stream_recv_data()      : threads the doq_conn pointer through
++
++Why this version is not affected
++--------------------------------
++The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
++3.5 years and nine minor releases after 1.13.1 (released February 2021, the
++version shipped in Debian 11 "bullseye" as 1.13.1-1+deb11u7).
++
++In this source tree (release-1.13.1) none of the affected code exists:
++
++  * services/listen_dnsport.c contains no doq_stream_* functions.
++  * There is no ngtcp2 / QUIC transport code anywhere in the tree.
++  * configure.ac has no --with-libngtcp2 option and no DoQ build support.
++
++Because there is no DNS-over-QUIC listener and no `quic-size` budget in this
++version, the vulnerable code path cannot be reached. The vulnerability does
++not apply to unbound 1.13.1.
++
++Conclusion
++----------
++No code change is required or possible for this version: the upstream fix
++touches functions that do not exist here, so it can be neither applied nor
++back-ported. This package version is NOT AFFECTED by CVE-2026-32665.
+Description: CVE-2026-42960 - Fix possible cache poisoning while following delegation
+ In scrub_normalize() (iterator/iter_scrub.c) address records in the
+ additional section were unconditionally marked as allowed glue for any
+ RRset in the authority section. A malicious authoritative server could
+ therefore attach address records as glue for non-delegation RR types
+ (e.g. MX) in the authority section and have them cached as a side effect
+ of the query, enabling a cache poisoning attack while following a
+ delegation.
+ .
+ This patch only marks additional address records as allowed glue when the
+ authority-section RRset is of type NS, matching the delegation semantics.
+ It complements the earlier fix for CVE-2025-11411.
+ .
+ A regression test (testdata/iter_scrub_mx.rpl) is added; it is discovered
+ automatically by the testbound replay runner (testdata/03-testbound.tdir)
+ which globs testdata/*.rpl.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/8ae4b4545dccaaabd30b597b0dcb0d9640c8cc39
+Author: NLnet Labs <unbound@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/iterator/iter_scrub.c
++++ b/iterator/iter_scrub.c
+@@ -566,7 +566,13 @@ scrub_normalize(sldns_buffer* pkt, struct msg_parse* msg,
+ 			rrset->rrset_all_next = NULL;
+ 			return 1;
+ 		}
+-		mark_additional_rrset(pkt, msg, rrset);
++		/* Only mark glue as allowed for type NS in the authority
++		 * section. Other RR types do not get glue for them, it
++		 * is allowed from the answer section, but not authority
++		 * so that a message can not have address records cached
++		 * as a side effect to the query. */
++		if(rrset->type==LDNS_RR_TYPE_NS)
++			mark_additional_rrset(pkt, msg, rrset);
+ 		prev = rrset;
+ 		rrset = rrset->rrset_all_next;
+ 	}
+--- /dev/null
++++ b/testdata/iter_scrub_mx.rpl
+@@ -0,0 +1,107 @@
++; config options
++server:
++	target-fetch-policy: "0 0 0 0 0"
++
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++
++stub-zone:
++	name: "example.com"
++	stub-addr: 1.2.3.4
++CONFIG_END
++
++SCENARIO_BEGIN Test scrubber does not cache glue for authority MX (CVE-2026-42960)
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++RANGE_END
++
++; ns.example.com.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++www.example.com. IN A
++SECTION ANSWER
++www.example.com. IN A	10.20.30.40
++SECTION AUTHORITY
++; MX in the authority section: its additional address glue must not be
++; kept and must not be cached as a side effect of this query.
++example.com.	IN MX	10 mail.attacker.com.
++SECTION ADDITIONAL
++mail.attacker.com.	IN 	A	6.6.6.6
++ENTRY_END
++
++; a follow-up query for the attacker glue name; if the scrubber wrongly
++; cached the additional A record above, this would be answered from cache.
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++mail.attacker.com. IN A
++SECTION ANSWER
++mail.attacker.com.	IN A	1.2.3.4
++ENTRY_END
++
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD
++SECTION QUESTION
++www.example.com. IN A
++ENTRY_END
++
++; recursion happens here.
++STEP 10 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++www.example.com. IN A
++SECTION ANSWER
++www.example.com. IN A	10.20.30.40
++SECTION AUTHORITY
++SECTION ADDITIONAL
++ENTRY_END
++
++; the attacker glue must have been scrubbed and NOT cached, so this query
++; must be resolved from the authoritative server (returning 1.2.3.4), not
++; from the poisoned additional-section value (6.6.6.6).
++STEP 20 QUERY
++ENTRY_BEGIN
++REPLY RD
++SECTION QUESTION
++mail.attacker.com. IN A
++ENTRY_END
++
++STEP 30 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++mail.attacker.com. IN A
++SECTION ANSWER
++mail.attacker.com.	IN A	1.2.3.4
++SECTION AUTHORITY
++SECTION ADDITIONAL
++ENTRY_END
++
++SCENARIO_END
+Description: CVE-2026-41292 - Limit number of parsed incoming EDNS options
+ Parsing a long list of incoming EDNS options degrades performance,
+ allowing a remote attacker to cause a denial of service by sending a
+ packet whose OPT record RDATA contains a very large number of EDNS
+ options. Each option triggers per-option processing (allocation and
+ append), so an attacker-controlled long list results in excessive CPU
+ and memory use.
+ .
+ This patch caps the number of EDNS options parsed from a single message
+ at MAX_PARSED_EDNS_OPTIONS (100) by adding a counter to the option
+ parsing loop. In unbound 1.13.1 the single parse_edns_options() helper
+ is used for both the query and the response parse paths (the upstream
+ fix later split it into parse_edns_options_from_query() and
+ parse_extract_edns_from_response_msg()), so guarding this one loop
+ covers both vulnerable paths.
+Origin: backport, https://github.com/NLnetLabs/unbound/commit/ef5ca84360934fa1e857ebc371d4b093aea6355d
+Author: Wouter Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/util/data/msgparse.c
++++ b/util/data/msgparse.c
+@@ -48,6 +48,8 @@
+ #include "sldns/parseutil.h"
+ #include "sldns/wire2str.h"
+ 
++#define MAX_PARSED_EDNS_OPTIONS 100
++
+ /** smart comparison of (compressed, valid) dnames from packet */
+ static int
+ smart_compare(sldns_buffer* pkt, uint8_t* dnow, 
+@@ -943,9 +945,10 @@
+ parse_edns_options(uint8_t* rdata_ptr, size_t rdata_len,
+ 	struct edns_data* edns, struct regional* region)
+ {
++	int i = 0;
+ 	/* while still more options, and have code+len to read */
+ 	/* ignores partial content (i.e. rdata len 3) */
+-	while(rdata_len >= 4) {
++	while(rdata_len >= 4 && i < MAX_PARSED_EDNS_OPTIONS) {
+ 		uint16_t opt_code = sldns_read_uint16(rdata_ptr);
+ 		uint16_t opt_len = sldns_read_uint16(rdata_ptr+2);
+ 		rdata_ptr += 4;
+@@ -959,6 +962,7 @@
+ 		}
+ 		rdata_ptr += opt_len;
+ 		rdata_len -= opt_len;
++		i++;
+ 	}
+ 	return 1;
+ }
+Description: CVE-2026-44690 - Fix cross-zone wildcard cache poisoning via RRSIG.labels manipulation
+ An attacker could poison the aggressive NSEC cache with wildcard-expanded
+ records whose RRSIG signer is outside the authoritative zone, by manipulating
+ the RRSIG labels field. This allowed cross-zone cache poisoning (CWE-345).
+ .
+ The fix hardens three places:
+ .
+  * validator/val_sigcrypt.c: reject an RRSIG whose labels count is lower than
+    the label count of the signer name (an impossible-to-be-valid wildcard).
+  * validator/validator.c: postpone the aggressive-NSEC wildcard cache update
+    until the positive wildcard proof has actually succeeded, instead of
+    caching the expansion eagerly.
+  * services/cache/rrset.c: before caching a wildcard expansion, verify that
+    the wildcard canonical parent falls within the authority of every RRSIG
+    signer of the rrset (dname_subdomain_rrsig_signers), otherwise drop it.
+ .
+ The internal helper rrsig_get_signer() is exported from validator/val_utils.c
+ for reuse by the rrset cache. A regression test (testdata/rrsig_agr_wild.rpl)
+ from the upstream fix is included; testbound auto-discovers testdata/*.rpl.
+ .
+ This is a backport of the upstream fix to 1.13.x: the target predates the
+ EDE/reason_bogus parameter of dnskey_verify_rrset_sig(), so the *reason_bogus
+ assignments from the upstream hunk are omitted while the security check is
+ preserved.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f7637a4f1811f4a9331707d8a95cf0af65a97c0f
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/3d5e6c06923eff9eac2f5e31a69c43a15ca9d3c2
+Bug: CVE-2026-44690
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/services/cache/rrset.c
++++ b/services/cache/rrset.c
+@@ -46,9 +46,11 @@
+ #include "util/data/packed_rrset.h"
+ #include "util/data/msgreply.h"
+ #include "util/data/msgparse.h"
++#include "util/data/dname.h"
+ #include "util/regional.h"
+ #include "util/alloc.h"
+ #include "util/net_help.h"
++#include "validator/val_utils.h"
+ 
+ void
+ rrset_markdel(void* key)
+@@ -239,12 +241,43 @@
+ 	return 0;
+ }
+ 
+-void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache, 
++/** See if the name is a within signer authority */
++static int
++dname_subdomain_rrsig_signers(uint8_t* dname,
++	struct ub_packed_rrset_key* rrset)
++{
++	struct packed_rrset_data* d = (struct packed_rrset_data*)
++		rrset->entry.data;
++	size_t i;
++	if(!d || !d->rrsig_count)
++		return 0;
++	for(i=0; i<d->rrsig_count; i++) {
++		uint8_t* sname = NULL;
++		size_t slen = 0;
++		rrsig_get_signer(d->rr_data[d->count+i], d->rr_len[d->count+i],
++			&sname, &slen);
++		if(!sname || !slen)
++			return 0; /* malformed */
++		if(!dname_subdomain_c(dname, sname))
++			return 0; /* not a subdomain */
++	}
++	return 1;
++}
++
++void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache,
+ 	struct ub_packed_rrset_key* rrset, uint8_t* ce, size_t ce_len,
+ 	struct alloc_cache* alloc, time_t timenow)
+ {
+ 	struct rrset_ref ref;
+ 	uint8_t wc_dname[LDNS_MAX_DOMAINLEN+3];
++
++	/* See if the RRSIG signer name allows this wildcard,
++	 * the new rrset should fall within the zone of the RRSIG signer(s). */
++	if(!dname_subdomain_rrsig_signers(ce, rrset)) {
++		verbose(VERB_ALGO, "wildcard canonical parent outside signer authority");
++		return;
++	}
++
+ 	rrset = packed_rrset_copy_alloc(rrset, alloc, timenow);
+ 	if(!rrset) {
+ 		log_err("malloc failure in rrset_cache_update_wildcard");
+--- a/validator/val_sigcrypt.c
++++ b/validator/val_sigcrypt.c
+@@ -1470,6 +1470,11 @@
+ 		*reason = "signature labelcount out of range";
+ 		return sec_status_bogus;
+ 	}
++	if((int)sig[2+3] < dname_signame_label_count(signer)) {
++		verbose(VERB_QUERY, "verify: RRSIG label count too low for signer");
++		*reason = "signature labelcount lower than signature signer";
++		return sec_status_bogus;
++	}
+ 
+ 	/* original ttl, always ok */
+ 
+--- a/validator/val_utils.c
++++ b/validator/val_utils.c
+@@ -130,7 +130,7 @@
+ }
+ 
+ /** Get signer name from RRSIG */
+-static void
++void
+ rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname, size_t* slen)
+ {
+ 	/* RRSIG rdata is not allowed to be compressed, it is stored
+--- a/validator/val_utils.h
++++ b/validator/val_utils.h
+@@ -424,4 +424,8 @@
+ struct dns_msg* val_find_DS(struct module_env* env, uint8_t* nm, size_t nmlen,
+ 	uint16_t c, struct regional* region, uint8_t* topname);
+ 
++/** Get signer name from RRSIG, sname is NULL if malformed. */
++void rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname,
++	size_t* slen);
++
+ #endif /* VALIDATOR_VAL_UTILS_H */
+--- a/validator/validator.c
++++ b/validator/validator.c
+@@ -786,6 +786,10 @@
+ 	uint8_t* wc = NULL;
+ 	size_t wl;
+ 	int wc_cached = 0;
++	int wc_to_cache = 0;
++	uint8_t* cache_wc = NULL;
++	size_t cache_wl = 0;
++	struct ub_packed_rrset_key* cache_s = NULL;
+ 	int wc_NSEC_ok = 0;
+ 	int nsec3s_seen = 0;
+ 	size_t i;
+@@ -806,8 +810,11 @@
+ 			return;
+ 		}
+ 		if(wc && !wc_cached && env->cfg->aggressive_nsec) {
+-			rrset_cache_update_wildcard(env->rrset_cache, s, wc, wl,
+-				env->alloc, *env->now);
++			/* Postpone cache adjust until proof has succeeded. */
++			wc_to_cache = 1;
++			cache_wc = wc;
++			cache_wl = wl;
++			cache_s = s;
+ 			wc_cached = 1;
+ 		}
+ 
+@@ -861,6 +868,10 @@
+ 			"did not exist");
+ 		chase_reply->security = sec_status_bogus;
+ 		return;
++	}
++	if(wc_to_cache) {
++		rrset_cache_update_wildcard(env->rrset_cache, cache_s,
++			cache_wc, cache_wl, env->alloc, *env->now);
+ 	}
+ 
+ 	verbose(VERB_ALGO, "Successfully validated positive response");
+--- /dev/null
++++ b/testdata/rrsig_agr_wild.rpl
+@@ -0,0 +1,374 @@
++; config options
++; The island of trust is at com.
++server:
++	trust-anchor: "test. DS 1444 8 2 8a87d067fd09a5965244fe2e317dd26d182c468e0a7f26ecc4c7b479bf89db9b"
++	val-override-date: "20201020135527"
++	target-fetch-policy: "0 0 0 0 0"
++	qname-minimisation: "no"
++	fake-sha1: yes
++	trust-anchor-signaling: no
++	minimal-responses: no
++	iter-scrub-promiscuous: no
++	aggressive-nsec: yes
++	local-zone: test. nodefault
++	log-servfail: yes
++
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++CONFIG_END
++
++SCENARIO_BEGIN Test with RRSIG labels for wildcard with aggressive cache.
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129 
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++test. IN NS
++SECTION AUTHORITY
++test.	IN NS	ns.test.
++SECTION ADDITIONAL
++ns.test. IN A 1.2.3.5
++ENTRY_END
++RANGE_END
++
++; ns.test
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.5
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++test. IN NS
++SECTION ANSWER
++test.    IN NS   ns.test
++test.	3600	IN	RRSIG	NS 8 1 3600 20201116135527 20201019135527 1444 test. RGCxIO32TbbLTk6xZmTr+fjYPH50hntBxeOQ2DIj2pDsmjALcHYtVkOfpfk2EhOhHZd+9PLuoJPbJh6a9NqLSFeBvr0XZoCZoQ2g0tCHUNHcH5EVjA2TuYBQem6DVYnPLJ3914aRx0uA1j42b8dC2xsam/XkOo7U+dLbUW2Os1s=
++SECTION ADDITIONAL
++ns.test. IN A 1.2.3.5
++ns.test.	3600	IN	RRSIG	A 8 2 3600 20201116135527 20201019135527 1444 test. GskCc4/k6GjH9V9Jz2V5L2XLiizbOeWkB0feSbf+aN859S3vxVvtuqkvIgwY4LafUO1QAn/pUcv9zA7rcFO++rlg+8t6gvZTo9p3v0bfeIv2uJDsfSBD5jDh0WXlxjekfnrKrQp7zE+GiA93tWwKUWKPvxXDgP+n886e6WcbHJw=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.test. IN A
++SECTION ANSWER
++ns.test. IN A 1.2.3.5
++ns.test.	3600	IN	RRSIG	A 8 2 3600 20201116135527 20201019135527 1444 test. GskCc4/k6GjH9V9Jz2V5L2XLiizbOeWkB0feSbf+aN859S3vxVvtuqkvIgwY4LafUO1QAn/pUcv9zA7rcFO++rlg+8t6gvZTo9p3v0bfeIv2uJDsfSBD5jDh0WXlxjekfnrKrQp7zE+GiA93tWwKUWKPvxXDgP+n886e6WcbHJw=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.test. IN AAAA
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++ns.test. 3600 IN NSEC nz.test. A RRSIG
++ns.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. PElArVB3KPg8KHAP7lzcNbhFuXNxTsHNTn1dZVncB5qmWRdIaeKpaXDjpH0JSXMaelGFS+/QhuQ6Hmw9+4VyZFRqMzGhw4agUR/2bxABHcDIG4ZpUwyeSP61ATTfHUkQVxaH2wjCWI/tfmesdP2xVE4GXyUvCIBxU914MkZbULU=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++test. IN DNSKEY
++SECTION ANSWER
++test.    3600    IN      DNSKEY  257 3 8 AwEAAbd9WqjzE2Pynz21OG5doSf9hFzMr5dhzz2waZ3vTa+0o5r7AjTAqmA1yH/B3+aAMihUm5ucZSfVqo7+kOaRE8yFj9aivOmA1n1+JLevJq/oyvQyjxQN2Qb89LyaNUT5oKZIiL+uyyhNW3KDR3SSbQ/GBwQNDHVcZi+JDR3RC0r7 ;{id = 1444 (ksk), size = 1024b}
++test.	3600	IN	RRSIG	DNSKEY 8 1 3600 20201116135527 20201019135527 1444 test. UmRMS4iG9NBBHZYOtpwFFcJgbEb5SfHSgHd9XRe/8pTWM31WSDayn5ViPOBMqI1T5TXg2amc13dDI574xIM2oKMus3b5cBW72jJLW13jprBtslO6P8BMWb4HNnvLrJtQjwf3ErRirtTxinLmywQtmyr1cdthyG3Gp4N7i90fHSc=
++SECTION ADDITIONAL
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qname qtype
++ADJUST copy_id
++REPLY QR AA NXDOMAIN
++SECTION QUESTION
++domain1.test. IN A
++SECTION ANSWER
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qname qtype
++ADJUST copy_id
++REPLY QR AA NXDOMAIN
++SECTION QUESTION
++domain2.test. IN DS
++SECTION ANSWER
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qname qtype
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++example.test. IN DS
++SECTION ANSWER
++example.test.	3600	IN	DS	55567 8 2 a2d578906330a10a57d40462257b6ce038bad3f7bf4a45c46c46086e20a94b39
++example.test.	3600	IN	RRSIG	DS 8 2 3600 20201116135527 20201019135527 1444 test. P7+FTYW2qHuJ4I1YbuvseEz5X1lOYAraGEHB3C5y0OOCQFmhmSiFRdquNi2NlpcS6FXLdsE0EU+Bo1+0atTG4EkMWXbpF21lrtbB51BdsnlX4Mzc/o375fvjiOMwmF6wPCUaOUN62jrVrhsE/hedaVyDphDToqL17ETohwgUO2I=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN NS
++SECTION AUTHORITY
++example.test.    IN NS   ns.example.test.
++example.test.	3600	IN	DS	55567 8 2 a2d578906330a10a57d40462257b6ce038bad3f7bf4a45c46c46086e20a94b39
++example.test.	3600	IN	RRSIG	DS 8 2 3600 20201116135527 20201019135527 1444 test. P7+FTYW2qHuJ4I1YbuvseEz5X1lOYAraGEHB3C5y0OOCQFmhmSiFRdquNi2NlpcS6FXLdsE0EU+Bo1+0atTG4EkMWXbpF21lrtbB51BdsnlX4Mzc/o375fvjiOMwmF6wPCUaOUN62jrVrhsE/hedaVyDphDToqL17ETohwgUO2I=
++SECTION ADDITIONAL
++ns.example.test. IN A 1.2.3.4
++ENTRY_END
++
++RANGE_END
++
++; ns.example.test.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN NS
++SECTION ANSWER
++example.test.    IN NS   ns.example.test.
++example.test.	3600	IN	RRSIG	NS 8 2 3600 20201116135527 20201019135527 55567 example.test. l1JT0wMlK0YI7/CWHzexf/k0iafUhCgN+BdgjBXIRXmSQNf4HDTiAkbcWL2/15qtnp12nQy9JeiTdSQ3vtPoHAJX4C5uTWaze4ms+Wrrf+n92sLCjacP9x50uuicH3URT6cKb1QCAPwlvlWxIlZjAMYFScSns7+C441NMJT8aE4=
++SECTION ADDITIONAL
++ns.example.test.         IN      A       1.2.3.4
++ns.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. 2PWaVaccZFQgfPKXNsdEGYUVaashCAj1ZhBo9XRt5eQKUFvZcauBjMnXIuxZFyWeootn1fZGw6GuPI5W48Y0FDx38H6adprkFgQikso2Y64jDdDMWznSo38Z/XqP+U0+kq4vmwonvmEMpm7hKnNEXvhqGKyGzyBwb+CZVJ2L8Eo=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.example.test. IN A
++SECTION ANSWER
++ns.example.test.         IN      A       1.2.3.4
++ns.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. 2PWaVaccZFQgfPKXNsdEGYUVaashCAj1ZhBo9XRt5eQKUFvZcauBjMnXIuxZFyWeootn1fZGw6GuPI5W48Y0FDx38H6adprkFgQikso2Y64jDdDMWznSo38Z/XqP+U0+kq4vmwonvmEMpm7hKnNEXvhqGKyGzyBwb+CZVJ2L8Eo=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.example.test. IN AAAA
++SECTION AUTHORITY
++example.test. 3600 IN SOA ns.example.test. host.example.test. 20301 3600 1800 604800 3600
++example.test.	3600	IN	RRSIG	SOA 8 2 3600 20201116135527 20201019135527 55567 example.test. 2UUkScBAN37fJpSrelhE8DotKvmOzj3q9wicaanCIaCv95DE4nQnePih5B+ek3FIRjB/Uv2+z4Ro5Uxy94XAnlK0rCkDLSa0U9U7KP0ytc88sevO0x1SCPAMoZoJO6JqHkv42pdh54WSz+Zb/D8npY0j/tksHe/uX+VQnMymgb8=
++ns.example.test. 3600 IN NSEC nz.example.test. A RRSIG
++example.test.	3600	IN	SOA	ns.example.test. host.example.test. 20301 3600 1800 604800 3600
++ENTRY_END
++
++; response to DNSKEY priming query
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN DNSKEY
++SECTION ANSWER
++example.test.	3600	IN	DNSKEY	257 3 8 AwEAAdug/L739i0mgN2nuK/bhxu3wFn5Ud9nK2+XUmZQlPUEZUC5YZvm1rfMmEWTGBn87fFxEu/kjFZHJ55JLzqsbbpVHLbmKCTT2gYR2FV2WDKROGKuYbVkJIXdKAjJ0ONuK507NinYvlWXIoxHn22KAWOd9wKgSTNHBlmGkX+ts3hh ;{id = 55567 (ksk), size = 1024b}
++example.test.	3600	IN	RRSIG	DNSKEY 8 2 3600 20201116135527 20201019135527 55567 example.test. IbWMC6quOuZFNPAVxQLqCJ9nLhindBo826rnLcg5yMgs9dGUSPOCXAfHTmbgJAUNs9HTFfrJWNvasnETs0UOpmEuifGwWdH1OlME7Gny4RL2QmITUFeMW81Jz1tiVQxFXl6yxT0jxOxvz+bqMHlrz+8IeWQXcO+GZTPu8ueq30g=
++ENTRY_END
++
++; response to query of interest
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++wild.example.test. IN A
++SECTION ANSWER
++wild.example.test. IN A 10.20.30.40
++; normal RRSIG:
++;wild.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. RzIsliJeEcLIHQGJqr5U2tfgxjzyxvwpqWYMdF2qOmb5a5erx3AFwRLbHhl7383Kdpdi+KxVKIWmkG6YCta0sWE42UeDXAVtZnFK/VeADRWpzWljQaTdIG8eN6FdB/X3gSPXnxMhsd9OoAWHPJYrwXtoFbciH6Hy0gl4Cosc+7Q=
++; with labelcount lower, 2 lower.
++; like it is : *.test. IN A 10.20.30.40
++wild.example.test.	3600	IN	RRSIG	A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA=
++SECTION AUTHORITY
++un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
++un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++wild2.example.test. IN DS
++SECTION ANSWER
++wild2.example.test. IN DS 12345 250 2 00000000
++; normal RRSIG
++; wild2.example.test.	3600	IN	RRSIG	DS 8 3 3600 20201116135527 20201019135527 55567 example.test. GdSaD9J3c2QwsAPRbzY7lbuqguaBNEu/19jnZIrdMx4nmRRaMOS1MqMGZyOJdYvupVA0zg32bhCbmZdHSQLwzybjIgixGeiPC9MnfHdSqZKG7QG/AlUR2A/Mhmedp7RngROgIf6c7de88zsX+60xSfvBgNtg55YmODHqOICvTLs=
++; with labelcount lower, 2 lower.
++; for *.test. IN DS 12345 250 2 00000000
++wild2.example.test.	3600	IN	RRSIG	DS 8 1 3600 20201116135527 20201019135527 55567 example.test. qZQ/bfTCVuGISm6Pkq6OYDnyZMx8/uQQE3vq402UVWyy7ZrDBVI/CAErEIqz7Xl4cGgFUoezL2LCBIS7BMERCbQ0cVm3YTpnSzCgiDNJsu9W778SLOTcWlqJaiJn9EieFGkiFo2k3c1iuW++yufdhQmuXGk+DdLzE87tgvIkQm0=
++SECTION AUTHORITY
++un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
++un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
++ENTRY_END
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++domain1.test. IN A
++ENTRY_END
++
++; Picks up NSECs for aggressive negative cache.
++STEP 10 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA AD DO NXDOMAIN
++SECTION QUESTION
++domain1.test. IN A
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++ENTRY_END
++
++STEP 20 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++wild.example.test. IN A
++ENTRY_END
++
++; query for the wildcard record.
++STEP 30 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA DO SERVFAIL
++SECTION QUESTION
++wild.example.test. IN A
++ENTRY_END
++;REPLY QR RD RA AD DO NXDOMAIN
++;SECTION QUESTION
++;domain1.test. IN A
++;SECTION ANSWER
++;wild.example.test. IN A 10.20.30.40
++;wild.example.test.	3600	IN	RRSIG	A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA=
++;SECTION AUTHORITY
++;un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
++;un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
++;ENTRY_END
++
++;STEP 40 QUERY
++;ENTRY_BEGIN
++;REPLY RD DO
++;SECTION QUESTION
++;domain2.test. IN A
++;ENTRY_END
++;
++;; aggressive cache synthesis, the '*.test' from the wildcard lookup.
++;STEP 50 CHECK_ANSWER
++;ENTRY_BEGIN
++;MATCH all
++;REPLY QR RD RA DO SERVFAIL
++;SECTION QUESTION
++;domain2.test. IN A
++;SECTION ANSWER
++;ENTRY_END
++
++STEP 60 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++wild2.example.test. IN DS
++ENTRY_END
++
++; wild2 is for *.test DS
++STEP 70 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA DO SERVFAIL
++SECTION QUESTION
++wild2.example.test. IN DS
++SECTION ANSWER
++ENTRY_END
++
++STEP 80 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++domain3.test. IN A
++ENTRY_END
++
++; aggressive cache synthesis, the '*.test' from the wildcard lookup.
++; with '*.test' DS record.
++STEP 90 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++
++; The bad answer
++;REPLY QR RD RA DO NOERROR
++;SECTION QUESTION
++;domain3.test. IN A
++;SECTION ANSWER
++;domain3.test.   0       IN      A       10.20.30.40
++;domain3.test.   0       IN      RRSIG   A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA= ;{id = 55567}
++;SECTION AUTHORITY
++;cee.test.       0       IN      NSEC    erts.test. DS RRSIG
++;cee.test.       0       IN      RRSIG   NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA= ;{id = 1444}
++
++; The correct answer
++REPLY QR RD RA AD DO NXDOMAIN
++SECTION QUESTION
++domain3.test. IN A
++SECTION AUTHORITY
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++ENTRY_END
++
++SCENARIO_END
+Description: CVE-2026-42944 - Heap overflow and crash with multiple nsid, cookie, padding EDNS options
+ Multiple (or large) nsid, cookie and padding EDNS options in a query could
+ cause unbound to under-reserve buffer space and write EDNS option data past
+ the end of the reply buffer, resulting in a heap overflow and crash.
+ .
+ This is an architecture-scoped backport of upstream commit
+ fe946ba4e935a1528e6866e108e5bc9e7533ae18 to the 1.13.1 code base shipped in
+ Debian bullseye.  The upstream commit also touches EDE handling, EDNS cookie
+ parsing and the parse-time option de-duplication in
+ parse_edns_options_from_query(); none of that code exists in 1.13.1, so those
+ hunks are not applicable and are intentionally omitted.  The applicable
+ root-cause fixes that this backport carries over are:
+ .
+   * calc_edns_field_size() accumulates option sizes in a size_t but returned a
+     uint16_t.  With enough / large options the returned size wrapped past
+     65535, so the caller reserved too little space in the packet buffer.  The
+     return type (and its prototype) is widened to size_t so the reservation is
+     always correct.
+   * attach_edns_record_max_msg_sz() now bounds-checks every option (and the
+     padding option) against both max_msg_sz and the actual buffer capacity
+     before writing, so it stops instead of overflowing when the options do not
+     fit.
+ .
+ A replacement regression test (edns_encode_overflow_test) is added to
+ testcode/unitmain.c because the upstream EDE-based tests do not exist in this
+ branch.  It builds an EDNS option list whose combined rdata exceeds 65535
+ octets and asserts that calc_edns_field_size() reports the full, untruncated
+ size (> 65535), which fails against the pre-fix uint16_t return value.
+Origin: backport, https://github.com/NLnetLabs/unbound/commit/fe946ba4e935a1528e6866e108e5bc9e7533ae18
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/util/data/msgencode.c
++++ b/util/data/msgencode.c
+@@ -789,7 +789,7 @@
+ 	return 1;
+ }
+ 
+-uint16_t
++size_t
+ calc_edns_field_size(struct edns_data* edns)
+ {
+ 	size_t rdatalen = 0;
+@@ -832,12 +832,18 @@
+ 			padding_option = opt;
+ 			continue;
+ 		}
++		if(sldns_buffer_position(pkt) + opt->opt_len + 4 > max_msg_sz)
++			break; /* no space for it */
++		if(!sldns_buffer_available(pkt, 4 + opt->opt_len))
++			break;
+ 		sldns_buffer_write_u16(pkt, opt->opt_code);
+ 		sldns_buffer_write_u16(pkt, opt->opt_len);
+ 		if(opt->opt_len != 0)
+ 			sldns_buffer_write(pkt, opt->opt_data, opt->opt_len);
+ 	}
+-	if (padding_option && edns->padding_block_size ) {
++	if (padding_option && edns->padding_block_size &&
++		sldns_buffer_position(pkt)+4 <= max_msg_sz &&
++		sldns_buffer_available(pkt, 4) /* if there is space for it */) {
+ 		size_t pad_pos = sldns_buffer_position(pkt);
+ 		size_t msg_sz = ((pad_pos + 3) / edns->padding_block_size + 1)
+ 		                               * edns->padding_block_size;
+--- a/util/data/msgencode.h
++++ b/util/data/msgencode.h
+@@ -106,7 +106,7 @@
+  * @param edns: edns data or NULL.
+  * @return octets to reserve for EDNS.
+  */
+-uint16_t calc_edns_field_size(struct edns_data* edns);
++size_t calc_edns_field_size(struct edns_data* edns);
+ 
+ /**
+  * Attach EDNS record to buffer. Buffer has complete packet. There must
+--- a/testcode/unitmain.c
++++ b/testcode/unitmain.c
+@@ -885,6 +885,47 @@
+ 	ub_randfree(outnet.rnd);
+ }
+ 
++#include "util/data/msgparse.h"
++#include "util/data/msgencode.h"
++#include "util/regional.h"
++/** Regression test for CVE-2026-42944: the EDNS option size accounting must
++ * not truncate to 16 bits.  Multiple/large nsid, cookie or padding EDNS
++ * options previously wrapped a uint16_t accumulator, under-reserving buffer
++ * space and causing a heap overflow when the record was written out. */
++static void
++edns_encode_overflow_test(void)
++{
++	struct regional* region = regional_create();
++	struct edns_data edns;
++	struct edns_option* opts = NULL;
++	size_t i, field_size, total = 0;
++	unit_show_func("util/data/msgencode.c", "calc_edns_field_size");
++	unit_assert(region);
++	memset(&edns, 0, sizeof(edns));
++	edns.edns_present = 1;
++	edns.udp_size = 4096;
++	/* Build several large EDNS options whose combined rdata clearly
++	 * exceeds 65535 octets, so a 16-bit size accumulator would wrap. */
++	for(i=0; i<5; i++) {
++		struct edns_option* o = (struct edns_option*)
++			regional_alloc_zero(region, sizeof(*o));
++		unit_assert(o);
++		o->opt_code = LDNS_EDNS_NSID;
++		o->opt_len = 20000;
++		o->opt_data = NULL; /* size accounting does not read data */
++		o->next = opts;
++		opts = o;
++		total += 4 + o->opt_len;
++	}
++	edns.opt_list = opts;
++	field_size = calc_edns_field_size(&edns);
++	/* '.' + type + class + ttl + rdatalen == 11 octets of overhead. */
++	unit_assert(field_size == (size_t)11 + total);
++	/* The key property: the size must NOT be truncated to 16 bits. */
++	unit_assert(field_size > 65535);
++	regional_destroy(region);
++}
++
+ void unit_show_func(const char* file, const char* func)
+ {
+ 	printf("test %s:%s\n", file, func);
+@@ -953,6 +994,7 @@
+ 	infra_test();
+ 	ldns_test();
+ 	msgparse_test();
++	edns_encode_overflow_test();
+ 	tcpid_test();
+ #ifdef CLIENT_SUBNET
+ 	ecs_test();
+Description: CVE-2026-42959 - Fix crash during DNSSEC validation of malicious content.
+ val_fill_reply() in validator/val_utils.c computed the write offsets for the
+ ADDITIONAL section using orig->ns_numrrsets instead of chase->ns_numrrsets.
+ Because chase is the reply being (re)built and its ns_numrrsets can differ
+ from the original reply, this could index chase->rrsets[] beyond the slots
+ that have actually been initialized, dereferencing an uninitialized rrset
+ pointer and crashing the validator when processing malicious content.
+ The fix uses chase->ns_numrrsets for both ADDITIONAL-section write offsets,
+ matching the counters used to fill the answer and authority sections.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/94d5babaee22a016e376bdcfee2b9bb40360367c
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/validator/val_utils.c
++++ b/validator/val_utils.c
+@@ -900,10 +900,10 @@ val_fill_reply(struct reply_info* chase, struct reply_info* orig,
+ 			if(query_dname_compare(name, 
+ 				orig->rrsets[i]->rk.dname) == 0)
+ 			    chase->rrsets[chase->an_numrrsets
+-				+orig->ns_numrrsets+chase->ar_numrrsets++] 
++				+chase->ns_numrrsets+chase->ar_numrrsets++]
+ 				= orig->rrsets[i];
+ 		} else if(rrset_has_signer(orig->rrsets[i], name, len)) {
+-			chase->rrsets[chase->an_numrrsets+orig->ns_numrrsets+
++			chase->rrsets[chase->an_numrrsets+chase->ns_numrrsets+
+ 				chase->ar_numrrsets++] = orig->rrsets[i];
+ 		}
+ 	}
+Description: CVE-2026-40622 - Fix "Ghost domain name" variant
+ Ghost-domain attacks let an attacker keep a revoked/expiring domain name
+ resolvable indefinitely by repeatedly re-injecting NS RRsets whose TTL is
+ larger than the one already cached. When a more-trustworthy NS RRset is
+ stored (newd->trust > cached->trust) unbound accepted the attacker-supplied
+ TTL verbatim, extending the lifetime of the delegation past the entry it
+ replaces. This clamps the new NS RRset TTL (and its per-RR TTLs) to that of
+ the non-expired cached entry it overwrites, so an NS refresh can never
+ extend a delegation's lifetime.
+ .
+ The upstream fix uses the TTL_IS_EXPIRED() macro, which is not present in
+ this version; it is hand-translated here to the equivalent raw ttl vs
+ timenow comparison already used by the sibling same-trust NS clamp in this
+ function.
+Origin: upstream, https://github.com/nlnetlabs/unbound/commit/8d8fa4226613138f5a244a9f1a2506704e049180
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/services/cache/rrset.c
++++ b/services/cache/rrset.c
+@@ -143,6 +143,16 @@ need_to_update_rrset(void* nd, void* cd, time_t timenow, int equal, int ns)
+ 		if(equal && cached->ttl >= timenow && 
+ 			cached->security == sec_status_bogus)
+ 			return 0;
++		/* ghost-domain: never let an NS overwrite extend lifetime
++		 * past the entry it replaces, regardless of trust. */
++		if(ns && cached->ttl >= timenow &&
++			newd->ttl > cached->ttl) {
++			size_t i;
++			newd->ttl = cached->ttl;
++			for(i=0; i<(newd->count+newd->rrsig_count); i++)
++				if(newd->rr_ttl[i] > newd->ttl)
++					newd->rr_ttl[i] = newd->ttl;
++		}
+                 return 1;
+ 	}
+ 	/*	o item in cache has expired */
+new file mode 100644
+--- /dev/null
++++ b/testdata/iter_ghost_ns_childapex.rpl
+@@ -0,0 +1,299 @@
++; config options
++server:
++	target-fetch-policy: "0 0 0 0 0"
++	qname-minimisation: no
++	minimal-responses: yes
++	log-servfail: yes
++	module-config: "iterator"
++
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++CONFIG_END
++
++SCENARIO_BEGIN Test for ghost domain with a child apex NS query.
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129 
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++tld. IN NS
++SECTION AUTHORITY
++tld.	IN NS	ns.tld.
++SECTION ADDITIONAL
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++RANGE_END
++
++; ns.tld
++RANGE_BEGIN 0 15
++	ADDRESS 1.2.3.5
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++tld. IN NS
++SECTION ANSWER
++tld.    IN NS   ns.tld
++SECTION ADDITIONAL
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN A
++SECTION ANSWER
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN AAAA
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++SECTION AUTHORITY
++mid.tld.    5 IN NS   ns.mid.tld.
++SECTION ADDITIONAL
++ns.mid.tld. 5 IN A 1.2.3.4
++ENTRY_END
++RANGE_END
++
++; ns.tld
++RANGE_BEGIN 20 100
++	ADDRESS 1.2.3.5
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++tld. IN NS
++SECTION ANSWER
++tld.    IN NS   ns.tld
++SECTION ADDITIONAL
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN A
++SECTION ANSWER
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN AAAA
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR AA NXDOMAIN
++SECTION QUESTION
++mid.tld. IN NS
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++RANGE_END
++
++; ns.mid.tld.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++SECTION ANSWER
++mid.tld. 86400 IN NS ns.mid.tld.
++SECTION ADDITIONAL
++ns.mid.tld. 86400 IN A 1.2.3.4
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.mid.tld. IN A
++SECTION ANSWER
++ns.mid.tld.         IN      A       1.2.3.4
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.mid.tld. IN AAAA
++SECTION AUTHORITY
++mid.tld. 3600 IN SOA ns.mid.tld. host.mid.tld. 20301 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++sub.mid.tld. IN NS
++SECTION AUTHORITY
++sub.mid.tld. 3600 IN NS ns.sub.mid.tld.
++SECTION ADDITIONAL
++ns.sub.mid.tld. 3600 IN A 1.2.3.6
++ENTRY_END
++RANGE_END
++
++; ns.sub.mid.tld.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.6
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++sub.mid.tld. IN NS
++SECTION ANSWER
++sub.mid.tld.    IN NS   ns.sub.mid.tld.
++SECTION ADDITIONAL
++ns.sub.mid.tld.         IN      A       1.2.3.6
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.sub.mid.tld. IN A
++SECTION ANSWER
++ns.sub.mid.tld.         IN      A       1.2.3.6
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.sub.mid.tld. IN AAAA
++SECTION AUTHORITY
++sub.mid.tld. 3600 IN SOA ns.sub.mid.tld. host.sub.mid.tld. 20301 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++a.sub.mid.tld. IN A
++SECTION ANSWER
++a.sub.mid.tld. 3600 IN A 10.20.30.40
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++b.sub.mid.tld. IN A
++SECTION ANSWER
++b.sub.mid.tld. 3600 IN A 10.20.30.41
++ENTRY_END
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD NOERROR
++SECTION QUESTION
++a.sub.mid.tld. IN A
++ENTRY_END
++
++STEP 2 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++a.sub.mid.tld. IN A
++SECTION ANSWER
++a.sub.mid.tld. 3600 IN A 10.20.30.40
++ENTRY_END
++
++STEP 10 QUERY
++ENTRY_BEGIN
++REPLY RD NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++ENTRY_END
++
++STEP 11 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++SECTION ANSWER
++mid.tld. 86400 IN NS ns.mid.tld.
++SECTION ADDITIONAL
++ns.mid.tld. 86400 IN A 1.2.3.4
++ENTRY_END
++
++STEP 20 TIME_PASSES ELAPSE 10
++; The authority for .tld switches to NXDOMAIN for mid.tld.
++
++STEP 30 QUERY
++ENTRY_BEGIN
++REPLY RD NOERROR
++SECTION QUESTION
++b.sub.mid.tld. IN A
++ENTRY_END
++
++STEP 31 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NXDOMAIN
++SECTION QUESTION
++b.sub.mid.tld. IN A
++SECTION ANSWER
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++
++SCENARIO_END
