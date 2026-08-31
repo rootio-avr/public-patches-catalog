@@ -1,11 +1,14 @@
-# libevent : 2.1.12-stable-8.aikido.2
+# libevent : 2.1.12-stable-8.aikido.3
 
-This patch is based on libevent version 2.1.12-stable-8.aikido.2, which is available at:
+This patch is based on libevent version 2.1.12-stable-8.aikido.3, which is available at:
 https://sources.debian.org/src/libevent/2.1.12-stable-8/
 
 ## Affected CVEs:
 - CVE-2026-63382
 - CVE-2026-63385
+- CVE-2026-63383
+- CVE-2026-63384
+- CVE-2026-63388
 
 ## How to Apply:
 1. Obtain the source package: `apt source libevent`
