@@ -1,10 +1,18 @@
-# nginx : 1.26.3-r00071
+# nginx : 1.26.3-r00072
 
-This patch is based on nginx version 1.26.3-r00071, which is available at:
+This patch is based on nginx version 1.26.3-r00072, which is available at:
 unknown
 
 ## Affected CVEs:
 - CVE-2026-42533
+- CVE-2026-27651
+- CVE-2026-32647
+- CVE-2026-27654
+- CVE-2026-1642
+- CVE-2026-42946
+- CVE-2026-42945
+- CVE-2026-56434
+- CVE-2026-60005
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source nginx`
