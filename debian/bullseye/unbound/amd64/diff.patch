@@ -1,343 +1,316 @@
-Description: CVE-2026-40622 - Fix "Ghost domain name" variant
- Ghost-domain attacks let an attacker keep a revoked/expiring domain name
- resolvable indefinitely by repeatedly re-injecting NS RRsets whose TTL is
- larger than the one already cached. When a more-trustworthy NS RRset is
- stored (newd->trust > cached->trust) unbound accepted the attacker-supplied
- TTL verbatim, extending the lifetime of the delegation past the entry it
- replaces. This clamps the new NS RRset TTL (and its per-RR TTLs) to that of
- the non-expired cached entry it overwrites, so an NS refresh can never
- extend a delegation's lifetime.
+Description: CVE-2026-42944 - Heap overflow and crash with multiple nsid, cookie, padding EDNS options
+ Multiple (or large) nsid, cookie and padding EDNS options in a query could
+ cause unbound to under-reserve buffer space and write EDNS option data past
+ the end of the reply buffer, resulting in a heap overflow and crash.
  .
- The upstream fix uses the TTL_IS_EXPIRED() macro, which is not present in
- this version; it is hand-translated here to the equivalent raw ttl vs
- timenow comparison already used by the sibling same-trust NS clamp in this
- function.
-Origin: upstream, https://github.com/nlnetlabs/unbound/commit/8d8fa4226613138f5a244a9f1a2506704e049180
+ This is an architecture-scoped backport of upstream commit
+ fe946ba4e935a1528e6866e108e5bc9e7533ae18 to the 1.13.1 code base shipped in
+ Debian bullseye.  The upstream commit also touches EDE handling, EDNS cookie
+ parsing and the parse-time option de-duplication in
+ parse_edns_options_from_query(); none of that code exists in 1.13.1, so those
+ hunks are not applicable and are intentionally omitted.  The applicable
+ root-cause fixes that this backport carries over are:
+ .
+   * calc_edns_field_size() accumulates option sizes in a size_t but returned a
+     uint16_t.  With enough / large options the returned size wrapped past
+     65535, so the caller reserved too little space in the packet buffer.  The
+     return type (and its prototype) is widened to size_t so the reservation is
+     always correct.
+   * attach_edns_record_max_msg_sz() now bounds-checks every option (and the
+     padding option) against both max_msg_sz and the actual buffer capacity
+     before writing, so it stops instead of overflowing when the options do not
+     fit.
+ .
+ A replacement regression test (edns_encode_overflow_test) is added to
+ testcode/unitmain.c because the upstream EDE-based tests do not exist in this
+ branch.  It builds an EDNS option list whose combined rdata exceeds 65535
+ octets and asserts that calc_edns_field_size() reports the full, untruncated
+ size (> 65535), which fails against the pre-fix uint16_t return value.
+Origin: backport, https://github.com/NLnetLabs/unbound/commit/fe946ba4e935a1528e6866e108e5bc9e7533ae18
 Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
 Last-Update: 2026-08-18
 ---
---- a/services/cache/rrset.c
-+++ b/services/cache/rrset.c
-@@ -143,6 +143,16 @@ need_to_update_rrset(void* nd, void* cd, time_t timenow, int equal, int ns)
- 		if(equal && cached->ttl >= timenow && 
- 			cached->security == sec_status_bogus)
- 			return 0;
-+		/* ghost-domain: never let an NS overwrite extend lifetime
-+		 * past the entry it replaces, regardless of trust. */
-+		if(ns && cached->ttl >= timenow &&
-+			newd->ttl > cached->ttl) {
-+			size_t i;
-+			newd->ttl = cached->ttl;
-+			for(i=0; i<(newd->count+newd->rrsig_count); i++)
-+				if(newd->rr_ttl[i] > newd->ttl)
-+					newd->rr_ttl[i] = newd->ttl;
-+		}
-                 return 1;
+--- a/util/data/msgencode.c
++++ b/util/data/msgencode.c
+@@ -789,7 +789,7 @@
+ 	return 1;
+ }
+ 
+-uint16_t
++size_t
+ calc_edns_field_size(struct edns_data* edns)
+ {
+ 	size_t rdatalen = 0;
+@@ -832,12 +832,18 @@
+ 			padding_option = opt;
+ 			continue;
+ 		}
++		if(sldns_buffer_position(pkt) + opt->opt_len + 4 > max_msg_sz)
++			break; /* no space for it */
++		if(!sldns_buffer_available(pkt, 4 + opt->opt_len))
++			break;
+ 		sldns_buffer_write_u16(pkt, opt->opt_code);
+ 		sldns_buffer_write_u16(pkt, opt->opt_len);
+ 		if(opt->opt_len != 0)
+ 			sldns_buffer_write(pkt, opt->opt_data, opt->opt_len);
  	}
- 	/*	o item in cache has expired */
-new file mode 100644
---- /dev/null
-+++ b/testdata/iter_ghost_ns_childapex.rpl
-@@ -0,0 +1,299 @@
-+; config options
-+server:
-+	target-fetch-policy: "0 0 0 0 0"
-+	qname-minimisation: no
-+	minimal-responses: yes
-+	log-servfail: yes
-+	module-config: "iterator"
+-	if (padding_option && edns->padding_block_size ) {
++	if (padding_option && edns->padding_block_size &&
++		sldns_buffer_position(pkt)+4 <= max_msg_sz &&
++		sldns_buffer_available(pkt, 4) /* if there is space for it */) {
+ 		size_t pad_pos = sldns_buffer_position(pkt);
+ 		size_t msg_sz = ((pad_pos + 3) / edns->padding_block_size + 1)
+ 		                               * edns->padding_block_size;
+--- a/util/data/msgencode.h
++++ b/util/data/msgencode.h
+@@ -106,7 +106,7 @@
+  * @param edns: edns data or NULL.
+  * @return octets to reserve for EDNS.
+  */
+-uint16_t calc_edns_field_size(struct edns_data* edns);
++size_t calc_edns_field_size(struct edns_data* edns);
+ 
+ /**
+  * Attach EDNS record to buffer. Buffer has complete packet. There must
+--- a/testcode/unitmain.c
++++ b/testcode/unitmain.c
+@@ -885,6 +885,47 @@
+ 	ub_randfree(outnet.rnd);
+ }
+ 
++#include "util/data/msgparse.h"
++#include "util/data/msgencode.h"
++#include "util/regional.h"
++/** Regression test for CVE-2026-42944: the EDNS option size accounting must
++ * not truncate to 16 bits.  Multiple/large nsid, cookie or padding EDNS
++ * options previously wrapped a uint16_t accumulator, under-reserving buffer
++ * space and causing a heap overflow when the record was written out. */
++static void
++edns_encode_overflow_test(void)
++{
++	struct regional* region = regional_create();
++	struct edns_data edns;
++	struct edns_option* opts = NULL;
++	size_t i, field_size, total = 0;
++	unit_show_func("util/data/msgencode.c", "calc_edns_field_size");
++	unit_assert(region);
++	memset(&edns, 0, sizeof(edns));
++	edns.edns_present = 1;
++	edns.udp_size = 4096;
++	/* Build several large EDNS options whose combined rdata clearly
++	 * exceeds 65535 octets, so a 16-bit size accumulator would wrap. */
++	for(i=0; i<5; i++) {
++		struct edns_option* o = (struct edns_option*)
++			regional_alloc_zero(region, sizeof(*o));
++		unit_assert(o);
++		o->opt_code = LDNS_EDNS_NSID;
++		o->opt_len = 20000;
++		o->opt_data = NULL; /* size accounting does not read data */
++		o->next = opts;
++		opts = o;
++		total += 4 + o->opt_len;
++	}
++	edns.opt_list = opts;
++	field_size = calc_edns_field_size(&edns);
++	/* '.' + type + class + ttl + rdatalen == 11 octets of overhead. */
++	unit_assert(field_size == (size_t)11 + total);
++	/* The key property: the size must NOT be truncated to 16 bits. */
++	unit_assert(field_size > 65535);
++	regional_destroy(region);
++}
 +
-+stub-zone:
-+	name: "."
-+	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
-+CONFIG_END
+ void unit_show_func(const char* file, const char* func)
+ {
+ 	printf("test %s:%s\n", file, func);
+@@ -953,6 +994,7 @@
+ 	infra_test();
+ 	ldns_test();
+ 	msgparse_test();
++	edns_encode_overflow_test();
+ 	tcpid_test();
+ #ifdef CLIENT_SUBNET
+ 	ecs_test();
+Description: CVE-2026-41292 - Limit number of parsed incoming EDNS options
+ Parsing a long list of incoming EDNS options degrades performance,
+ allowing a remote attacker to cause a denial of service by sending a
+ packet whose OPT record RDATA contains a very large number of EDNS
+ options. Each option triggers per-option processing (allocation and
+ append), so an attacker-controlled long list results in excessive CPU
+ and memory use.
+ .
+ This patch caps the number of EDNS options parsed from a single message
+ at MAX_PARSED_EDNS_OPTIONS (100) by adding a counter to the option
+ parsing loop. In unbound 1.13.1 the single parse_edns_options() helper
+ is used for both the query and the response parse paths (the upstream
+ fix later split it into parse_edns_options_from_query() and
+ parse_extract_edns_from_response_msg()), so guarding this one loop
+ covers both vulnerable paths.
+Origin: backport, https://github.com/NLnetLabs/unbound/commit/ef5ca84360934fa1e857ebc371d4b093aea6355d
+Author: Wouter Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/util/data/msgparse.c
++++ b/util/data/msgparse.c
+@@ -48,6 +48,8 @@
+ #include "sldns/parseutil.h"
+ #include "sldns/wire2str.h"
+ 
++#define MAX_PARSED_EDNS_OPTIONS 100
 +
-+SCENARIO_BEGIN Test for ghost domain with a child apex NS query.
+ /** smart comparison of (compressed, valid) dnames from packet */
+ static int
+ smart_compare(sldns_buffer* pkt, uint8_t* dnow, 
+@@ -943,9 +945,10 @@
+ parse_edns_options(uint8_t* rdata_ptr, size_t rdata_len,
+ 	struct edns_data* edns, struct regional* region)
+ {
++	int i = 0;
+ 	/* while still more options, and have code+len to read */
+ 	/* ignores partial content (i.e. rdata len 3) */
+-	while(rdata_len >= 4) {
++	while(rdata_len >= 4 && i < MAX_PARSED_EDNS_OPTIONS) {
+ 		uint16_t opt_code = sldns_read_uint16(rdata_ptr);
+ 		uint16_t opt_len = sldns_read_uint16(rdata_ptr+2);
+ 		rdata_ptr += 4;
+@@ -959,6 +962,7 @@
+ 		}
+ 		rdata_ptr += opt_len;
+ 		rdata_len -= opt_len;
++		i++;
+ 	}
+ 	return 1;
+ }
+Description: Fix CVE-2026-33278 - use-after-free / RCE during DNSSEC validation.
+ Upstream CVE-2026-33278 is a use-after-free in dns_msg_deepcopy_region()
+ reached through the NSEC3 computational-budget suspend/resume path, both of
+ which were introduced in unbound 1.19.1 and do not exist in this 1.13.1
+ target. This backports the portable, applicable half of upstream fix commit
+ 6a31e470f80a6e5c559ebe7fd4cfc0582d3b6d0a: a defensive param_set_same() input
+ check that rejects NSEC3 record sets whose members come from distinct NSEC3
+ chains (mismatched algorithm, iteration count, or salt) or that are malformed,
+ before running the expensive NSEC3 proofs. This mixed-chain/malformed NSEC3
+ record set from a malicious signed zone is the attacker-controlled precondition
+ that drives the excessive NSEC3 computation underlying the vulnerability. The
+ guard is added at the entry of all five NSEC3 proof functions.
+Origin: ai-synthesized, CVE-2026-33278
+Author: Root.io Novel Patcher <security@root.io>
+Last-Update: 2026-08-18
+
+--- a/validator/val_nsec3.c
++++ b/validator/val_nsec3.c
+@@ -443,6 +443,67 @@ filter_init(struct nsec3_filter* filter, struct ub_packed_rrset_key** list,
+ 	}
+ }
+ 
++/** Check if the NSEC3s have the same parameter set. */
++static int
++param_set_same(struct nsec3_filter* flt, char** reason)
++{
++	size_t rrsetnum;
++	int rrnum;
++	struct ub_packed_rrset_key* rrset;
++	int have_params = 0;
++	int first_algo = 0;
++	size_t first_iter = 0;
++	uint8_t* first_salt = NULL;
++	size_t first_saltlen = 0;
 +
-+; K.ROOT-SERVERS.NET.
-+RANGE_BEGIN 0 100
-+	ADDRESS 193.0.14.129 
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+. IN NS
-+SECTION ANSWER
-+. IN NS	K.ROOT-SERVERS.NET.
-+SECTION ADDITIONAL
-+K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
-+ENTRY_END
++	/* If the NSEC3 parameter sets have distinct values, then they are
++	 * from different NSEC3 chains, and we do not want that. */
++	for(rrset=filter_first(flt, &rrsetnum, &rrnum); rrset;
++		rrset=filter_next(flt, &rrsetnum, &rrnum)) {
++		if(!have_params) {
++			first_algo = nsec3_get_algo(rrset, rrnum);
++			first_iter = nsec3_get_iter(rrset, rrnum);
++			if(!nsec3_get_salt(rrset, rrnum, &first_salt,
++				&first_saltlen)) {
++				verbose(VERB_ALGO, "NSEC3 salt malformed");
++				if(reason)
++					*reason = "NSEC3 salt malformed";
++				return 0;
++			}
++			have_params = 1;
++		} else {
++			uint8_t* salt = NULL;
++			size_t saltlen = 0;
++			if(nsec3_get_algo(rrset, rrnum) != first_algo) {
++				verbose(VERB_ALGO, "NSEC3 algorithm mismatch");
++				if(reason)
++					*reason = "NSEC3 algorithm mismatch";
++				return 0;
++			}
++			if(nsec3_get_iter(rrset, rrnum) != first_iter) {
++				verbose(VERB_ALGO, "NSEC3 iterations mismatch");
++				if(reason)
++					*reason = "NSEC3 iterations mismatch";
++				return 0;
++			}
++			if(!nsec3_get_salt(rrset, rrnum, &salt, &saltlen)) {
++				verbose(VERB_ALGO, "NSEC3 salt malformed");
++				if(reason)
++					*reason = "NSEC3 salt malformed";
++				return 0;
++			}
++			if(saltlen != first_saltlen ||
++				memcmp(salt, first_salt, saltlen) != 0) {
++				verbose(VERB_ALGO, "NSEC3 salt mismatch");
++				if(reason)
++					*reason = "NSEC3 salt mismatch";
++				return 0;
++			}
++		}
++	}
++	return 1;
++}
 +
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+tld. IN NS
-+SECTION AUTHORITY
-+tld.	IN NS	ns.tld.
-+SECTION ADDITIONAL
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+RANGE_END
-+
-+; ns.tld
-+RANGE_BEGIN 0 15
-+	ADDRESS 1.2.3.5
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+tld. IN NS
-+SECTION ANSWER
-+tld.    IN NS   ns.tld
-+SECTION ADDITIONAL
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN A
-+SECTION ANSWER
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN AAAA
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION AUTHORITY
-+mid.tld.    5 IN NS   ns.mid.tld.
-+SECTION ADDITIONAL
-+ns.mid.tld. 5 IN A 1.2.3.4
-+ENTRY_END
-+RANGE_END
-+
-+; ns.tld
-+RANGE_BEGIN 20 100
-+	ADDRESS 1.2.3.5
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+tld. IN NS
-+SECTION ANSWER
-+tld.    IN NS   ns.tld
-+SECTION ADDITIONAL
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN A
-+SECTION ANSWER
-+ns.tld. IN A 1.2.3.5
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.tld. IN AAAA
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR AA NXDOMAIN
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+RANGE_END
-+
-+; ns.mid.tld.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.4
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION ANSWER
-+mid.tld. 86400 IN NS ns.mid.tld.
-+SECTION ADDITIONAL
-+ns.mid.tld. 86400 IN A 1.2.3.4
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.mid.tld. IN A
-+SECTION ANSWER
-+ns.mid.tld.         IN      A       1.2.3.4
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.mid.tld. IN AAAA
-+SECTION AUTHORITY
-+mid.tld. 3600 IN SOA ns.mid.tld. host.mid.tld. 20301 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+sub.mid.tld. IN NS
-+SECTION AUTHORITY
-+sub.mid.tld. 3600 IN NS ns.sub.mid.tld.
-+SECTION ADDITIONAL
-+ns.sub.mid.tld. 3600 IN A 1.2.3.6
-+ENTRY_END
-+RANGE_END
-+
-+; ns.sub.mid.tld.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.6
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+sub.mid.tld. IN NS
-+SECTION ANSWER
-+sub.mid.tld.    IN NS   ns.sub.mid.tld.
-+SECTION ADDITIONAL
-+ns.sub.mid.tld.         IN      A       1.2.3.6
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.sub.mid.tld. IN A
-+SECTION ANSWER
-+ns.sub.mid.tld.         IN      A       1.2.3.6
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+ns.sub.mid.tld. IN AAAA
-+SECTION AUTHORITY
-+sub.mid.tld. 3600 IN SOA ns.sub.mid.tld. host.sub.mid.tld. 20301 3600 1800 604800 3600
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+a.sub.mid.tld. IN A
-+SECTION ANSWER
-+a.sub.mid.tld. 3600 IN A 10.20.30.40
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR AA NOERROR
-+SECTION QUESTION
-+b.sub.mid.tld. IN A
-+SECTION ANSWER
-+b.sub.mid.tld. 3600 IN A 10.20.30.41
-+ENTRY_END
-+RANGE_END
-+
-+STEP 1 QUERY
-+ENTRY_BEGIN
-+REPLY RD NOERROR
-+SECTION QUESTION
-+a.sub.mid.tld. IN A
-+ENTRY_END
-+
-+STEP 2 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+a.sub.mid.tld. IN A
-+SECTION ANSWER
-+a.sub.mid.tld. 3600 IN A 10.20.30.40
-+ENTRY_END
-+
-+STEP 10 QUERY
-+ENTRY_BEGIN
-+REPLY RD NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+ENTRY_END
-+
-+STEP 11 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+mid.tld. IN NS
-+SECTION ANSWER
-+mid.tld. 86400 IN NS ns.mid.tld.
-+SECTION ADDITIONAL
-+ns.mid.tld. 86400 IN A 1.2.3.4
-+ENTRY_END
-+
-+STEP 20 TIME_PASSES ELAPSE 10
-+; The authority for .tld switches to NXDOMAIN for mid.tld.
-+
-+STEP 30 QUERY
-+ENTRY_BEGIN
-+REPLY RD NOERROR
-+SECTION QUESTION
-+b.sub.mid.tld. IN A
-+ENTRY_END
-+
-+STEP 31 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NXDOMAIN
-+SECTION QUESTION
-+b.sub.mid.tld. IN A
-+SECTION ANSWER
-+SECTION AUTHORITY
-+tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
-+ENTRY_END
-+
-+SCENARIO_END
+ /**
+  * Find max iteration count using config settings and key size
+  * @param ve: validator environment with iteration count config settings.
+@@ -1075,6 +1136,8 @@ nsec3_prove_nameerror(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 	log_nametypeclass(VERB_ALGO, "start nsec3 nameerror proof, zone", 
+@@ -1234,6 +1297,8 @@ nsec3_prove_nodata(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 	return nsec3_do_prove_nodata(env, &flt, &ct, qinfo);
+@@ -1258,6 +1323,8 @@ nsec3_prove_wildcard(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 
+@@ -1338,6 +1405,8 @@ nsec3_prove_nods(struct module_env* env, struct val_env* ve,
+ 		*reason = "no NSEC3 records";
+ 		return sec_status_bogus; /* no RRs */
+ 	}
++	if(!param_set_same(&flt, reason))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 
+@@ -1418,6 +1487,8 @@ nsec3_prove_nxornodata(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 
 Description: CVE-2026-44690 - Fix cross-zone wildcard cache poisoning via RRSIG.labels manipulation
  An attacker could poison the aggressive NSEC cache with wildcard-expanded
  records whose RRSIG signer is outside the authoritative zone, by manipulating
@@ -878,6 +851,346 @@ Last-Update: 2026-08-18
 +ENTRY_END
 +
 +SCENARIO_END
+Description: CVE-2026-40622 - Fix "Ghost domain name" variant
+ Ghost-domain attacks let an attacker keep a revoked/expiring domain name
+ resolvable indefinitely by repeatedly re-injecting NS RRsets whose TTL is
+ larger than the one already cached. When a more-trustworthy NS RRset is
+ stored (newd->trust > cached->trust) unbound accepted the attacker-supplied
+ TTL verbatim, extending the lifetime of the delegation past the entry it
+ replaces. This clamps the new NS RRset TTL (and its per-RR TTLs) to that of
+ the non-expired cached entry it overwrites, so an NS refresh can never
+ extend a delegation's lifetime.
+ .
+ The upstream fix uses the TTL_IS_EXPIRED() macro, which is not present in
+ this version; it is hand-translated here to the equivalent raw ttl vs
+ timenow comparison already used by the sibling same-trust NS clamp in this
+ function.
+Origin: upstream, https://github.com/nlnetlabs/unbound/commit/8d8fa4226613138f5a244a9f1a2506704e049180
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/services/cache/rrset.c
++++ b/services/cache/rrset.c
+@@ -143,6 +143,16 @@ need_to_update_rrset(void* nd, void* cd, time_t timenow, int equal, int ns)
+ 		if(equal && cached->ttl >= timenow && 
+ 			cached->security == sec_status_bogus)
+ 			return 0;
++		/* ghost-domain: never let an NS overwrite extend lifetime
++		 * past the entry it replaces, regardless of trust. */
++		if(ns && cached->ttl >= timenow &&
++			newd->ttl > cached->ttl) {
++			size_t i;
++			newd->ttl = cached->ttl;
++			for(i=0; i<(newd->count+newd->rrsig_count); i++)
++				if(newd->rr_ttl[i] > newd->ttl)
++					newd->rr_ttl[i] = newd->ttl;
++		}
+                 return 1;
+ 	}
+ 	/*	o item in cache has expired */
+new file mode 100644
+--- /dev/null
++++ b/testdata/iter_ghost_ns_childapex.rpl
+@@ -0,0 +1,299 @@
++; config options
++server:
++	target-fetch-policy: "0 0 0 0 0"
++	qname-minimisation: no
++	minimal-responses: yes
++	log-servfail: yes
++	module-config: "iterator"
++
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++CONFIG_END
++
++SCENARIO_BEGIN Test for ghost domain with a child apex NS query.
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129 
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++tld. IN NS
++SECTION AUTHORITY
++tld.	IN NS	ns.tld.
++SECTION ADDITIONAL
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++RANGE_END
++
++; ns.tld
++RANGE_BEGIN 0 15
++	ADDRESS 1.2.3.5
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++tld. IN NS
++SECTION ANSWER
++tld.    IN NS   ns.tld
++SECTION ADDITIONAL
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN A
++SECTION ANSWER
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN AAAA
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++SECTION AUTHORITY
++mid.tld.    5 IN NS   ns.mid.tld.
++SECTION ADDITIONAL
++ns.mid.tld. 5 IN A 1.2.3.4
++ENTRY_END
++RANGE_END
++
++; ns.tld
++RANGE_BEGIN 20 100
++	ADDRESS 1.2.3.5
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++tld. IN NS
++SECTION ANSWER
++tld.    IN NS   ns.tld
++SECTION ADDITIONAL
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN A
++SECTION ANSWER
++ns.tld. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.tld. IN AAAA
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR AA NXDOMAIN
++SECTION QUESTION
++mid.tld. IN NS
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++RANGE_END
++
++; ns.mid.tld.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++SECTION ANSWER
++mid.tld. 86400 IN NS ns.mid.tld.
++SECTION ADDITIONAL
++ns.mid.tld. 86400 IN A 1.2.3.4
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.mid.tld. IN A
++SECTION ANSWER
++ns.mid.tld.         IN      A       1.2.3.4
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.mid.tld. IN AAAA
++SECTION AUTHORITY
++mid.tld. 3600 IN SOA ns.mid.tld. host.mid.tld. 20301 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++sub.mid.tld. IN NS
++SECTION AUTHORITY
++sub.mid.tld. 3600 IN NS ns.sub.mid.tld.
++SECTION ADDITIONAL
++ns.sub.mid.tld. 3600 IN A 1.2.3.6
++ENTRY_END
++RANGE_END
++
++; ns.sub.mid.tld.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.6
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++sub.mid.tld. IN NS
++SECTION ANSWER
++sub.mid.tld.    IN NS   ns.sub.mid.tld.
++SECTION ADDITIONAL
++ns.sub.mid.tld.         IN      A       1.2.3.6
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.sub.mid.tld. IN A
++SECTION ANSWER
++ns.sub.mid.tld.         IN      A       1.2.3.6
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.sub.mid.tld. IN AAAA
++SECTION AUTHORITY
++sub.mid.tld. 3600 IN SOA ns.sub.mid.tld. host.sub.mid.tld. 20301 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++a.sub.mid.tld. IN A
++SECTION ANSWER
++a.sub.mid.tld. 3600 IN A 10.20.30.40
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++b.sub.mid.tld. IN A
++SECTION ANSWER
++b.sub.mid.tld. 3600 IN A 10.20.30.41
++ENTRY_END
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD NOERROR
++SECTION QUESTION
++a.sub.mid.tld. IN A
++ENTRY_END
++
++STEP 2 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++a.sub.mid.tld. IN A
++SECTION ANSWER
++a.sub.mid.tld. 3600 IN A 10.20.30.40
++ENTRY_END
++
++STEP 10 QUERY
++ENTRY_BEGIN
++REPLY RD NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++ENTRY_END
++
++STEP 11 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++mid.tld. IN NS
++SECTION ANSWER
++mid.tld. 86400 IN NS ns.mid.tld.
++SECTION ADDITIONAL
++ns.mid.tld. 86400 IN A 1.2.3.4
++ENTRY_END
++
++STEP 20 TIME_PASSES ELAPSE 10
++; The authority for .tld switches to NXDOMAIN for mid.tld.
++
++STEP 30 QUERY
++ENTRY_BEGIN
++REPLY RD NOERROR
++SECTION QUESTION
++b.sub.mid.tld. IN A
++ENTRY_END
++
++STEP 31 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NXDOMAIN
++SECTION QUESTION
++b.sub.mid.tld. IN A
++SECTION ANSWER
++SECTION AUTHORITY
++tld. 3600 IN SOA ns.tld. host.tld. 20201 3600 1800 604800 3600
++ENTRY_END
++
++SCENARIO_END
 Description: CVE-2026-42959 - Fix crash during DNSSEC validation of malicious content.
  val_fill_reply() in validator/val_utils.c computed the write offsets for the
  ADDITIONAL section using orig->ns_numrrsets instead of chase->ns_numrrsets.
@@ -906,118 +1219,6 @@ Last-Update: 2026-08-18
  				chase->ar_numrrsets++] = orig->rrsets[i];
  		}
  	}
-Description: CVE-2026-41292 - Limit number of parsed incoming EDNS options
- Parsing a long list of incoming EDNS options degrades performance,
- allowing a remote attacker to cause a denial of service by sending a
- packet whose OPT record RDATA contains a very large number of EDNS
- options. Each option triggers per-option processing (allocation and
- append), so an attacker-controlled long list results in excessive CPU
- and memory use.
- .
- This patch caps the number of EDNS options parsed from a single message
- at MAX_PARSED_EDNS_OPTIONS (100) by adding a counter to the option
- parsing loop. In unbound 1.13.1 the single parse_edns_options() helper
- is used for both the query and the response parse paths (the upstream
- fix later split it into parse_edns_options_from_query() and
- parse_extract_edns_from_response_msg()), so guarding this one loop
- covers both vulnerable paths.
-Origin: backport, https://github.com/NLnetLabs/unbound/commit/ef5ca84360934fa1e857ebc371d4b093aea6355d
-Author: Wouter Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/util/data/msgparse.c
-+++ b/util/data/msgparse.c
-@@ -48,6 +48,8 @@
- #include "sldns/parseutil.h"
- #include "sldns/wire2str.h"
- 
-+#define MAX_PARSED_EDNS_OPTIONS 100
-+
- /** smart comparison of (compressed, valid) dnames from packet */
- static int
- smart_compare(sldns_buffer* pkt, uint8_t* dnow, 
-@@ -943,9 +945,10 @@
- parse_edns_options(uint8_t* rdata_ptr, size_t rdata_len,
- 	struct edns_data* edns, struct regional* region)
- {
-+	int i = 0;
- 	/* while still more options, and have code+len to read */
- 	/* ignores partial content (i.e. rdata len 3) */
--	while(rdata_len >= 4) {
-+	while(rdata_len >= 4 && i < MAX_PARSED_EDNS_OPTIONS) {
- 		uint16_t opt_code = sldns_read_uint16(rdata_ptr);
- 		uint16_t opt_len = sldns_read_uint16(rdata_ptr+2);
- 		rdata_ptr += 4;
-@@ -959,6 +962,7 @@
- 		}
- 		rdata_ptr += opt_len;
- 		rdata_len -= opt_len;
-+		i++;
- 	}
- 	return 1;
- }
-Description: CVE-2026-32665 - not applicable to unbound 1.13.1 (Debian 11 bullseye)
- CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial of service caused by a
- quic-size budget bypass. The upstream fix (commit 01dfd2f) modifies the DoQ
- stream-handling functions in services/listen_dnsport.c (doq_stream_open_cb,
- doq_stream_datalen_complete, doq_stream_pickup_answer, doq_stream_recv_data).
- .
- The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
- 3.5 years and nine minor releases after 1.13.1 (the version shipped in Debian
- 11 "bullseye"). In the 1.13.1 source tree none of the affected code exists:
- services/listen_dnsport.c has no doq_stream_* functions, there is no
- ngtcp2/QUIC transport code, and configure.ac has no DoQ build support. The
- vulnerable code path therefore cannot be reached and the upstream fix can be
- neither applied nor back-ported.
- .
- This is a no-op documentation patch: it records the NOT-AFFECTED analysis and
- makes no code change, because no code change is required or possible for this
- version.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/01dfd2f466d383370405d8ecf939570947f3523e
-Author: Aikido Security <security@aikido.dev>
-Last-Update: 2026-08-18
-Forwarded: not-needed
----
---- /dev/null
-+++ b/doc/CVE-2026-32665.NOT-AFFECTED
-@@ -0,0 +1,37 @@
-+CVE-2026-32665 — Not applicable to unbound 1.13.1 (Debian 11 "bullseye")
-+========================================================================
-+
-+Summary
-+-------
-+CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial-of-service caused by a
-+`quic-size` budget bypass. The upstream fix (NLnetLabs/unbound commit
-+01dfd2f466d383370405d8ecf939570947f3523e) modifies the DoQ stream-handling
-+code in services/listen_dnsport.c:
-+
-+  - doq_stream_open_cb()        : removes the unconditional budget bypass for
-+                                  stream_id 0 and 4
-+  - doq_stream_datalen_complete(): adds a quic-size availability check
-+  - doq_stream_pickup_answer()  : adds a quic-size availability check
-+  - doq_stream_recv_data()      : threads the doq_conn pointer through
-+
-+Why this version is not affected
-+--------------------------------
-+The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
-+3.5 years and nine minor releases after 1.13.1 (released February 2021, the
-+version shipped in Debian 11 "bullseye" as 1.13.1-1+deb11u7).
-+
-+In this source tree (release-1.13.1) none of the affected code exists:
-+
-+  * services/listen_dnsport.c contains no doq_stream_* functions.
-+  * There is no ngtcp2 / QUIC transport code anywhere in the tree.
-+  * configure.ac has no --with-libngtcp2 option and no DoQ build support.
-+
-+Because there is no DNS-over-QUIC listener and no `quic-size` budget in this
-+version, the vulnerable code path cannot be reached. The vulnerability does
-+not apply to unbound 1.13.1.
-+
-+Conclusion
-+----------
-+No code change is required or possible for this version: the upstream fix
-+touches functions that do not exist here, so it can be neither applied nor
-+back-ported. This package version is NOT AFFECTED by CVE-2026-32665.
 Description: CVE-2026-50252 - Fix possible cache poisoning attack by mapping
  source port population per thread.
  .
@@ -2226,6 +2427,68 @@ Last-Update: 2026-08-18
  #ifdef CLIENT_SUBNET
  	ecs_test();
  #endif /* CLIENT_SUBNET */
+Description: CVE-2026-32665 - not applicable to unbound 1.13.1 (Debian 11 bullseye)
+ CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial of service caused by a
+ quic-size budget bypass. The upstream fix (commit 01dfd2f) modifies the DoQ
+ stream-handling functions in services/listen_dnsport.c (doq_stream_open_cb,
+ doq_stream_datalen_complete, doq_stream_pickup_answer, doq_stream_recv_data).
+ .
+ The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
+ 3.5 years and nine minor releases after 1.13.1 (the version shipped in Debian
+ 11 "bullseye"). In the 1.13.1 source tree none of the affected code exists:
+ services/listen_dnsport.c has no doq_stream_* functions, there is no
+ ngtcp2/QUIC transport code, and configure.ac has no DoQ build support. The
+ vulnerable code path therefore cannot be reached and the upstream fix can be
+ neither applied nor back-ported.
+ .
+ This is a no-op documentation patch: it records the NOT-AFFECTED analysis and
+ makes no code change, because no code change is required or possible for this
+ version.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/01dfd2f466d383370405d8ecf939570947f3523e
+Author: Aikido Security <security@aikido.dev>
+Last-Update: 2026-08-18
+Forwarded: not-needed
+---
+--- /dev/null
++++ b/doc/CVE-2026-32665.NOT-AFFECTED
+@@ -0,0 +1,37 @@
++CVE-2026-32665 — Not applicable to unbound 1.13.1 (Debian 11 "bullseye")
++========================================================================
++
++Summary
++-------
++CVE-2026-32665 is a remote DNS-over-QUIC (DoQ) denial-of-service caused by a
++`quic-size` budget bypass. The upstream fix (NLnetLabs/unbound commit
++01dfd2f466d383370405d8ecf939570947f3523e) modifies the DoQ stream-handling
++code in services/listen_dnsport.c:
++
++  - doq_stream_open_cb()        : removes the unconditional budget bypass for
++                                  stream_id 0 and 4
++  - doq_stream_datalen_complete(): adds a quic-size availability check
++  - doq_stream_pickup_answer()  : adds a quic-size availability check
++  - doq_stream_recv_data()      : threads the doq_conn pointer through
++
++Why this version is not affected
++--------------------------------
++The entire DNS-over-QUIC subsystem was introduced in unbound 1.22.0, roughly
++3.5 years and nine minor releases after 1.13.1 (released February 2021, the
++version shipped in Debian 11 "bullseye" as 1.13.1-1+deb11u7).
++
++In this source tree (release-1.13.1) none of the affected code exists:
++
++  * services/listen_dnsport.c contains no doq_stream_* functions.
++  * There is no ngtcp2 / QUIC transport code anywhere in the tree.
++  * configure.ac has no --with-libngtcp2 option and no DoQ build support.
++
++Because there is no DNS-over-QUIC listener and no `quic-size` budget in this
++version, the vulnerable code path cannot be reached. The vulnerability does
++not apply to unbound 1.13.1.
++
++Conclusion
++----------
++No code change is required or possible for this version: the upstream fix
++touches functions that do not exist here, so it can be neither applied nor
++back-ported. This package version is NOT AFFECTED by CVE-2026-32665.
 Description: CVE-2026-42960 - Fix possible cache poisoning while following delegation
  In scrub_normalize() (iterator/iter_scrub.c) address records in the
  additional section were unconditionally marked as allowed glue for any
@@ -2373,134 +2636,3 @@ Last-Update: 2026-08-18
 +ENTRY_END
 +
 +SCENARIO_END
-Description: Fix CVE-2026-33278 - use-after-free / RCE during DNSSEC validation.
- Upstream CVE-2026-33278 is a use-after-free in dns_msg_deepcopy_region()
- reached through the NSEC3 computational-budget suspend/resume path, both of
- which were introduced in unbound 1.19.1 and do not exist in this 1.13.1
- target. This backports the portable, applicable half of upstream fix commit
- 6a31e470f80a6e5c559ebe7fd4cfc0582d3b6d0a: a defensive param_set_same() input
- check that rejects NSEC3 record sets whose members come from distinct NSEC3
- chains (mismatched algorithm, iteration count, or salt) or that are malformed,
- before running the expensive NSEC3 proofs. This mixed-chain/malformed NSEC3
- record set from a malicious signed zone is the attacker-controlled precondition
- that drives the excessive NSEC3 computation underlying the vulnerability. The
- guard is added at the entry of all five NSEC3 proof functions.
-Origin: ai-synthesized, CVE-2026-33278
-Author: Root.io Novel Patcher <security@root.io>
-Last-Update: 2026-08-18
-
---- a/validator/val_nsec3.c
-+++ b/validator/val_nsec3.c
-@@ -443,6 +443,67 @@ filter_init(struct nsec3_filter* filter, struct ub_packed_rrset_key** list,
- 	}
- }
- 
-+/** Check if the NSEC3s have the same parameter set. */
-+static int
-+param_set_same(struct nsec3_filter* flt, char** reason)
-+{
-+	size_t rrsetnum;
-+	int rrnum;
-+	struct ub_packed_rrset_key* rrset;
-+	int have_params = 0;
-+	int first_algo = 0;
-+	size_t first_iter = 0;
-+	uint8_t* first_salt = NULL;
-+	size_t first_saltlen = 0;
-+
-+	/* If the NSEC3 parameter sets have distinct values, then they are
-+	 * from different NSEC3 chains, and we do not want that. */
-+	for(rrset=filter_first(flt, &rrsetnum, &rrnum); rrset;
-+		rrset=filter_next(flt, &rrsetnum, &rrnum)) {
-+		if(!have_params) {
-+			first_algo = nsec3_get_algo(rrset, rrnum);
-+			first_iter = nsec3_get_iter(rrset, rrnum);
-+			if(!nsec3_get_salt(rrset, rrnum, &first_salt,
-+				&first_saltlen)) {
-+				verbose(VERB_ALGO, "NSEC3 salt malformed");
-+				if(reason)
-+					*reason = "NSEC3 salt malformed";
-+				return 0;
-+			}
-+			have_params = 1;
-+		} else {
-+			uint8_t* salt = NULL;
-+			size_t saltlen = 0;
-+			if(nsec3_get_algo(rrset, rrnum) != first_algo) {
-+				verbose(VERB_ALGO, "NSEC3 algorithm mismatch");
-+				if(reason)
-+					*reason = "NSEC3 algorithm mismatch";
-+				return 0;
-+			}
-+			if(nsec3_get_iter(rrset, rrnum) != first_iter) {
-+				verbose(VERB_ALGO, "NSEC3 iterations mismatch");
-+				if(reason)
-+					*reason = "NSEC3 iterations mismatch";
-+				return 0;
-+			}
-+			if(!nsec3_get_salt(rrset, rrnum, &salt, &saltlen)) {
-+				verbose(VERB_ALGO, "NSEC3 salt malformed");
-+				if(reason)
-+					*reason = "NSEC3 salt malformed";
-+				return 0;
-+			}
-+			if(saltlen != first_saltlen ||
-+				memcmp(salt, first_salt, saltlen) != 0) {
-+				verbose(VERB_ALGO, "NSEC3 salt mismatch");
-+				if(reason)
-+					*reason = "NSEC3 salt mismatch";
-+				return 0;
-+			}
-+		}
-+	}
-+	return 1;
-+}
-+
- /**
-  * Find max iteration count using config settings and key size
-  * @param ve: validator environment with iteration count config settings.
-@@ -1075,6 +1136,8 @@ nsec3_prove_nameerror(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 	log_nametypeclass(VERB_ALGO, "start nsec3 nameerror proof, zone", 
-@@ -1234,6 +1297,8 @@ nsec3_prove_nodata(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 	return nsec3_do_prove_nodata(env, &flt, &ct, qinfo);
-@@ -1258,6 +1323,8 @@ nsec3_prove_wildcard(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 
-@@ -1338,6 +1405,8 @@ nsec3_prove_nods(struct module_env* env, struct val_env* ve,
- 		*reason = "no NSEC3 records";
- 		return sec_status_bogus; /* no RRs */
- 	}
-+	if(!param_set_same(&flt, reason))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 
-@@ -1418,6 +1487,8 @@ nsec3_prove_nxornodata(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 
