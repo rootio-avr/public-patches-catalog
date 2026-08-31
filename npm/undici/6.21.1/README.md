@@ -4,8 +4,10 @@ This patch is based on undici version 6.21.1, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-2229
+- CVE-2026-1526
 - CVE-2026-1528
+- CVE-2026-2229
+- CVE-2026-12151
 
 ## How to Apply:
 1. Clone or download the source code for undici
