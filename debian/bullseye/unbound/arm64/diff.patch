@@ -1,3 +1,899 @@
+Description: CVE-2026-44690 - Fix cross-zone wildcard cache poisoning via RRSIG.labels manipulation
+ An attacker could poison the aggressive NSEC cache with wildcard-expanded
+ records whose RRSIG signer is outside the authoritative zone, by manipulating
+ the RRSIG labels field. This allowed cross-zone cache poisoning (CWE-345).
+ .
+ The fix hardens three places:
+ .
+  * validator/val_sigcrypt.c: reject an RRSIG whose labels count is lower than
+    the label count of the signer name (an impossible-to-be-valid wildcard).
+  * validator/validator.c: postpone the aggressive-NSEC wildcard cache update
+    until the positive wildcard proof has actually succeeded, instead of
+    caching the expansion eagerly.
+  * services/cache/rrset.c: before caching a wildcard expansion, verify that
+    the wildcard canonical parent falls within the authority of every RRSIG
+    signer of the rrset (dname_subdomain_rrsig_signers), otherwise drop it.
+ .
+ The internal helper rrsig_get_signer() is exported from validator/val_utils.c
+ for reuse by the rrset cache. A regression test (testdata/rrsig_agr_wild.rpl)
+ from the upstream fix is included; testbound auto-discovers testdata/*.rpl.
+ .
+ This is a backport of the upstream fix to 1.13.x: the target predates the
+ EDE/reason_bogus parameter of dnskey_verify_rrset_sig(), so the *reason_bogus
+ assignments from the upstream hunk are omitted while the security check is
+ preserved.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f7637a4f1811f4a9331707d8a95cf0af65a97c0f
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/3d5e6c06923eff9eac2f5e31a69c43a15ca9d3c2
+Bug: CVE-2026-44690
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/services/cache/rrset.c
++++ b/services/cache/rrset.c
+@@ -46,9 +46,11 @@
+ #include "util/data/packed_rrset.h"
+ #include "util/data/msgreply.h"
+ #include "util/data/msgparse.h"
++#include "util/data/dname.h"
+ #include "util/regional.h"
+ #include "util/alloc.h"
+ #include "util/net_help.h"
++#include "validator/val_utils.h"
+ 
+ void
+ rrset_markdel(void* key)
+@@ -239,12 +241,43 @@
+ 	return 0;
+ }
+ 
+-void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache, 
++/** See if the name is a within signer authority */
++static int
++dname_subdomain_rrsig_signers(uint8_t* dname,
++	struct ub_packed_rrset_key* rrset)
++{
++	struct packed_rrset_data* d = (struct packed_rrset_data*)
++		rrset->entry.data;
++	size_t i;
++	if(!d || !d->rrsig_count)
++		return 0;
++	for(i=0; i<d->rrsig_count; i++) {
++		uint8_t* sname = NULL;
++		size_t slen = 0;
++		rrsig_get_signer(d->rr_data[d->count+i], d->rr_len[d->count+i],
++			&sname, &slen);
++		if(!sname || !slen)
++			return 0; /* malformed */
++		if(!dname_subdomain_c(dname, sname))
++			return 0; /* not a subdomain */
++	}
++	return 1;
++}
++
++void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache,
+ 	struct ub_packed_rrset_key* rrset, uint8_t* ce, size_t ce_len,
+ 	struct alloc_cache* alloc, time_t timenow)
+ {
+ 	struct rrset_ref ref;
+ 	uint8_t wc_dname[LDNS_MAX_DOMAINLEN+3];
++
++	/* See if the RRSIG signer name allows this wildcard,
++	 * the new rrset should fall within the zone of the RRSIG signer(s). */
++	if(!dname_subdomain_rrsig_signers(ce, rrset)) {
++		verbose(VERB_ALGO, "wildcard canonical parent outside signer authority");
++		return;
++	}
++
+ 	rrset = packed_rrset_copy_alloc(rrset, alloc, timenow);
+ 	if(!rrset) {
+ 		log_err("malloc failure in rrset_cache_update_wildcard");
+--- a/validator/val_sigcrypt.c
++++ b/validator/val_sigcrypt.c
+@@ -1470,6 +1470,11 @@
+ 		*reason = "signature labelcount out of range";
+ 		return sec_status_bogus;
+ 	}
++	if((int)sig[2+3] < dname_signame_label_count(signer)) {
++		verbose(VERB_QUERY, "verify: RRSIG label count too low for signer");
++		*reason = "signature labelcount lower than signature signer";
++		return sec_status_bogus;
++	}
+ 
+ 	/* original ttl, always ok */
+ 
+--- a/validator/val_utils.c
++++ b/validator/val_utils.c
+@@ -130,7 +130,7 @@
+ }
+ 
+ /** Get signer name from RRSIG */
+-static void
++void
+ rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname, size_t* slen)
+ {
+ 	/* RRSIG rdata is not allowed to be compressed, it is stored
+--- a/validator/val_utils.h
++++ b/validator/val_utils.h
+@@ -424,4 +424,8 @@
+ struct dns_msg* val_find_DS(struct module_env* env, uint8_t* nm, size_t nmlen,
+ 	uint16_t c, struct regional* region, uint8_t* topname);
+ 
++/** Get signer name from RRSIG, sname is NULL if malformed. */
++void rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname,
++	size_t* slen);
++
+ #endif /* VALIDATOR_VAL_UTILS_H */
+--- a/validator/validator.c
++++ b/validator/validator.c
+@@ -786,6 +786,10 @@
+ 	uint8_t* wc = NULL;
+ 	size_t wl;
+ 	int wc_cached = 0;
++	int wc_to_cache = 0;
++	uint8_t* cache_wc = NULL;
++	size_t cache_wl = 0;
++	struct ub_packed_rrset_key* cache_s = NULL;
+ 	int wc_NSEC_ok = 0;
+ 	int nsec3s_seen = 0;
+ 	size_t i;
+@@ -806,8 +810,11 @@
+ 			return;
+ 		}
+ 		if(wc && !wc_cached && env->cfg->aggressive_nsec) {
+-			rrset_cache_update_wildcard(env->rrset_cache, s, wc, wl,
+-				env->alloc, *env->now);
++			/* Postpone cache adjust until proof has succeeded. */
++			wc_to_cache = 1;
++			cache_wc = wc;
++			cache_wl = wl;
++			cache_s = s;
+ 			wc_cached = 1;
+ 		}
+ 
+@@ -861,6 +868,10 @@
+ 			"did not exist");
+ 		chase_reply->security = sec_status_bogus;
+ 		return;
++	}
++	if(wc_to_cache) {
++		rrset_cache_update_wildcard(env->rrset_cache, cache_s,
++			cache_wc, cache_wl, env->alloc, *env->now);
+ 	}
+ 
+ 	verbose(VERB_ALGO, "Successfully validated positive response");
+--- /dev/null
++++ b/testdata/rrsig_agr_wild.rpl
+@@ -0,0 +1,374 @@
++; config options
++; The island of trust is at com.
++server:
++	trust-anchor: "test. DS 1444 8 2 8a87d067fd09a5965244fe2e317dd26d182c468e0a7f26ecc4c7b479bf89db9b"
++	val-override-date: "20201020135527"
++	target-fetch-policy: "0 0 0 0 0"
++	qname-minimisation: "no"
++	fake-sha1: yes
++	trust-anchor-signaling: no
++	minimal-responses: no
++	iter-scrub-promiscuous: no
++	aggressive-nsec: yes
++	local-zone: test. nodefault
++	log-servfail: yes
++
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++CONFIG_END
++
++SCENARIO_BEGIN Test with RRSIG labels for wildcard with aggressive cache.
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129 
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++test. IN NS
++SECTION AUTHORITY
++test.	IN NS	ns.test.
++SECTION ADDITIONAL
++ns.test. IN A 1.2.3.5
++ENTRY_END
++RANGE_END
++
++; ns.test
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.5
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++test. IN NS
++SECTION ANSWER
++test.    IN NS   ns.test
++test.	3600	IN	RRSIG	NS 8 1 3600 20201116135527 20201019135527 1444 test. RGCxIO32TbbLTk6xZmTr+fjYPH50hntBxeOQ2DIj2pDsmjALcHYtVkOfpfk2EhOhHZd+9PLuoJPbJh6a9NqLSFeBvr0XZoCZoQ2g0tCHUNHcH5EVjA2TuYBQem6DVYnPLJ3914aRx0uA1j42b8dC2xsam/XkOo7U+dLbUW2Os1s=
++SECTION ADDITIONAL
++ns.test. IN A 1.2.3.5
++ns.test.	3600	IN	RRSIG	A 8 2 3600 20201116135527 20201019135527 1444 test. GskCc4/k6GjH9V9Jz2V5L2XLiizbOeWkB0feSbf+aN859S3vxVvtuqkvIgwY4LafUO1QAn/pUcv9zA7rcFO++rlg+8t6gvZTo9p3v0bfeIv2uJDsfSBD5jDh0WXlxjekfnrKrQp7zE+GiA93tWwKUWKPvxXDgP+n886e6WcbHJw=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.test. IN A
++SECTION ANSWER
++ns.test. IN A 1.2.3.5
++ns.test.	3600	IN	RRSIG	A 8 2 3600 20201116135527 20201019135527 1444 test. GskCc4/k6GjH9V9Jz2V5L2XLiizbOeWkB0feSbf+aN859S3vxVvtuqkvIgwY4LafUO1QAn/pUcv9zA7rcFO++rlg+8t6gvZTo9p3v0bfeIv2uJDsfSBD5jDh0WXlxjekfnrKrQp7zE+GiA93tWwKUWKPvxXDgP+n886e6WcbHJw=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.test. IN AAAA
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++ns.test. 3600 IN NSEC nz.test. A RRSIG
++ns.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. PElArVB3KPg8KHAP7lzcNbhFuXNxTsHNTn1dZVncB5qmWRdIaeKpaXDjpH0JSXMaelGFS+/QhuQ6Hmw9+4VyZFRqMzGhw4agUR/2bxABHcDIG4ZpUwyeSP61ATTfHUkQVxaH2wjCWI/tfmesdP2xVE4GXyUvCIBxU914MkZbULU=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++test. IN DNSKEY
++SECTION ANSWER
++test.    3600    IN      DNSKEY  257 3 8 AwEAAbd9WqjzE2Pynz21OG5doSf9hFzMr5dhzz2waZ3vTa+0o5r7AjTAqmA1yH/B3+aAMihUm5ucZSfVqo7+kOaRE8yFj9aivOmA1n1+JLevJq/oyvQyjxQN2Qb89LyaNUT5oKZIiL+uyyhNW3KDR3SSbQ/GBwQNDHVcZi+JDR3RC0r7 ;{id = 1444 (ksk), size = 1024b}
++test.	3600	IN	RRSIG	DNSKEY 8 1 3600 20201116135527 20201019135527 1444 test. UmRMS4iG9NBBHZYOtpwFFcJgbEb5SfHSgHd9XRe/8pTWM31WSDayn5ViPOBMqI1T5TXg2amc13dDI574xIM2oKMus3b5cBW72jJLW13jprBtslO6P8BMWb4HNnvLrJtQjwf3ErRirtTxinLmywQtmyr1cdthyG3Gp4N7i90fHSc=
++SECTION ADDITIONAL
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qname qtype
++ADJUST copy_id
++REPLY QR AA NXDOMAIN
++SECTION QUESTION
++domain1.test. IN A
++SECTION ANSWER
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qname qtype
++ADJUST copy_id
++REPLY QR AA NXDOMAIN
++SECTION QUESTION
++domain2.test. IN DS
++SECTION ANSWER
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qname qtype
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++example.test. IN DS
++SECTION ANSWER
++example.test.	3600	IN	DS	55567 8 2 a2d578906330a10a57d40462257b6ce038bad3f7bf4a45c46c46086e20a94b39
++example.test.	3600	IN	RRSIG	DS 8 2 3600 20201116135527 20201019135527 1444 test. P7+FTYW2qHuJ4I1YbuvseEz5X1lOYAraGEHB3C5y0OOCQFmhmSiFRdquNi2NlpcS6FXLdsE0EU+Bo1+0atTG4EkMWXbpF21lrtbB51BdsnlX4Mzc/o375fvjiOMwmF6wPCUaOUN62jrVrhsE/hedaVyDphDToqL17ETohwgUO2I=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN NS
++SECTION AUTHORITY
++example.test.    IN NS   ns.example.test.
++example.test.	3600	IN	DS	55567 8 2 a2d578906330a10a57d40462257b6ce038bad3f7bf4a45c46c46086e20a94b39
++example.test.	3600	IN	RRSIG	DS 8 2 3600 20201116135527 20201019135527 1444 test. P7+FTYW2qHuJ4I1YbuvseEz5X1lOYAraGEHB3C5y0OOCQFmhmSiFRdquNi2NlpcS6FXLdsE0EU+Bo1+0atTG4EkMWXbpF21lrtbB51BdsnlX4Mzc/o375fvjiOMwmF6wPCUaOUN62jrVrhsE/hedaVyDphDToqL17ETohwgUO2I=
++SECTION ADDITIONAL
++ns.example.test. IN A 1.2.3.4
++ENTRY_END
++
++RANGE_END
++
++; ns.example.test.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN NS
++SECTION ANSWER
++example.test.    IN NS   ns.example.test.
++example.test.	3600	IN	RRSIG	NS 8 2 3600 20201116135527 20201019135527 55567 example.test. l1JT0wMlK0YI7/CWHzexf/k0iafUhCgN+BdgjBXIRXmSQNf4HDTiAkbcWL2/15qtnp12nQy9JeiTdSQ3vtPoHAJX4C5uTWaze4ms+Wrrf+n92sLCjacP9x50uuicH3URT6cKb1QCAPwlvlWxIlZjAMYFScSns7+C441NMJT8aE4=
++SECTION ADDITIONAL
++ns.example.test.         IN      A       1.2.3.4
++ns.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. 2PWaVaccZFQgfPKXNsdEGYUVaashCAj1ZhBo9XRt5eQKUFvZcauBjMnXIuxZFyWeootn1fZGw6GuPI5W48Y0FDx38H6adprkFgQikso2Y64jDdDMWznSo38Z/XqP+U0+kq4vmwonvmEMpm7hKnNEXvhqGKyGzyBwb+CZVJ2L8Eo=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.example.test. IN A
++SECTION ANSWER
++ns.example.test.         IN      A       1.2.3.4
++ns.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. 2PWaVaccZFQgfPKXNsdEGYUVaashCAj1ZhBo9XRt5eQKUFvZcauBjMnXIuxZFyWeootn1fZGw6GuPI5W48Y0FDx38H6adprkFgQikso2Y64jDdDMWznSo38Z/XqP+U0+kq4vmwonvmEMpm7hKnNEXvhqGKyGzyBwb+CZVJ2L8Eo=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.example.test. IN AAAA
++SECTION AUTHORITY
++example.test. 3600 IN SOA ns.example.test. host.example.test. 20301 3600 1800 604800 3600
++example.test.	3600	IN	RRSIG	SOA 8 2 3600 20201116135527 20201019135527 55567 example.test. 2UUkScBAN37fJpSrelhE8DotKvmOzj3q9wicaanCIaCv95DE4nQnePih5B+ek3FIRjB/Uv2+z4Ro5Uxy94XAnlK0rCkDLSa0U9U7KP0ytc88sevO0x1SCPAMoZoJO6JqHkv42pdh54WSz+Zb/D8npY0j/tksHe/uX+VQnMymgb8=
++ns.example.test. 3600 IN NSEC nz.example.test. A RRSIG
++example.test.	3600	IN	SOA	ns.example.test. host.example.test. 20301 3600 1800 604800 3600
++ENTRY_END
++
++; response to DNSKEY priming query
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN DNSKEY
++SECTION ANSWER
++example.test.	3600	IN	DNSKEY	257 3 8 AwEAAdug/L739i0mgN2nuK/bhxu3wFn5Ud9nK2+XUmZQlPUEZUC5YZvm1rfMmEWTGBn87fFxEu/kjFZHJ55JLzqsbbpVHLbmKCTT2gYR2FV2WDKROGKuYbVkJIXdKAjJ0ONuK507NinYvlWXIoxHn22KAWOd9wKgSTNHBlmGkX+ts3hh ;{id = 55567 (ksk), size = 1024b}
++example.test.	3600	IN	RRSIG	DNSKEY 8 2 3600 20201116135527 20201019135527 55567 example.test. IbWMC6quOuZFNPAVxQLqCJ9nLhindBo826rnLcg5yMgs9dGUSPOCXAfHTmbgJAUNs9HTFfrJWNvasnETs0UOpmEuifGwWdH1OlME7Gny4RL2QmITUFeMW81Jz1tiVQxFXl6yxT0jxOxvz+bqMHlrz+8IeWQXcO+GZTPu8ueq30g=
++ENTRY_END
++
++; response to query of interest
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++wild.example.test. IN A
++SECTION ANSWER
++wild.example.test. IN A 10.20.30.40
++; normal RRSIG:
++;wild.example.test.	3600	IN	RRSIG	A 8 3 3600 20201116135527 20201019135527 55567 example.test. RzIsliJeEcLIHQGJqr5U2tfgxjzyxvwpqWYMdF2qOmb5a5erx3AFwRLbHhl7383Kdpdi+KxVKIWmkG6YCta0sWE42UeDXAVtZnFK/VeADRWpzWljQaTdIG8eN6FdB/X3gSPXnxMhsd9OoAWHPJYrwXtoFbciH6Hy0gl4Cosc+7Q=
++; with labelcount lower, 2 lower.
++; like it is : *.test. IN A 10.20.30.40
++wild.example.test.	3600	IN	RRSIG	A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA=
++SECTION AUTHORITY
++un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
++un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++wild2.example.test. IN DS
++SECTION ANSWER
++wild2.example.test. IN DS 12345 250 2 00000000
++; normal RRSIG
++; wild2.example.test.	3600	IN	RRSIG	DS 8 3 3600 20201116135527 20201019135527 55567 example.test. GdSaD9J3c2QwsAPRbzY7lbuqguaBNEu/19jnZIrdMx4nmRRaMOS1MqMGZyOJdYvupVA0zg32bhCbmZdHSQLwzybjIgixGeiPC9MnfHdSqZKG7QG/AlUR2A/Mhmedp7RngROgIf6c7de88zsX+60xSfvBgNtg55YmODHqOICvTLs=
++; with labelcount lower, 2 lower.
++; for *.test. IN DS 12345 250 2 00000000
++wild2.example.test.	3600	IN	RRSIG	DS 8 1 3600 20201116135527 20201019135527 55567 example.test. qZQ/bfTCVuGISm6Pkq6OYDnyZMx8/uQQE3vq402UVWyy7ZrDBVI/CAErEIqz7Xl4cGgFUoezL2LCBIS7BMERCbQ0cVm3YTpnSzCgiDNJsu9W778SLOTcWlqJaiJn9EieFGkiFo2k3c1iuW++yufdhQmuXGk+DdLzE87tgvIkQm0=
++SECTION AUTHORITY
++un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
++un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
++ENTRY_END
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++domain1.test. IN A
++ENTRY_END
++
++; Picks up NSECs for aggressive negative cache.
++STEP 10 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA AD DO NXDOMAIN
++SECTION QUESTION
++domain1.test. IN A
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++ENTRY_END
++
++STEP 20 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++wild.example.test. IN A
++ENTRY_END
++
++; query for the wildcard record.
++STEP 30 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA DO SERVFAIL
++SECTION QUESTION
++wild.example.test. IN A
++ENTRY_END
++;REPLY QR RD RA AD DO NXDOMAIN
++;SECTION QUESTION
++;domain1.test. IN A
++;SECTION ANSWER
++;wild.example.test. IN A 10.20.30.40
++;wild.example.test.	3600	IN	RRSIG	A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA=
++;SECTION AUTHORITY
++;un.example.test. 3600 IN NSEC xy.example.test. A RRSIG
++;un.example.test.	3600	IN	RRSIG	NSEC 8 3 3600 20201116135527 20201019135527 55567 example.test. rP0p0viq8A3y/RSth9BNkDVAufPRVp8uohX+Wp1lby4naxlOjZCONz3aeLz8c0XgrIUtdU4t2sZZz9gF9jfr/QnAr5JDMDAIpMXKYGx/3dk5mSP/OBRX9sNVuBdr9YuyYy5N9K97aKTSQTRNU8FdTVYx9yjImVlwA8KI+SkztJ4=
++;ENTRY_END
++
++;STEP 40 QUERY
++;ENTRY_BEGIN
++;REPLY RD DO
++;SECTION QUESTION
++;domain2.test. IN A
++;ENTRY_END
++;
++;; aggressive cache synthesis, the '*.test' from the wildcard lookup.
++;STEP 50 CHECK_ANSWER
++;ENTRY_BEGIN
++;MATCH all
++;REPLY QR RD RA DO SERVFAIL
++;SECTION QUESTION
++;domain2.test. IN A
++;SECTION ANSWER
++;ENTRY_END
++
++STEP 60 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++wild2.example.test. IN DS
++ENTRY_END
++
++; wild2 is for *.test DS
++STEP 70 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA DO SERVFAIL
++SECTION QUESTION
++wild2.example.test. IN DS
++SECTION ANSWER
++ENTRY_END
++
++STEP 80 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++domain3.test. IN A
++ENTRY_END
++
++; aggressive cache synthesis, the '*.test' from the wildcard lookup.
++; with '*.test' DS record.
++STEP 90 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++
++; The bad answer
++;REPLY QR RD RA DO NOERROR
++;SECTION QUESTION
++;domain3.test. IN A
++;SECTION ANSWER
++;domain3.test.   0       IN      A       10.20.30.40
++;domain3.test.   0       IN      RRSIG   A 8 1 3600 20201116135527 20201019135527 55567 example.test. XR1dPkaZmhIXoKRBmVLiDdIROYxlVNuII0kD/Nh/L3QteSvjwdfDBbVvwWGc+y011is0eFZBlFHWxmhw8BXytktlcJ3rZ1GPbcixkX7XPIIZER7jvZiFnKDS2Fwgh2wgpAXdo8KrmMgeUGPjP9scbzbBxLfSV/ja93PTuTSi6VA= ;{id = 55567}
++;SECTION AUTHORITY
++;cee.test.       0       IN      NSEC    erts.test. DS RRSIG
++;cee.test.       0       IN      RRSIG   NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA= ;{id = 1444}
++
++; The correct answer
++REPLY QR RD RA AD DO NXDOMAIN
++SECTION QUESTION
++domain3.test. IN A
++SECTION AUTHORITY
++test. 3600 IN NSEC abc.test. NS SOA DNSKEY RRSIG NSEC
++test.	3600	IN	RRSIG	NSEC 8 1 3600 20201116135527 20201019135527 1444 test. SHU0veyxtCpPvwdJxn2xCEq9xXJZLIvAlYYy7/dBMSjo6ugBPSxs1+8hUZFxks+YQoPLR5nTU0C0yuhZ9dfg/2VGkCYLsDLYnh1lJj6uQ2VgwfhbwSJC0E9hwYvD7yl6LcmpySbGiyI0cCbK/wWHE8wVw4VBcbuv01f3Cj6F+mo=
++cee.test. 3600 IN NSEC erts.test. RRSIG DS
++cee.test.	3600	IN	RRSIG	NSEC 8 2 3600 20201116135527 20201019135527 1444 test. kIveXrsXAeb7fsc3YNZ6UyJeCGxENpeUAl3mUCW2py+0vXfLjmDNs4FG5cwkLSIrni1z8k4939Bt+/3i+ABE84Utb77LpF29+dIay0L5V9c+avY2rJH8F1JU0kidtFQAccZqXuHtGSHHAi35w09UqghK+hNKfv+7qRUICX5ByCA=
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++test.	3600	IN	RRSIG	SOA 8 1 3600 20201116135527 20201019135527 1444 test. IZJIDmEgf0W7A5G7hvvZ2hUqJ9Trbv1/i7ySapDmPbYV9lVCmHHobySxO01yDhI2/Pvpsvxqrm1Tiv3BxH8uzZ4keKgiQjBsSy4htAsFct9I4E7ly2glPj/Fm3oun3PsjJDv5QYhx0KS7w4IQKU7Nc9pfJc92uoUI5bdoC1pRGw=
++ENTRY_END
++
++SCENARIO_END
+Description: CVE-2026-41292 - Limit number of parsed incoming EDNS options
+ Parsing a long list of incoming EDNS options degrades performance,
+ allowing a remote attacker to cause a denial of service by sending a
+ packet whose OPT record RDATA contains a very large number of EDNS
+ options. Each option triggers per-option processing (allocation and
+ append), so an attacker-controlled long list results in excessive CPU
+ and memory use.
+ .
+ This patch caps the number of EDNS options parsed from a single message
+ at MAX_PARSED_EDNS_OPTIONS (100) by adding a counter to the option
+ parsing loop. In unbound 1.13.1 the single parse_edns_options() helper
+ is used for both the query and the response parse paths (the upstream
+ fix later split it into parse_edns_options_from_query() and
+ parse_extract_edns_from_response_msg()), so guarding this one loop
+ covers both vulnerable paths.
+Origin: backport, https://github.com/NLnetLabs/unbound/commit/ef5ca84360934fa1e857ebc371d4b093aea6355d
+Author: Wouter Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/util/data/msgparse.c
++++ b/util/data/msgparse.c
+@@ -48,6 +48,8 @@
+ #include "sldns/parseutil.h"
+ #include "sldns/wire2str.h"
+ 
++#define MAX_PARSED_EDNS_OPTIONS 100
++
+ /** smart comparison of (compressed, valid) dnames from packet */
+ static int
+ smart_compare(sldns_buffer* pkt, uint8_t* dnow, 
+@@ -943,9 +945,10 @@
+ parse_edns_options(uint8_t* rdata_ptr, size_t rdata_len,
+ 	struct edns_data* edns, struct regional* region)
+ {
++	int i = 0;
+ 	/* while still more options, and have code+len to read */
+ 	/* ignores partial content (i.e. rdata len 3) */
+-	while(rdata_len >= 4) {
++	while(rdata_len >= 4 && i < MAX_PARSED_EDNS_OPTIONS) {
+ 		uint16_t opt_code = sldns_read_uint16(rdata_ptr);
+ 		uint16_t opt_len = sldns_read_uint16(rdata_ptr+2);
+ 		rdata_ptr += 4;
+@@ -959,6 +962,7 @@
+ 		}
+ 		rdata_ptr += opt_len;
+ 		rdata_len -= opt_len;
++		i++;
+ 	}
+ 	return 1;
+ }
+Description: CVE-2026-42959 - Fix crash during DNSSEC validation of malicious content.
+ val_fill_reply() in validator/val_utils.c computed the write offsets for the
+ ADDITIONAL section using orig->ns_numrrsets instead of chase->ns_numrrsets.
+ Because chase is the reply being (re)built and its ns_numrrsets can differ
+ from the original reply, this could index chase->rrsets[] beyond the slots
+ that have actually been initialized, dereferencing an uninitialized rrset
+ pointer and crashing the validator when processing malicious content.
+ The fix uses chase->ns_numrrsets for both ADDITIONAL-section write offsets,
+ matching the counters used to fill the answer and authority sections.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/94d5babaee22a016e376bdcfee2b9bb40360367c
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/validator/val_utils.c
++++ b/validator/val_utils.c
+@@ -900,10 +900,10 @@ val_fill_reply(struct reply_info* chase, struct reply_info* orig,
+ 			if(query_dname_compare(name, 
+ 				orig->rrsets[i]->rk.dname) == 0)
+ 			    chase->rrsets[chase->an_numrrsets
+-				+orig->ns_numrrsets+chase->ar_numrrsets++] 
++				+chase->ns_numrrsets+chase->ar_numrrsets++]
+ 				= orig->rrsets[i];
+ 		} else if(rrset_has_signer(orig->rrsets[i], name, len)) {
+-			chase->rrsets[chase->an_numrrsets+orig->ns_numrrsets+
++			chase->rrsets[chase->an_numrrsets+chase->ns_numrrsets+
+ 				chase->ar_numrrsets++] = orig->rrsets[i];
+ 		}
+ 	}
+Description: CVE-2026-42960 - Fix possible cache poisoning while following delegation
+ In scrub_normalize() (iterator/iter_scrub.c) address records in the
+ additional section were unconditionally marked as allowed glue for any
+ RRset in the authority section. A malicious authoritative server could
+ therefore attach address records as glue for non-delegation RR types
+ (e.g. MX) in the authority section and have them cached as a side effect
+ of the query, enabling a cache poisoning attack while following a
+ delegation.
+ .
+ This patch only marks additional address records as allowed glue when the
+ authority-section RRset is of type NS, matching the delegation semantics.
+ It complements the earlier fix for CVE-2025-11411.
+ .
+ A regression test (testdata/iter_scrub_mx.rpl) is added; it is discovered
+ automatically by the testbound replay runner (testdata/03-testbound.tdir)
+ which globs testdata/*.rpl.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/8ae4b4545dccaaabd30b597b0dcb0d9640c8cc39
+Author: NLnet Labs <unbound@nlnetlabs.nl>
+Last-Update: 2026-08-18
+---
+--- a/iterator/iter_scrub.c
++++ b/iterator/iter_scrub.c
+@@ -566,7 +566,13 @@ scrub_normalize(sldns_buffer* pkt, struct msg_parse* msg,
+ 			rrset->rrset_all_next = NULL;
+ 			return 1;
+ 		}
+-		mark_additional_rrset(pkt, msg, rrset);
++		/* Only mark glue as allowed for type NS in the authority
++		 * section. Other RR types do not get glue for them, it
++		 * is allowed from the answer section, but not authority
++		 * so that a message can not have address records cached
++		 * as a side effect to the query. */
++		if(rrset->type==LDNS_RR_TYPE_NS)
++			mark_additional_rrset(pkt, msg, rrset);
+ 		prev = rrset;
+ 		rrset = rrset->rrset_all_next;
+ 	}
+--- /dev/null
++++ b/testdata/iter_scrub_mx.rpl
+@@ -0,0 +1,107 @@
++; config options
++server:
++	target-fetch-policy: "0 0 0 0 0"
++
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++
++stub-zone:
++	name: "example.com"
++	stub-addr: 1.2.3.4
++CONFIG_END
++
++SCENARIO_BEGIN Test scrubber does not cache glue for authority MX (CVE-2026-42960)
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++RANGE_END
++
++; ns.example.com.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++www.example.com. IN A
++SECTION ANSWER
++www.example.com. IN A	10.20.30.40
++SECTION AUTHORITY
++; MX in the authority section: its additional address glue must not be
++; kept and must not be cached as a side effect of this query.
++example.com.	IN MX	10 mail.attacker.com.
++SECTION ADDITIONAL
++mail.attacker.com.	IN 	A	6.6.6.6
++ENTRY_END
++
++; a follow-up query for the attacker glue name; if the scrubber wrongly
++; cached the additional A record above, this would be answered from cache.
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++mail.attacker.com. IN A
++SECTION ANSWER
++mail.attacker.com.	IN A	1.2.3.4
++ENTRY_END
++
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD
++SECTION QUESTION
++www.example.com. IN A
++ENTRY_END
++
++; recursion happens here.
++STEP 10 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++www.example.com. IN A
++SECTION ANSWER
++www.example.com. IN A	10.20.30.40
++SECTION AUTHORITY
++SECTION ADDITIONAL
++ENTRY_END
++
++; the attacker glue must have been scrubbed and NOT cached, so this query
++; must be resolved from the authoritative server (returning 1.2.3.4), not
++; from the poisoned additional-section value (6.6.6.6).
++STEP 20 QUERY
++ENTRY_BEGIN
++REPLY RD
++SECTION QUESTION
++mail.attacker.com. IN A
++ENTRY_END
++
++STEP 30 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA NOERROR
++SECTION QUESTION
++mail.attacker.com. IN A
++SECTION ANSWER
++mail.attacker.com.	IN A	1.2.3.4
++SECTION AUTHORITY
++SECTION ADDITIONAL
++ENTRY_END
++
++SCENARIO_END
+Description: Fix CVE-2026-33278 - use-after-free / RCE during DNSSEC validation.
+ Upstream CVE-2026-33278 is a use-after-free in dns_msg_deepcopy_region()
+ reached through the NSEC3 computational-budget suspend/resume path, both of
+ which were introduced in unbound 1.19.1 and do not exist in this 1.13.1
+ target. This backports the portable, applicable half of upstream fix commit
+ 6a31e470f80a6e5c559ebe7fd4cfc0582d3b6d0a: a defensive param_set_same() input
+ check that rejects NSEC3 record sets whose members come from distinct NSEC3
+ chains (mismatched algorithm, iteration count, or salt) or that are malformed,
+ before running the expensive NSEC3 proofs. This mixed-chain/malformed NSEC3
+ record set from a malicious signed zone is the attacker-controlled precondition
+ that drives the excessive NSEC3 computation underlying the vulnerability. The
+ guard is added at the entry of all five NSEC3 proof functions.
+Origin: ai-synthesized, CVE-2026-33278
+Author: Root.io Novel Patcher <security@root.io>
+Last-Update: 2026-08-18
+
+--- a/validator/val_nsec3.c
++++ b/validator/val_nsec3.c
+@@ -443,6 +443,67 @@ filter_init(struct nsec3_filter* filter, struct ub_packed_rrset_key** list,
+ 	}
+ }
+ 
++/** Check if the NSEC3s have the same parameter set. */
++static int
++param_set_same(struct nsec3_filter* flt, char** reason)
++{
++	size_t rrsetnum;
++	int rrnum;
++	struct ub_packed_rrset_key* rrset;
++	int have_params = 0;
++	int first_algo = 0;
++	size_t first_iter = 0;
++	uint8_t* first_salt = NULL;
++	size_t first_saltlen = 0;
++
++	/* If the NSEC3 parameter sets have distinct values, then they are
++	 * from different NSEC3 chains, and we do not want that. */
++	for(rrset=filter_first(flt, &rrsetnum, &rrnum); rrset;
++		rrset=filter_next(flt, &rrsetnum, &rrnum)) {
++		if(!have_params) {
++			first_algo = nsec3_get_algo(rrset, rrnum);
++			first_iter = nsec3_get_iter(rrset, rrnum);
++			if(!nsec3_get_salt(rrset, rrnum, &first_salt,
++				&first_saltlen)) {
++				verbose(VERB_ALGO, "NSEC3 salt malformed");
++				if(reason)
++					*reason = "NSEC3 salt malformed";
++				return 0;
++			}
++			have_params = 1;
++		} else {
++			uint8_t* salt = NULL;
++			size_t saltlen = 0;
++			if(nsec3_get_algo(rrset, rrnum) != first_algo) {
++				verbose(VERB_ALGO, "NSEC3 algorithm mismatch");
++				if(reason)
++					*reason = "NSEC3 algorithm mismatch";
++				return 0;
++			}
++			if(nsec3_get_iter(rrset, rrnum) != first_iter) {
++				verbose(VERB_ALGO, "NSEC3 iterations mismatch");
++				if(reason)
++					*reason = "NSEC3 iterations mismatch";
++				return 0;
++			}
++			if(!nsec3_get_salt(rrset, rrnum, &salt, &saltlen)) {
++				verbose(VERB_ALGO, "NSEC3 salt malformed");
++				if(reason)
++					*reason = "NSEC3 salt malformed";
++				return 0;
++			}
++			if(saltlen != first_saltlen ||
++				memcmp(salt, first_salt, saltlen) != 0) {
++				verbose(VERB_ALGO, "NSEC3 salt mismatch");
++				if(reason)
++					*reason = "NSEC3 salt mismatch";
++				return 0;
++			}
++		}
++	}
++	return 1;
++}
++
+ /**
+  * Find max iteration count using config settings and key size
+  * @param ve: validator environment with iteration count config settings.
+@@ -1075,6 +1136,8 @@ nsec3_prove_nameerror(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 	log_nametypeclass(VERB_ALGO, "start nsec3 nameerror proof, zone", 
+@@ -1234,6 +1297,8 @@ nsec3_prove_nodata(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 	return nsec3_do_prove_nodata(env, &flt, &ct, qinfo);
+@@ -1258,6 +1323,8 @@ nsec3_prove_wildcard(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 
+@@ -1338,6 +1405,8 @@ nsec3_prove_nods(struct module_env* env, struct val_env* ve,
+ 		*reason = "no NSEC3 records";
+ 		return sec_status_bogus; /* no RRs */
+ 	}
++	if(!param_set_same(&flt, reason))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 
+@@ -1418,6 +1487,8 @@ nsec3_prove_nxornodata(struct module_env* env, struct val_env* ve,
+ 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
+ 	if(!flt.zone)
+ 		return sec_status_bogus; /* no RRs */
++	if(!param_set_same(&flt, NULL))
++		return sec_status_bogus; /* nsec3 params from distinct chains*/
+ 	if(nsec3_iteration_count_high(ve, &flt, kkey))
+ 		return sec_status_insecure; /* iteration count too high */
+ 
 Description: CVE-2026-50252 - Fix possible cache poisoning attack by mapping
  source port population per thread.
  .
@@ -1206,359 +2102,3 @@ Last-Update: 2026-08-18
  #ifdef CLIENT_SUBNET
  	ecs_test();
  #endif /* CLIENT_SUBNET */
-Description: Fix CVE-2026-33278 - use-after-free / RCE during DNSSEC validation.
- Upstream CVE-2026-33278 is a use-after-free in dns_msg_deepcopy_region()
- reached through the NSEC3 computational-budget suspend/resume path, both of
- which were introduced in unbound 1.19.1 and do not exist in this 1.13.1
- target. This backports the portable, applicable half of upstream fix commit
- 6a31e470f80a6e5c559ebe7fd4cfc0582d3b6d0a: a defensive param_set_same() input
- check that rejects NSEC3 record sets whose members come from distinct NSEC3
- chains (mismatched algorithm, iteration count, or salt) or that are malformed,
- before running the expensive NSEC3 proofs. This mixed-chain/malformed NSEC3
- record set from a malicious signed zone is the attacker-controlled precondition
- that drives the excessive NSEC3 computation underlying the vulnerability. The
- guard is added at the entry of all five NSEC3 proof functions.
-Origin: ai-synthesized, CVE-2026-33278
-Author: Root.io Novel Patcher <security@root.io>
-Last-Update: 2026-08-18
-
---- a/validator/val_nsec3.c
-+++ b/validator/val_nsec3.c
-@@ -443,6 +443,67 @@ filter_init(struct nsec3_filter* filter, struct ub_packed_rrset_key** list,
- 	}
- }
- 
-+/** Check if the NSEC3s have the same parameter set. */
-+static int
-+param_set_same(struct nsec3_filter* flt, char** reason)
-+{
-+	size_t rrsetnum;
-+	int rrnum;
-+	struct ub_packed_rrset_key* rrset;
-+	int have_params = 0;
-+	int first_algo = 0;
-+	size_t first_iter = 0;
-+	uint8_t* first_salt = NULL;
-+	size_t first_saltlen = 0;
-+
-+	/* If the NSEC3 parameter sets have distinct values, then they are
-+	 * from different NSEC3 chains, and we do not want that. */
-+	for(rrset=filter_first(flt, &rrsetnum, &rrnum); rrset;
-+		rrset=filter_next(flt, &rrsetnum, &rrnum)) {
-+		if(!have_params) {
-+			first_algo = nsec3_get_algo(rrset, rrnum);
-+			first_iter = nsec3_get_iter(rrset, rrnum);
-+			if(!nsec3_get_salt(rrset, rrnum, &first_salt,
-+				&first_saltlen)) {
-+				verbose(VERB_ALGO, "NSEC3 salt malformed");
-+				if(reason)
-+					*reason = "NSEC3 salt malformed";
-+				return 0;
-+			}
-+			have_params = 1;
-+		} else {
-+			uint8_t* salt = NULL;
-+			size_t saltlen = 0;
-+			if(nsec3_get_algo(rrset, rrnum) != first_algo) {
-+				verbose(VERB_ALGO, "NSEC3 algorithm mismatch");
-+				if(reason)
-+					*reason = "NSEC3 algorithm mismatch";
-+				return 0;
-+			}
-+			if(nsec3_get_iter(rrset, rrnum) != first_iter) {
-+				verbose(VERB_ALGO, "NSEC3 iterations mismatch");
-+				if(reason)
-+					*reason = "NSEC3 iterations mismatch";
-+				return 0;
-+			}
-+			if(!nsec3_get_salt(rrset, rrnum, &salt, &saltlen)) {
-+				verbose(VERB_ALGO, "NSEC3 salt malformed");
-+				if(reason)
-+					*reason = "NSEC3 salt malformed";
-+				return 0;
-+			}
-+			if(saltlen != first_saltlen ||
-+				memcmp(salt, first_salt, saltlen) != 0) {
-+				verbose(VERB_ALGO, "NSEC3 salt mismatch");
-+				if(reason)
-+					*reason = "NSEC3 salt mismatch";
-+				return 0;
-+			}
-+		}
-+	}
-+	return 1;
-+}
-+
- /**
-  * Find max iteration count using config settings and key size
-  * @param ve: validator environment with iteration count config settings.
-@@ -1075,6 +1136,8 @@ nsec3_prove_nameerror(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 	log_nametypeclass(VERB_ALGO, "start nsec3 nameerror proof, zone", 
-@@ -1234,6 +1297,8 @@ nsec3_prove_nodata(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 	return nsec3_do_prove_nodata(env, &flt, &ct, qinfo);
-@@ -1258,6 +1323,8 @@ nsec3_prove_wildcard(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 
-@@ -1338,6 +1405,8 @@ nsec3_prove_nods(struct module_env* env, struct val_env* ve,
- 		*reason = "no NSEC3 records";
- 		return sec_status_bogus; /* no RRs */
- 	}
-+	if(!param_set_same(&flt, reason))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 
-@@ -1418,6 +1487,8 @@ nsec3_prove_nxornodata(struct module_env* env, struct val_env* ve,
- 	filter_init(&flt, list, num, qinfo); /* init RR iterator */
- 	if(!flt.zone)
- 		return sec_status_bogus; /* no RRs */
-+	if(!param_set_same(&flt, NULL))
-+		return sec_status_bogus; /* nsec3 params from distinct chains*/
- 	if(nsec3_iteration_count_high(ve, &flt, kkey))
- 		return sec_status_insecure; /* iteration count too high */
- 
-Description: CVE-2026-42959 - Fix crash during DNSSEC validation of malicious content.
- val_fill_reply() in validator/val_utils.c computed the write offsets for the
- ADDITIONAL section using orig->ns_numrrsets instead of chase->ns_numrrsets.
- Because chase is the reply being (re)built and its ns_numrrsets can differ
- from the original reply, this could index chase->rrsets[] beyond the slots
- that have actually been initialized, dereferencing an uninitialized rrset
- pointer and crashing the validator when processing malicious content.
- The fix uses chase->ns_numrrsets for both ADDITIONAL-section write offsets,
- matching the counters used to fill the answer and authority sections.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/94d5babaee22a016e376bdcfee2b9bb40360367c
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/validator/val_utils.c
-+++ b/validator/val_utils.c
-@@ -900,10 +900,10 @@ val_fill_reply(struct reply_info* chase, struct reply_info* orig,
- 			if(query_dname_compare(name, 
- 				orig->rrsets[i]->rk.dname) == 0)
- 			    chase->rrsets[chase->an_numrrsets
--				+orig->ns_numrrsets+chase->ar_numrrsets++] 
-+				+chase->ns_numrrsets+chase->ar_numrrsets++]
- 				= orig->rrsets[i];
- 		} else if(rrset_has_signer(orig->rrsets[i], name, len)) {
--			chase->rrsets[chase->an_numrrsets+orig->ns_numrrsets+
-+			chase->rrsets[chase->an_numrrsets+chase->ns_numrrsets+
- 				chase->ar_numrrsets++] = orig->rrsets[i];
- 		}
- 	}
-Description: CVE-2026-41292 - Limit number of parsed incoming EDNS options
- Parsing a long list of incoming EDNS options degrades performance,
- allowing a remote attacker to cause a denial of service by sending a
- packet whose OPT record RDATA contains a very large number of EDNS
- options. Each option triggers per-option processing (allocation and
- append), so an attacker-controlled long list results in excessive CPU
- and memory use.
- .
- This patch caps the number of EDNS options parsed from a single message
- at MAX_PARSED_EDNS_OPTIONS (100) by adding a counter to the option
- parsing loop. In unbound 1.13.1 the single parse_edns_options() helper
- is used for both the query and the response parse paths (the upstream
- fix later split it into parse_edns_options_from_query() and
- parse_extract_edns_from_response_msg()), so guarding this one loop
- covers both vulnerable paths.
-Origin: backport, https://github.com/NLnetLabs/unbound/commit/ef5ca84360934fa1e857ebc371d4b093aea6355d
-Author: Wouter Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/util/data/msgparse.c
-+++ b/util/data/msgparse.c
-@@ -48,6 +48,8 @@
- #include "sldns/parseutil.h"
- #include "sldns/wire2str.h"
- 
-+#define MAX_PARSED_EDNS_OPTIONS 100
-+
- /** smart comparison of (compressed, valid) dnames from packet */
- static int
- smart_compare(sldns_buffer* pkt, uint8_t* dnow, 
-@@ -943,9 +945,10 @@
- parse_edns_options(uint8_t* rdata_ptr, size_t rdata_len,
- 	struct edns_data* edns, struct regional* region)
- {
-+	int i = 0;
- 	/* while still more options, and have code+len to read */
- 	/* ignores partial content (i.e. rdata len 3) */
--	while(rdata_len >= 4) {
-+	while(rdata_len >= 4 && i < MAX_PARSED_EDNS_OPTIONS) {
- 		uint16_t opt_code = sldns_read_uint16(rdata_ptr);
- 		uint16_t opt_len = sldns_read_uint16(rdata_ptr+2);
- 		rdata_ptr += 4;
-@@ -959,6 +962,7 @@
- 		}
- 		rdata_ptr += opt_len;
- 		rdata_len -= opt_len;
-+		i++;
- 	}
- 	return 1;
- }
-Description: CVE-2026-42960 - Fix possible cache poisoning while following delegation
- In scrub_normalize() (iterator/iter_scrub.c) address records in the
- additional section were unconditionally marked as allowed glue for any
- RRset in the authority section. A malicious authoritative server could
- therefore attach address records as glue for non-delegation RR types
- (e.g. MX) in the authority section and have them cached as a side effect
- of the query, enabling a cache poisoning attack while following a
- delegation.
- .
- This patch only marks additional address records as allowed glue when the
- authority-section RRset is of type NS, matching the delegation semantics.
- It complements the earlier fix for CVE-2025-11411.
- .
- A regression test (testdata/iter_scrub_mx.rpl) is added; it is discovered
- automatically by the testbound replay runner (testdata/03-testbound.tdir)
- which globs testdata/*.rpl.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/8ae4b4545dccaaabd30b597b0dcb0d9640c8cc39
-Author: NLnet Labs <unbound@nlnetlabs.nl>
-Last-Update: 2026-08-18
----
---- a/iterator/iter_scrub.c
-+++ b/iterator/iter_scrub.c
-@@ -566,7 +566,13 @@ scrub_normalize(sldns_buffer* pkt, struct msg_parse* msg,
- 			rrset->rrset_all_next = NULL;
- 			return 1;
- 		}
--		mark_additional_rrset(pkt, msg, rrset);
-+		/* Only mark glue as allowed for type NS in the authority
-+		 * section. Other RR types do not get glue for them, it
-+		 * is allowed from the answer section, but not authority
-+		 * so that a message can not have address records cached
-+		 * as a side effect to the query. */
-+		if(rrset->type==LDNS_RR_TYPE_NS)
-+			mark_additional_rrset(pkt, msg, rrset);
- 		prev = rrset;
- 		rrset = rrset->rrset_all_next;
- 	}
---- /dev/null
-+++ b/testdata/iter_scrub_mx.rpl
-@@ -0,0 +1,107 @@
-+; config options
-+server:
-+	target-fetch-policy: "0 0 0 0 0"
-+
-+stub-zone:
-+	name: "."
-+	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
-+
-+stub-zone:
-+	name: "example.com"
-+	stub-addr: 1.2.3.4
-+CONFIG_END
-+
-+SCENARIO_BEGIN Test scrubber does not cache glue for authority MX (CVE-2026-42960)
-+
-+; K.ROOT-SERVERS.NET.
-+RANGE_BEGIN 0 100
-+	ADDRESS 193.0.14.129
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+. IN NS
-+SECTION ANSWER
-+. IN NS	K.ROOT-SERVERS.NET.
-+SECTION ADDITIONAL
-+K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
-+ENTRY_END
-+RANGE_END
-+
-+; ns.example.com.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.4
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+www.example.com. IN A
-+SECTION ANSWER
-+www.example.com. IN A	10.20.30.40
-+SECTION AUTHORITY
-+; MX in the authority section: its additional address glue must not be
-+; kept and must not be cached as a side effect of this query.
-+example.com.	IN MX	10 mail.attacker.com.
-+SECTION ADDITIONAL
-+mail.attacker.com.	IN 	A	6.6.6.6
-+ENTRY_END
-+
-+; a follow-up query for the attacker glue name; if the scrubber wrongly
-+; cached the additional A record above, this would be answered from cache.
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+mail.attacker.com. IN A
-+SECTION ANSWER
-+mail.attacker.com.	IN A	1.2.3.4
-+ENTRY_END
-+
-+RANGE_END
-+
-+STEP 1 QUERY
-+ENTRY_BEGIN
-+REPLY RD
-+SECTION QUESTION
-+www.example.com. IN A
-+ENTRY_END
-+
-+; recursion happens here.
-+STEP 10 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+www.example.com. IN A
-+SECTION ANSWER
-+www.example.com. IN A	10.20.30.40
-+SECTION AUTHORITY
-+SECTION ADDITIONAL
-+ENTRY_END
-+
-+; the attacker glue must have been scrubbed and NOT cached, so this query
-+; must be resolved from the authoritative server (returning 1.2.3.4), not
-+; from the poisoned additional-section value (6.6.6.6).
-+STEP 20 QUERY
-+ENTRY_BEGIN
-+REPLY RD
-+SECTION QUESTION
-+mail.attacker.com. IN A
-+ENTRY_END
-+
-+STEP 30 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA NOERROR
-+SECTION QUESTION
-+mail.attacker.com. IN A
-+SECTION ANSWER
-+mail.attacker.com.	IN A	1.2.3.4
-+SECTION AUTHORITY
-+SECTION ADDITIONAL
-+ENTRY_END
-+
-+SCENARIO_END
