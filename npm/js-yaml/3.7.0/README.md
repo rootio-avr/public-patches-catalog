@@ -4,6 +4,7 @@ This patch is based on js-yaml version 3.7.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- GHSA-8j8c-7jfh-h6hx
 - GHSA-5p4m-2wfm-xmqj
 
 ## How to Apply:
