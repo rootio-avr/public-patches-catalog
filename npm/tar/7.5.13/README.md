@@ -8,6 +8,7 @@ unknown
 - CVE-2026-59871
 - CVE-2026-59873
 - CVE-2026-59874
+- CVE-2026-73566
 
 ## How to Apply:
 1. Clone or download the source code for tar
