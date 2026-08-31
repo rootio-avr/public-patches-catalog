@@ -4,6 +4,7 @@ This patch is based on @grpc/grpc-js version 1.12.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-48068
 - CVE-2026-48069
 
 ## How to Apply:
