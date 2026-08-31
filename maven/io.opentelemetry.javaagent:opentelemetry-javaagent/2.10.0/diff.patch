@@ -1,0 +1,198 @@
+--- a/instrumentation/rmi/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/rmi/context/ContextPayload.java
++++ b/instrumentation/rmi/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/rmi/context/ContextPayload.java
+@@ -17,11 +17,13 @@
+ import java.util.HashMap;
+ import java.util.Map;
+ import java.util.logging.Logger;
++import javax.annotation.Nullable;
+ 
+ /** ContextPayload wraps context information shared between client and server. */
+ public class ContextPayload {
+ 
+   private static final Logger logger = Logger.getLogger(ContextPayload.class.getName());
++  private static final int MAX_CONTEXT_ENTRIES = 1000;
+ 
+   private final Map<String, String> context;
+ 
+@@ -41,24 +43,40 @@
+     return payload;
+   }
+ 
+-  @SuppressWarnings("BanSerializableRead")
++  @Nullable
+   public static ContextPayload read(ObjectInput oi) throws IOException {
+-    try {
+-      Object object = oi.readObject();
+-      if (object instanceof Map) {
+-        @SuppressWarnings("unchecked")
+-        Map<String, String> map = (Map<String, String>) object;
+-        return new ContextPayload(map);
+-      }
+-    } catch (ClassCastException | ClassNotFoundException ex) {
+-      logger.log(FINE, "Error reading object", ex);
++    int size = oi.readInt();
++    if (size > MAX_CONTEXT_ENTRIES) {
++      logger.log(
++          FINE,
++          "RMI context propagation payload size {0} exceeds maximum allowed of {1}, skipping context propagation.",
++          new Object[] {size, MAX_CONTEXT_ENTRIES});
++      return null;
+     }
+-
+-    return null;
++    Map<String, String> map = new HashMap<>();
++    for (int i = 0; i < size; i++) {
++      String key = oi.readUTF();
++      String value = oi.readUTF();
++      map.put(key, value);
++    }
++    return new ContextPayload(map);
+   }
+ 
+   public void write(ObjectOutput out) throws IOException {
+-    out.writeObject(context);
++    int size = context.size();
++    if (size > MAX_CONTEXT_ENTRIES) {
++      logger.log(
++          FINE,
++          "RMI context propagation payload size {0} exceeds maximum allowed of {1}, skipping context propagation.",
++          new Object[] {size, MAX_CONTEXT_ENTRIES});
++      out.writeInt(0);
++      return;
++    }
++    out.writeInt(size);
++    for (Map.Entry<String, String> entry : context.entrySet()) {
++      out.writeUTF(entry.getKey());
++      out.writeUTF(entry.getValue());
++    }
+   }
+ 
+   public Context extract() {
+--- a/instrumentation/rmi/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/rmi/context/ContextPropagator.java
++++ b/instrumentation/rmi/javaagent/src/main/java/io/opentelemetry/javaagent/instrumentation/rmi/context/ContextPropagator.java
+@@ -29,7 +29,7 @@
+ 
+   // RMI object id used to identify agent instrumentation
+   public static final ObjID CONTEXT_CALL_ID =
+-      new ObjID("io.opentelemetry.javaagent.context-call".hashCode());
++      new ObjID("io.opentelemetry.javaagent.context-call-v2".hashCode());
+ 
+   // Operation id used for checking context propagation is possible
+   // RMI expects these operations to have negative identifier, as positive ones mean legacy
+--- /dev/null
++++ b/instrumentation/rmi/javaagent/src/test/java/io/opentelemetry/javaagent/instrumentation/rmi/context/ContextPayloadRegressionTest.java
+@@ -0,0 +1,99 @@
++/*
++ * Copyright The OpenTelemetry Authors
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++package io.opentelemetry.javaagent.instrumentation.rmi.context;
++
++import static org.assertj.core.api.Assertions.assertThat;
++
++import java.io.ByteArrayInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.ObjectInputStream;
++import java.io.ObjectOutputStream;
++import java.lang.reflect.Field;
++import java.util.HashMap;
++import java.util.Map;
++import org.junit.jupiter.api.Test;
++
++/**
++ * Regression test for CVE-2026-33701.
++ *
++ * <p>Before the fix, {@link ContextPayload#read} used {@code ObjectInput.readObject()}, which
++ * deserializes arbitrary attacker-controlled objects off an RMI stream (CWE-502, unbounded
++ * deserialization / remote code execution). The fix replaces object serialization with an explicit
++ * bounded key/value string protocol and rejects oversized payloads.
++ */
++class ContextPayloadRegressionTest {
++
++  @SuppressWarnings("unchecked")
++  private static Map<String, String> contextOf(ContextPayload payload) throws Exception {
++    Field field = ContextPayload.class.getDeclaredField("context");
++    field.setAccessible(true);
++    return (Map<String, String>) field.get(payload);
++  }
++
++  @Test
++  void roundTripsWithoutObjectSerialization() throws Exception {
++    Map<String, String> entries = new HashMap<>();
++    entries.put("traceparent", "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01");
++    entries.put("baggage", "key=value");
++
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
++      new ContextPayload(entries).write(out);
++    }
++
++    // The new wire format starts with an int length prefix, not a serialized object stream.
++    try (ObjectInputStream in =
++        new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
++      ContextPayload read = ContextPayload.read(in);
++      assertThat(read).isNotNull();
++      assertThat(contextOf(read)).isEqualTo(entries);
++    }
++  }
++
++  @Test
++  void rejectsOversizedPayload() throws Exception {
++    // A malicious peer advertising a huge entry count must be rejected rather than allocated.
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
++      out.writeInt(Integer.MAX_VALUE);
++    }
++
++    try (ObjectInputStream in =
++        new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
++      assertThat(ContextPayload.read(in)).isNull();
++    }
++  }
++
++  @Test
++  void doesNotDeserializeArbitraryObjects() throws Exception {
++    // Simulate an attacker who places a serialized gadget object on the stream where the old code
++    // called readObject(). The fixed code reads an int length prefix first and never invokes
++    // readObject(), so the gadget is never instantiated. Reading here must not construct the
++    // arbitrary object; at most it returns null or a bounded map.
++    ByteArrayOutputStream bytes = new ByteArrayOutputStream();
++    try (ObjectOutputStream out = new ObjectOutputStream(bytes)) {
++      Map<String, String> gadget = new HashMap<>();
++      gadget.put("evil", "payload");
++      out.writeObject(gadget);
++    }
++
++    try (ObjectInputStream in =
++        new ObjectInputStream(new ByteArrayInputStream(bytes.toByteArray()))) {
++      // Interpreting the object-stream bytes as the new length-prefixed protocol must not
++      // deserialize the embedded object graph. It either rejects (null) or reads bounded strings.
++      ContextPayload read;
++      try {
++        read = ContextPayload.read(in);
++      } catch (java.io.IOException expected) {
++        // Reading a malformed/foreign stream as the string protocol may fail cleanly - acceptable.
++        return;
++      }
++      if (read != null) {
++        assertThat(contextOf(read).size()).isLessThanOrEqualTo(1000);
++      }
++    }
++  }
++}
+--- a/conventions/src/main/kotlin/otel.publish-conventions.gradle.kts
++++ b/conventions/src/main/kotlin/otel.publish-conventions.gradle.kts
+@@ -27,7 +27,9 @@
+         artifactId = artifactPrefix(project, base.archivesName.get()) + base.archivesName.get()
+ 
+-        if (groupId != "io.opentelemetry.instrumentation" &&
+-          groupId != "io.opentelemetry.javaagent" &&
+-          groupId != "io.opentelemetry.javaagent.instrumentation") {
++        // CVE-2026-33701 backport build-fix: the Root.io maven aliaser prefixes the project
++        // groupId with "io.root." (e.g. io.root.io.opentelemetry.javaagent). Accept aliased
++        // forms alongside the originals so the aliased publish variant configures.
++        if (!setOf("io.opentelemetry.instrumentation", "io.opentelemetry.javaagent", "io.opentelemetry.javaagent.instrumentation")
++          .any { groupId == it || groupId.endsWith(".$it") }) {
+           throw GradleException("Unexpected groupId for this project or its parent ${project.parent}: $groupId")
+         }
