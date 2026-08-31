@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - CVE-2025-65106
 - CVE-2025-68664
+- CVE-2026-34070
+- CVE-2026-44843
 
 ## How to Apply:
 1. Clone or download the source code for langchain-core
