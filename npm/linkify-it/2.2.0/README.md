@@ -4,6 +4,7 @@ This patch is based on linkify-it version 2.2.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-59887
 - CVE-2026-48801
 
 ## How to Apply:
