@@ -4,8 +4,13 @@ This patch is based on org.apache.tomcat:tomcat version 10.1.52, which is availa
 unknown
 
 ## Affected CVEs:
+- CVE-2026-29129
+- CVE-2026-34483
+- CVE-2026-41284
 - CVE-2026-41293
+- CVE-2026-42498
 - CVE-2026-43512
+- CVE-2026-43513
 - CVE-2026-43515
 
 ## How to Apply:
