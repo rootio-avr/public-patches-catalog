@@ -4,6 +4,7 @@ This patch is based on minimatch version 7.4.6, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-27903
 - CVE-2026-26996
 - CVE-2026-27904
 
