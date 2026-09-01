@@ -4,6 +4,7 @@ This patch is based on @apollo/gateway version 2.2.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-32621
 - CVE-2025-32031
 - CVE-2024-43414
 
