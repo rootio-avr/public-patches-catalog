@@ -4,6 +4,7 @@ This patch is based on is-svg version 3.0.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2021-29059
 - CVE-2021-28092
 
 ## How to Apply:
