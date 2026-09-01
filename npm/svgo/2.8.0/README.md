@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-29074
+- CVE-2026-73650
 
 ## How to Apply:
 1. Clone or download the source code for svgo
