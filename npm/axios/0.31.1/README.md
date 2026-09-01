@@ -9,6 +9,12 @@ unknown
 - CVE-2026-44486
 - CVE-2026-44490
 - CVE-2026-44487
+- GHSA-pmv8-rq9r-6j72
+- GHSA-42h9-826w-cgv3
+- GHSA-f4gw-2p7v-4548
+- GHSA-hcpx-6fm6-wx23
+- GHSA-mmx7-hfxf-jppx
+- GHSA-7q8q-rj6j-mhjq
 - GHSA-gcfj-64vw-6mp9
 
 ## How to Apply:
