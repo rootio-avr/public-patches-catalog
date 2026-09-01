@@ -180,7 +180,7 @@
 
 --- a/src/index.ts
 +++ b/src/index.ts
-@@ -58,6 +58,7 @@
+@@ -58,6 +58,7 @@ import {
    ServiceDefinition,
  } from '@apollo/federation-internals';
  import { getDefaultLogger } from './logger';
@@ -192,56 +192,56 @@
    private experimental_didResolveQueryPlan?: Experimental_DidResolveQueryPlanCallback;
    // Used to communicate supergraph updates
    private experimental_didUpdateSupergraph?: Experimental_DidUpdateSupergraphCallback;
-+  // Used to disable the recursive selections limit that guards the query
-+  // planner. Setting this to `true` is not advised if gateway is being used to
-+  // serve queries outside your control, as doing so will leave the query
-+  // planner susceptible to denial-of-service attacks (CVE-2025-32031).
++  // Used to disable the recursive selections limit enforced before query
++  // planning. Setting this to `true` is not advised if gateway is being used to
++  // serve queries outside your control, as doing so will leave the gateway
++  // susceptible to denial-of-service attacks.
 +  private recursiveSelectionsLimitDisabled: boolean;
    // how often service defs should be loaded/updated
    private pollIntervalInMs?: number;
    // Functions to call during gateway cleanup (when stop() is called)
-@@ -174,6 +180,14 @@
+@@ -174,6 +180,13 @@
      this.experimental_didUpdateSupergraph =
        config?.experimental_didUpdateSupergraph;
  
-+    // Check environment variables to see whether the recursive selections limit
-+    // that guards the query planner should be disabled. Setting this variable to
-+    // `true` is not advised if gateway is being used to serve queries outside
-+    // your control, as doing so will leave the query planner susceptible to
-+    // denial-of-service attacks (CVE-2025-32031).
++    // Check environment variable to see whether the recursive selections limit
++    // should be disabled. Setting this variable to `true` is not advised if
++    // gateway is being used to serve queries outside your control, as doing so
++    // will leave the gateway susceptible to denial-of-service attacks.
 +    this.recursiveSelectionsLimitDisabled =
 +      process.env.APOLLO_DISABLE_SECURITY_RECURSIVE_SELECTIONS_CHECK === 'true';
 +
      if (isManagedConfig(this.config)) {
        this.pollIntervalInMs =
          this.config.fallbackPollIntervalInMs ?? this.config.pollIntervalInMs;
-@@ -785,6 +799,17 @@
-                     document,
-                     { operationName: request.operationName },
-                   );
-+                  // Before handing the operation to the query planner, which
-+                  // expands named fragments recursively, ensure that doing so
-+                  // won't generate too many selections. This bounds the work
-+                  // performed by query planning and protects against the
-+                  // resource-exhaustion attack described in CVE-2025-32031.
-+                  // Note that top-level introspection fields are not split off
-+                  // from the query given to query planning, so this check also
-+                  // imposes a limit on the introspection part of queries.
+@@ -780,6 +793,14 @@
+               OpenTelemetrySpanNames.PLAN,
+               (span) => {
+                 try {
++                  // Before running anything that might expand named fragments
++                  // recursively, ensure that doing so won't generate too many
++                  // selections. This guards against a small document expanding
++                  // into an astronomically large operation and exhausting
++                  // gateway resources (CVE-2025-32031 / CWE-770).
 +                  if (!this.recursiveSelectionsLimitDisabled) {
-+                    validateRecursiveSelections(operation);
++                    validateRecursiveSelections(document);
 +                  }
-                   // TODO(#631): Can we be sure the query planner has been initialized here?
-                   return this.queryPlanner!.buildQueryPlan(operation);
-                 } catch (err) {
+                   const operation = operationFromDocument(
+                     this.apiSchema!,
+                     document,
 --- /dev/null
 +++ b/src/recursiveSelectionsLimit.ts
-@@ -0,0 +1,84 @@
+@@ -0,0 +1,130 @@
 +import {
-+  assertUnreachable,
-+  Operation,
-+  SelectionSet,
-+} from '@apollo/federation-internals';
++  DocumentNode,
++  FragmentDefinitionNode,
++  SelectionSetNode,
++} from 'graphql';
 +
++// Maximum number of selections that may be produced by recursively expanding
++// the named fragments of an operation. Operations exceeding this bound are
++// rejected before query planning, since fragment expansion of such documents
++// can consume an unbounded amount of CPU and memory (CWE-770).
 +export const MAX_RECURSIVE_SELECTIONS = 10_000_000;
 +
 +/**
@@ -249,32 +249,19 @@
 + * given selection set while recursing into fragment spreads. Returns `null` if
 + * this number exceeds `MAX_RECURSIVE_SELECTIONS`.
 + *
-+ * Assumes that fragments referenced by spreads exist and don't form cycles. If
-+ * a fragment spread appears multiple times for the same named fragment, it is
-+ * counted multiple times.
-+ *
-+ * NOTE (backport of the CVE-2025-32031 fix, upstream commit 302aa3a4): the
-+ * upstream mitigation lives in `@apollo/query-planner`, but the published
-+ * `@apollo/gateway@2.2.3` tarball only contains the gateway package and depends
-+ * on an unmodified `@apollo/query-planner@2.2.3`. To keep the fix self-contained
-+ * within the gateway package, this guard is implemented here and invoked before
-+ * `queryPlanner.buildQueryPlan(operation)` in `ApolloGateway`. It walks the
-+ * operation's selection set exactly as the query planner would when expanding
-+ * named fragments recursively, so it bounds the amount of work query planning
-+ * can be made to perform. The running `count` is hard-bounded by
-+ * `MAX_RECURSIVE_SELECTIONS`, so the total work performed by this walk is itself
-+ * bounded, which is what protects the query planner from the resource-exhaustion
-+ * attack (GHSA-q2f9-x4p4-7xmh / GHSA-p2q6-pwh5-m6jr).
-+ *
-+ * A fragment spread's sub-selection is reached through the common
-+ * `FragmentSelection.selectionSet` accessor, which for a spread transparently
-+ * resolves to the referenced named fragment's selection set.
++ * Fragments referenced by spreads are looked up in `fragments`. If a fragment
++ * spread appears multiple times for the same named fragment, it is counted
++ * multiple times (which is what makes deeply reused fragments so expensive to
++ * expand). Per-fragment subtotals are memoized in `fragmentCache` so that each
++ * named fragment is only walked once.
 + */
 +function countRecursiveSelections(
-+  selectionSet: SelectionSet,
++  fragments: Map<string, FragmentDefinitionNode>,
++  fragmentCache: Map<string, number>,
++  selectionSet: SelectionSetNode,
 +  count: number,
 +): number | null {
-+  for (const selection of selectionSet.selections()) {
++  for (const selection of selectionSet.selections) {
 +    // Add 1 for the current selection and check bounds.
 +    count++;
 +    if (count > MAX_RECURSIVE_SELECTIONS) {
@@ -282,9 +269,11 @@
 +    }
 +
 +    switch (selection.kind) {
-+      case 'FieldSelection': {
++      case 'Field': {
 +        if (selection.selectionSet) {
 +          const result = countRecursiveSelections(
++            fragments,
++            fragmentCache,
 +            selection.selectionSet,
 +            count,
 +          );
@@ -293,12 +282,10 @@
 +        }
 +        break;
 +      }
-+      case 'FragmentSelection': {
-+        // Recurse into the fragment's selection set. For a fragment spread this
-+        // resolves (via the `selectionSet` accessor) to the referenced named
-+        // fragment's selections, so spreads are expanded and counted just like
-+        // inline fragments.
++      case 'InlineFragment': {
 +        const result = countRecursiveSelections(
++          fragments,
++          fragmentCache,
 +          selection.selectionSet,
 +          count,
 +        );
@@ -306,133 +293,683 @@
 +        count = result;
 +        break;
 +      }
-+      default:
-+        assertUnreachable(selection);
++      case 'FragmentSpread': {
++        const name = selection.name.value;
++        const cached = fragmentCache.get(name);
++
++        if (cached !== undefined) {
++          count = count + cached;
++          if (count > MAX_RECURSIVE_SELECTIONS) {
++            return null;
++          }
++        } else {
++          const fragment = fragments.get(name);
++          // If the spread references an unknown fragment the document is
++          // invalid; leave that error to be surfaced by validation/planning
++          // and simply don't recurse here.
++          if (fragment) {
++            const oldCount = count;
++            const result = countRecursiveSelections(
++              fragments,
++              fragmentCache,
++              fragment.selectionSet,
++              count,
++            );
++            if (result === null) return null;
++            count = result;
++            fragmentCache.set(name, count - oldCount);
++          }
++        }
++        break;
++      }
 +    }
 +  }
 +
 +  return count;
 +}
 +
-+export function validateRecursiveSelections(operation: Operation) {
-+  const result = countRecursiveSelections(operation.selectionSet, 0);
-+  if (result === null) {
-+    throw new Error('Exceeded maximum recursive selections in this operation');
++/**
++ * Validates that expanding the named fragments of the given operation document
++ * would not produce more than `MAX_RECURSIVE_SELECTIONS` selections, throwing
++ * before any (potentially exponential) fragment expansion is attempted.
++ *
++ * This is done up front, before query planning, so that a malicious client
++ * cannot exhaust gateway resources with a small document that expands into an
++ * astronomically large operation (CWE-770 / CVE-2025-32031).
++ */
++export function validateRecursiveSelections(document: DocumentNode): void {
++  const fragments = new Map<string, FragmentDefinitionNode>();
++  for (const definition of document.definitions) {
++    if (definition.kind === 'FragmentDefinition') {
++      fragments.set(definition.name.value, definition);
++    }
++  }
++
++  const fragmentCache = new Map<string, number>();
++  for (const definition of document.definitions) {
++    if (definition.kind === 'OperationDefinition') {
++      const result = countRecursiveSelections(
++        fragments,
++        fragmentCache,
++        definition.selectionSet,
++        0,
++      );
++      if (result === null) {
++        throw new Error(
++          'Exceeded maximum recursive selections in this operation',
++        );
++      }
++    }
 +  }
 +}
 --- /dev/null
 +++ b/src/__tests__/recursiveSelectionsLimit.test.ts
-@@ -0,0 +1,110 @@
-+import { buildSchema, parseOperation } from '@apollo/federation-internals';
+@@ -0,0 +1,90 @@
++import { parse } from 'graphql';
 +import {
-+  MAX_RECURSIVE_SELECTIONS,
 +  validateRecursiveSelections,
++  MAX_RECURSIVE_SELECTIONS,
 +} from '../recursiveSelectionsLimit';
 +
 +/**
-+ * Regression test for CVE-2025-32031 (GHSA-q2f9-x4p4-7xmh /
-+ * GHSA-p2q6-pwh5-m6jr).
++ * Regression test for CVE-2025-32031 (GHSA-p2q6-pwh5-m6jr / GHSA-q2f9-x4p4-7xmh).
 + *
-+ * The upstream fix commit (302aa3a4) shipped no test, and the upstream
-+ * mitigation lives in `@apollo/query-planner`. Since the published
-+ * `@apollo/gateway@2.2.3` tarball only contains the gateway package (and
-+ * depends on an unmodified `@apollo/query-planner@2.2.3`), the guard is
-+ * backported into the gateway package itself and invoked before
-+ * `queryPlanner.buildQueryPlan(operation)`. This is an authored replacement
-+ * regression test that exercises that guard directly.
++ * The gateway performed no bound on the number of selections produced by
++ * recursively expanding named fragments during query planning. A tiny document
++ * whose fragments each spread the previous fragment several times expands
++ * exponentially, exhausting CPU/memory and rendering the gateway inoperable
++ * (CWE-770: uncontrolled resource consumption).
 + *
-+ * The attack pattern is a query that reuses a chain of named fragments, each
-+ * one spreading the previous fragment several times. Because fragment spreads
-+ * are expanded recursively during query planning, the number of effective
-+ * selections grows exponentially with the depth of the chain even though the
-+ * query document itself is tiny. Without the guard, planning such a query
-+ * exhausts CPU/memory and renders the gateway inoperable.
++ * `validateRecursiveSelections` counts the selections that recursive fragment
++ * expansion would produce *before* expanding them, and throws once the count
++ * exceeds MAX_RECURSIVE_SELECTIONS instead of attempting the expansion.
 + */
 +describe('CVE-2025-32031: recursive selections limit', () => {
-+  const schema = buildSchema(`#graphql
-+    type Query {
-+      t: T
++  // Build a query whose named fragments each spread the previous fragment
++  // multiple times. Because spreads are counted with multiplicity when
++  // recursing, the effective selection count grows exponentially with the
++  // number of fragments, blowing past the limit with a tiny document.
++  function buildExponentialFragmentQuery(levels: number): string {
++    let doc = '';
++    // f0 is a small leaf fragment.
++    doc += `fragment f0 on T { id }\n`;
++    for (let i = 1; i <= levels; i++) {
++      // Each fragment spreads the previous one four times -> 4^i growth.
++      doc +=
++        `fragment f${i} on T { ` +
++        `a { ...f${i - 1} } ` +
++        `b { ...f${i - 1} } ` +
++        `c { ...f${i - 1} } ` +
++        `d { ...f${i - 1} } ` +
++        `}\n`;
 +    }
-+
-+    type T {
-+      id: ID!
-+      a: T
-+      b: T
-+      c: T
-+      d: T
-+      e: T
-+      f: T
-+      g: T
-+      h: T
-+      i: T
-+      j: T
-+    }
-+  `);
-+
-+  // Builds an operation string whose named fragments each spread the previous
-+  // fragment many times, so the fully expanded selection count blows past
-+  // MAX_RECURSIVE_SELECTIONS while the document itself stays small.
-+  function buildExponentialFragmentQuery(
-+    depth: number,
-+    fanout: number,
-+  ): string {
-+    const fields = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j'];
-+    const lines: string[] = [];
-+
-+    // frag0 is a plain leaf selection.
-+    lines.push('fragment frag0 on T { id }');
-+
-+    for (let level = 1; level <= depth; level++) {
-+      const body: string[] = [];
-+      for (let n = 0; n < fanout; n++) {
-+        const field = fields[n % fields.length];
-+        body.push(`${field} { ...frag${level - 1} }`);
-+      }
-+      lines.push(`fragment frag${level} on T { ${body.join(' ')} }`);
-+    }
-+
-+    return `
-+      query {
-+        t { ...frag${depth} }
-+      }
-+      ${lines.join('\n')}
-+    `;
++    doc += `query { t { ...f${levels} } }\n`;
++    return doc;
 +  }
 +
-+  it('exposes the documented limit', () => {
-+    expect(MAX_RECURSIVE_SELECTIONS).toBe(10_000_000);
-+  });
++  it('rejects queries whose recursive fragment expansion exceeds the limit', () => {
++    // 4^15 ~= 1.07e9 selections, far above the 10M limit, but the document
++    // itself is tiny (a handful of fragments).
++    const document = parse(buildExponentialFragmentQuery(15));
 +
-+  it('rejects queries that expand to too many recursive selections', () => {
-+    // depth 9 with fanout 10 => ~10^9 expanded selections, far over the limit.
-+    const operation = parseOperation(
-+      schema,
-+      buildExponentialFragmentQuery(9, 10),
-+    );
-+
-+    expect(() => validateRecursiveSelections(operation)).toThrow(
-+      /Exceeded maximum recursive selections/,
++    expect(() => validateRecursiveSelections(document)).toThrow(
++      /recursive selections/i,
 +    );
 +  });
 +
-+  it('allows a normal (small) query', () => {
-+    const operation = parseOperation(
-+      schema,
-+      `#graphql
-+        query {
-+          t {
++  it('accepts a normal, bounded query', () => {
++    const document = parse(`
++      query {
++        t {
++          id
++          a {
 +            id
-+            a {
-+              id
-+            }
 +          }
 +        }
-+      `,
-+    );
++      }
++    `);
 +
-+    expect(() => validateRecursiveSelections(operation)).not.toThrow();
++    expect(() => validateRecursiveSelections(document)).not.toThrow();
++  });
++
++  it('accepts a bounded query that reuses a small named fragment', () => {
++    const document = parse(`
++      query {
++        t {
++          ...f
++          a {
++            ...f
++          }
++        }
++      }
++      fragment f on T {
++        id
++      }
++    `);
++
++    expect(() => validateRecursiveSelections(document)).not.toThrow();
++  });
++
++  it('exposes a finite, positive selection budget', () => {
++    expect(MAX_RECURSIVE_SELECTIONS).toBeGreaterThan(0);
++    expect(Number.isFinite(MAX_RECURSIVE_SELECTIONS)).toBe(true);
 +  });
 +});
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -39,6 +39,7 @@
+ Object.defineProperty(exports, "LocalCompose", { enumerable: true, get: function () { return supergraphManagers_1.LocalCompose; } });
+ const federation_internals_1 = require("@apollo/federation-internals");
+ const logger_1 = require("./logger");
++const recursiveSelectionsLimit_1 = require("./recursiveSelectionsLimit");
+ exports.HEALTH_CHECK_QUERY = 'query __ApolloServiceHealthCheck__ { __typename }';
+ exports.SERVICE_DEFINITION_QUERY = 'query __ApolloGetServiceDefinition__ { _service { sdl } }';
+ class ApolloGateway {
+@@ -72,6 +73,9 @@
+                     if (!queryPlan) {
+                         queryPlan = opentelemetry_1.tracer.startActiveSpan(opentelemetry_1.OpenTelemetrySpanNames.PLAN, (span) => {
+                             try {
++                                if (!this.recursiveSelectionsLimitDisabled) {
++                                    (0, recursiveSelectionsLimit_1.validateRecursiveSelections)(document);
++                                }
+                                 const operation = (0, federation_internals_1.operationFromDocument)(this.apiSchema, document, { operationName: request.operationName });
+                                 return this.queryPlanner.buildQueryPlan(operation);
+                             }
+@@ -143,6 +147,8 @@
+             config === null || config === void 0 ? void 0 : config.experimental_didResolveQueryPlan;
+         this.experimental_didUpdateSupergraph =
+             config === null || config === void 0 ? void 0 : config.experimental_didUpdateSupergraph;
++        this.recursiveSelectionsLimitDisabled =
++            process.env.APOLLO_DISABLE_SECURITY_RECURSIVE_SELECTIONS_CHECK === 'true';
+         if ((0, config_1.isManagedConfig)(this.config)) {
+             this.pollIntervalInMs =
+                 (_b = this.config.fallbackPollIntervalInMs) !== null && _b !== void 0 ? _b : this.config.pollIntervalInMs;
+--- /dev/null
++++ b/dist/recursiveSelectionsLimit.js
+@@ -0,0 +1,71 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.validateRecursiveSelections = exports.MAX_RECURSIVE_SELECTIONS = void 0;
++exports.MAX_RECURSIVE_SELECTIONS = 10000000;
++function countRecursiveSelections(fragments, fragmentCache, selectionSet, count) {
++    for (const selection of selectionSet.selections) {
++        count++;
++        if (count > exports.MAX_RECURSIVE_SELECTIONS) {
++            return null;
++        }
++        switch (selection.kind) {
++            case 'Field': {
++                if (selection.selectionSet) {
++                    const result = countRecursiveSelections(fragments, fragmentCache, selection.selectionSet, count);
++                    if (result === null)
++                        return null;
++                    count = result;
++                }
++                break;
++            }
++            case 'InlineFragment': {
++                const result = countRecursiveSelections(fragments, fragmentCache, selection.selectionSet, count);
++                if (result === null)
++                    return null;
++                count = result;
++                break;
++            }
++            case 'FragmentSpread': {
++                const name = selection.name.value;
++                const cached = fragmentCache.get(name);
++                if (cached !== undefined) {
++                    count = count + cached;
++                    if (count > exports.MAX_RECURSIVE_SELECTIONS) {
++                        return null;
++                    }
++                }
++                else {
++                    const fragment = fragments.get(name);
++                    if (fragment) {
++                        const oldCount = count;
++                        const result = countRecursiveSelections(fragments, fragmentCache, fragment.selectionSet, count);
++                        if (result === null)
++                            return null;
++                        count = result;
++                        fragmentCache.set(name, count - oldCount);
++                    }
++                }
++                break;
++            }
++        }
++    }
++    return count;
++}
++function validateRecursiveSelections(document) {
++    const fragments = new Map();
++    for (const definition of document.definitions) {
++        if (definition.kind === 'FragmentDefinition') {
++            fragments.set(definition.name.value, definition);
++        }
++    }
++    const fragmentCache = new Map();
++    for (const definition of document.definitions) {
++        if (definition.kind === 'OperationDefinition') {
++            const result = countRecursiveSelections(fragments, fragmentCache, definition.selectionSet, 0);
++            if (result === null) {
++                throw new Error('Exceeded maximum recursive selections in this operation');
++            }
++        }
++    }
++}
++exports.validateRecursiveSelections = validateRecursiveSelections;
+
+Backport CVE-2025-32030 recursive fragment-expansion limit into @apollo/gateway 2.2.3.
+
+Upgrades the CVE-2025-32031 source+dist guard (operationName, GraphQLError, cycle
+detection) after 32031 has already installed the baseline limit.
+
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -74,7 +74,7 @@
+                         queryPlan = opentelemetry_1.tracer.startActiveSpan(opentelemetry_1.OpenTelemetrySpanNames.PLAN, (span) => {
+                             try {
+                                 if (!this.recursiveSelectionsLimitDisabled) {
+-                                    (0, recursiveSelectionsLimit_1.validateRecursiveSelections)(document);
++                                    (0, recursiveSelectionsLimit_1.validateRecursiveSelections)(document, request.operationName || undefined);
+                                 }
+                                 const operation = (0, federation_internals_1.operationFromDocument)(this.apiSchema, document, { operationName: request.operationName });
+                                 return this.queryPlanner.buildQueryPlan(operation);
+--- a/dist/recursiveSelectionsLimit.js
++++ b/dist/recursiveSelectionsLimit.js
+@@ -1,71 +1,84 @@
+ "use strict";
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.validateRecursiveSelections = exports.MAX_RECURSIVE_SELECTIONS = void 0;
++const graphql_1 = require("graphql");
++/**
++ * Maximum number of selections that a single operation is allowed to expand to
++ * once all of its named fragment spreads have been (recursively) inlined.
++ *
++ * Gateway-level guard for CVE-2025-32030 (named-fragment expansion DoS) and
++ * CVE-2025-32031 (query-planner optimization bypass). Checked before the
++ * query planner expands fragments.
++ */
+ exports.MAX_RECURSIVE_SELECTIONS = 10000000;
+-function countRecursiveSelections(fragments, fragmentCache, selectionSet, count) {
+-    for (const selection of selectionSet.selections) {
+-        count++;
+-        if (count > exports.MAX_RECURSIVE_SELECTIONS) {
+-            return null;
+-        }
+-        switch (selection.kind) {
+-            case 'Field': {
+-                if (selection.selectionSet) {
+-                    const result = countRecursiveSelections(fragments, fragmentCache, selection.selectionSet, count);
+-                    if (result === null)
+-                        return null;
+-                    count = result;
+-                }
+-                break;
+-            }
+-            case 'InlineFragment': {
+-                const result = countRecursiveSelections(fragments, fragmentCache, selection.selectionSet, count);
+-                if (result === null)
+-                    return null;
+-                count = result;
+-                break;
+-            }
+-            case 'FragmentSpread': {
+-                const name = selection.name.value;
+-                const cached = fragmentCache.get(name);
+-                if (cached !== undefined) {
+-                    count = count + cached;
+-                    if (count > exports.MAX_RECURSIVE_SELECTIONS) {
+-                        return null;
+-                    }
+-                }
+-                else {
+-                    const fragment = fragments.get(name);
+-                    if (fragment) {
+-                        const oldCount = count;
+-                        const result = countRecursiveSelections(fragments, fragmentCache, fragment.selectionSet, count);
+-                        if (result === null)
+-                            return null;
+-                        count = result;
+-                        fragmentCache.set(name, count - oldCount);
+-                    }
+-                }
+-                break;
+-            }
+-        }
+-    }
+-    return count;
+-}
+-function validateRecursiveSelections(document) {
++function validateRecursiveSelections(document, operationName) {
+     const fragments = new Map();
++    const operations = [];
+     for (const definition of document.definitions) {
+-        if (definition.kind === 'FragmentDefinition') {
++        if (definition.kind === graphql_1.Kind.FRAGMENT_DEFINITION) {
+             fragments.set(definition.name.value, definition);
+         }
++        else if (definition.kind === graphql_1.Kind.OPERATION_DEFINITION) {
++            operations.push(definition);
++        }
+     }
+-    const fragmentCache = new Map();
+-    for (const definition of document.definitions) {
+-        if (definition.kind === 'OperationDefinition') {
+-            const result = countRecursiveSelections(fragments, fragmentCache, definition.selectionSet, 0);
+-            if (result === null) {
+-                throw new Error('Exceeded maximum recursive selections in this operation');
++    let operation;
++    if (operationName) {
++        operation = operations.find((op) => { var _a; return ((_a = op.name) === null || _a === void 0 ? void 0 : _a.value) === operationName; });
++    }
++    else if (operations.length === 1) {
++        operation = operations[0];
++    }
++    if (!operation) {
++        return;
++    }
++    const fragmentCounts = new Map();
++    const clamp = (n) => n > exports.MAX_RECURSIVE_SELECTIONS ? exports.MAX_RECURSIVE_SELECTIONS + 1 : n;
++    const countSelectionSet = (selectionSet) => {
++        let count = 0;
++        for (const selection of selectionSet.selections) {
++            switch (selection.kind) {
++                case graphql_1.Kind.FIELD:
++                    count += 1;
++                    if (selection.selectionSet) {
++                        count += countSelectionSet(selection.selectionSet);
++                    }
++                    break;
++                case graphql_1.Kind.INLINE_FRAGMENT:
++                    count += countSelectionSet(selection.selectionSet);
++                    break;
++                case graphql_1.Kind.FRAGMENT_SPREAD:
++                    count += countFragment(selection.name.value);
++                    break;
++            }
++            count = clamp(count);
++            if (count > exports.MAX_RECURSIVE_SELECTIONS) {
++                return count;
+             }
+         }
++        return count;
++    };
++    const countFragment = (name) => {
++        const cached = fragmentCounts.get(name);
++        if (cached !== undefined) {
++            return cached !== null && cached !== void 0 ? cached : 0;
++        }
++        const fragment = fragments.get(name);
++        if (!fragment) {
++            return 0;
++        }
++        fragmentCounts.set(name, null);
++        const count = clamp(countSelectionSet(fragment.selectionSet));
++        fragmentCounts.set(name, count);
++        return count;
++    };
++    const total = countSelectionSet(operation.selectionSet);
++    if (total > exports.MAX_RECURSIVE_SELECTIONS) {
++        throw new graphql_1.GraphQLError(`Exceeded maximum recursive selections (${exports.MAX_RECURSIVE_SELECTIONS}) ` +
++            `while expanding named fragments. This limit exists to protect the ` +
++            `gateway from denial-of-service attacks; it can be disabled by ` +
++            `setting the APOLLO_DISABLE_SECURITY_RECURSIVE_SELECTIONS_CHECK ` +
++            `environment variable to 'true'.`);
+     }
+ }
+ exports.validateRecursiveSelections = validateRecursiveSelections;
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -796,7 +796,10 @@
+                   // into an astronomically large operation and exhausting
+                   // gateway resources (CVE-2025-32031 / CWE-770).
+                   if (!this.recursiveSelectionsLimitDisabled) {
+-                    validateRecursiveSelections(document);
++                    validateRecursiveSelections(
++                      document,
++                      request.operationName ?? undefined,
++                    );
+                   }
+                   const operation = operationFromDocument(
+                     this.apiSchema!,
+--- a/src/recursiveSelectionsLimit.ts
++++ b/src/recursiveSelectionsLimit.ts
+@@ -1,130 +1,127 @@
+ import {
+   DocumentNode,
+   FragmentDefinitionNode,
++  GraphQLError,
++  Kind,
++  OperationDefinitionNode,
+   SelectionSetNode,
+ } from 'graphql';
+ 
+-// Maximum number of selections that may be produced by recursively expanding
+-// the named fragments of an operation. Operations exceeding this bound are
+-// rejected before query planning, since fragment expansion of such documents
+-// can consume an unbounded amount of CPU and memory (CWE-770).
+-export const MAX_RECURSIVE_SELECTIONS = 10_000_000;
+-
+ /**
+- * Measures the number of selections that would be encountered if we walked the
+- * given selection set while recursing into fragment spreads. Returns `null` if
+- * this number exceeds `MAX_RECURSIVE_SELECTIONS`.
++ * Maximum number of selections that a single operation is allowed to expand to
++ * once all of its named fragment spreads have been (recursively) inlined.
+  *
+- * Fragments referenced by spreads are looked up in `fragments`. If a fragment
+- * spread appears multiple times for the same named fragment, it is counted
+- * multiple times (which is what makes deeply reused fragments so expensive to
+- * expand). Per-fragment subtotals are memoized in `fragmentCache` so that each
+- * named fragment is only walked once.
++ * This mirrors the limit introduced upstream in the query planner
++ * (`@apollo/query-planner`) for CVE-2025-32030. Because the published
++ * `@apollo/gateway` package cannot patch its sibling packages, the gateway
++ * enforces the equivalent limit itself, on the incoming operation document,
++ * before the query planner ever attempts to expand named fragments.
+  */
+-function countRecursiveSelections(
+-  fragments: Map<string, FragmentDefinitionNode>,
+-  fragmentCache: Map<string, number>,
+-  selectionSet: SelectionSetNode,
+-  count: number,
+-): number | null {
+-  for (const selection of selectionSet.selections) {
+-    // Add 1 for the current selection and check bounds.
+-    count++;
+-    if (count > MAX_RECURSIVE_SELECTIONS) {
+-      return null;
+-    }
+-
+-    switch (selection.kind) {
+-      case 'Field': {
+-        if (selection.selectionSet) {
+-          const result = countRecursiveSelections(
+-            fragments,
+-            fragmentCache,
+-            selection.selectionSet,
+-            count,
+-          );
+-          if (result === null) return null;
+-          count = result;
+-        }
+-        break;
+-      }
+-      case 'InlineFragment': {
+-        const result = countRecursiveSelections(
+-          fragments,
+-          fragmentCache,
+-          selection.selectionSet,
+-          count,
+-        );
+-        if (result === null) return null;
+-        count = result;
+-        break;
+-      }
+-      case 'FragmentSpread': {
+-        const name = selection.name.value;
+-        const cached = fragmentCache.get(name);
+-
+-        if (cached !== undefined) {
+-          count = count + cached;
+-          if (count > MAX_RECURSIVE_SELECTIONS) {
+-            return null;
+-          }
+-        } else {
+-          const fragment = fragments.get(name);
+-          // If the spread references an unknown fragment the document is
+-          // invalid; leave that error to be surfaced by validation/planning
+-          // and simply don't recurse here.
+-          if (fragment) {
+-            const oldCount = count;
+-            const result = countRecursiveSelections(
+-              fragments,
+-              fragmentCache,
+-              fragment.selectionSet,
+-              count,
+-            );
+-            if (result === null) return null;
+-            count = result;
+-            fragmentCache.set(name, count - oldCount);
+-          }
+-        }
+-        break;
+-      }
+-    }
+-  }
+-
+-  return count;
+-}
++export const MAX_RECURSIVE_SELECTIONS = 10_000_000;
+ 
+ /**
+- * Validates that expanding the named fragments of the given operation document
+- * would not produce more than `MAX_RECURSIVE_SELECTIONS` selections, throwing
+- * before any (potentially exponential) fragment expansion is attempted.
++ * Validates that the given operation would not, once its named fragment spreads
++ * are recursively expanded, produce more than `MAX_RECURSIVE_SELECTIONS`
++ * selections.
+  *
+- * This is done up front, before query planning, so that a malicious client
+- * cannot exhaust gateway resources with a small document that expands into an
+- * astronomically large operation (CWE-770 / CVE-2025-32031).
++ * A malicious query can reuse a small number of named fragments in a deeply
++ * nested fashion so that naive per-spread expansion grows exponentially in the
++ * number of nesting levels. Left unchecked, planning such a query exhausts CPU
++ * and memory and renders the gateway inoperable (CWE-770, CVE-2025-32030).
++ *
++ * The expanded selection count is computed with per-fragment memoization, so
++ * this check itself runs in time linear in the size of the query document even
++ * though the count it computes may be astronomically large. Counts are clamped
++ * so the arithmetic never overflows `Number.MAX_SAFE_INTEGER`.
++ *
++ * @throws {GraphQLError} if the operation exceeds the recursive selection limit.
+  */
+-export function validateRecursiveSelections(document: DocumentNode): void {
++export function validateRecursiveSelections(
++  document: DocumentNode,
++  operationName?: string,
++): void {
+   const fragments = new Map<string, FragmentDefinitionNode>();
++  const operations: OperationDefinitionNode[] = [];
++
+   for (const definition of document.definitions) {
+-    if (definition.kind === 'FragmentDefinition') {
++    if (definition.kind === Kind.FRAGMENT_DEFINITION) {
+       fragments.set(definition.name.value, definition);
++    } else if (definition.kind === Kind.OPERATION_DEFINITION) {
++      operations.push(definition);
+     }
+   }
+ 
+-  const fragmentCache = new Map<string, number>();
+-  for (const definition of document.definitions) {
+-    if (definition.kind === 'OperationDefinition') {
+-      const result = countRecursiveSelections(
+-        fragments,
+-        fragmentCache,
+-        definition.selectionSet,
+-        0,
+-      );
+-      if (result === null) {
+-        throw new Error(
+-          'Exceeded maximum recursive selections in this operation',
+-        );
++  let operation: OperationDefinitionNode | undefined;
++  if (operationName) {
++    operation = operations.find((op) => op.name?.value === operationName);
++  } else if (operations.length === 1) {
++    operation = operations[0];
++  }
++
++  // If we can't unambiguously resolve the operation, let the normal execution
++  // path surface the appropriate error rather than guessing here.
++  if (!operation) {
++    return;
++  }
++
++  // Memoized count of the recursively-expanded selections of each named
++  // fragment. `null` marks a fragment that is currently being computed, which
++  // lets us detect (otherwise invalid) fragment cycles without recursing
++  // forever.
++  const fragmentCounts = new Map<string, number | null>();
++
++  const clamp = (n: number): number =>
++    n > MAX_RECURSIVE_SELECTIONS ? MAX_RECURSIVE_SELECTIONS + 1 : n;
++
++  const countSelectionSet = (selectionSet: SelectionSetNode): number => {
++    let count = 0;
++    for (const selection of selectionSet.selections) {
++      switch (selection.kind) {
++        case Kind.FIELD:
++          count += 1;
++          if (selection.selectionSet) {
++            count += countSelectionSet(selection.selectionSet);
++          }
++          break;
++        case Kind.INLINE_FRAGMENT:
++          count += countSelectionSet(selection.selectionSet);
++          break;
++        case Kind.FRAGMENT_SPREAD:
++          count += countFragment(selection.name.value);
++          break;
++      }
++      count = clamp(count);
++      if (count > MAX_RECURSIVE_SELECTIONS) {
++        return count;
+       }
+     }
++    return count;
++  };
++
++  const countFragment = (name: string): number => {
++    const cached = fragmentCounts.get(name);
++    if (cached !== undefined) {
++      // `null` => cycle in progress; treat as 0 to break the recursion.
++      return cached ?? 0;
++    }
++    const fragment = fragments.get(name);
++    if (!fragment) {
++      return 0;
++    }
++    fragmentCounts.set(name, null);
++    const count = clamp(countSelectionSet(fragment.selectionSet));
++    fragmentCounts.set(name, count);
++    return count;
++  };
++
++  const total = countSelectionSet(operation.selectionSet);
++  if (total > MAX_RECURSIVE_SELECTIONS) {
++    throw new GraphQLError(
++      `Exceeded maximum recursive selections (${MAX_RECURSIVE_SELECTIONS}) ` +
++        `while expanding named fragments. This limit exists to protect the ` +
++        `gateway from denial-of-service attacks; it can be disabled by ` +
++        `setting the APOLLO_DISABLE_SECURITY_RECURSIVE_SELECTIONS_CHECK ` +
++        `environment variable to 'true'.`,
++    );
+   }
+ }
 
 CVE-2024-43414: bump federation deps so @apollo/query-planner uses BigInt in possiblePlans().
 
