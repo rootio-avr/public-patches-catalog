@@ -1,6 +1,6 @@
-# tiff : 4.2.0-1+deb11u8.aikido.19
+# tiff : 4.2.0-1+deb11u8.aikido.20
 
-This patch is based on tiff version 4.2.0-1+deb11u8.aikido.19, which is available at:
+This patch is based on tiff version 4.2.0-1+deb11u8.aikido.20, which is available at:
 https://sources.debian.org/src/tiff/4.2.0-1+deb11u8/
 
 ## Affected CVEs:
@@ -13,6 +13,7 @@ https://sources.debian.org/src/tiff/4.2.0-1+deb11u8/
 - CVE-2025-61145
 - CVE-2026-12912
 - CVE-2026-36849
+- CVE-2026-52490
 
 ## How to Apply:
 1. Obtain the source package: `apt source tiff`
