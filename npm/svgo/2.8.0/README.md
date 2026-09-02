@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-29074
+- GHSA-2p49-hgcm-8545
 - CVE-2026-73650
 
 ## How to Apply:
