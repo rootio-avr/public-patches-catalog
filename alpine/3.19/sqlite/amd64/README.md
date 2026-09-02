@@ -1,10 +1,13 @@
-# sqlite : 3.44.2-r10071
+# sqlite : 3.44.2-r10072
 
-This patch is based on sqlite version 3.44.2-r10071, which is available at:
+This patch is based on sqlite version 3.44.2-r10072, which is available at:
 unknown
 
 ## Affected CVEs:
 - CVE-2025-3277
+- CVE-2025-70873
+- CVE-2026-11824
+- CVE-2026-11822
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source sqlite`
