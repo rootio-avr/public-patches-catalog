@@ -1,6 +1,6 @@
-# openexr : 2.5.4-2+deb11u1.aikido.17
+# openexr : 2.5.4-2+deb11u1.aikido.18
 
-This patch is based on openexr version 2.5.4-2+deb11u1.aikido.17, which is available at:
+This patch is based on openexr version 2.5.4-2+deb11u1.aikido.18, which is available at:
 https://sources.debian.org/src/openexr/2.5.4-2+deb11u1/
 
 ## Affected CVEs:
@@ -22,6 +22,14 @@ https://sources.debian.org/src/openexr/2.5.4-2+deb11u1/
 - CVE-2026-34589
 - CVE-2026-34543
 - CVE-2026-34544
+- CVE-2026-59187
+- CVE-2026-59982
+- CVE-2026-68515
+- CVE-2026-59186
+- CVE-2026-59189
+- CVE-2026-59981
+- CVE-2026-59184
+- CVE-2026-53532
 
 ## How to Apply:
 1. Obtain the source package: `apt source openexr`
