@@ -4,6 +4,7 @@ This patch is based on marked version 0.3.19, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2022-21680
 - CVE-2022-21681
 
 ## How to Apply:
