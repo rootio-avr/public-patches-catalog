@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2022-37601
+- CVE-2022-37603
 - CVE-2022-37599
 
 ## How to Apply:
