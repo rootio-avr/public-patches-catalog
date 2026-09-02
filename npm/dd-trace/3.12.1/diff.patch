@@ -1,0 +1,141 @@
+Description: Fix CVE-2026-50272 — enforce item/byte caps on legacy ot-baggage- extraction
+ dd-trace v3.12.1 predates the W3C baggage propagator that the upstream fix
+ (commit a7d4c0da, PR #8255) hardens, but its legacy ot-baggage- extraction
+ path in TextMapPropagator._extractBaggageItems() shares the identical
+ missing-cap weakness: it allocates one _baggageItems entry per inbound
+ ot-baggage-* header with no limit on the number of items or their cumulative
+ byte size. An unauthenticated attacker can force unbounded per-request
+ allocation via excessive or oversized baggage headers (CWE-400/CWE-770 DoS).
+ This backport adds baggageMaxItems (DD_TRACE_BAGGAGE_MAX_ITEMS, default 64)
+ and baggageMaxBytes (DD_TRACE_BAGGAGE_MAX_BYTES, default 8192) caps to the
+ extraction loop, matching the env var names and default values described in
+ the advisory.
+Origin: ai-synthesized, CVE-2026-50272
+Author: Root.io Novel Patcher <security@root.io>
+Last-Update: 2026-09-01
+
+--- a/packages/dd-trace/src/opentracing/propagation/text_map.js
++++ b/packages/dd-trace/src/opentracing/propagation/text_map.js
+@@ -32,6 +32,17 @@ const logKeys = ddKeys.concat(b3Keys)
+ const traceparentExpr = /^(\d{2})-([A-Fa-f0-9]{32})-([A-Fa-f0-9]{16})-(\d{2})$/i
+ const traceparentKey = 'traceparent'
+ 
++// Cap the resources consumed while extracting attacker-controlled baggage
++// headers so a request carrying an excessive number of ot-baggage-* headers
++// (or oversized values) cannot exhaust CPU/memory (CVE-2026-50272,
++// CWE-400/CWE-770). Env var names and defaults mirror the upstream mitigation.
++const parsePositiveInt = (value, fallback) => {
++  const parsed = parseInt(value, 10)
++  return Number.isInteger(parsed) && parsed > 0 ? parsed : fallback
++}
++const baggageMaxItems = parsePositiveInt(process.env.DD_TRACE_BAGGAGE_MAX_ITEMS, 64)
++const baggageMaxBytes = parsePositiveInt(process.env.DD_TRACE_BAGGAGE_MAX_BYTES, 8192)
++
+ class TextMapPropagator {
+   constructor (config) {
+     this._config = config
+@@ -286,13 +297,26 @@ class TextMapPropagator {
+   }
+ 
+   _extractBaggageItems (carrier, spanContext) {
+-    Object.keys(carrier).forEach(key => {
++    let itemCount = 0
++    let byteCount = 0
++    for (const key of Object.keys(carrier)) {
+       const match = key.match(baggageExpr)
+ 
+-      if (match) {
+-        spanContext._baggageItems[match[1]] = carrier[key]
++      if (!match) continue
++
++      if (itemCount >= baggageMaxItems) {
++        log.error('Baggage items from carrier exceed the item limit, skipping remaining extraction.')
++        break
+       }
+-    })
++      const value = String(carrier[key])
++      byteCount += Buffer.byteLength(match[1]) + Buffer.byteLength(value)
++      if (byteCount > baggageMaxBytes) {
++        log.error('Baggage items from carrier exceed the byte limit, skipping remaining extraction.')
++        break
++      }
++      spanContext._baggageItems[match[1]] = carrier[key]
++      itemCount++
++    }
+   }
+ 
+   _extractSamplingPriority (carrier, spanContext) {
+--- /dev/null
++++ b/packages/dd-trace/test/opentracing/propagation/text_map_cve_2026_50272.spec.js
+@@ -0,0 +1,71 @@
++'use strict'
++
++// Regression test for CVE-2026-50272 (CWE-400 / CWE-770).
++// The legacy ot-baggage- extraction path in TextMapPropagator._extractBaggageItems()
++// previously allocated one _baggageItems entry per inbound ot-baggage-* header with
++// no cap on the number of items or their cumulative byte size, allowing an
++// unauthenticated attacker to exhaust CPU/memory via excessive/oversized baggage
++// headers. The fix caps extraction at baggageMaxItems (default 64) items and
++// baggageMaxBytes (default 8192) bytes.
++
++const id = require('../../../src/id')
++
++describe('TextMapPropagator baggage extraction limits (CVE-2026-50272)', () => {
++  let TextMapPropagator
++  let propagator
++
++  const baseCarrier = () => ({
++    'x-datadog-trace-id': '123',
++    'x-datadog-parent-id': '18446744073709551160'
++  })
++
++  beforeEach(() => {
++    TextMapPropagator = require('../../../src/opentracing/propagation/text_map')
++    propagator = new TextMapPropagator({ experimental: { b3: false }, tagsHeaderMaxLength: 512 })
++  })
++
++  it('should still extract a small, legitimate baggage set unchanged', () => {
++    const carrier = baseCarrier()
++    carrier['ot-baggage-foo'] = 'bar'
++    carrier['ot-baggage-baz'] = 'qux'
++
++    const spanContext = propagator.extract(carrier)
++
++    expect(spanContext._baggageItems.foo).to.equal('bar')
++    expect(spanContext._baggageItems.baz).to.equal('qux')
++    expect(Object.keys(spanContext._baggageItems)).to.have.length(2)
++  })
++
++  it('should cap the number of extracted baggage items at 64 (item-count DoS)', () => {
++    const carrier = baseCarrier()
++    for (let i = 0; i < 5000; i++) {
++      carrier[`ot-baggage-k${i}`] = 'v'
++    }
++
++    const spanContext = propagator.extract(carrier)
++
++    expect(Object.keys(spanContext._baggageItems).length).to.be.at.most(64)
++  })
++
++  it('should stop extraction once the byte cap is exceeded (oversized-value DoS)', () => {
++    const carrier = baseCarrier()
++    // A single oversized value beyond the 8192-byte default must not be committed.
++    carrier['ot-baggage-huge'] = 'A'.repeat(9000)
++
++    const spanContext = propagator.extract(carrier)
++
++    expect(spanContext._baggageItems).to.not.have.property('huge')
++  })
++
++  it('should not affect non-baggage context extraction', () => {
++    const carrier = baseCarrier()
++    for (let i = 0; i < 200; i++) {
++      carrier[`ot-baggage-k${i}`] = 'v'
++    }
++
++    const spanContext = propagator.extract(carrier)
++
++    expect(spanContext.toTraceId()).to.equal('123')
++    expect(spanContext.toSpanId()).to.equal(id('18446744073709551160', 10).toString())
++  })
++})
