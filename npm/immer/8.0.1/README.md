@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2021-23436
+- CVE-2021-3757
 
 ## How to Apply:
 1. Clone or download the source code for immer
