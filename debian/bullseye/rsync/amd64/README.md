@@ -1,6 +1,6 @@
-# rsync : 3.2.3-4+deb11u4.aikido.2
+# rsync : 3.2.3-4+deb11u4.aikido.3
 
-This patch is based on rsync version 3.2.3-4+deb11u4.aikido.2, which is available at:
+This patch is based on rsync version 3.2.3-4+deb11u4.aikido.3, which is available at:
 https://sources.debian.org/src/rsync/3.2.3-4+deb11u4/
 
 ## Affected CVEs:
@@ -23,6 +23,7 @@ https://sources.debian.org/src/rsync/3.2.3-4+deb11u4/
 - CVE-2026-70452
 - CVE-2026-53790
 - CVE-2026-70460
+- CVE-2026-70461
 
 ## How to Apply:
 1. Obtain the source package: `apt source rsync`
