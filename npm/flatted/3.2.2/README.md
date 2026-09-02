@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-32141
+- CVE-2026-33228
 
 ## How to Apply:
 1. Clone or download the source code for flatted
