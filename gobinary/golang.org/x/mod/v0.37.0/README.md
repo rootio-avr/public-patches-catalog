@@ -4,6 +4,7 @@ This patch is based on golang.org/x/mod version v0.37.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-56864
 - CVE-2026-56865
 
 ## How to Apply:
