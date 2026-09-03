@@ -2577,3 +2577,193 @@
  type markerConn struct {
  	closed uint32
  	used   uint32
+
+ssh: enforce the source-address critical option for all auth callbacks
+
+Backport of upstream golang/crypto e557b08ec2b4f5dd00f38356919fc7b051dd88f8
+(CL 797040) for CVE-2026-56854. Before this fix the "source-address" critical
+option was only validated for Permissions returned by PublicKeyCallback.
+Permissions returned by PasswordCallback, KeyboardInteractiveCallback,
+NoClientAuthCallback and GSSAPI were never checked, allowing a client to bypass
+the source-address restriction.
+
+A new helper checkSourceAddressCriticalOption centralizes the check, and the
+auth loop now enforces it on the final Permissions of any successful callback.
+The upstream commit also modified VerifiedPublicKeyCallback, which does not
+exist in v0.32.0; those hunks are dropped/adapted for this release. The upstream
+regression test TestAuthCallbacksSourceAddress is appended to server_test.go
+(the anchor test TestVerifiedPubKeyCallbackSourceAddress is absent from this
+release, so the new test is added at end of file).
+
+--- a/ssh/server.go
++++ b/ssh/server.go
+@@ -25,10 +25,12 @@
+ 	// defines "force-command" (only allow the given command to
+ 	// execute) and "source-address" (only allow connections from
+ 	// the given address). The SSH package currently only enforces
+-	// the "source-address" critical option. It is up to server
+-	// implementations to enforce other critical options, such as
+-	// "force-command", by checking them after the SSH handshake
+-	// is successful. In general, SSH servers should reject
++	// the "source-address" critical option: it is validated against
++	// the client's remote address whenever it is present in the
++	// Permissions returned by any authentication callback. It is up
++	// to server implementations to enforce other critical options,
++	// such as "force-command", by checking them after the SSH
++	// handshake is successful. In general, SSH servers should reject
+ 	// connections that specify critical options that are unknown
+ 	// or not supported.
+ 	CriticalOptions map[string]string
+@@ -426,6 +428,19 @@
+ 	return fmt.Errorf("ssh: remote address %v is not allowed because of source-address restriction", addr)
+ }
+ 
++// checkSourceAddressCriticalOption enforces the source-address critical
++// option, if present in perms, as documented in Permissions.CriticalOptions.
++func checkSourceAddressCriticalOption(addr net.Addr, perms *Permissions) error {
++	if perms == nil {
++		return nil
++	}
++	saco := perms.CriticalOptions[sourceAddressCriticalOption]
++	if saco == "" {
++		return nil
++	}
++	return checkSourceAddress(addr, saco)
++}
++
+ func gssExchangeToken(gssapiConfig *GSSAPIWithMICConfig, token []byte, s *connection,
+ 	sessionID []byte, userAuthReq userAuthRequestMsg) (authErr error, perms *Permissions, err error) {
+ 	gssAPIServer := gssapiConfig.Server
+@@ -712,13 +727,13 @@
+ 				candidate.perms, candidate.result = authConfig.PublicKeyCallback(s, pubKey)
+ 				_, isPartialSuccessError := candidate.result.(*PartialSuccessError)
+ 
+-				if (candidate.result == nil || isPartialSuccessError) &&
+-					candidate.perms != nil &&
+-					candidate.perms.CriticalOptions != nil &&
+-					candidate.perms.CriticalOptions[sourceAddressCriticalOption] != "" {
+-					if err := checkSourceAddress(
+-						s.RemoteAddr(),
+-						candidate.perms.CriticalOptions[sourceAddressCriticalOption]); err != nil {
++				// This check is authoritative for the Permissions returned by
++				// PublicKeyCallback: the check at the end of the auth loop is
++				// skipped on partial success and only sees the final
++				// Permissions. It also makes public key queries fail before the
++				// client signs when PublicKeyCallback supplies the restriction.
++				if candidate.result == nil || isPartialSuccessError {
++					if err := checkSourceAddressCriticalOption(s.RemoteAddr(), candidate.perms); err != nil {
+ 						candidate.result = err
+ 					}
+ 				}
+@@ -838,6 +853,17 @@
+ 			}
+ 		default:
+ 			authErr = fmt.Errorf("ssh: unknown method %q", userAuthReq.Method)
++		}
++
++		// The source-address critical option is enforced on the Permissions
++		// returned by any authentication callback. Permissions returned
++		// together with a PartialSuccessError skip this check: that is safe
++		// because perms is only assigned on the success paths above where
++		// authErr is nil.
++		if authErr == nil {
++			if err := checkSourceAddressCriticalOption(s.RemoteAddr(), perms); err != nil {
++				authErr = err
++			}
+ 		}
+ 
+ 		// Enforce the source-address critical option for any auth method
+--- a/ssh/server_test.go
++++ b/ssh/server_test.go
+@@ -558,3 +558,91 @@
+ 		}
+ 	})
+ }
++
++func TestAuthCallbacksSourceAddress(t *testing.T) {
++	permsWithSourceAddress := func(sourceAddress string) *Permissions {
++		return &Permissions{
++			CriticalOptions: map[string]string{
++				sourceAddressCriticalOption: sourceAddress,
++			},
++		}
++	}
++	methods := []struct {
++		name         string
++		serverConfig func(sourceAddress string) *ServerConfig
++		clientAuth   []AuthMethod
++	}{
++		{
++			name: "password",
++			serverConfig: func(sourceAddress string) *ServerConfig {
++				return &ServerConfig{
++					PasswordCallback: func(conn ConnMetadata, password []byte) (*Permissions, error) {
++						return permsWithSourceAddress(sourceAddress), nil
++					},
++				}
++			},
++			clientAuth: []AuthMethod{Password(clientPassword)},
++		},
++		{
++			name: "keyboard-interactive",
++			serverConfig: func(sourceAddress string) *ServerConfig {
++				return &ServerConfig{
++					KeyboardInteractiveCallback: func(conn ConnMetadata, challenge KeyboardInteractiveChallenge) (*Permissions, error) {
++						return permsWithSourceAddress(sourceAddress), nil
++					},
++				}
++			},
++			clientAuth: []AuthMethod{
++				KeyboardInteractive(func(name, instruction string, questions []string, echos []bool) ([]string, error) {
++					return nil, nil
++				}),
++			},
++		},
++		{
++			name: "none",
++			serverConfig: func(sourceAddress string) *ServerConfig {
++				return &ServerConfig{
++					NoClientAuth: true,
++					NoClientAuthCallback: func(conn ConnMetadata) (*Permissions, error) {
++						return permsWithSourceAddress(sourceAddress), nil
++					},
++				}
++			},
++		},
++	}
++	for _, method := range methods {
++		for _, tc := range []struct {
++			name          string
++			sourceAddress string
++			wantErr       bool
++		}{
++			{"mismatching", "192.168.99.99", true},
++			{"matching", "127.0.0.0/8,::1/128", false},
++		} {
++			t.Run(method.name+"/"+tc.name, func(t *testing.T) {
++				clientConf := &ClientConfig{
++					User:            "user",
++					Auth:            method.clientAuth,
++					HostKeyCallback: InsecureIgnoreHostKey(),
++				}
++				serverAuthErrors, err := doClientServerAuth(t, method.serverConfig(tc.sourceAddress), clientConf)
++				if tc.wantErr {
++					if err == nil {
++						t.Fatalf("client login succeeded with %s callback returning mismatching source-address", method.name)
++					}
++					var sourceAddressErrors int
++					for _, err := range serverAuthErrors {
++						if err != nil && strings.Contains(err.Error(), "source-address restriction") {
++							sourceAddressErrors++
++						}
++					}
++					if sourceAddressErrors == 0 {
++						t.Fatalf("no server auth error mentions the source-address restriction, got %v", serverAuthErrors)
++					}
++				} else if err != nil {
++					t.Fatalf("client login failed with matching source-address: %v", err)
++				}
++			})
++		}
++	}
++}
