@@ -77,3 +77,563 @@
 +	}
 +	return len(substr) == 0
 +}
+
+--- a/backend/local/local.go
++++ b/backend/local/local.go
+@@ -817,7 +817,7 @@ func (f *Fs) PutStream(ctx context.Context, in io.Reader, src fs.ObjectInfo, opt
+ // Mkdir creates the directory if it doesn't exist
+ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
+ 	localPath := f.localPath(dir)
+-	err := file.MkdirAll(localPath, 0777)
++	err := f.mkdirAll(localPath)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -1434,10 +1434,84 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (in io.Read
+ 	return in, nil
+ }
+ 
++// osRoot opens an *os.Root anchored at f.root, together with localPath
++// expressed relative to it. The caller must Close the returned root.
++//
++// When translating symlinks (-l/--links) all writes go through an os.Root so a
++// symlink planted by a malicious source can never be traversed to escape the
++// destination (CWE-59, GHSA-cf44-9pgv-m4xc).
++//
++// f.root is the trusted destination the user chose, so it is created (and
++// followed if it is itself a symlink) before being opened.
++func (f *Fs) osRoot(localPath string) (root *os.Root, rel string, err error) {
++	rel, err = filepath.Rel(f.root, localPath)
++	if err != nil {
++		return nil, "", err
++	}
++	if err = file.MkdirAll(f.root, 0777); err != nil {
++		return nil, "", err
++	}
++	root, err = os.OpenRoot(f.root)
++	if err != nil {
++		return nil, "", err
++	}
++	return root, rel, nil
++}
++
++// mkdirAll makes localPath and any missing parents. When translating
++// symlinks it does so through os.Root so directory creation can't be
++// redirected through a planted symlink out of the destination.
++func (f *Fs) mkdirAll(localPath string) (err error) {
++	if !f.opt.TranslateSymlinks {
++		return file.MkdirAll(localPath, 0777)
++	}
++	root, rel, err := f.osRoot(localPath)
++	if err != nil {
++		return err
++	}
++	defer fs.CheckClose(root, &err)
++	if rel == "." {
++		return nil // the root itself, already created by linkRoot
++	}
++	return root.MkdirAll(rel, 0777)
++}
++
++// openFile opens localPath for writing. When translating symlinks it goes
++// through os.Root so a symlink planted at the path, or at any parent, is never
++// followed out of the destination. The returned file is independent of the
++// root, which is closed before returning.
++func (f *Fs) openFile(localPath string, flags int, perm os.FileMode) (fi *os.File, err error) {
++	if !f.opt.TranslateSymlinks {
++		return file.OpenFile(localPath, flags, perm)
++	}
++	root, rel, err := f.osRoot(localPath)
++	if err != nil {
++		return nil, err
++	}
++	defer fs.CheckClose(root, &err)
++	return root.OpenFile(rel, flags, perm)
++}
++
++// symlink creates a symlink with the given target at localPath, removing
++// any existing file or symlink there first. It goes through os.Root, which
++// creates the link verbatim (the target may point anywhere, preserving a
++// faithful backup) but refuses to create it through a planted symlink, and
++// won't remove a directory in the way.
++func (f *Fs) symlink(target, localPath string) (err error) {
++	root, rel, err := f.osRoot(localPath)
++	if err != nil {
++		return err
++	}
++	defer fs.CheckClose(root, &err)
++	if err := root.Remove(rel); err != nil && !os.IsNotExist(err) {
++		return err
++	}
++	return root.Symlink(target, rel)
++}
++
+ // mkdirAll makes all the directories needed to store the object
+ func (o *Object) mkdirAll() error {
+-	dir := filepath.Dir(o.path)
+-	return file.MkdirAll(dir, 0777)
++	return o.fs.mkdirAll(filepath.Dir(o.path))
+ }
+ 
+ type nopWriterCloser struct {
+@@ -1479,13 +1553,13 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
+ 	// If it is a translated link, just read in the contents, and
+ 	// then create a symlink
+ 	if !o.translatedLink {
+-		f, err := file.OpenFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
++		f, err := o.fs.openFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+ 		if err != nil {
+ 			if runtime.GOOS == "windows" && os.IsPermission(err) {
+ 				// If permission denied on Windows might be trying to update a
+ 				// hidden file, in which case try opening without CREATE
+ 				// See: https://stackoverflow.com/questions/13215716/ioerror-errno-13-permission-denied-when-trying-to-open-hidden-file-in-w-mod
+-				f, err = file.OpenFile(o.path, os.O_WRONLY|os.O_TRUNC, 0666)
++				f, err = o.fs.openFile(o.path, os.O_WRONLY|os.O_TRUNC, 0666)
+ 				if err != nil {
+ 					return err
+ 				}
+@@ -1522,15 +1596,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
+ 
+ 	if o.translatedLink {
+ 		if err == nil {
+-			// Remove any current symlink or file, if one exists
+-			if _, err := os.Lstat(o.path); err == nil {
+-				if removeErr := os.Remove(o.path); removeErr != nil {
+-					fs.Errorf(o, "Failed to remove previous file: %v", removeErr)
+-					return removeErr
+-				}
+-			}
+-			// Use the contents for the copied object to create a symlink
+-			err = os.Symlink(symlinkData.String(), o.path)
++			// Use the contents of the copied object to create a symlink,
++			// without following or creating it through a planted symlink
++			// (CWE-59). Any existing file or symlink at the path is replaced.
++			err = o.fs.symlink(symlinkData.String(), o.path)
+ 		}
+ 
+ 		// only continue if symlink creation succeeded
+@@ -1594,7 +1663,7 @@ func (f *Fs) OpenWriterAt(ctx context.Context, remote string, size int64) (fs.Wr
+ 		return nil, errors.New("can't open a symlink for random writing")
+ 	}
+ 
+-	out, err := file.OpenFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
++	out, err := f.openFile(o.path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0666)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+--- a/backend/local/local_internal_test.go
++++ b/backend/local/local_internal_test.go
+@@ -10,6 +10,7 @@ import (
+ 	"path/filepath"
+ 	"runtime"
+ 	"sort"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -204,6 +205,140 @@ func TestSymlinkError(t *testing.T) {
+ 	assert.Equal(t, errLinksAndCopyLinks, err)
+ }
+ 
++// putLink writes target as a translated link object (name + ".rclonelink") on f.
++func putLink(ctx context.Context, f fs.Fs, name, target string) error {
++	in := bytes.NewBufferString(target)
++	src := object.NewStaticObjectInfo(name+fs.LinkSuffix, fstest.Time("2001-02-03T04:05:10Z"), int64(len(target)), true, nil, nil)
++	_, err := f.Put(ctx, in, src)
++	return err
++}
++
++// putFile writes content as a regular object on f.
++func putFile(ctx context.Context, f fs.Fs, remote, content string) error {
++	in := bytes.NewBufferString(content)
++	src := object.NewStaticObjectInfo(remote, fstest.Time("2001-02-03T04:05:10Z"), int64(len(content)), true, nil, nil)
++	_, err := f.Put(ctx, in, src)
++	return err
++}
++
++// linksMode puts f into "-l/--links" mode, as if --links or the backend
++// links=true option were set.
++func linksMode(f *Fs) {
++	f.opt.FollowSymlinks = false
++	f.opt.TranslateSymlinks = true
++	f.lstat = os.Lstat
++}
++
++// TestSymlinkEscapeWriteThroughBlocked mirrors the GHSA-cf44-9pgv-m4xc PoC: a
++// malicious --links source serves "pwn.rclonelink" whose body is a path outside
++// the destination, plus a sibling "pwn/authkeys" that sorts after it and would
++// be written through the planted symlink. rclone reproduces the symlink (a
++// faithful backup of the source) but must refuse to write through it, so
++// nothing lands outside the destination (CWE-59).
++func TestSymlinkEscapeWriteThroughBlocked(t *testing.T) {
++	ctx := context.Background()
++
++	// A directory outside the destination the attacker wants to write into
++	evil := t.TempDir()
++	evilFile := filepath.Join(evil, "authkeys")
++
++	r := fstest.NewRun(t)
++	f := r.Flocal.(*Fs)
++	linksMode(f)
++
++	// The symlink is reproduced faithfully, pointing outside the destination.
++	require.NoError(t, putLink(ctx, f, "pwn", evil))
++	link := filepath.Join(f.root, "pwn")
++	fi, err := os.Lstat(link)
++	require.NoError(t, err)
++	require.True(t, fi.Mode()&os.ModeSymlink != 0, "symlink should be reproduced faithfully")
++	target, err := os.Readlink(link)
++	require.NoError(t, err)
++	require.Equal(t, evil, target)
++
++	// But writing the sibling object through it must be refused.
++	err = putFile(ctx, f, "pwn/authkeys", "PWNED")
++	require.Error(t, err, "writing through a planted symlink should be refused")
++
++	// Nothing escaped the destination.
++	_, err = os.Stat(evilFile)
++	require.True(t, os.IsNotExist(err), "a file escaped the destination into %q", evilFile)
++}
++
++// TestSymlinkEscapeNestedBlocked covers the chained variant: an in-tree symlink
++// "evil" -> "." (the destination root) is created, then "evil/pwn" -> outside
++// is planted through it, then a write nested under that. Every component is
++// re-validated against the root, so the write-through is refused and nothing
++// escapes.
++func TestSymlinkEscapeNestedBlocked(t *testing.T) {
++	ctx := context.Background()
++
++	evil := t.TempDir()
++	evilFile := filepath.Join(evil, "authkeys")
++
++	r := fstest.NewRun(t)
++	f := r.Flocal.(*Fs)
++	linksMode(f)
++
++	require.NoError(t, putLink(ctx, f, "evil", "."))
++	require.NoError(t, putLink(ctx, f, "evil/pwn", evil))
++
++	err := putFile(ctx, f, "evil/pwn/authkeys", "PWNED")
++	require.Error(t, err, "writing through a nested planted symlink should be refused")
++
++	_, err = os.Stat(evilFile)
++	require.True(t, os.IsNotExist(err), "a file escaped the destination into %q", evilFile)
++}
++
++// TestSymlinkEscapeConcurrent races symlink creation against the sibling write
++// for many pairs at once, exercising the time-of-check/time-of-use window.
++// os.Root resolves relative to a directory file descriptor, so whatever the
++// interleaving nothing may escape the destination.
++func TestSymlinkEscapeConcurrent(t *testing.T) {
++	ctx := context.Background()
++
++	evil := t.TempDir()
++
++	r := fstest.NewRun(t)
++	f := r.Flocal.(*Fs)
++	linksMode(f)
++
++	const pairs = 50
++	var wg sync.WaitGroup
++	for i := range pairs {
++		name := fmt.Sprintf("pwn%d", i)
++		wg.Add(2)
++		go func() { defer wg.Done(); _ = putLink(ctx, f, name, evil) }()
++		go func() { defer wg.Done(); _ = putFile(ctx, f, name+"/authkeys", "PWNED") }()
++	}
++	wg.Wait()
++
++	entries, err := os.ReadDir(evil)
++	require.NoError(t, err)
++	require.Empty(t, entries, "files escaped the destination into %q", evil)
++}
++
++// TestSymlinkInTreeWriteThroughWorks checks the fix doesn't break legitimate
++// use: an in-tree symlink to a sibling directory can still be created and
++// written through, since that write stays inside the destination.
++func TestSymlinkInTreeWriteThroughWorks(t *testing.T) {
++	ctx := context.Background()
++
++	r := fstest.NewRun(t)
++	f := r.Flocal.(*Fs)
++	linksMode(f)
++
++	require.NoError(t, putFile(ctx, f, "sub/keep.txt", "hello"))
++	require.NoError(t, putLink(ctx, f, "link", "sub"))
++
++	require.NoError(t, putFile(ctx, f, "link/file.txt", "world"))
++
++	// The write landed in the real sibling directory, inside the destination.
++	got, err := os.ReadFile(filepath.Join(f.root, "sub", "file.txt"))
++	require.NoError(t, err)
++	require.Equal(t, "world", string(got))
++}
++
+ func TestHashWithTypeNone(t *testing.T) {
+ 	ctx := context.Background()
+ 	r := fstest.NewRun(t)
+--- a/docs/content/local.md
++++ b/docs/content/local.md
+@@ -296,6 +296,31 @@ backends and the VFS.
+ 
+ Note that this flag is incompatible with `-copy-links` / `-L`.
+ 
++#### Symlink targets and the destination
++
++When rclone recreates a `.rclonelink` file as a symlink on local storage,
++the symlink can point anywhere - including, with an absolute path or one
++using `../` - to a location outside the directory you are copying into. This
++is normal - rclone reproduces whatever target the link had, so backups
++round-trip faithfully.
++
++What rclone will **not** do is *write through* such a link. If a remote you
++are copying from contains both a symlink and a file or directory that would
++be placed inside it - for example a `dir.rclonelink` pointing somewhere
++outside the destination, alongside a `dir/file.txt` - rclone refuses to
++follow the symlink when writing `dir/file.txt`. The offending file is
++skipped with an error, the rest of the transfer continues, and the skipped
++file is counted in the error summary printed at the end of the run.
++
++This protects you from a malicious or compromised remote using `-l` /
++`--links` to plant a symlink and then write through it to somewhere outside
++your destination. Ordinary symlink round-trips, and symlinks that stay
++inside the destination, are unaffected.
++
++If you have intentionally pre-created a symlinked directory inside your
++destination and want rclone to write into the directory it points at, do
++not use `-l` / `--links` for that copy, or remove the symlink first.
++
+ ### Restricting filesystems with --one-file-system
+ 
+ Normally rclone will recurse through filesystems as mounted.
+
+--- a/cmd/serve/restic/restic.go
++++ b/cmd/serve/restic/restic.go
+@@ -244,6 +244,12 @@
+ 			urlpath = r.URL.Path
+ 		}
+ 		urlpath = strings.Trim(urlpath, "/")
++		// Reject any non-canonical path, in particular one containing ".."
++		// traversal elements.
++		if urlpath != "" && path.Clean(urlpath) != urlpath {
++			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
++			return
++		}
+ 		parts := matchData.FindStringSubmatch(urlpath)
+ 		// if no data directory, layout is flat
+ 		if parts != nil {
+--- a/cmd/serve/restic/restic_privaterepos_test.go
++++ b/cmd/serve/restic/restic_privaterepos_test.go
+@@ -75,4 +75,16 @@
+ 		checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusForbidden)})
+ 	}
+ 
++	// Reaching another user's repo via a ".." traversal in the path must be
++	// rejected even though the {userID} segment matches the authenticated user
++	// (GHSA-fqj9-69pf-6pjg).
++	reqs = []*http.Request{
++		newAuthenticatedRequest(t, "GET", "/test/../other_user/config", nil, opt.Auth.BasicUser, opt.Auth.BasicPass),
++		newAuthenticatedRequest(t, "POST", "/test/../other_user/config", strings.NewReader("evil"), opt.Auth.BasicUser, opt.Auth.BasicPass),
++		newAuthenticatedRequest(t, "DELETE", "/test/../other_user/config", nil, opt.Auth.BasicUser, opt.Auth.BasicPass),
++	}
++	for _, req := range reqs {
++		checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusBadRequest)})
++	}
++
+ }
+
+--- a/cmd/serve/restic/restic.go
++++ b/cmd/serve/restic/restic.go
+@@ -6,6 +6,7 @@ import (
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
++	iofs "io/fs"
+ 	"net"
+ 	"net/http"
+ 	"os"
+@@ -247,9 +248,14 @@
+ 		}
+ 		urlpath = strings.Trim(urlpath, "/")
+-		// Reject any non-canonical path, in particular one containing ".."
+-		// traversal elements.
+-		if urlpath != "" && path.Clean(urlpath) != urlpath {
++		// Reject anything which isn't a canonical relative path free of "."
++		// and ".." elements. The backends join the path with the Fs root, so
++		// such elements could otherwise address objects outside it.
++		//
++		// The empty path is the root of the API so is allowed. "." is not a
++		// valid object name here, even though iofs.ValidPath accepts it as
++		// the root of an FS.
++		if urlpath != "" && (urlpath == "." || !iofs.ValidPath(urlpath)) {
+ 			http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+ 			return
+ 		}
+ 		parts := matchData.FindStringSubmatch(urlpath)
+--- /dev/null
++++ b/cmd/serve/restic/restic_traversal_test.go
+@@ -0,0 +1,76 @@
++package restic
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"strings"
++	"testing"
++	"time"
++
++	_ "github.com/rclone/rclone/backend/memory"
++	"github.com/rclone/rclone/cmd"
++	"github.com/rclone/rclone/fs"
++	"github.com/rclone/rclone/fs/operations"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// TestResticPathTraversal checks that request paths with "." or ".."
++// components are rejected before they reach the backend, so they can't be
++// joined with the Fs root to reach objects outside the directory served.
++//
++// The memory backend is used because it resolves ".." by joining paths,
++// unlike the local backend which encodes the components as file names.
++func TestResticPathTraversal(t *testing.T) {
++	ctx := context.Background()
++
++	// outside is the parent of the directory served and holds an object
++	// which must stay unreachable through the server.
++	outside := cmd.NewFsSrc([]string{":memory:traversal-test"})
++	_, err := operations.Rcat(ctx, outside, "outside-secret.txt", io.NopCloser(strings.NewReader("SECRET")), time.Now(), nil)
++	require.NoError(t, err)
++
++	f := cmd.NewFsSrc([]string{":memory:traversal-test/served-root"})
++	_, err = operations.Rcat(ctx, f, "inside.txt", io.NopCloser(strings.NewReader("INSIDE")), time.Now(), nil)
++	require.NoError(t, err)
++
++	opt := newOpt()
++	s, err := newServer(ctx, f, &opt)
++	require.NoError(t, err)
++	router := s.server.Router()
++
++	// A path inside the served root is unaffected
++	checkRequest(t, router.ServeHTTP,
++		newRequest(t, "GET", "/inside.txt", nil),
++		[]wantFunc{wantCode(http.StatusOK), wantBody("INSIDE")})
++
++	for _, urlpath := range []string{
++		"..",
++		"../",
++		"../../",
++		"../outside-secret.txt",
++		"../../outside-secret.txt",
++		"%2e%2e/outside-secret.txt",
++		"../outside-write.txt",
++		"a/../outside-secret.txt",
++		"a/../../outside-secret.txt",
++		".",
++		"./inside.txt",
++	} {
++		for _, method := range []string{"GET", "HEAD", "POST", "DELETE"} {
++			t.Run(method+" /"+urlpath, func(t *testing.T) {
++				req := newRequest(t, method, "/"+urlpath, strings.NewReader("EVIL"))
++				checkRequest(t, router.ServeHTTP, req, []wantFunc{wantCode(http.StatusBadRequest)})
++			})
++		}
++	}
++
++	// The object outside the served root was neither read nor modified, and
++	// no new object was created next to it.
++	o, err := outside.NewObject(ctx, "outside-secret.txt")
++	require.NoError(t, err)
++	assert.Equal(t, int64(len("SECRET")), o.Size())
++	_, err = outside.NewObject(ctx, "outside-write.txt")
++	assert.Equal(t, fs.ErrorObjectNotFound, err)
++}
+
+Description: sftp: fix command injection via crafted filenames on PowerShell remotes
+ PowerShell treats several Unicode smart-quote characters (U+2018, U+2019,
+ U+201A, U+201B) as single-quote delimiters in addition to the ASCII
+ apostrophe. The quoting helper only doubled the ASCII apostrophe, so a
+ remote filename containing one of these could close the quoted path and
+ inject statements that ran as the SSH account during server-side hashing.
+ Double all five delimiters when wrapping a PowerShell path so a filename
+ is always treated as data.
+Origin: upstream, https://github.com/rclone/rclone/commit/e122fba1a57641b63a580aa26c026903a84e2e88
+CVE: CVE-2026-71312
+Bug: GHSA-2m8m-jhrm-w6j2
+--- a/backend/sftp/sftp.go
++++ b/backend/sftp/sftp.go
+@@ -2066,12 +2066,27 @@ func (o *Object) Hash(ctx context.Context, r hash.Type) (string, error) {
+ 	return hashString, nil
+ }
+
++// powerShellQuoteEscaper doubles every character PowerShell accepts as a
++// single-quote string delimiter. As well as the ASCII apostrophe, PowerShell
++// treats the Unicode smart quotes U+2018, U+2019, U+201A and U+201B as single
++// quotes, so a path wrapped in apostrophes must double all of them or an
++// attacker controlled filename could close the literal and inject a statement.
++// Doubling a delimiter is PowerShell's escape for a literal occurrence of it,
++// and preserves the exact character.
++var powerShellQuoteEscaper = strings.NewReplacer(
++	"'", "''",
++	"‘", "‘‘",
++	"’", "’’",
++	"‚", "‚‚",
++	"‛", "‛‛",
++)
++
+ // quoteOrEscapeShellPath makes path a valid string argument in configured shell
+ // and also ensures it cannot cause unintended behavior.
+ func quoteOrEscapeShellPath(shellType string, shellPath string) (string, error) {
+ 	// PowerShell
+ 	if shellType == "powershell" {
+-		return "'" + strings.ReplaceAll(shellPath, "'", "''") + "'", nil
++		return "'" + powerShellQuoteEscaper.Replace(shellPath) + "'", nil
+ 	}
+ 	// Windows Command Prompt
+ 	if shellType == "cmd" {
+--- a/backend/sftp/sftp_internal_test.go
++++ b/backend/sftp/sftp_internal_test.go
+@@ -4,6 +4,7 @@ package sftp
+
+ import (
+ 	"fmt"
++	"strings"
+ 	"testing"
+
+ 	"github.com/rclone/rclone/lib/encoder"
+@@ -47,6 +48,11 @@ func TestShellEscapeCmd(t *testing.T) {
+ }
+
+ func TestShellEscapePowerShell(t *testing.T) {
++	// PowerShell treats U+2018, U+2019, U+201A and U+201B as single-quote
++	// delimiters in addition to the ASCII apostrophe, so all of them are
++	// doubled inside the wrapping apostrophes. Doubling is PowerShell's escape
++	// for a literal delimiter and preserves the exact character.
++	unquote := strings.NewReplacer("''", "'", "‘‘", "‘", "’’", "’", "‚‚", "‚", "‛‛", "‛")
+ 	for i, test := range []struct {
+ 		unescaped, escaped string
+ 	}{
+@@ -55,10 +61,23 @@ func TestShellEscapePowerShell(t *testing.T) {
+ 		{"c:/test&notepad", "'c:/test&notepad'"},
+ 		{"c:/test\"&\"notepad", "'c:/test\"&\"notepad'"},
+ 		{"c:/test'&'notepad", "'c:/test''&''notepad'"},
++		// injection attempts via the ASCII apostrophe and each smart quote
++		{"x';calc;#", "'x'';calc;#'"},
++		{"x’;calc;#", "'x’’;calc;#'"},
++		{"x‘;calc;#", "'x‘‘;calc;#'"},
++		{"x‚;calc;#", "'x‚‚;calc;#'"},
++		{"x‛;calc;#", "'x‛‛;calc;#'"},
+ 	} {
+ 		got, err := quoteOrEscapeShellPath("powershell", test.unescaped)
+ 		assert.NoError(t, err)
+ 		assert.Equal(t, test.escaped, got, fmt.Sprintf("Test %d unescaped = %q", i, test.unescaped))
++		// Every single-quote delimiter must appear an even number of times so
++		// none is left unpaired to close the literal early.
++		for _, q := range []string{"'", "‘", "’", "‚", "‛"} {
++			assert.Zero(t, strings.Count(got, q)%2, fmt.Sprintf("Test %d odd %q count in %q", i, q, got))
++		}
++		// Undoubling the quoted body recovers the original path exactly.
++		assert.Equal(t, test.unescaped, unquote.Replace(got[1:len(got)-1]), fmt.Sprintf("Test %d round-trip", i))
+ 	}
+ }
