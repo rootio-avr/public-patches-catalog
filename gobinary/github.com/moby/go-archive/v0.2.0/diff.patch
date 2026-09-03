@@ -1,0 +1,383 @@
+--- a/archive.go
++++ b/archive.go
+@@ -467,11 +467,18 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
+ 		}
+ 
+ 	case tar.TypeLink:
+-		// #nosec G305 -- The target path is checked for path traversal.
+-		targetPath := filepath.Join(extractDir, hdr.Linkname)
+-		// check for hardlink breakout
+-		if !strings.HasPrefix(targetPath, extractDir) {
+-			return breakoutError(fmt.Errorf("invalid hardlink %q -> %q", targetPath, hdr.Linkname))
++		// A hardlink target must resolve to a location within the extraction
++		// directory. Reject non-local targets outright (defence in depth), then
++		// resolve the target through fsRootPath so any symlink components are
++		// bounded within extractDir and cannot be followed out of it.
++		linkname := filepath.Clean(hdr.Linkname)
++		if linkname == "." || !filepath.IsLocal(linkname) {
++			return breakoutError(fmt.Errorf("invalid hardlink %q -> %q", path, hdr.Linkname))
++		}
++		// #nosec G305 -- The target path is confined to extractDir by fsRootPath.
++		targetPath, err := fsRootPath(extractDir, linkname)
++		if err != nil {
++			return breakoutError(fmt.Errorf("invalid hardlink %q -> %q: %w", path, hdr.Linkname, err))
+ 		}
+ 		if err := os.Link(targetPath, path); err != nil {
+ 			return err
+@@ -480,10 +487,15 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
+ 	case tar.TypeSymlink:
+ 		// 	path 				-> hdr.Linkname = targetPath
+ 		// e.g. /extractDir/path/to/symlink 	-> ../2/file	= /extractDir/path/2/file
++		//
++		// path has already been resolved within extractDir via fsRootPath by
++		// the caller, so filepath.Dir(path) is the symlink's real (symlink-
++		// bounded) parent directory. Rejecting targets that resolve outside
++		// extractDir therefore also defeats multi-hop symlink chains, where an
++		// earlier "go up" symlink would otherwise make a naive lexical check
++		// under-count how far "../" escapes.
+ 		targetPath := filepath.Join(filepath.Dir(path), hdr.Linkname) // #nosec G305 -- The target path is checked for path traversal.
+ 
+-		// the reason we don't need to check symlinks in the path (with FollowSymlinkInScope) is because
+-		// that symlink would first have to be created, which would be caught earlier, at this very check:
+ 		if !strings.HasPrefix(targetPath, extractDir) {
+ 			return breakoutError(fmt.Errorf("invalid symlink %q -> %q", path, hdr.Linkname))
+ 		}
+@@ -828,10 +840,15 @@ func Unpack(decompressedArchive io.Reader, dest string, options *TarOptions) err
+ 			continue
+ 		}
+ 
+-		// Normalize name, for safety and for a simple is-root check
+-		// This keeps "../" as-is, but normalizes "/../" to "/". Or Windows:
+-		// This keeps "..\" as-is, but normalizes "\..\" to "\".
+-		hdr.Name = filepath.Clean(hdr.Name)
++		// Strip a leading "/" so absolute entries stay root-relative, and
++		// normalize the name. Reject, rather than lexically clamp, any entry
++		// whose name is not local to the destination (absolute paths or paths
++		// containing ".." components): those are the traversal entries an
++		// attacker uses to escape the extraction directory.
++		hdr.Name = filepath.Clean(strings.TrimLeft(hdr.Name, "/"))
++		if hdr.Name != "." && !filepath.IsLocal(hdr.Name) {
++			return breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
++		}
+ 
+ 		for _, exclude := range options.ExcludePatterns {
+ 			if strings.HasPrefix(hdr.Name, exclude) {
+@@ -845,14 +862,15 @@ func Unpack(decompressedArchive io.Reader, dest string, options *TarOptions) err
+ 			return err
+ 		}
+ 
+-		// #nosec G305 -- The joined path is checked for path traversal.
+-		path := filepath.Join(dest, hdr.Name)
+-		rel, err := filepath.Rel(dest, path)
++		// Resolve the entry within dest, bounding any symlink components that
++		// earlier entries may have created so they cannot redirect this write
++		// outside the extraction directory (link following / path traversal).
++		// fsRootPath walks each path component and re-anchors any symlink it
++		// follows back under dest, so the returned path is always contained.
++		// #nosec G305 -- The path is confined to dest by fsRootPath.
++		path, err := fsRootPath(dest, hdr.Name)
+ 		if err != nil {
+-			return err
+-		}
+-		if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+-			return breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
++			return breakoutError(fmt.Errorf("%q is outside of %q: %w", hdr.Name, dest, err))
+ 		}
+ 
+ 		// If path exits we almost always just want to remove and replace it
+@@ -910,7 +928,10 @@ func Unpack(decompressedArchive io.Reader, dest string, options *TarOptions) err
+ 
+ 	for _, hdr := range dirs {
+ 		// #nosec G305 -- The header was checked for path traversal before it was appended to the dirs slice.
+-		path := filepath.Join(dest, hdr.Name)
++		path, err := fsRootPath(dest, hdr.Name)
++		if err != nil {
++			return breakoutError(fmt.Errorf("%q is outside of %q: %w", hdr.Name, dest, err))
++		}
+ 
+ 		if err := chtimes(path, boundTime(latestTime(hdr.AccessTime, hdr.ModTime)), boundTime(hdr.ModTime)); err != nil {
+ 			return err
+@@ -931,7 +952,12 @@ func createImpliedDirectories(dest string, hdr *tar.Header, options *TarOptions)
+ 	// Not the root directory, ensure that the parent directory exists
+ 	if !strings.HasSuffix(hdr.Name, string(os.PathSeparator)) {
+ 		parent := filepath.Dir(hdr.Name)
+-		parentPath := filepath.Join(dest, parent)
++		// Resolve the parent within dest, bounding any symlink components so
++		// implied directories cannot be created outside the extraction root.
++		parentPath, err := fsRootPath(dest, parent)
++		if err != nil {
++			return breakoutError(fmt.Errorf("%q is outside of %q: %w", parent, dest, err))
++		}
+ 		if _, err := os.Lstat(parentPath); err != nil && os.IsNotExist(err) {
+ 			// RootPair() is confined inside this loop as most cases will not require a call, so we can spend some
+ 			// unneeded function calls in the uncommon case to encapsulate logic -- implied directories are a niche
+--- /dev/null
++++ b/cve_2026_17106_test.go
+@@ -0,0 +1,90 @@
++package archive
++
++import (
++	"archive/tar"
++	"bytes"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++// TestUntarSymlinkBreakout is a regression test for CVE-2026-17106: a crafted
++// archive that chains symlinks to escape the extraction directory and write a
++// file at an arbitrary path (link following / path traversal). It ports the
++// upstream regression test added in moby/go-archive df55fdf.
++//
++// The archive creates "inner/go_up" -> ".." and then "inner/go_up/escape" ->
++// "../victim"; a following regular-file entry "inner/go_up/escape/newfile"
++// would, without containment, be written into the sibling "victim" directory
++// outside dest. The extractor must either reject the traversal or redirect the
++// write back inside dest, so victim/newfile must never appear.
++func TestUntarSymlinkBreakout(t *testing.T) {
++	tmpdir := t.TempDir()
++	dest := filepath.Join(tmpdir, "dest")
++	victim := filepath.Join(tmpdir, "victim")
++	if err := os.Mkdir(dest, 0o755); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Mkdir(victim, 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	buf := &bytes.Buffer{}
++	tw := tar.NewWriter(buf)
++	for _, hdr := range []*tar.Header{
++		{Name: "inner", Typeflag: tar.TypeDir, Mode: 0o755},
++		{Name: "inner/go_up", Typeflag: tar.TypeSymlink, Linkname: ".."},
++		{Name: "inner/go_up/escape", Typeflag: tar.TypeSymlink, Linkname: "../victim"},
++		{Name: "inner/go_up/escape/newfile", Typeflag: tar.TypeReg, Mode: 0o644},
++	} {
++		if err := tw.WriteHeader(hdr); err != nil {
++			t.Fatal(err)
++		}
++	}
++	_ = tw.Close()
++
++	// Ignore any extraction error: a breakoutError means the escape was
++	// caught; no error means the write was safely redirected within dest.
++	// NoLchown suppresses the ownership call so the test runs without root.
++	_ = Untar(buf, dest, &TarOptions{NoLchown: true})
++
++	// victim/newfile must not exist; its presence proves a breakout.
++	if _, err := os.Lstat(filepath.Join(victim, "newfile")); err == nil {
++		t.Fatal("archive breakout: newfile was written outside extraction root via symlink chain")
++	}
++}
++
++// TestUntarRejectsParentTraversal verifies that an entry whose name escapes the
++// destination via ".." components is rejected rather than written outside dest.
++func TestUntarRejectsParentTraversal(t *testing.T) {
++	tmpdir := t.TempDir()
++	dest := filepath.Join(tmpdir, "dest")
++	if err := os.Mkdir(dest, 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	buf := &bytes.Buffer{}
++	tw := tar.NewWriter(buf)
++	if err := tw.WriteHeader(&tar.Header{
++		Name:     "../escape.txt",
++		Typeflag: tar.TypeReg,
++		Mode:     0o644,
++		Size:     int64(len("pwned")),
++	}); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := tw.Write([]byte("pwned")); err != nil {
++		t.Fatal(err)
++	}
++	_ = tw.Close()
++
++	err := Untar(buf, dest, &TarOptions{NoLchown: true})
++	if err == nil {
++		t.Fatal("expected Untar to reject an entry escaping the destination via '..'")
++	}
++
++	// escape.txt must not have been written in the parent (tmpdir) of dest.
++	if _, statErr := os.Lstat(filepath.Join(tmpdir, "escape.txt")); statErr == nil {
++		t.Fatal("archive breakout: escape.txt was written outside the extraction root")
++	}
++}
+--- a/diff.go
++++ b/diff.go
+@@ -48,8 +48,14 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
+ 
+ 		size += hdr.Size
+ 
+-		// Normalize name, for safety and for a simple is-root check
+-		hdr.Name = filepath.Clean(hdr.Name)
++		// Strip a leading "/" so absolute entries stay root-relative, then
++		// reject, rather than lexically clamp, any entry whose name is not
++		// local to the destination (absolute paths or paths containing ".."
++		// components): those are the traversal entries used to escape dest.
++		hdr.Name = filepath.Clean(strings.TrimLeft(hdr.Name, "/"))
++		if hdr.Name != "." && !filepath.IsLocal(hdr.Name) {
++			return 0, breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
++		}
+ 
+ 		// Windows does not support filenames with colons in them. Ignore
+ 		// these files. This is not a problem though (although it might
+@@ -101,16 +107,14 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
+ 				continue
+ 			}
+ 		}
+-		// #nosec G305 -- The joined path is guarded against path traversal.
+-		path := filepath.Join(dest, hdr.Name)
+-		rel, err := filepath.Rel(dest, path)
++		// Resolve the entry within dest, bounding any symlink components that
++		// earlier entries may have created so they cannot redirect this
++		// operation outside the extraction directory (link following / path
++		// traversal). fsRootPath re-anchors any followed symlink back under dest.
++		// #nosec G305 -- The path is confined to dest by fsRootPath.
++		path, err := fsRootPath(dest, hdr.Name)
+ 		if err != nil {
+-			return 0, err
+-		}
+-
+-		// Note as these operations are platform specific, so must the slash be.
+-		if strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+-			return 0, breakoutError(fmt.Errorf("%q is outside of %q", hdr.Name, dest))
++			return 0, breakoutError(fmt.Errorf("%q is outside of %q: %w", hdr.Name, dest, err))
+ 		}
+ 		base := filepath.Base(path)
+ 
+@@ -197,7 +201,10 @@ func UnpackLayer(dest string, layer io.Reader, options *TarOptions) (size int64,
+ 
+ 	for _, hdr := range dirs {
+ 		// #nosec G305 -- The header was checked for path traversal before it was appended to the dirs slice.
+-		path := filepath.Join(dest, hdr.Name)
++		path, err := fsRootPath(dest, hdr.Name)
++		if err != nil {
++			return 0, breakoutError(fmt.Errorf("%q is outside of %q: %w", hdr.Name, dest, err))
++		}
+ 		if err := chtimes(path, hdr.AccessTime, hdr.ModTime); err != nil {
+ 			return 0, err
+ 		}
+--- /dev/null
++++ b/rootpath.go
+@@ -0,0 +1,119 @@
++/*
++   Copyright The containerd Authors.
++
++   Licensed under the Apache License, Version 2.0 (the "License");
++   you may not use this file except in compliance with the License.
++   You may obtain a copy of the License at
++
++       http://www.apache.org/licenses/LICENSE-2.0
++
++   Unless required by applicable law or agreed to in writing, software
++   distributed under the License is distributed on an "AS IS" BASIS,
++   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++   See the License for the specific language governing permissions and
++   limitations under the License.
++*/
++
++package archive
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++)
++
++var errTooManyLinks = errors.New("too many links")
++
++// fsRootPath joins a path with a root, evaluating and bounding any
++// symlink to the root directory.
++//
++// It is a straight fork of containerd/continuity fs.RootPath, un-exported and
++// trimmed to the functions used here. It resolves every path component relative
++// to root, following symlinks but always re-anchoring the result inside root, so
++// a crafted archive cannot use symlink components to escape the extraction
++// directory. This is the Go 1.23-compatible equivalent of the upstream os.Root
++// (openat-based) containment used from go-archive v0.3.0 onwards.
++func fsRootPath(root, path string) (string, error) {
++	if path == "" {
++		return root, nil
++	}
++	var linksWalked int // to protect against cycles
++	for {
++		i := linksWalked
++		newpath, err := walkLinks(root, path, &linksWalked)
++		if err != nil {
++			return "", err
++		}
++		path = newpath
++		if i == linksWalked {
++			newpath = filepath.Join(string(os.PathSeparator), newpath)
++			if path == newpath {
++				return filepath.Join(root, newpath), nil
++			}
++			path = newpath
++		}
++	}
++}
++
++func walkLink(root, path string, linksWalked *int) (newpath string, islink bool, err error) {
++	if *linksWalked > 255 {
++		return "", false, errTooManyLinks
++	}
++
++	path = filepath.Join(string(os.PathSeparator), path)
++	if path == string(os.PathSeparator) {
++		return path, false, nil
++	}
++	realPath := filepath.Join(root, path)
++
++	fi, err := os.Lstat(realPath)
++	if err != nil {
++		// If path does not yet exist, treat as non-symlink
++		if os.IsNotExist(err) {
++			return path, false, nil
++		}
++		return "", false, err
++	}
++	if fi.Mode()&os.ModeSymlink == 0 {
++		return path, false, nil
++	}
++	newpath, err = os.Readlink(realPath)
++	if err != nil {
++		return "", false, err
++	}
++	*linksWalked++
++	return newpath, true, nil
++}
++
++func walkLinks(root, path string, linksWalked *int) (string, error) {
++	switch dir, file := filepath.Split(path); {
++	case dir == "":
++		newpath, _, err := walkLink(root, file, linksWalked)
++		return newpath, err
++	case file == "":
++		if os.IsPathSeparator(dir[len(dir)-1]) {
++			if dir == string(os.PathSeparator) {
++				return dir, nil
++			}
++			return walkLinks(root, dir[:len(dir)-1], linksWalked)
++		}
++		newpath, _, err := walkLink(root, dir, linksWalked)
++		return newpath, err
++	default:
++		newdir, err := walkLinks(root, dir, linksWalked)
++		if err != nil {
++			return "", err
++		}
++		newpath, islink, err := walkLink(root, filepath.Join(newdir, file), linksWalked)
++		if err != nil {
++			return "", err
++		}
++		if !islink {
++			return newpath, nil
++		}
++		if filepath.IsAbs(newpath) {
++			return newpath, nil
++		}
++		return filepath.Join(newdir, newpath), nil
++	}
++}
