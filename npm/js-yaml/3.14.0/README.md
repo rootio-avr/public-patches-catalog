@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-5p4m-2wfm-xmqj
+- CVE-2026-59869
 
 ## How to Apply:
 1. Clone or download the source code for js-yaml
