@@ -1,0 +1,158 @@
+--- a/server/etcdserver/api/v3rpc/watch.go
++++ b/server/etcdserver/api/v3rpc/watch.go
+@@ -260,15 +260,6 @@ func (sws *serverWatchStream) recvLoop() error {
+ 				// \x00 is the smallest key
+ 				creq.Key = []byte{0}
+ 			}
+-			if len(creq.RangeEnd) == 0 {
+-				// force nil since watchstream.Watch distinguishes
+-				// between nil and []byte{} for single key / >=
+-				creq.RangeEnd = nil
+-			}
+-			if len(creq.RangeEnd) == 1 && creq.RangeEnd[0] == 0 {
+-				// support  >= key queries
+-				creq.RangeEnd = []byte{}
+-			}
+ 			if creq.StartRevision < 0 {
+ 				wr := &pb.WatchResponse{
+ 					Header:       sws.newResponseHeader(sws.watchStream.Rev()),
+@@ -319,6 +310,16 @@ func (sws *serverWatchStream) recvLoop() error {
+ 				}
+ 			}
+
++			if len(creq.RangeEnd) == 0 {
++				// force nil since watchstream.Watch distinguishes
++				// between nil and []byte{} for single key / >=
++				creq.RangeEnd = nil
++			}
++			if len(creq.RangeEnd) == 1 && creq.RangeEnd[0] == 0 {
++				// support  >= key queries
++				creq.RangeEnd = []byte{}
++			}
++
+ 			filters := FiltersFromRequest(creq)
+
+ 			id, err := sws.watchStream.Watch(mvcc.WatchID(creq.WatchId), creq.Key, creq.RangeEnd, creq.StartRevision, filters...)
+--- /dev/null
++++ b/tests/e2e/cve_2026_73499_test.go
+@@ -0,0 +1,120 @@
++// Copyright 2026 The etcd Authors
++//
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++//     http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++// These tests are performance sensitive, addition of cluster proxy makes them unstable.
++//go:build !cluster_proxy
++
++package e2e
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++
++	v3rpc "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
++	clientv3 "go.etcd.io/etcd/client/v3"
++	"go.etcd.io/etcd/tests/v3/framework/config"
++	"go.etcd.io/etcd/tests/v3/framework/e2e"
++)
++
++// newClientWithAuthCVE202673499 returns an authenticated clientv3 client. It is
++// a local helper for this regression test so it does not collide with helpers
++// added by later upstream commits.
++func newClientWithAuthCVE202673499(t *testing.T, epc *e2e.EtcdProcessCluster, username, password string) *clientv3.Client {
++	c, err := clientv3.New(clientv3.Config{
++		Endpoints:   epc.EndpointsGRPC(),
++		Username:    username,
++		Password:    password,
++		DialTimeout: 5 * time.Second,
++	})
++	require.NoError(t, err)
++	t.Cleanup(func() { c.Close() })
++	return c
++}
++
++// TestWatchWithLowPermissionUser guards against CVE-2026-73499, a security issue
++// where a user granted READ permission on exactly one key could still receive
++// watch responses for every key starting from (and beyond) that key.
++//
++// Root cause was in server/etcdserver/api/v3rpc/watch.go: it rewrote the wire
++// sentinel for an open-ended ">= key" watch (RangeEnd == a single 0x00 byte,
++// which is what clientv3.WithFromKey() sends) into []byte{} *before* the
++// permission check ran. server/auth/range_perm_cache.go's isRangeOpPermitted
++// does `if len(rangeEnd) == 0`, and len([]byte{}) is 0 just like len(nil) - so
++// the open-ended range request was checked as if it were an exact single-key
++// point query. A single-key grant satisfied that point check, so the watch was
++// created covering [key, +inf) instead of being denied. Fixed by running the
++// permission check against the unmodified RangeEnd, before the []byte{}/nil
++// rewrite for watchStream.Watch.
++func TestWatchWithLowPermissionUser(t *testing.T) {
++	e2e.BeforeTest(t)
++
++	t.Log("Create a new one member cluster")
++	cfg := e2e.NewConfig(e2e.WithClusterSize(1))
++	epc, err := e2e.NewEtcdProcessCluster(t.Context(), t, e2e.WithConfig(cfg))
++	require.NoError(t, err)
++	defer func() {
++		require.NoError(t, epc.Close())
++	}()
++
++	t.Log("Create users and roles")
++	ec := epc.Etcdctl()
++	_, err = ec.UserAdd(t.Context(), "root", "rootPassword", config.UserAddOptions{})
++	require.NoError(t, err)
++	_, err = ec.UserGrantRole(t.Context(), "root", "root")
++	require.NoError(t, err)
++	_, err = ec.RoleAdd(t.Context(), "test")
++	require.NoError(t, err)
++	// Grant read permission on the EXACT single key "foo" only (RangeEnd == "").
++	_, err = ec.RoleGrantPermission(t.Context(), "test", "foo", "", clientv3.PermissionType(clientv3.PermRead))
++	require.NoError(t, err)
++	_, err = ec.UserAdd(t.Context(), "test", "testPassword", config.UserAddOptions{})
++	require.NoError(t, err)
++	_, err = ec.UserGrantRole(t.Context(), "test", "test")
++	require.NoError(t, err)
++
++	t.Log("Enable auth")
++	require.NoError(t, ec.AuthEnable(t.Context()))
++
++	rootClient := newClientWithAuthCVE202673499(t, epc, "root", "rootPassword")
++	testClient := newClientWithAuthCVE202673499(t, epc, "test", "testPassword")
++
++	t.Log("Low-permission user (exact single-key read permission on 'foo') tries to watch from 'foo' onward, which exceeds its permission")
++	watchCtx, cancelWatch := context.WithCancel(t.Context())
++	defer cancelWatch()
++	wc := testClient.Watch(watchCtx, "foo", clientv3.WithFromKey(), clientv3.WithCreatedNotify())
++
++	select {
++	case wresp := <-wc:
++		require.EqualError(t, wresp.Err(), v3rpc.ErrGRPCPermissionDenied.Error())
++		require.True(t, wresp.Canceled)
++	case <-time.After(3 * time.Second):
++		t.Fatal("timed out waiting for watch creation ack")
++	}
++
++	t.Log("Confirm root can still write to a sibling key sharing the 'foo' prefix without any leaked event reaching 'test'")
++	_, err = rootClient.Put(t.Context(), "foo1", "leaked-value")
++	require.NoError(t, err)
++
++	select {
++	case wresp, ok := <-wc:
++		if ok {
++			t.Fatalf("expected watch channel to be closed after denial, got response: %+v", wresp)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("timed out waiting for watch channel to close")
++	}
++}
