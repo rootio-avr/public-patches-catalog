@@ -1,10 +1,12 @@
-# wget : 1.25.0-r20071
+# wget : 1.25.0-r20072
 
-This patch is based on wget version 1.25.0-r20071, which is available at:
+This patch is based on wget version 1.25.0-r20072, which is available at:
 unknown
 
 ## Affected CVEs:
 - CVE-2026-58471
+- CVE-2026-58472
+- CVE-2026-58469
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source wget`
