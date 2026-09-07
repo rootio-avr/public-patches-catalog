@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-33186
+- CVE-2026-84304
 - GHSA-hrxh-6v49-42gf
 
 ## How to Apply:
