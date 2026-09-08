@@ -4,6 +4,7 @@ This patch is based on google.golang.org/grpc version v1.81.1, which is availabl
 unknown
 
 ## Affected CVEs:
+- CVE-2026-84304
 - GHSA-hrxh-6v49-42gf
 
 ## How to Apply:
