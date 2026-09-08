@@ -1,10 +1,11 @@
-# p11-kit : 0.25.5-3.aikido.2
+# p11-kit : 0.25.5-3.aikido.3
 
-This patch is based on p11-kit version 0.25.5-3.aikido.2, which is available at:
+This patch is based on p11-kit version 0.25.5-3.aikido.3, which is available at:
 https://sources.debian.org/src/p11-kit/0.25.5-3/
 
 ## Affected CVEs:
 - CVE-2026-13757
+- CVE-2026-18938
 
 ## How to Apply:
 1. Obtain the source package: `apt source p11-kit`
