@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-41602
+- CVE-2026-43871
 
 ## How to Apply:
 1. Clone or download the source code for github.com/apache/thrift
