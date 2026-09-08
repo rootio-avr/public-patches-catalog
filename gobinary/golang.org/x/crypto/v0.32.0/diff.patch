@@ -2767,3 +2767,203 @@ release, so the new test is added at end of file).
 +		}
 +	}
 +}
+
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -166,6 +167,12 @@
+ 	// (for outbound channels) or received (for inbound channels).
+ 	decided bool
+ 
++	// established is set to true once the channel is open and may carry normal
++	// channel traffic: for an outbound channel when the peer's open
++	// confirmation is received, for an inbound channel when the local side
++	// accepts it. It is set and read from different goroutines.
++	established atomic.Bool
++
+ 	// direction contains either channelOutbound, for channels created
+ 	// locally, or channelInbound, for channels created by the peer.
+ 	direction channelDirection
+@@ -404,10 +411,20 @@
+ 		return errors.New("ssh: duplicate response received for channel")
+ 	}
+ 	ch.decided = true
++	ch.established.Store(true)
+ 	return nil
+ }
+ 
+ func (ch *channel) handlePacket(packet []byte) error {
++	// Only the open response is expected before the channel is established.
++	if !ch.established.Load() {
++		switch packet[0] {
++		case msgChannelOpenConfirm, msgChannelOpenFailure:
++		default:
++			return nil
++		}
++	}
++
+ 	switch packet[0] {
+ 	case msgChannelData, msgChannelExtendedData:
+ 		return ch.handleData(packet)
+@@ -512,6 +529,7 @@
+ 		MaxPacketSize: ch.maxIncomingPayload,
+ 	}
+ 	ch.decided = true
++	ch.established.Store(true)
+ 	if err := ch.sendMessage(confirm); err != nil {
+ 		return nil, nil, err
+ 	}
+--- /dev/null
++++ b/ssh/cve_2026_78662_test.go
+@@ -0,0 +1,152 @@
++// Copyright 2026 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ssh
++
++import (
++	"testing"
++)
++
++// Regression tests for CVE-2026-78662: a channel registered in the mux's
++// chanList but not yet established (outbound: no open confirmation received;
++// inbound: not yet accepted, or rejected) must not process arbitrary channel
++// traffic. Before the fix a misbehaving peer could flood the channel's
++// incomingRequests and deadlock the whole connection. handlePacket now drops
++// every packet other than the open confirmation/failure until the channel is
++// established, without blocking and without tearing down the connection.
++//
++// Grounded on upstream ssh/mux_test.go from fix commit
++// a6cdac60840750226b15617ac8858be44361b36b.
++
++func TestCVE202678662UndecidedOutboundDropsTraffic(t *testing.T) {
++	// Traffic on an outbound channel the peer has not confirmed yet is dropped;
++	// the open confirmation is still processed.
++	a, b := memPipe()
++	defer a.Close()
++	defer b.Close()
++	// Drain the peer end so that a write would not block.
++	go func() {
++		for {
++			if _, err := b.readPacket(); err != nil {
++				return
++			}
++		}
++	}()
++
++	m := newMux(a)
++	ch := m.newChannel("session", channelOutbound, nil)
++	if ch.decided {
++		t.Fatal("freshly opened outbound channel should not be decided")
++	}
++
++	// Flooding channel requests must not block.
++	reqPacket := Marshal(channelRequestMsg{PeersID: ch.localId, Request: "x"})
++	for i := 0; i < chanSize*4; i++ {
++		if err := ch.handlePacket(reqPacket); err != nil {
++			t.Fatalf("handlePacket(channelRequest): %v", err)
++		}
++	}
++	if n := len(ch.incomingRequests); n != 0 {
++		t.Fatalf("incomingRequests should be empty, has %d entries", n)
++	}
++
++	// A close before the confirmation must not remove or close the channel, and
++	// must not emit a close for the still-unknown remote id.
++	if err := ch.handlePacket(Marshal(channelCloseMsg{PeersID: ch.localId})); err != nil {
++		t.Fatalf("handlePacket(channelClose): %v", err)
++	}
++	if m.chanList.getChan(ch.localId) != ch {
++		t.Fatal("premature close removed the channel from the chanList")
++	}
++
++	// The open confirmation is still processed and decides the channel.
++	confirm := Marshal(channelOpenConfirmMsg{
++		PeersID:       ch.localId,
++		MyID:          42,
++		MyWindow:      1 << 20,
++		MaxPacketSize: 1 << 15,
++	})
++	if err := ch.handlePacket(confirm); err != nil {
++		t.Fatalf("handlePacket(openConfirm): %v", err)
++	}
++	if !ch.decided {
++		t.Fatal("channel not decided after open confirmation")
++	}
++	if _, ok := (<-ch.msg).(*channelOpenConfirmMsg); !ok {
++		t.Fatal("open confirmation was not delivered on ch.msg")
++	}
++}
++
++func TestCVE202678662UndecidedInboundDropsRequests(t *testing.T) {
++	// Channel requests on an inbound channel the local application has not
++	// accepted or rejected yet are dropped.
++	serverMux, clientMux := muxPair()
++	defer serverMux.Close()
++	defer clientMux.Close()
++	go DiscardRequests(serverMux.incomingRequests)
++
++	// The server assigns its first inbound channel id 0; open such a channel
++	// and flood it before it is decided. The channel is left undecided, as it
++	// would be in the window before the server accepts or rejects it: its
++	// NewChannel is never received from incomingChannels.
++	ch := clientMux.newChannel("chan", channelOutbound, nil)
++	if err := clientMux.sendMessage(channelOpenMsg{
++		ChanType:      "chan",
++		PeersWindow:   ch.myWindow,
++		MaxPacketSize: ch.maxIncomingPayload,
++		PeersID:       ch.localId,
++	}); err != nil {
++		t.Fatalf("send open: %v", err)
++	}
++	for i := 0; i < chanSize*4; i++ {
++		if err := clientMux.sendMessage(channelRequestMsg{PeersID: 0, Request: "x"}); err != nil {
++			break // the server may have closed the connection
++		}
++	}
++
++	// The server loop keeps reading: closing the client makes it observe EOF
++	// and return from Wait.
++	clientMux.Close()
++	serverMux.Wait()
++}
++
++func TestCVE202678662RejectedInboundDropsTraffic(t *testing.T) {
++	// A rejected channel is decided but is never established, and traffic on it
++	// is dropped.
++	a, b := memPipe()
++	defer a.Close()
++	defer b.Close()
++	go func() {
++		for {
++			if _, err := b.readPacket(); err != nil {
++				return
++			}
++		}
++	}()
++
++	m := newMux(a)
++	ch := m.newChannel("session", channelInbound, nil)
++	ch.remoteId = 42
++
++	if err := ch.Reject(ConnectionFailed, "no thanks"); err != nil {
++		t.Fatalf("Reject: %v", err)
++	}
++	if !ch.decided {
++		t.Fatal("a rejected channel should be decided")
++	}
++	if ch.established.Load() {
++		t.Fatal("a rejected channel should not be established")
++	}
++
++	// Flooding channel requests must not block.
++	reqPacket := Marshal(channelRequestMsg{PeersID: ch.localId, Request: "x"})
++	for i := 0; i < chanSize*4; i++ {
++		if err := ch.handlePacket(reqPacket); err != nil {
++			t.Fatalf("handlePacket(channelRequest): %v", err)
++		}
++	}
++	if n := len(ch.incomingRequests); n != 0 {
++		t.Fatalf("incomingRequests should be empty, has %d entries", n)
++	}
++}
