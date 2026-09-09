@@ -1,10 +1,9 @@
-# gnupg2 : 2.2.27-2+deb11u2.aikido.3
+# gnupg2 : 2.2.27-2+deb11u3.aikido.4
 
-This patch is based on gnupg2 version 2.2.27-2+deb11u2.aikido.3, which is available at:
-https://sources.debian.org/src/gnupg2/2.2.27-2+deb11u2/
+This patch is based on gnupg2 version 2.2.27-2+deb11u3.aikido.4, which is available at:
+https://sources.debian.org/src/gnupg2/2.2.27-2+deb11u3/
 
 ## Affected CVEs:
-- CVE-2025-68973
 - CVE-2025-30258
 - CVE-2025-68972
 
