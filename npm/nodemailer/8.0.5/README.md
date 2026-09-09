@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - GHSA-h3hj-cmcx-xc66
+- CVE-2026-82659
+- GHSA-2x7j-588g-ccc2
 
 ## How to Apply:
 1. Clone or download the source code for nodemailer

@@ -13,3 +13,208 @@
          } else if (this._useMixed) {
              this.message = this._createMixed();
          } else if (this._useAlternative) {
+
+--- /dev/null
++++ b/test/mail-composer/cve-2026-82659.test.js
+@@ -0,0 +1,64 @@
++'use strict';
++
++const { describe, it } = require('node:test');
++const assert = require('node:assert/strict');
++const MailComposer = require('../../lib/mail-composer');
++
++// Regression test for CVE-2026-82659 (GHSA-p6gq-j5cr-w38f)
++// MailComposer.compile() built the root MimeNode for a message-level `raw`
++// option without threading the disableFileAccess / disableUrlAccess flags,
++// so `raw: { path }` / `raw: { href }` was read/fetched even when an
++// application set those flags to sandbox untrusted input (local-file
++// disclosure and full-response SSRF). The fix threads both flags onto the
++// raw root node so _getStream() enforces them.
++describe('CVE-2026-82659 raw message file/url access enforcement', () => {
++    it('should load raw message from file when access is not restricted', (t, done) => {
++        let data = {
++            raw: {
++                path: __dirname + '/fixtures/attachment.bin'
++            }
++        };
++
++        let mail = new MailComposer(data).compile();
++        mail.build((err, message) => {
++            assert.ok(!err);
++            // raw content is emitted verbatim (not base64-encoded like an attachment)
++            assert.ok(message.toString().includes('õkva'));
++            done();
++        });
++    });
++
++    it('should not load raw message from file if disableFileAccess is set', (t, done) => {
++        let data = {
++            raw: {
++                path: __dirname + '/fixtures/attachment.bin'
++            },
++            disableFileAccess: true
++        };
++
++        let mail = new MailComposer(data).compile();
++        mail.build((err, message) => {
++            assert.ok(err);
++            assert.strictEqual(err.code, 'EFILEACCESS');
++            assert.ok(!message);
++            done();
++        });
++    });
++
++    it('should not load raw message from url if disableUrlAccess is set', (t, done) => {
++        let data = {
++            raw: {
++                href: 'http://localhost:1/raw'
++            },
++            disableUrlAccess: true
++        };
++
++        let mail = new MailComposer(data).compile();
++        mail.build((err, message) => {
++            assert.ok(err);
++            assert.strictEqual(err.code, 'EURLACCESS');
++            assert.ok(!message);
++            done();
++        });
++    });
++});
+
+--- a/lib/addressparser/index.js
++++ b/lib/addressparser/index.js
+@@ -344,8 +344,10 @@
+ 
+     addresses.forEach(addr => {
+         const handled = _handleAddress(addr, depth);
+-        if (handled.length) {
+-            parsedAddresses = parsedAddresses.concat(handled);
++        // Appended in place. Rebuilding the accumulator with concat() would copy every
++        // entry collected so far on each address, making a flat list cost O(n^2).
++        for (let i = 0; i < handled.length; i++) {
++            parsedAddresses.push(handled[i]);
+         }
+     });
+ 
+@@ -353,14 +355,20 @@
+     // "Joe Foo, PhD <joe@example.com>" is split on the comma into
+     // [{name:"Joe Foo", address:""}, {name:"PhD", address:"joe@example.com"}].
+     // Recombine: a name-only entry followed by an entry with both name and address.
+-    for (let i = parsedAddresses.length - 2; i >= 0; i--) {
++    // Walked back to front so that a run of fragments folds into one entry in a single
++    // pass. Splicing each fragment out of the list instead would cost O(n^2).
++    const mergedAddresses = [];
++    for (let i = parsedAddresses.length - 1; i >= 0; i--) {
+         const current = parsedAddresses[i];
+-        const next = parsedAddresses[i + 1];
+-        if (current.address === '' && current.name && !current.group && next.address && next.name) {
++        const next = mergedAddresses.length ? mergedAddresses[mergedAddresses.length - 1] : null;
++        if (next && current.address === '' && current.name && !current.group && next.address && next.name) {
+             next.name = current.name + ', ' + next.name;
+-            parsedAddresses.splice(i, 1);
++        } else {
++            mergedAddresses.push(current);
+         }
+     }
++    mergedAddresses.reverse();
++    parsedAddresses = mergedAddresses;
+ 
+     if (options.flatten) {
+         const flatAddresses = [];
+--- a/lib/mime-node/index.js
++++ b/lib/mime-node/index.js
+@@ -843,9 +843,10 @@
+                 this._envelope.from = list[0].address;
+             }
+         }
++        const seenRecipients = new Set();
+         ['to', 'cc', 'bcc'].forEach(key => {
+             if (envelope[key]) {
+-                this._convertAddresses(this._parseAddresses(envelope[key]), this._envelope.to);
++                this._convertAddresses(this._parseAddresses(envelope[key]), this._envelope.to, seenRecipients);
+             }
+         });
+ 
+@@ -868,15 +869,17 @@
+      */
+     getAddresses() {
+         const addresses = {};
++        const seenByKey = new Map();
+ 
+         this._headers.forEach(header => {
+             const key = header.key.toLowerCase();
+             if (['from', 'sender', 'reply-to', 'to', 'cc', 'bcc'].includes(key)) {
+                 if (!Array.isArray(addresses[key])) {
+                     addresses[key] = [];
++                    seenByKey.set(key, new Set());
+                 }
+ 
+-                this._convertAddresses(this._parseAddresses(header.value), addresses[key]);
++                this._convertAddresses(this._parseAddresses(header.value), addresses[key], seenByKey.get(key));
+             }
+         });
+ 
+@@ -897,6 +900,12 @@
+             from: false,
+             to: []
+         };
++
++        // Built once and carried across the headers. Letting _convertAddresses seed it per
++        // call would cost O(headers x recipients), and a message can carry many address
++        // headers: `headers: { to: [...] }` emits one To per entry.
++        const seenRecipients = new Set();
++
+         this._headers.forEach(header => {
+             const list = [];
+             if (header.key === 'From' || (!envelope.from && ['Reply-To', 'Sender'].includes(header.key))) {
+@@ -905,7 +914,7 @@
+                     envelope.from = list[0].address;
+                 }
+             } else if (['To', 'Cc', 'Bcc'].includes(header.key)) {
+-                this._convertAddresses(this._parseAddresses(header.value), envelope.to);
++                this._convertAddresses(this._parseAddresses(header.value), envelope.to, seenRecipients);
+             }
+         });
+ 
+@@ -1177,11 +1186,22 @@
+      * @param {Array} [uniqueList] An array to be populated with addresses
+      * @return {String} address string
+      */
+-    _convertAddresses(addresses, uniqueList) {
++    _convertAddresses(addresses, uniqueList, seenAddresses) {
+         const values = [];
+ 
+         uniqueList = uniqueList || [];
+ 
++        // Membership is checked once per address, so scanning uniqueList itself would make
++        // a recipient list cost O(n^2). Groups recurse with the same set so that a nested
++        // group still dedupes against the addresses collected around it, and a caller that
++        // passes a partly filled list (To, then Cc, then Bcc) keeps deduping across headers.
++        if (!seenAddresses) {
++            seenAddresses = new Set();
++            for (let i = 0; i < uniqueList.length; i++) {
++                seenAddresses.add(uniqueList[i].address);
++            }
++        }
++
+         [].concat(addresses || []).forEach(address => {
+             if (address.address) {
+                 address.address = this._normalizeAddress(address.address);
+@@ -1192,11 +1212,14 @@
+                     values.push(`${this._encodeAddressName(address.name)} <${address.address}>`);
+                 }
+ 
+-                if (!uniqueList.some(a => a.address === address.address)) {
++                if (!seenAddresses.has(address.address)) {
++                    seenAddresses.add(address.address);
+                     uniqueList.push(address);
+                 }
+             } else if (address.group) {
+-                const groupListAddresses = (address.group.length ? this._convertAddresses(address.group, uniqueList) : '').trim();
++                const groupListAddresses = (
++                    address.group.length ? this._convertAddresses(address.group, uniqueList, seenAddresses) : ''
++                ).trim();
+                 values.push(`${this._encodeAddressName(address.name)}:${groupListAddresses};`);
+             }
+         });
