@@ -19,6 +19,7 @@ unknown
 - CVE-2025-57822
 - AIKIDO-2026-10755
 - AIKIDO-2026-10756
+- GHSA-q4gf-8mx6-v5v3
 
 ## How to Apply:
 1. Clone or download the source code for next
