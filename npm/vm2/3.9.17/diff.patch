@@ -8226,6 +8226,175 @@ index cd1814f..5728c4c 100644
  if (!localReflectSetPrototypeOf(context, localObject.prototype)) throw localUnexpected();
  
 
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -1686,7 +1686,15 @@
+ 				if (!proto) {
+ 					return other;
+ 				}
++				// SECURITY (GHSA-cfcw-xp6x-25gj / CVE-2026-47698): track whether the
++				// sandbox Object.prototype is ever seen while walking the chain. Every
++				// genuine sandbox-realm object reaches it; a host-realm object whose
++				// [[Prototype]] was severed host-side (stacked-indirection or map/bind
++				// laundering) walks to null without a protoMapping AND without ever
++				// passing through it.
++				let sawSandboxObjectProto = false;
+ 				while (proto) {
++					if (proto === thisObjectPrototype) sawSandboxObjectProto = true; // SECURITY (GHSA-cfcw-xp6x-25gj / CVE-2026-47698)
+ 					const mapping = thisReflectApply(thisMapGet, protoMappings, [proto]);
+ 					if (mapping) {
+ 						const mapped = thisReflectApply(thisWeakMapGet, mappingOtherToThis, [other]);
+@@ -1694,6 +1702,17 @@
+ 						return mapping(defaultFactory, other);
+ 					}
+ 					proto = thisReflectGetPrototypeOf(proto);
++				}
++				// SECURITY (GHSA-cfcw-xp6x-25gj / CVE-2026-47698): mechanism-independent
++				// payoff defense. Walked the entire chain to null with no protoMapping;
++				// if the sandbox Object.prototype was never on the chain this is a
++				// severed host-realm carrier. Refuse to surface it raw and return the
++				// frozen sentinel, whose `.constructor` is undefined so the canonical
++				// `e.constructor.constructor` host-Function pivot cannot fire. The
++				// immediate null-proto branch above (sandbox {__proto__:null},
++				// GHSA-9vg3-4rfj-wgcm) returned earlier and is unaffected.
++				if (!isHost && !sawSandboxObjectProto) {
++					return emptyFrozenObject;
+ 				}
+ 				return other;
+ 			case 'symbol':
+--- /dev/null
++++ b/test/cve-2026-47698.test.js
+@@ -0,0 +1,129 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++/*
++ * CVE-2026-47698 / GHSA-cfcw-xp6x-25gj
++ *
++ * Regression test backported for vm2 3.9.17. Grounded on the upstream repro
++ * test/ghsa/GHSA-cfcw-xp6x-25gj/repro.js (fix commit a85acb61). That file is
++ * not shipped in this target tree, so this is a minimal replacement exercising
++ * the same fixed behavior.
++ *
++ * Vulnerability: sandbox code severs a host intrinsic's prototype chain
++ * (host-side, via stacked Function.prototype.call indirection or map/bind
++ * laundering) so the bridge's proto-mapping lookups miss and a RAW host-realm
++ * error surfaces in a sandbox catch. The sandbox then pivots
++ * `e.constructor.constructor` to host `Function` for RCE.
++ *
++ * Fix (mechanism-independent payoff defense): `thisEnsureThis` in
++ * lib/bridge.js — the chokepoint every caught value re-enters through
++ * (`handleException === ensureThis`) — refuses to surface any host-realm
++ * object whose prototype chain reaches null without ever passing through the
++ * sandbox `Object.prototype`, returning the frozen sentinel instead. The
++ * sentinel's `.constructor` is undefined, so the host-Function pivot cannot
++ * fire, regardless of HOW the chain was severed.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const {VM} = require('..');
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++// The canonical PoC relies on WebAssembly.compileStreaming rejecting with a
++// host Node-internal error; it exists on Node 14+.
++const HAS_WASM_STREAMING = NODE_MAJOR >= 14;
++
++function escapeAttempt(code) {
++	const vm = new VM({timeout: 2000});
++	const pwnKey = '__CVE_2026_47698_pwned_' + Math.random().toString(36).slice(2);
++	global[pwnKey] = false;
++	try {
++		vm.run(code.replace(/__PWN_KEY__/g, JSON.stringify(pwnKey)));
++	} catch (_) {
++		/* bridge-level throws are also acceptable — escape blocked */
++	}
++	return new Promise(function (resolve) {
++		setTimeout(function () {
++			const escaped = global[pwnKey] === true;
++			delete global[pwnKey];
++			resolve(escaped);
++		}, 300);
++	});
++}
++
++describe('CVE-2026-47698 (GHSA-cfcw-xp6x-25gj) host prototype severance escape', function () {
++	(HAS_WASM_STREAMING ? it : it.skip)('blocks the stacked-indirection PoC (Buffer.call.call(Buffer.call, setProto, ...))', async function () {
++		this.timeout(5000);
++		const escaped = await escapeAttempt(`
++			"use strict";
++			const getProto = Buffer.call.call(Buffer.call, {}.__lookupGetter__, Buffer, "__proto__");
++			const setProto = Buffer.call.call(Buffer.call, {}.__lookupSetter__, Buffer, "__proto__");
++			async function f() {
++				try { await WebAssembly.compileStreaming(); }
++				catch (e) {
++					try {
++						Buffer.call.call(Buffer.call, setProto,
++							Buffer.call.call(Buffer.call, getProto, e), null);
++					} catch (_) {}
++				}
++				try { await WebAssembly.compileStreaming(); }
++				catch (e) {
++					try {
++						const HostFunction = e.constructor.constructor;
++						new HostFunction("globalThis[" + JSON.stringify(__PWN_KEY__) + "] = true")();
++					} catch (_) {}
++				}
++			}
++			f().catch(() => {});
++		`);
++		assert.strictEqual(escaped, false, 'stacked-indirection PoC succeeded');
++	});
++
++	(HAS_WASM_STREAMING ? it : it.skip)('blocks the map/bind host-side laundering bypass', async function () {
++		this.timeout(5000);
++		const escaped = await escapeAttempt(`
++			"use strict";
++			const ca = Buffer.call.call(Buffer.bind, Buffer.apply, Buffer.call, Buffer.call);
++			function caar(a){ const r = Buffer.of().toJSON().data; r[0] = a; return r.map(ca); }
++			async function f() {
++				try { await WebAssembly.compileStreaming(); }
++				catch (e) {
++					try {
++						const g = caar([{}.__lookupGetter__, Buffer, "__proto__"]); g[1] = e;
++						const s = caar([{}.__lookupSetter__, Buffer, "__proto__"]); s[1] = ca(g); s[2] = null;
++						ca(s);
++					} catch (_) {}
++				}
++				try { await WebAssembly.compileStreaming(); }
++				catch (e) {
++					try {
++						e.constructor.constructor("globalThis[" + JSON.stringify(__PWN_KEY__) + "] = true")();
++					} catch (_) {}
++				}
++			}
++			f().catch(() => {});
++		`);
++		assert.strictEqual(escaped, false, 'map/bind host-side laundering PoC succeeded');
++	});
++
++	it('preserves legitimate sandbox setPrototypeOf on sandbox objects', function () {
++		const vm = new VM();
++		const out = vm.run(`
++			const a = {};
++			const b = { kind: 'parent' };
++			Object.setPrototypeOf(a, b);
++			a.kind;
++		`);
++		assert.strictEqual(out, 'parent', 'legitimate setPrototypeOf broke');
++	});
++
++	it('preserves normal sandbox exception handling', function () {
++		const vm = new VM();
++		const msg = vm.run(`
++			try { throw new Error('boom'); }
++			catch (e) { e.message; }
++		`);
++		assert.strictEqual(msg, 'boom', 'normal sandbox catch broke');
++	});
++});
+
 diff --git a/lib/bridge.js b/lib/bridge.js
 index 0a43037..2d76376 100644
 --- a/lib/bridge.js
@@ -8295,7 +8464,7 @@ index 0000000..1da2282
 +
 +---
 +
-+## CVE-2026-44009 / GHSA-9vg3-4rfj-wgcm
++## CVE-2026-44009 / AIKIDO-2026-10731 / GHSA-9vg3-4rfj-wgcm
 +
 +**Status:** Not applicable to this fork. No code changes made.
 +
@@ -8380,7 +8549,7 @@ index 5728c4c..6e1ee94 100644
   * Promise sanitization
   */
  
-+// SECURITY (CVE-2026-45411 / GHSA-248r-7h7q-cr24): cached here, before any
++// SECURITY (CVE-2026-45411 / AIKIDO-2026-10808 / GHSA-248r-7h7q-cr24): cached here, before any
 +// override below replaces `PromisePrototype.then`, so the async-generator
 +// sanitization further down can chain onto iterator-result promises using the
 +// real native `.then` -- never the sandbox-visible override (which would
@@ -8399,7 +8568,7 @@ index 5728c4c..6e1ee94 100644
  	if (!pinned) throw new VMError('Unsafe Promise species cannot be reset');
  }
  
-+// SECURITY (CVE-2026-45411 / GHSA-248r-7h7q-cr24): Async generator
++// SECURITY (CVE-2026-45411 / AIKIDO-2026-10808 / GHSA-248r-7h7q-cr24): Async generator
 +// yield*-return thenable exception capture.
 +//
 +// When sandbox code delegates via `yield*` inside an async generator to an
