@@ -8226,6 +8226,372 @@ index cd1814f..5728c4c 100644
  if (!localReflectSetPrototypeOf(context, localObject.prototype)) throw localUnexpected();
  
 
+diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
+index 768e879..850e771 100644
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -351,6 +351,251 @@ function allocUnsafeSlow(size) {
+ 
+ connect(allocUnsafeSlow, host.Buffer.allocUnsafeSlow);
+ 
++// SECURITY (GHSA-v836-6xw4-9cx3): close the memory-exhaustion DoS class.
++//
++// `ArrayBuffer`, `SharedArrayBuffer`, every TypedArray constructor, and
++// `WebAssembly.Memory` allocate host backing-store memory through the SAME
++// synchronous, timeout-immune V8 C++ path (`ArrayBuffer::NewBackingStore` ->
++// `ArrayBufferAllocator::Allocate` -> `calloc`). `timeout` only fires between
++// bytecodes and cannot preempt a single native allocation, so a ~200-byte
++// sandbox payload (`new ArrayBuffer(1<<30)`) amplifies into gigabytes of host
++// RSS in one uninterruptible call and can OOM-kill the host process.
++//
++// Fix: when a finite `bufferAllocLimit` is configured, replace each
++// sandbox-realm allocation constructor with a `construct`-trapping Proxy that
++// runs `checkBufferAllocLimit` on the ToIndex-coerced byte count BEFORE the
++// native allocation, and pin every `prototype.constructor` back-reference to
++// the wrapper so the original uncapped intrinsic cannot be recovered via a
++// constructor walk such as `new Uint8Array(0).buffer.constructor`. The Proxy
++// forwards `prototype`, `[Symbol.species]`, and `[[Prototype]]` to the
++// original, so `instanceof`, species-derived construction, and subclassing
++// keep working.
++//
++// Gated on a finite limit: with the default `bufferAllocLimit: Infinity` the
++// native intrinsics are left completely untouched — zero behavioural or
++// identity change for embedders who have not opted into the cap.
++if (typeof localBufferAllocLimit === 'number' && localBufferAllocLimit !== Infinity) {
++	installAllocationCaps(localBufferAllocLimit);
++}
++
++function installAllocationCaps(limit) {
++	function checkBufferAllocLimit(bytes) {
++		if (bytes > limit) {
++			throw new RangeError('Buffer allocation limit exceeded.');
++		}
++	}
++
++	// The native constructors size their allocation with ToIndex(arg), i.e.
++	// ToNumber first — so a length supplied as a string ("209715200"), an object
++	// with `valueOf` / `Symbol.toPrimitive`, etc. is coerced to a large number by
++	// V8. A `typeof === 'number'` guard would wave all of those through.
++	// `coerceAllocMagnitude` mirrors the ToNumber step so the cap measures the
++	// SAME magnitude V8 will allocate. Values that cannot yield a large positive
++	// allocation collapse to 0 (the native constructor still applies its own
++	// validation/throws); Symbols and BigInts throw under unary `+` and are
++	// caught — for those the native call throws before allocating, so 0 is safe.
++	function coerceAllocMagnitude(value) {
++		let n;
++		try {
++			n = +value;
++		} catch (e) {
++			return 0;
++		}
++		if (n !== n || n < 0) return 0;
++		return n;
++	}
++
++	function isObjectLike(value) {
++		return value !== null && (typeof value === 'object' || typeof value === 'function');
++	}
++
++	// The magnitude must be read EXACTLY ONCE. `checkBufferAllocLimit(compute(args))`
++	// followed by `construct(target, args)` reads any `valueOf` / accessor twice —
++	// a getter returning small-then-large slips the real (large) value past the cap
++	// (TOCTOU). The construct traps below canonicalize every object-valued size
++	// input to the primitive the cap checked, and hand the native constructor THAT
++	// primitive, so check-time and alloc-time observe identical values.
++
++	function defineGlobalCtor(name, value) {
++		localReflectDefineProperty(global, name, {
++			__proto__: null,
++			value: value,
++			writable: true,
++			enumerable: false,
++			configurable: true
++		});
++	}
++
++	function pinConstructor(prototype, capProxy) {
++		if (!prototype) return;
++		localReflectDefineProperty(prototype, 'constructor', {
++			__proto__: null,
++			value: capProxy,
++			writable: true,
++			enumerable: false,
++			configurable: true
++		});
++	}
++
++	// ArrayBuffer / SharedArrayBuffer. The allocated bytes are the larger of the
++	// committed `length` (arg0) and the reserved `maxByteLength` (resizable /
++	// growable forms reserve max up front). Both are canonicalized to primitives
++	// so a `maxByteLength` accessor cannot read small here and large inside V8 —
++	// which would otherwise leave the buffer resizable past the cap and let a
++	// later `.resize()` / `.grow()` commit the full (uncapped) maximum.
++	function capArrayBuffer(OriginalCtor) {
++		const capProxy = new LocalProxy(OriginalCtor, {
++			__proto__: null,
++			construct(target, args, newTarget) {
++				const rawLen = args.length > 0 ? args[0] : 0;
++				const lenMag = coerceAllocMagnitude(rawLen);
++				let capBytes = lenMag;
++				let maxPresent = false;
++				let maxMag = 0;
++				const options = args.length > 1 ? args[1] : undefined;
++				if (options !== null && typeof options === 'object') {
++					const rawMax = options.maxByteLength;
++					if (rawMax !== undefined) {
++						maxPresent = true;
++						maxMag = coerceAllocMagnitude(rawMax);
++						if (maxMag > capBytes) capBytes = maxMag;
++					}
++				}
++				checkBufferAllocLimit(capBytes);
++				if (isObjectLike(rawLen) || maxPresent) {
++					const finalLen = isObjectLike(rawLen) ? lenMag : rawLen;
++					args = maxPresent
++						? [finalLen, {__proto__: null, maxByteLength: maxMag}]
++						: [finalLen];
++				}
++				return localReflectConstruct(target, args, newTarget === capProxy ? OriginalCtor : newTarget);
++			}
++		});
++		pinConstructor(OriginalCtor.prototype, capProxy);
++		return capProxy;
++	}
++
++	// TypedArray. Two allocating shapes carry an attacker-controlled size:
++	//   (1) `new TA(N)` — primitive length, ToIndex(N) * BYTES_PER_ELEMENT bytes.
++	//   (2) `new TA(arrayLike)` — object with a `length` property; V8 reads
++	//       LengthOfArrayLike and allocates that many elements in one shot.
++	// The (buffer[, offset[, len]]) view form views an existing buffer and the
++	// iterable form is bounded by interruptible JS iteration — neither is a
++	// single-shot amplifier. We cap `arg0.length`: a real ArrayBuffer has no
++	// `length` property (coerces to 0 → no false positive); an array-like exposes
++	// its element count. The primitive path (1) is immutable (no TOCTOU). A
++	// hostile `length` *accessor* on an array-like is a documented residual; the
++	// common data-property amplifier is fully capped.
++	function capTypedArray(OriginalCtor, bytesPerElement) {
++		const capProxy = new LocalProxy(OriginalCtor, {
++			__proto__: null,
++			construct(target, args, newTarget) {
++				const rawLen = args.length > 0 ? args[0] : 0;
++				const sizeSource = isObjectLike(rawLen) ? rawLen.length : rawLen;
++				checkBufferAllocLimit(coerceAllocMagnitude(sizeSource) * bytesPerElement);
++				return localReflectConstruct(target, args, newTarget === capProxy ? OriginalCtor : newTarget);
++			}
++		});
++		pinConstructor(OriginalCtor.prototype, capProxy);
++		return capProxy;
++	}
++
++	if (typeof global.ArrayBuffer === 'function') {
++		defineGlobalCtor('ArrayBuffer', capArrayBuffer(global.ArrayBuffer));
++	}
++	if (typeof global.SharedArrayBuffer === 'function') {
++		defineGlobalCtor('SharedArrayBuffer', capArrayBuffer(global.SharedArrayBuffer));
++	}
++
++	const typedArrayNames = [
++		'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
++		'Int16Array', 'Uint16Array', 'Float16Array',
++		'Int32Array', 'Uint32Array', 'Float32Array',
++		'Float64Array', 'BigInt64Array', 'BigUint64Array'
++	];
++	for (let i = 0; i < typedArrayNames.length; i++) {
++		const name = typedArrayNames[i];
++		const Ctor = global[name];
++		// Feature-gated: Float16Array (Node 22+), BigInt64Array/BigUint64Array
++		// (Node 10+) may be absent on older runtimes.
++		if (typeof Ctor !== 'function') continue;
++		defineGlobalCtor(name, capTypedArray(Ctor, Ctor.BYTES_PER_ELEMENT));
++	}
++
++	// WebAssembly.Memory commits host pages (64 KiB each) through the same
++	// backing-store path; `initial` is attacker-controlled and `grow()` extends
++	// the commitment incrementally. Cap the initial reservation at construction
++	// and bound cumulative growth in `grow()`. `maximum` only reserves virtual
++	// address space (not RSS), so it is not capped here.
++	if (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Memory === 'function') {
++		const WASM_PAGE_BYTES = 65536;
++		const OriginalMemory = WebAssembly.Memory;
++		const memoryProto = OriginalMemory.prototype;
++		const originalGrow = memoryProto ? memoryProto.grow : undefined;
++		const memoryBufferDescriptor = memoryProto ? localReflectGetOwnPropertyDescriptor(memoryProto, 'buffer') : undefined;
++
++		const memoryCapProxy = new LocalProxy(OriginalMemory, {
++			__proto__: null,
++			construct(target, args, newTarget) {
++				const descriptor = args.length > 0 ? args[0] : undefined;
++				let pages = 0;
++				let initialPresent = false;
++				if (descriptor !== null && typeof descriptor === 'object') {
++					const rawInitial = descriptor.initial;
++					if (rawInitial !== undefined) {
++						initialPresent = true;
++						pages = coerceAllocMagnitude(rawInitial);
++					}
++				}
++				checkBufferAllocLimit(pages * WASM_PAGE_BYTES);
++				if (initialPresent) {
++					const rebuilt = {__proto__: null, initial: pages};
++					// COMPAT: forward `maximum` / `shared` only when supplied; Node 8
++					// coerces an explicit `maximum: undefined` to 0 and rejects the
++					// descriptor. Each is read exactly once, preserving TOCTOU safety.
++					const rawMaximum = descriptor.maximum;
++					if (rawMaximum !== undefined) rebuilt.maximum = rawMaximum;
++					const rawShared = descriptor.shared;
++					if (rawShared !== undefined) rebuilt.shared = rawShared;
++					args = [rebuilt];
++				}
++				return localReflectConstruct(target, args, newTarget === memoryCapProxy ? OriginalMemory : newTarget);
++			}
++		});
++
++		if (typeof originalGrow === 'function' && memoryBufferDescriptor && typeof memoryBufferDescriptor.get === 'function') {
++			const memoryBufferGetter = memoryBufferDescriptor.get;
++			const cappedGrow = function grow(delta) {
++				// Bound the post-grow total. Read current size off the live backing
++				// buffer; a non-Memory `this` makes the getter throw, preserving
++				// native semantics. `delta` is coerced once and the canonical
++				// primitive forwarded to the native grow (TOCTOU-safe).
++				const currentBuffer = localReflectApply(memoryBufferGetter, this, []);
++				const currentBytes = currentBuffer ? currentBuffer.byteLength : 0;
++				const addedPages = coerceAllocMagnitude(delta);
++				checkBufferAllocLimit(currentBytes + addedPages * WASM_PAGE_BYTES);
++				return localReflectApply(originalGrow, this, [addedPages]);
++			};
++			localReflectDefineProperty(memoryProto, 'grow', {
++				__proto__: null,
++				value: cappedGrow,
++				writable: true,
++				enumerable: false,
++				configurable: true
++			});
++		}
++
++		pinConstructor(memoryProto, memoryCapProxy);
++		localReflectDefineProperty(WebAssembly, 'Memory', {
++			__proto__: null,
++			value: memoryCapProxy,
++			writable: true,
++			enumerable: false,
++			configurable: true
++		});
++	}
++}
++
+ /**
+  * Replacement for Buffer inspect
+  *
+diff --git a/test/ghsa-v836-6xw4-9cx3.js b/test/ghsa-v836-6xw4-9cx3.js
+new file mode 100644
+index 0000000..2f2617f
+--- /dev/null
++++ b/test/ghsa-v836-6xw4-9cx3.js
+@@ -0,0 +1,103 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++// Regression test for GHSA-v836-6xw4-9cx3 (CWE-770): memory-exhaustion DoS via
++// bufferAllocLimit bypass. In vm2 3.9.17 the ArrayBuffer / SharedArrayBuffer /
++// TypedArray / WebAssembly.Memory constructors allocate host backing-store
++// memory through the same synchronous, timeout-immune V8 path as Buffer.alloc,
++// but were subject to no allocation cap. The novel patch adds an opt-in
++// `bufferAllocLimit` VM option that caps those intrinsics.
++//
++// These assertions are grounded in vuln_analysis.json: (a) the previously
++// unbounded allocations are now rejected once a finite cap is configured,
++// including the coercion / TOCTOU / constructor-walk variants, and (b) normal
++// (sub-limit) allocations and the non-configured default still work.
++
++const assert = require('assert');
++const {VM} = require('..');
++
++const LIMIT = 1024 * 1024; // 1 MiB
++const BIG = 64 * 1024 * 1024; // 64 MiB — well over the cap
++
++function capped(code) {
++	return () => new VM({bufferAllocLimit: LIMIT}).run(code);
++}
++
++describe('GHSA-v836-6xw4-9cx3: bufferAllocLimit caps native allocators', () => {
++	it('caps ArrayBuffer over the limit', () => {
++		assert.throws(capped(`new ArrayBuffer(${BIG})`), /allocation limit/i);
++	});
++
++	it('caps TypedArray numeric length over the limit', () => {
++		assert.throws(capped(`new Uint8Array(${BIG})`), /allocation limit/i);
++		assert.throws(capped(`new Float64Array(${BIG})`), /allocation limit/i);
++	});
++
++	it('caps TypedArray array-like {length: N} amplifier', () => {
++		assert.throws(capped(`new Uint8Array({length: ${BIG}})`), /allocation limit/i);
++	});
++
++	it('caps string / valueOf coercion of the length (ToIndex parity)', () => {
++		assert.throws(capped(`new ArrayBuffer("${BIG}")`), /allocation limit/i);
++		assert.throws(capped(`new ArrayBuffer({valueOf(){return ${BIG};}})`), /allocation limit/i);
++	});
++
++	it('is TOCTOU-safe: a toggling valueOf cannot slip a large value past the cap', () => {
++		assert.throws(capped(`
++			let t = 0;
++			new ArrayBuffer({valueOf(){ return t++ ? ${BIG} : 8; }});
++		`), /allocation limit/i);
++	});
++
++	it('caps resizable ArrayBuffer via maxByteLength', () => {
++		assert.throws(capped(`new ArrayBuffer(8, {maxByteLength: ${BIG}})`), /allocation limit/i);
++	});
++
++	it('cannot recover the uncapped intrinsic via a constructor walk', () => {
++		assert.throws(capped(`
++			const AB = new Uint8Array(8).buffer.constructor;
++			new AB(${BIG});
++		`), /allocation limit/i);
++	});
++
++	it('caps SharedArrayBuffer when available', () => {
++		if (typeof SharedArrayBuffer !== 'function') return;
++		assert.throws(capped(`new SharedArrayBuffer(${BIG})`), /allocation limit/i);
++	});
++
++	it('caps WebAssembly.Memory initial pages when available', () => {
++		if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Memory !== 'function') return;
++		// 64 MiB / 64 KiB per page = 1024 pages, over the 1 MiB cap.
++		assert.throws(capped(`new WebAssembly.Memory({initial: 1024})`), /allocation limit/i);
++	});
++
++	it('allows allocations at or under the limit', () => {
++		const out = new VM({bufferAllocLimit: LIMIT}).run(`
++			const a = new ArrayBuffer(1024);
++			const b = new Uint8Array(1024);
++			a.byteLength + b.length;
++		`);
++		assert.strictEqual(out, 2048);
++	});
++
++	it('preserves instanceof / prototype semantics under the cap', () => {
++		const ok = new VM({bufferAllocLimit: LIMIT}).run(`
++			const a = new ArrayBuffer(8);
++			const u = new Uint8Array(8);
++			(a instanceof ArrayBuffer) && (u instanceof Uint8Array);
++		`);
++		assert.strictEqual(ok, true);
++	});
++
++	it('is opt-in: default (no limit) leaves large allocations working', () => {
++		const n = new VM().run(`new ArrayBuffer(${BIG}).byteLength`);
++		assert.strictEqual(n, BIG);
++	});
++
++	it('rejects an invalid bufferAllocLimit option', () => {
++		assert.throws(() => new VM({bufferAllocLimit: -1}), /bufferAllocLimit/);
++		assert.throws(() => new VM({bufferAllocLimit: 'nope'}), /bufferAllocLimit/);
++	});
++});
+
 --- a/lib/resolver-compat.js
 +++ b/lib/resolver-compat.js
 @@ -255,7 +255,25 @@
