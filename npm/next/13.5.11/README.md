@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2025-59471
 - CVE-2026-44573
+- CVE-2026-44578
 - CVE-2026-44580
 - CVE-2026-44581
 - CVE-2026-64641
@@ -24,6 +25,7 @@ unknown
 - AIKIDO-2026-10755
 - AIKIDO-2026-10756
 - GHSA-q4gf-8mx6-v5v3
+- GHSA-8h8q-6873-q5fj
 
 ## How to Apply:
 1. Clone or download the source code for next
