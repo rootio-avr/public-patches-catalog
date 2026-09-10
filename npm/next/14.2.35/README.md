@@ -5,6 +5,10 @@ unknown
 
 ## Affected CVEs:
 - GHSA-h25m-26qc-wcjf
+- CVE-2026-64641
+- CVE-2026-44578
+- GHSA-q4gf-8mx6-v5v3
+- CVE-2026-64649
 
 ## How to Apply:
 1. Clone or download the source code for next
