@@ -1,7 +1,7 @@
-# libxml2 : 2.9.10+dfsg-6.7+deb11u4.aikido.8
+# libxml2 : 2.9.10+dfsg-6.7+deb11u10.aikido.9
 
-This patch is based on libxml2 version 2.9.10+dfsg-6.7+deb11u4.aikido.8, which is available at:
-https://sources.debian.org/src/libxml2/2.9.10+dfsg-6.7+deb11u9/
+This patch is based on libxml2 version 2.9.10+dfsg-6.7+deb11u10.aikido.9, which is available at:
+https://sources.debian.org/src/libxml2/2.9.10+dfsg-6.7+deb11u10/
 
 ## Affected CVEs:
 - CVE-2025-12863
