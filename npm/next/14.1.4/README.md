@@ -9,6 +9,7 @@ unknown
 - CVE-2026-64645
 - GHSA-8h8q-6873-q5fj
 - CVE-2026-44573
+- CVE-2026-75604
 
 ## How to Apply:
 1. Clone or download the source code for next
