@@ -4,6 +4,7 @@ This patch is based on next version 12.3.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-44573
 - CVE-2026-64645
 
 ## How to Apply:
