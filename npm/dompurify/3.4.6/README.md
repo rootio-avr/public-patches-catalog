@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-49978
+- CVE-2026-65898
+- CVE-2026-65902
 - GHSA-76mc-f452-cxcm
 - GHSA-cmwh-pvxp-8882
 
