@@ -4,8 +4,10 @@ This patch is based on org.bouncycastle:bc-java version 1.78, which is available
 unknown
 
 ## Affected CVEs:
-- CVE-2026-5588
+- CVE-2025-14813
 - CVE-2025-8916
+- CVE-2026-0636
+- CVE-2026-5588
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-java
