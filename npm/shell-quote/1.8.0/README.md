@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-9277
+- CVE-2026-13311
 
 ## How to Apply:
 1. Clone or download the source code for shell-quote
