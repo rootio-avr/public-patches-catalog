@@ -4,6 +4,7 @@ This patch is based on next version 14.1.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-64645
 - GHSA-mwv6-3258-q52c
 - CVE-2026-44578
 
