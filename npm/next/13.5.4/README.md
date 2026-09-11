@@ -4,6 +4,18 @@ This patch is based on next version 13.5.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2024-34351
+- CVE-2024-46982
+- CVE-2024-51479
+- CVE-2025-29927
+- CVE-2026-44573
+- CVE-2026-44578
+- CVE-2026-64641
+- CVE-2026-64645
+- GHSA-5j59-xgg2-r9c4
+- GHSA-8h8q-6873-q5fj
+- GHSA-h25m-26qc-wcjf
+- GHSA-mwv6-3258-q52c
 - GHSA-q4gf-8mx6-v5v3
 
 ## How to Apply:
