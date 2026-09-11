@@ -4,6 +4,7 @@ This patch is based on next version 14.0.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- GHSA-8h8q-6873-q5fj
 - CVE-2024-46982
 - GHSA-h25m-26qc-wcjf
 - CVE-2024-51479
