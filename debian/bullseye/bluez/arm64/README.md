@@ -1,11 +1,12 @@
-# bluez : 5.55-3.1+deb11u2.aikido.6
+# bluez : 5.55-3.1+deb11u2.aikido.7
 
-This patch is based on bluez version 5.55-3.1+deb11u2.aikido.6, which is available at:
+This patch is based on bluez version 5.55-3.1+deb11u2.aikido.7, which is available at:
 https://sources.debian.org/src/bluez/5.55-3.1+deb11u2/
 
 ## Affected CVEs:
 - CVE-2023-44431
 - CVE-2023-51594
+- CVE-2026-80186
 
 ## How to Apply:
 1. Obtain the source package: `apt source bluez`
