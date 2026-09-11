@@ -1,0 +1,1056 @@
+--- /dev/null
++++ b/src/main/java/graphql/parser/ParseCancelledException.java
+@@ -0,0 +1,12 @@
++package graphql.parser;
++
++import graphql.PublicApi;
++import graphql.language.SourceLocation;
++
++@PublicApi
++public class ParseCancelledException extends InvalidSyntaxException {
++
++    public ParseCancelledException(String msg, SourceLocation sourceLocation, String offendingToken) {
++        super(sourceLocation, msg, null, offendingToken, null);
++    }
++}
+--- a/src/main/java/graphql/parser/Parser.java
++++ b/src/main/java/graphql/parser/Parser.java
+@@ -1,8 +1,10 @@
+ package graphql.parser;
+ 
++import graphql.Internal;
+ import graphql.PublicApi;
+ import graphql.language.Document;
+ import graphql.language.SourceLocation;
++import graphql.parser.antlr.GraphqlBaseListener;
+ import graphql.parser.antlr.GraphqlLexer;
+ import graphql.parser.antlr.GraphqlParser;
+ import org.antlr.v4.runtime.BaseErrorListener;
+@@ -13,22 +15,31 @@ import org.antlr.v4.runtime.RecognitionException;
+ import org.antlr.v4.runtime.Recognizer;
+ import org.antlr.v4.runtime.Token;
+ import org.antlr.v4.runtime.atn.PredictionMode;
++import org.antlr.v4.runtime.tree.ParseTreeListener;
++import org.antlr.v4.runtime.tree.TerminalNode;
+ 
+ import java.io.IOException;
+ import java.io.Reader;
+ import java.io.UncheckedIOException;
+ import java.util.List;
++import java.util.Optional;
++import java.util.function.BiConsumer;
+ 
+ @PublicApi
+ public class Parser {
+ 
++    @Internal
++    public static final int CHANNEL_COMMENTS = 2;
++    @Internal
++    public static final int CHANNEL_WHITESPACE = 3;
++
+ 
+     public static Document parse(String input) {
+         return new Parser().parseDocument(input);
+     }
+ 
+     public Document parseDocument(String input) throws InvalidSyntaxException {
+-        return parseDocument(input, null);
++        return parseDocument(input, (String) null);
+     }
+ 
+     public Document parseDocument(String input, String sourceName) throws InvalidSyntaxException {
+@@ -36,10 +47,22 @@ public class Parser {
+                 .string(input, sourceName)
+                 .trackData(true)
+                 .build();
+-        return parseDocument(multiSourceReader);
++        return parseDocument(multiSourceReader, null);
++    }
++
++    public Document parseDocument(String input, ParserOptions parserOptions) throws InvalidSyntaxException {
++        MultiSourceReader multiSourceReader = MultiSourceReader.newMultiSourceReader()
++                .string(input, null)
++                .trackData(true)
++                .build();
++        return parseDocument(multiSourceReader, parserOptions);
+     }
+ 
+     public Document parseDocument(Reader reader) throws InvalidSyntaxException {
++        return parseDocument(reader, null);
++    }
++
++    public Document parseDocument(Reader reader, ParserOptions parserOptions) throws InvalidSyntaxException {
+         MultiSourceReader multiSourceReader;
+         if (reader instanceof MultiSourceReader) {
+             multiSourceReader = (MultiSourceReader) reader;
+@@ -65,7 +88,16 @@ public class Parser {
+             }
+         });
+ 
+-        CommonTokenStream tokens = new CommonTokenStream(lexer);
++        // default in the parser options if they are not set
++        parserOptions = Optional.ofNullable(parserOptions).orElse(ParserOptions.getDefaultParserOptions());
++
++        // this lexer wrapper allows us to stop lexing when too many tokens are in place.  This prevents DOS attacks.
++        int maxTokens = parserOptions.getMaxTokens();
++        int maxWhitespaceTokens = parserOptions.getMaxWhitespaceTokens();
++        BiConsumer<Integer, Token> onTooManyTokens = (maxTokenCount, token) -> throwCancelParseIfTooManyTokens(token, maxTokenCount, multiSourceReader);
++        SafeTokenSource safeTokenSource = new SafeTokenSource(lexer, maxTokens, maxWhitespaceTokens, onTooManyTokens);
++
++        CommonTokenStream tokens = new CommonTokenStream(safeTokenSource);
+ 
+         GraphqlParser parser = new GraphqlParser(tokens);
+         parser.removeErrorListeners();
+@@ -75,6 +107,10 @@ public class Parser {
+         parser.setErrorHandler(bailStrategy);
+ 
+         GraphqlAntlrToLanguage toLanguage = getAntlrToLanguage(tokens, multiSourceReader);
++
++        // prevent a billion laugh attacks by restricting how many grammar tokens we allow
++        setupParserListener(multiSourceReader, parser, maxTokens);
++
+         GraphqlParser.DocumentContext documentContext = parser.document();
+ 
+         Document doc = toLanguage.createDocument(documentContext);
+@@ -96,6 +132,37 @@ public class Parser {
+         return doc;
+     }
+ 
++    private void setupParserListener(MultiSourceReader multiSourceReader, GraphqlParser parser, int maxTokens) {
++        ParseTreeListener listener = new GraphqlBaseListener() {
++            int count = 0;
++
++            @Override
++            public void visitTerminal(TerminalNode node) {
++                final Token token = node.getSymbol();
++                count++;
++                if (count > maxTokens) {
++                    throwCancelParseIfTooManyTokens(token, maxTokens, multiSourceReader);
++                }
++            }
++        };
++        parser.addParseListener(listener);
++    }
++
++    private void throwCancelParseIfTooManyTokens(Token token, int maxTokens, MultiSourceReader multiSourceReader) throws ParseCancelledException {
++        String tokenType = "grammar";
++        SourceLocation sourceLocation = null;
++        String offendingToken = null;
++        if (token != null) {
++            int channel = token.getChannel();
++            tokenType = channel == CHANNEL_WHITESPACE ? "whitespace" : (channel == CHANNEL_COMMENTS ? "comments" : "grammar");
++
++            offendingToken = token.getText();
++            sourceLocation = AntlrHelper.createSourceLocation(multiSourceReader, token.getLine(), token.getCharPositionInLine());
++        }
++        String msg = String.format("More than %d %s tokens have been presented. To prevent Denial Of Service attacks, parsing has been cancelled.", maxTokens, tokenType);
++        throw new ParseCancelledException(msg, sourceLocation, offendingToken);
++    }
++
+     /**
+      * Allows you to override the ANTLR to AST code.
+      *
+--- /dev/null
++++ b/src/main/java/graphql/parser/ParserOptions.java
+@@ -0,0 +1,177 @@
++package graphql.parser;
++
++import graphql.PublicApi;
++
++import java.util.function.Consumer;
++
++import static graphql.Assert.assertNotNull;
++
++/**
++ * Options that control how the {@link Parser} behaves.
++ */
++@PublicApi
++public class ParserOptions {
++
++    /**
++     * A graphql hacking vector is to send nonsensical queries that burn lots of parsing CPU time and burn
++     * memory representing a document that won't ever execute.  To prevent this for most users, graphql-java
++     * set this value to 15000.  ANTLR parsing time is linear to the number of tokens presented.  The more you
++     * allow the longer it takes.
++     *
++     * If you want to allow more, then {@link #setDefaultParserOptions(ParserOptions)} allows you to change this
++     * JVM wide.
++     */
++    public static final int MAX_QUERY_TOKENS = 15_000;
++    /**
++     * Another graphql hacking vector is to send large amounts of whitespace in operations that burn lots of parsing CPU time and burn
++     * memory representing a document.  Whitespace token processing in ANTLR is 2 orders of magnitude faster than grammar token processing
++     * however it still takes some time to happen.
++     *
++     * If you want to allow more, then {@link #setDefaultParserOptions(ParserOptions)} allows you to change this
++     * JVM wide.
++     */
++    public static final int MAX_WHITESPACE_TOKENS = 200_000;
++
++    private static ParserOptions defaultJvmParserOptions = newParserOptions()
++            .maxTokens(MAX_QUERY_TOKENS) // to prevent a billion laughs style attacks, we set a default for graphql-java
++            .maxWhitespaceTokens(MAX_WHITESPACE_TOKENS)
++            .build();
++
++    private static ParserOptions defaultJvmOperationParserOptions = newParserOptions()
++            .maxTokens(MAX_QUERY_TOKENS) // to prevent a billion laughs style attacks, we set a default for graphql-java
++            .maxWhitespaceTokens(MAX_WHITESPACE_TOKENS)
++            .build();
++
++    private static ParserOptions defaultJvmSdlParserOptions = newParserOptions()
++            .maxTokens(Integer.MAX_VALUE) // we are less worried about a billion laughs with SDL parsing since the call path is not facing attackers
++            .maxWhitespaceTokens(Integer.MAX_VALUE)
++            .build();
++
++    /**
++     * A JVM wide default set of parser options used for query parsing.  These place limits on the
++     * number of tokens and whitespace tokens the parser will accept, to prevent Denial Of Service attacks.
++     *
++     * @return the static default JVM value
++     */
++    public static ParserOptions getDefaultParserOptions() {
++        return defaultJvmParserOptions;
++    }
++
++    /**
++     * Allows the JVM wide default query parser options to be changed.
++     *
++     * @param options - the new default JVM parser options
++     */
++    public static void setDefaultParserOptions(ParserOptions options) {
++        defaultJvmParserOptions = assertNotNull(options);
++    }
++
++    /**
++     * A JVM wide default set of parser options used for operation parsing.
++     *
++     * @return the static default JVM value for operation parsing
++     */
++    public static ParserOptions getDefaultOperationParserOptions() {
++        return defaultJvmOperationParserOptions;
++    }
++
++    /**
++     * Allows the JVM wide default operation parser options to be changed.
++     *
++     * @param options - the new default JVM parser options for operation parsing
++     */
++    public static void setDefaultOperationParserOptions(ParserOptions options) {
++        defaultJvmOperationParserOptions = assertNotNull(options);
++    }
++
++    /**
++     * A JVM wide default set of parser options used for SDL parsing.  The SDL default options allow unlimited
++     * tokens and whitespace, since a DOS attack vector is not commonly available via schema SDL parsing.
++     *
++     * @return the static default JVM value for SDL parsing
++     *
++     * @see graphql.schema.idl.SchemaParser
++     */
++    public static ParserOptions getDefaultSdlParserOptions() {
++        return defaultJvmSdlParserOptions;
++    }
++
++    /**
++     * Allows the JVM wide default SDL parser options to be changed.
++     *
++     * @param options - the new default JVM parser options for SDL parsing
++     */
++    public static void setDefaultSdlParserOptions(ParserOptions options) {
++        defaultJvmSdlParserOptions = assertNotNull(options);
++    }
++
++    private final int maxTokens;
++    private final int maxWhitespaceTokens;
++
++    private ParserOptions(Builder builder) {
++        this.maxTokens = builder.maxTokens;
++        this.maxWhitespaceTokens = builder.maxWhitespaceTokens;
++    }
++
++    /**
++     * A graphql hacking vector is to send nonsensical queries that burn lots of parsing CPU time and burns
++     * memory representing a document that won't ever execute.  To prevent this you can set a maximum number of parse
++     * tokens that will be accepted before an exception is thrown and the parsing is stopped.
++     *
++     * @return the maximum number of raw tokens the parser will accept, after which an exception will be thrown.
++     */
++    public int getMaxTokens() {
++        return maxTokens;
++    }
++
++    /**
++     * A graphql hacking vector is to send larges amounts of whitespace that burn lots of parsing CPU time and burn
++     * memory representing a document.  To prevent this you can set a maximum number of whitespace parse
++     * tokens that will be accepted before an exception is thrown and the parsing is stopped.
++     *
++     * @return the maximum number of raw whitespace tokens the parser will accept, after which an exception will be thrown.
++     */
++    public int getMaxWhitespaceTokens() {
++        return maxWhitespaceTokens;
++    }
++
++    public ParserOptions transform(Consumer<Builder> builderConsumer) {
++        Builder builder = new Builder(this);
++        builderConsumer.accept(builder);
++        return builder.build();
++    }
++
++    public static Builder newParserOptions() {
++        return new Builder();
++    }
++
++    public static class Builder {
++
++        private int maxTokens = MAX_QUERY_TOKENS;
++        private int maxWhitespaceTokens = MAX_WHITESPACE_TOKENS;
++
++        Builder() {
++        }
++
++        Builder(ParserOptions parserOptions) {
++            this.maxTokens = parserOptions.maxTokens;
++            this.maxWhitespaceTokens = parserOptions.maxWhitespaceTokens;
++        }
++
++        public Builder maxTokens(int maxTokens) {
++            this.maxTokens = maxTokens;
++            return this;
++        }
++
++        public Builder maxWhitespaceTokens(int maxWhitespaceTokens) {
++            this.maxWhitespaceTokens = maxWhitespaceTokens;
++            return this;
++        }
++
++        public ParserOptions build() {
++            return new ParserOptions(this);
++        }
++
++    }
++
++}
+--- /dev/null
++++ b/src/main/java/graphql/parser/SafeTokenSource.java
+@@ -0,0 +1,94 @@
++package graphql.parser;
++
++import graphql.Internal;
++import org.antlr.v4.runtime.CharStream;
++import org.antlr.v4.runtime.Token;
++import org.antlr.v4.runtime.TokenFactory;
++import org.antlr.v4.runtime.TokenSource;
++
++import java.util.function.BiConsumer;
++
++/**
++ * This token source can wrap a lexer and if it asks for more than a maximum number of tokens
++ * the user can take some action, typically throw an exception to stop lexing.
++ *
++ * It tracks the maximum number per token channel, so we have 3 at the moment, and they will all be tracked.
++ *
++ * This is used to protect us from evil input.  The lexer will eagerly try to find all tokens
++ * at times and certain inputs (directives butted together for example) will cause the lexer
++ * to keep doing work even though before the tokens are presented back to the parser
++ * and hence before it has a chance to stop work once too much as been done.
++ */
++@Internal
++public class SafeTokenSource implements TokenSource {
++
++    private final TokenSource lexer;
++    private final int maxTokens;
++    private final int maxWhitespaceTokens;
++    private final BiConsumer<Integer, Token> whenMaxTokensExceeded;
++    private final int channelCounts[];
++
++    public SafeTokenSource(TokenSource lexer, int maxTokens, int maxWhitespaceTokens, BiConsumer<Integer, Token> whenMaxTokensExceeded) {
++        this.lexer = lexer;
++        this.maxTokens = maxTokens;
++        this.maxWhitespaceTokens = maxWhitespaceTokens;
++        this.whenMaxTokensExceeded = whenMaxTokensExceeded;
++        // this could be a Map<int,int> however we want it to be faster as possible.
++        // we only have 3 channels - but they are 0,2 and 3 so use 5 for safety - still faster than a map get/put
++        // if we ever add another channel beyond 5 it will IOBEx during tests so future changes will be handled before release!
++        this.channelCounts = new int[]{0, 0, 0, 0, 0};
++    }
++
++
++    @Override
++    public Token nextToken() {
++        Token token = lexer.nextToken();
++        if (token != null) {
++            int channel = token.getChannel();
++            int currentCount = ++channelCounts[channel];
++            if (channel == Parser.CHANNEL_WHITESPACE) {
++                // whitespace gets its own max count
++                callbackIfMaxExceeded(maxWhitespaceTokens, currentCount, token);
++            } else {
++                callbackIfMaxExceeded(maxTokens, currentCount, token);
++            }
++        }
++        return token;
++    }
++
++    private void callbackIfMaxExceeded(int maxCount, int currentCount, Token token) {
++        if (currentCount > maxCount) {
++            whenMaxTokensExceeded.accept(maxCount, token);
++        }
++    }
++
++    @Override
++    public int getLine() {
++        return lexer.getLine();
++    }
++
++    @Override
++    public int getCharPositionInLine() {
++        return lexer.getCharPositionInLine();
++    }
++
++    @Override
++    public CharStream getInputStream() {
++        return lexer.getInputStream();
++    }
++
++    @Override
++    public String getSourceName() {
++        return lexer.getSourceName();
++    }
++
++    @Override
++    public void setTokenFactory(TokenFactory<?> factory) {
++        lexer.setTokenFactory(factory);
++    }
++
++    @Override
++    public TokenFactory<?> getTokenFactory() {
++        return lexer.getTokenFactory();
++    }
++}
+--- a/src/main/java/graphql/schema/idl/SchemaParser.java
++++ b/src/main/java/graphql/schema/idl/SchemaParser.java
+@@ -8,6 +8,7 @@ import graphql.language.Document;
+ import graphql.language.SDLDefinition;
+ import graphql.parser.InvalidSyntaxException;
+ import graphql.parser.Parser;
++import graphql.parser.ParserOptions;
+ import graphql.schema.idl.errors.NonSDLDefinitionError;
+ import graphql.schema.idl.errors.SchemaProblem;
+ 
+@@ -94,7 +95,9 @@ public class SchemaParser {
+     public TypeDefinitionRegistry parseImpl(Reader schemaInput) {
+         try {
+             Parser parser = new Parser();
+-            Document document = parser.parseDocument(schemaInput);
++            // for SDL we don't stop how many parser tokens there are - it's not the attack vector
++            // to be prevented compared to queries
++            Document document = parser.parseDocument(schemaInput, ParserOptions.getDefaultSdlParserOptions());
+ 
+             return buildRegistry(document);
+         } catch (InvalidSyntaxException e) {
+--- /dev/null
++++ b/src/test/groovy/graphql/parser/CVE_2022_37734_Test.groovy
+@@ -0,0 +1,76 @@
++package graphql.parser
++
++import spock.lang.Specification
++
++/**
++ * Regression test for CVE-2022-37734.
++ *
++ * graphql-java before the fix would let the ANTLR lexer/parser eagerly consume an
++ * unbounded number of tokens for hostile input (a "billion laughs" / large-whitespace
++ * denial of service).  The fix bounds the number of grammar tokens (maxTokens) and
++ * whitespace tokens (maxWhitespaceTokens) via {@link ParserOptions} and a
++ * {@link SafeTokenSource} wrapper around the lexer, throwing a
++ * {@link ParseCancelledException} once the limit is exceeded.
++ *
++ * This is a fresh replacement test - the upstream ParserTest.groovy additions from
++ * commit 226aabd9 do not apply cleanly against the 16.2 test file.
++ */
++class CVE_2022_37734_Test extends Specification {
++
++    def "a large grammar-token attack is prevented by default"() {
++        given:
++        // each '@lol' pair produces multiple grammar tokens; 10000 of them blows past MAX_QUERY_TOKENS (15000)
++        def lol = "@lol" * 10000
++        def text = "query { f $lol }"
++
++        when:
++        Parser.parse(text)
++
++        then:
++        def e = thrown(ParseCancelledException)
++        e.getMessage().contains("parsing has been cancelled")
++    }
++
++    def "a large whitespace attack is prevented by default"() {
++        given:
++        def spaces = " " * 300_000
++        def text = "query { f $spaces }"
++
++        when:
++        Parser.parse(text)
++
++        then:
++        def e = thrown(ParseCancelledException)
++        e.getMessage().contains("parsing has been cancelled")
++    }
++
++    def "callers may opt out of the whitespace limit for their own large documents"() {
++        given:
++        def spaces = " " * 300_000
++        def text = "query { f $spaces }"
++        def options = ParserOptions.newParserOptions().maxWhitespaceTokens(Integer.MAX_VALUE).build()
++
++        when:
++        def doc = new Parser().parseDocument(text, options)
++
++        then:
++        doc != null
++    }
++
++    def "normal small queries still parse without being cancelled"() {
++        when:
++        def doc = Parser.parse("query { hello world }")
++
++        then:
++        doc != null
++    }
++
++    def "default query parser options carry the DOS-prevention limits"() {
++        expect:
++        ParserOptions.getDefaultParserOptions().getMaxTokens() == ParserOptions.MAX_QUERY_TOKENS
++        ParserOptions.getDefaultParserOptions().getMaxWhitespaceTokens() == ParserOptions.MAX_WHITESPACE_TOKENS
++        // SDL parsing is not the attack vector, so it is left unbounded
++        ParserOptions.getDefaultSdlParserOptions().getMaxTokens() == Integer.MAX_VALUE
++        ParserOptions.getDefaultSdlParserOptions().getMaxWhitespaceTokens() == Integer.MAX_VALUE
++    }
++}
+--- a/build.gradle
++++ b/build.gradle
+@@ -1,7 +1,6 @@
+ import java.text.SimpleDateFormat
+ 
+ plugins {
+-    id "com.jfrog.bintray" version "1.8.4"
+     id 'java'
+     id 'java-library'
+     id 'maven'
+@@ -27,13 +26,6 @@ def getDevelopmentVersion() {
+     version
+ }
+ 
+-if (JavaVersion.current() != JavaVersion.VERSION_1_8) {
+-    def msg = String.format("This build must be run with java 1.8 - you are running %s - gradle finds the JDK via JAVA_HOME=%s",
+-            JavaVersion.current(), System.getenv("JAVA_HOME"))
+-    throw new GradleException(msg)
+-}
+-
+-
+ sourceCompatibility = 1.8
+ targetCompatibility = 1.8
+ def reactiveStreamsVersion = '1.0.2'
+@@ -234,36 +226,6 @@ publishing {
+ }
+ 
+ 
+-bintray {
+-    user = System.env.BINTRAY_USER ?: project["bintray.user"]
+-    key = System.env.BINTRAY_API_KEY ?: project["bintray.key"]
+-    publications = ['graphqlJava']
+-    publish = true
+-    pkg {
+-        repo = 'graphql-java'
+-        name = 'graphql-java'
+-        desc = 'GraphQL in Java'
+-        licenses = ['MIT']
+-        vcsUrl = 'https://github.com/graphql-java/graphql-java'
+-
+-        version {
+-            name = project.version
+-            desc = project.description
+-            released = new Date()
+-            vcsTag = 'v' + project.version
+-            gpg {
+-                sign = true
+-            }
+-            mavenCentralSync {
+-                sync = true
+-                user = System.env.MAVEN_CENTRAL_USER
+-                password = System.env.MAVEN_CENTRAL_PASSWORD
+-                close = '1'
+-            }
+-        }
+-    }
+-}
+-
+ // all publish tasks depend on the build task
+ tasks.withType(PublishToMavenRepository) {
+     dependsOn build
+
+diff --git a/src/main/java/graphql/parser/ParseCancelledTooDeepException.java b/src/main/java/graphql/parser/ParseCancelledTooDeepException.java
+new file mode 100644
+index 0000000..76cb3a1
+--- /dev/null
++++ b/src/main/java/graphql/parser/ParseCancelledTooDeepException.java
+@@ -0,0 +1,19 @@
++package graphql.parser;
++
++import graphql.Internal;
++import graphql.language.SourceLocation;
++
++/**
++ * Thrown when a GraphQL document is parsed and the depth of the grammar rules
++ * exceeds the configured maximum. This prevents stack consumption (StackOverflowError)
++ * denial-of-service attacks via deeply nested queries (CVE-2023-28867).
++ */
++@Internal
++public class ParseCancelledTooDeepException extends InvalidSyntaxException {
++
++    ParseCancelledTooDeepException(SourceLocation sourceLocation, String offendingToken, int maxDepth) {
++        super(sourceLocation,
++                String.format("More than %d deep 'grammar' rules have been entered. To prevent Denial Of Service attacks, parsing has been cancelled.", maxDepth),
++                null, offendingToken, null);
++    }
++}
+diff --git a/src/main/java/graphql/parser/Parser.java b/src/main/java/graphql/parser/Parser.java
+index 39913e7..6e8d1d3 100644
+--- a/src/main/java/graphql/parser/Parser.java
++++ b/src/main/java/graphql/parser/Parser.java
+@@ -11,6 +11,7 @@ import org.antlr.v4.runtime.BaseErrorListener;
+ import org.antlr.v4.runtime.CharStreams;
+ import org.antlr.v4.runtime.CodePointCharStream;
+ import org.antlr.v4.runtime.CommonTokenStream;
++import org.antlr.v4.runtime.ParserRuleContext;
+ import org.antlr.v4.runtime.RecognitionException;
+ import org.antlr.v4.runtime.Recognizer;
+ import org.antlr.v4.runtime.Token;
+@@ -33,6 +34,13 @@ public class Parser {
+     @Internal
+     public static final int CHANNEL_WHITESPACE = 3;
+ 
++    /**
++     * A graphql hacking vector is to send nonsensical queries that have a lot of grammar rule
++     * depth to them, which can cause stack consumption (StackOverflowError) denial-of-service
++     * attacks (CVE-2023-28867). This limits how deep the parser rules may recurse.
++     */
++    public static final int MAX_RULE_DEPTH = 1_000;
++
+ 
+     public static Document parse(String input) {
+         return new Parser().parseDocument(input);
+@@ -111,6 +119,10 @@ public class Parser {
+         // prevent a billion laugh attacks by restricting how many grammar tokens we allow
+         setupParserListener(multiSourceReader, parser, maxTokens);
+ 
++        // prevent deeply nested query stack consumption attacks by restricting how deep
++        // the grammar rules are allowed to recurse
++        setupRuleDepthListener(multiSourceReader, parser);
++
+         GraphqlParser.DocumentContext documentContext = parser.document();
+ 
+         Document doc = toLanguage.createDocument(documentContext);
+@@ -148,6 +160,36 @@ public class Parser {
+         parser.addParseListener(listener);
+     }
+ 
++    private void setupRuleDepthListener(MultiSourceReader multiSourceReader, GraphqlParser parser) {
++        ParseTreeListener listener = new GraphqlBaseListener() {
++            int depth = 0;
++
++            @Override
++            public void enterEveryRule(ParserRuleContext ctx) {
++                depth++;
++                if (depth > MAX_RULE_DEPTH) {
++                    throwCancelParseIfTooDeep(ctx.getStart(), multiSourceReader);
++                }
++            }
++
++            @Override
++            public void exitEveryRule(ParserRuleContext ctx) {
++                depth--;
++            }
++        };
++        parser.addParseListener(listener);
++    }
++
++    private void throwCancelParseIfTooDeep(Token token, MultiSourceReader multiSourceReader) throws ParseCancelledTooDeepException {
++        SourceLocation sourceLocation = null;
++        String offendingToken = null;
++        if (token != null) {
++            offendingToken = token.getText();
++            sourceLocation = AntlrHelper.createSourceLocation(multiSourceReader, token.getLine(), token.getCharPositionInLine());
++        }
++        throw new ParseCancelledTooDeepException(sourceLocation, offendingToken, MAX_RULE_DEPTH);
++    }
++
+     private void throwCancelParseIfTooManyTokens(Token token, int maxTokens, MultiSourceReader multiSourceReader) throws ParseCancelledException {
+         String tokenType = "grammar";
+         SourceLocation sourceLocation = null;
+diff --git a/src/test/groovy/graphql/parser/Cve202328867RegressionTest.groovy b/src/test/groovy/graphql/parser/Cve202328867RegressionTest.groovy
+new file mode 100644
+index 0000000..84d42ec
+--- /dev/null
++++ b/src/test/groovy/graphql/parser/Cve202328867RegressionTest.groovy
+@@ -0,0 +1,60 @@
++package graphql.parser
++
++import spock.lang.Specification
++
++/**
++ * Regression test for CVE-2023-28867.
++ *
++ * A crafted GraphQL query with deeply nested parser rules used to cause stack
++ * consumption (StackOverflowError) and a denial of service, because the parser
++ * imposed no limit on grammar rule recursion depth. The fix limits the depth of
++ * parser rules (Parser.MAX_RULE_DEPTH) and throws a ParseCancelledTooDeepException
++ * instead of overflowing the stack.
++ *
++ * Grounded on the upstream ParserStressTest "deep query stack overflows are
++ * prevented by limiting the depth of rules" test (commit 8a1c884). The nesting
++ * count is kept well under ParserOptions.MAX_QUERY_TOKENS so the rule-depth guard
++ * trips before the CVE-2022-37734 token-count guard.
++ */
++class Cve202328867RegressionTest extends Specification {
++
++    static String mkDeepQuery(int howMany) {
++        def field = 'f(a:"")'
++        StringBuilder sb = new StringBuilder("query q{")
++        for (int i = 0; i < howMany; i++) {
++            sb.append(field)
++            if (i < howMany - 1) {
++                sb.append("{")
++            }
++        }
++        for (int i = 0; i < howMany - 1; i++) {
++            sb.append("}")
++        }
++        sb.append("}")
++        return sb.toString()
++    }
++
++    def "deeply nested queries are prevented instead of overflowing the stack"() {
++        given:
++        String text = mkDeepQuery(500)
++
++        when:
++        Parser.parse(text)
++
++        then:
++        def e = thrown(ParseCancelledTooDeepException)
++        e.getMessage().contains("parsing has been cancelled")
++    }
++
++    def "normal shallow queries still parse successfully"() {
++        given:
++        String text = "query q { f(a:\"\") { g } }"
++
++        when:
++        def document = Parser.parse(text)
++
++        then:
++        document != null
++        document.definitions.size() == 1
++    }
++}
+
+--- a/src/main/java/graphql/execution/Execution.java
++++ b/src/main/java/graphql/execution/Execution.java
+@@ -11,11 +11,13 @@ import graphql.execution.instrumentation.InstrumentationContext;
+ import graphql.execution.instrumentation.InstrumentationState;
+ import graphql.execution.instrumentation.parameters.InstrumentationExecuteOperationParameters;
+ import graphql.execution.instrumentation.parameters.InstrumentationExecutionParameters;
++import graphql.introspection.Introspection;
+ import graphql.language.Document;
+ import graphql.language.FragmentDefinition;
+ import graphql.language.NodeUtil;
+ import graphql.language.OperationDefinition;
+ import graphql.language.VariableDefinition;
++import graphql.normalized.NormalizedQueryTreeFactory;
+ import graphql.schema.GraphQLObjectType;
+ import graphql.schema.GraphQLSchema;
+ import graphql.util.LogKit;
+@@ -24,6 +26,7 @@ import org.slf4j.Logger;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.concurrent.CompletableFuture;
+ 
+ import static graphql.Assert.assertShouldNeverHappen;
+@@ -39,6 +42,15 @@ import static java.util.concurrent.CompletableFuture.completedFuture;
+ public class Execution {
+     private static final Logger logNotSafe = LogKit.getNotPrivacySafeLogger(Execution.class);
+ 
++    /**
++     * The maximum number of normalized fields a good-faith introspection query may create (CVE-2024-40094).
++     */
++    private static final int GOOD_FAITH_MAX_FIELDS_COUNT = 500;
++    /**
++     * The maximum depth a good-faith introspection query may reach (CVE-2024-40094).
++     */
++    private static final int GOOD_FAITH_MAX_DEPTH_COUNT = 20;
++
+     private final FieldCollector fieldCollector = new FieldCollector();
+     private final ValuesResolver valuesResolver = new ValuesResolver();
+     private final ExecutionStrategy queryStrategy;
+@@ -136,6 +148,20 @@ public class Execution {
+ 
+         MergedSelectionSet fields = fieldCollector.collectFields(collectorParameters, operationDefinition.getSelectionSet());
+ 
++        // CVE-2024-40094: a crafted introspection query can explode into an excessive number of
++        // ExecutableNormalizedFields during normalization, exhausting resources.  For queries that
++        // touch the introspection meta fields (__schema / __type) we normalize the operation under a
++        // bounded field-count and depth limit up front, so that a malicious introspection query is
++        // aborted before the (otherwise unbounded) normalized query tree is ever built.
++        Optional<ExecutionResult> introspectionAbort = checkIntrospection(executionContext, fields);
++        if (introspectionAbort.isPresent()) {
++            ExecutionResult executionResult = introspectionAbort.get();
++            CompletableFuture<ExecutionResult> resultCompletableFuture = completedFuture(executionResult);
++            executeOperationCtx.onDispatched(resultCompletableFuture);
++            executeOperationCtx.onCompleted(executionResult, null);
++            return resultCompletableFuture;
++        }
++
+         ResultPath path = ResultPath.rootPath();
+         ExecutionStepInfo executionStepInfo = newExecutionStepInfo().type(operationRootType).path(path).build();
+         NonNullableFieldValidator nonNullableFieldValidator = new NonNullableFieldValidator(executionContext, executionStepInfo);
+@@ -182,6 +208,43 @@ public class Execution {
+         return result;
+     }
+ 
++    /**
++     * If the operation queries the introspection meta fields (__schema / __type), this normalizes the operation
++     * under a bounded field-count and depth limit so that a maliciously crafted introspection query
++     * (CVE-2024-40094) is aborted before an unbounded normalized query tree is built.
++     *
++     * @param executionContext the execution context
++     * @param mergedSelectionSet the top level merged selection set of the operation
++     *
++     * @return an optional error result if the introspection query exceeded the good-faith limits
++     */
++    private Optional<ExecutionResult> checkIntrospection(ExecutionContext executionContext, MergedSelectionSet mergedSelectionSet) {
++        boolean isIntrospection = false;
++        for (String key : mergedSelectionSet.getKeys()) {
++            String fieldName = mergedSelectionSet.getSubField(key).getName();
++            if (fieldName.equals(Introspection.SchemaMetaFieldDef.getName())
++                    || fieldName.equals(Introspection.TypeMetaFieldDef.getName())) {
++                isIntrospection = true;
++                break;
++            }
++        }
++        if (!isIntrospection) {
++            return Optional.empty();
++        }
++        try {
++            NormalizedQueryTreeFactory.createNormalizedQuery(
++                    executionContext.getGraphQLSchema(),
++                    executionContext.getOperationDefinition(),
++                    executionContext.getFragmentsByName(),
++                    executionContext.getVariables(),
++                    GOOD_FAITH_MAX_FIELDS_COUNT,
++                    GOOD_FAITH_MAX_DEPTH_COUNT);
++        } catch (AbortExecutionException e) {
++            return Optional.of(e.toExecutionResult());
++        }
++        return Optional.empty();
++    }
++
+ 
+     private GraphQLObjectType getOperationRootType(GraphQLSchema graphQLSchema, OperationDefinition operationDefinition) {
+         OperationDefinition.Operation operation = operationDefinition.getOperation();
+--- a/src/main/java/graphql/normalized/NormalizedQueryTreeFactory.java
++++ b/src/main/java/graphql/normalized/NormalizedQueryTreeFactory.java
+@@ -1,6 +1,7 @@
+ package graphql.normalized;
+ 
+ import graphql.Internal;
++import graphql.execution.AbortExecutionException;
+ import graphql.execution.MergedField;
+ import graphql.execution.nextgen.Common;
+ import graphql.language.Document;
+@@ -21,6 +22,25 @@ import java.util.Map;
+ @Internal
+ public class NormalizedQueryTreeFactory {
+ 
++    /**
++     * A sentinel value meaning "no limit" for the maximum number of normalized fields and the
++     * maximum children depth allowed while building a {@link NormalizedQueryTree}.
++     */
++    public static final int NO_MAX = Integer.MAX_VALUE;
++
++    private final int maxFieldsCount;
++    private final int maxChildrenDepth;
++    private int fieldCount = 0;
++
++    public NormalizedQueryTreeFactory() {
++        this(NO_MAX, NO_MAX);
++    }
++
++    private NormalizedQueryTreeFactory(int maxFieldsCount, int maxChildrenDepth) {
++        this.maxFieldsCount = maxFieldsCount;
++        this.maxChildrenDepth = maxChildrenDepth;
++    }
++
+     public static NormalizedQueryTree createNormalizedQuery(GraphQLSchema graphQLSchema,
+                                                             Document document,
+                                                             String operationName,
+@@ -37,6 +57,32 @@ public class NormalizedQueryTreeFactory {
+         return new NormalizedQueryTreeFactory().createNormalizedQueryImpl(graphQLSchema, operationDefinition, fragments, variables);
+     }
+ 
++    /**
++     * Creates a normalized query tree while restricting the number of normalized fields created and the maximum
++     * children depth reached.  This guards against denial-of-service attacks (CVE-2024-40094) that craft small
++     * queries which explode into an excessive number of {@link NormalizedField}s during normalization.
++     *
++     * @param graphQLSchema       the schema to use
++     * @param operationDefinition the operation to normalize
++     * @param fragments           the fragments associated with the operation
++     * @param variables           the coerced variable values
++     * @param maxFieldsCount      the maximum number of normalized fields that may be created ({@link #NO_MAX} for no limit)
++     * @param maxChildrenDepth    the maximum children depth allowed ({@link #NO_MAX} for no limit)
++     *
++     * @return a normalized query tree
++     *
++     * @throws AbortExecutionException if the field count or depth limit is exceeded
++     */
++    public static NormalizedQueryTree createNormalizedQuery(GraphQLSchema graphQLSchema,
++                                                            OperationDefinition operationDefinition,
++                                                            Map<String, FragmentDefinition> fragments,
++                                                            Map<String, Object> variables,
++                                                            int maxFieldsCount,
++                                                            int maxChildrenDepth) {
++        return new NormalizedQueryTreeFactory(maxFieldsCount, maxChildrenDepth)
++                .createNormalizedQueryImpl(graphQLSchema, operationDefinition, fragments, variables);
++    }
++
+     /**
+      * Creates a new Query execution tree for the provided query
+      */
+@@ -93,6 +139,8 @@ public class NormalizedQueryTreeFactory {
+                                                    Map<NormalizedField, MergedField> normalizedFieldToMergedField,
+                                                    Map<FieldCoordinates, List<NormalizedField>> coordinatesToNormalizedFields,
+                                                    int curLevel) {
++        checkFieldCountExceeded();
++        checkMaxDepthExceeded(curLevel);
+         CollectFieldResult fieldsWithoutChildren = fieldCollector.collectFields(fieldCollectorNormalizedQueryParams, field, mergedField, curLevel + 1);
+         List<NormalizedField> realChildren = new ArrayList<>();
+         for (NormalizedField fieldWithoutChildren : fieldsWithoutChildren.getChildren()) {
+@@ -111,6 +159,19 @@ public class NormalizedQueryTreeFactory {
+         return field.transform(builder -> builder.children(realChildren));
+     }
+ 
++    private void checkFieldCountExceeded() {
++        this.fieldCount++;
++        if (this.fieldCount > this.maxFieldsCount) {
++            throw new AbortExecutionException("Maximum field count exceeded. " + this.fieldCount + " > " + this.maxFieldsCount);
++        }
++    }
++
++    private void checkMaxDepthExceeded(int curLevel) {
++        if (curLevel > this.maxChildrenDepth) {
++            throw new AbortExecutionException("Maximum query depth exceeded. " + curLevel + " > " + this.maxChildrenDepth);
++        }
++    }
++
+     private void updateByAstFieldMap(NormalizedField normalizedField, MergedField mergedField, Map<Field, List<NormalizedField>> fieldToNormalizedField) {
+         for (Field astField : mergedField.getFields()) {
+             fieldToNormalizedField.computeIfAbsent(astField, ignored -> new ArrayList<>()).add(normalizedField);
+--- /dev/null
++++ b/src/test/groovy/graphql/introspection/GoodFaithIntrospectionTest.groovy
+@@ -0,0 +1,93 @@
++package graphql.introspection
++
++import graphql.GraphQL
++import graphql.TestUtil
++import spock.lang.Specification
++
++/**
++ * Regression test for CVE-2024-40094.
++ *
++ * A crafted introspection query can explode into an excessive number of normalized fields (ENFs)
++ * during query normalization, allowing a denial of service via modest sized queries.  The fix
++ * normalizes introspection operations under a bounded field-count / depth limit up front and aborts
++ * execution when those good-faith limits are exceeded, while legitimate introspection continues to work.
++ */
++class GoodFaithIntrospectionTest extends Specification {
++
++    def graphQLSchema = TestUtil.schema("""
++            type Query {
++                hello: String
++            }
++        """)
++
++    def graphQL = GraphQL.newGraphQL(graphQLSchema).build()
++
++    def "a normal introspection query is allowed"() {
++        given:
++        def query = IntrospectionQuery.INTROSPECTION_QUERY
++
++        when:
++        def result = graphQL.execute(query)
++
++        then:
++        result.errors.isEmpty()
++        result.data != null
++        result.data["__schema"] != null
++    }
++
++    def "a small explicit introspection query is allowed"() {
++        given:
++        def query = '{ __type(name: "Query") { name kind } }'
++
++        when:
++        def result = graphQL.execute(query)
++
++        then:
++        result.errors.isEmpty()
++        result.data["__type"]["name"] == "Query"
++    }
++
++    def "a deeply nested introspection query is aborted"() {
++        given:
++        // craft a __type query with deeply nested ofType selections that blows past the good faith depth limit
++        StringBuilder sb = new StringBuilder()
++        int depth = 60
++        depth.times { sb.append("ofType { name ") }
++        depth.times { sb.append("} ") }
++        def query = """
++            {
++                __type(name: "Query") {
++                    name
++                    ${sb.toString()}
++                }
++            }
++        """
++
++        when:
++        def result = graphQL.execute(query)
++
++        then:
++        !result.errors.isEmpty()
++        result.errors[0].message.contains("Maximum query depth exceeded")
++    }
++
++    def "a wide introspection query that creates too many fields is aborted"() {
++        given:
++        // craft many aliased __type introspection fields, each expanding into many normalized fields,
++        // so the total number of ENFs exceeds the good faith field-count limit
++        StringBuilder sb = new StringBuilder()
++        sb.append("{\n")
++        200.times { i ->
++            sb.append("  a${i}: __type(name: \"Query\") { name kind fields { name } inputFields { name } interfaces { name } possibleTypes { name } enumValues { name } }\n")
++        }
++        sb.append("}\n")
++        def query = sb.toString()
++
++        when:
++        def result = graphQL.execute(query)
++
++        then:
++        !result.errors.isEmpty()
++        result.errors[0].message.contains("Maximum field count exceeded")
++    }
++}
