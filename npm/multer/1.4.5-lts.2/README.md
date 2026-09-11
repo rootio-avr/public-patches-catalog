@@ -8,6 +8,7 @@ unknown
 - CVE-2025-47935
 - CVE-2025-47944
 - CVE-2025-48997
+- CVE-2026-5079
 
 ## How to Apply:
 1. Clone or download the source code for multer
