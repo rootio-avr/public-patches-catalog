@@ -7,9 +7,15 @@ unknown
 - CVE-2025-29927
 - CVE-2026-44578
 - CVE-2026-64645
-- GHSA-8h8q-6873-q5fj
 - CVE-2026-44573
 - CVE-2026-75604
+- CVE-2024-51479
+- CVE-2024-46982
+- CVE-2026-64649
+- CVE-2026-64641
+- GHSA-8h8q-6873-q5fj
+- GHSA-h25m-26qc-wcjf
+- GHSA-5j59-xgg2-r9c4
 
 ## How to Apply:
 1. Clone or download the source code for next
