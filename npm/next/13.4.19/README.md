@@ -5,12 +5,15 @@ unknown
 
 ## Affected CVEs:
 - GHSA-q4gf-8mx6-v5v3
+- GHSA-mwv6-3258-q52c
 - CVE-2024-39693
 - GHSA-5j59-xgg2-r9c4
 - CVE-2024-34351
+- CVE-2026-64641
 - CVE-2024-34350
 - CVE-2024-51479
 - CVE-2026-44573
+- CVE-2026-44578
 - CVE-2026-64645
 
 ## How to Apply:
