@@ -4,6 +4,7 @@ This patch is based on next version 14.2.5, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2024-46982
 - CVE-2026-64641
 - CVE-2024-51479
 
