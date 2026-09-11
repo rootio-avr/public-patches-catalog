@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-54xq-cgqr-rpm3
+- GHSA-f88m-g3jw-g9cj
 
 ## How to Apply:
 1. Clone or download the source code for sharp
