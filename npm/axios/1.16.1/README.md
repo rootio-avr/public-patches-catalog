@@ -14,6 +14,8 @@ unknown
 - GHSA-hcpx-6fm6-wx23
 - GHSA-pmv8-rq9r-6j72
 - GHSA-xj6q-8x83-jv6g
+- GHSA-68jp-44vc-2x5h
+- CVE-2026-67320
 
 ## How to Apply:
 1. Clone or download the source code for axios
