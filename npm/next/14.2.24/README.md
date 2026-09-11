@@ -6,8 +6,14 @@ unknown
 ## Affected CVEs:
 - CVE-2025-29927
 - CVE-2026-44573
+- GHSA-5j59-xgg2-r9c4
+- GHSA-h25m-26qc-wcjf
+- GHSA-8h8q-6873-q5fj
 - GHSA-q4gf-8mx6-v5v3
 - CVE-2026-64645
+- CVE-2026-44578
+- CVE-2026-64641
+- CVE-2026-64649
 
 ## How to Apply:
 1. Clone or download the source code for next
