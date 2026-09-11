@@ -1,7 +1,7 @@
-# sudo : 1.9.5p2-3+deb11u1.aikido.6
+# sudo : 1.9.5p2-3+deb11u4.aikido.7
 
-This patch is based on sudo version 1.9.5p2-3+deb11u1.aikido.6, which is available at:
-https://sources.debian.org/src/sudo/1.9.5p2-3+deb11u2/
+This patch is based on sudo version 1.9.5p2-3+deb11u4.aikido.7, which is available at:
+https://sources.debian.org/src/sudo/1.9.5p2-3+deb11u4/
 
 ## Affected CVEs:
 - CVE-2023-42465
