@@ -4,6 +4,8 @@ This patch is based on com.rabbitmq:amqp-client version 5.25.0, which is availab
 unknown
 
 ## Affected CVEs:
+- CVE-2026-69219
+- CVE-2026-69220
 - CVE-2026-63337
 
 ## How to Apply:
