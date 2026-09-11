@@ -4,11 +4,17 @@ This patch is based on next version 14.2.0, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-64641
-- CVE-2026-64649
-- CVE-2025-29927
 - CVE-2024-46982
+- CVE-2024-51479
+- CVE-2025-29927
 - CVE-2026-44573
+- CVE-2026-44578
+- CVE-2026-64641
+- CVE-2026-64645
+- CVE-2026-64649
+- GHSA-5j59-xgg2-r9c4
+- GHSA-8h8q-6873-q5fj
+- GHSA-h25m-26qc-wcjf
 - GHSA-mwv6-3258-q52c
 
 ## How to Apply:
