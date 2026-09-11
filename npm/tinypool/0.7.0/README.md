@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-938696
+- AIKIDO-2026-396404
 
 ## How to Apply:
 1. Clone or download the source code for tinypool
