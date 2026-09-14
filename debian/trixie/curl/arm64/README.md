@@ -1,7 +1,7 @@
-# curl : 8.14.1-2+deb13u4.aikido.17
+# curl : 8.14.1-2+deb13u5.aikido.18
 
-This patch is based on curl version 8.14.1-2+deb13u4.aikido.17, which is available at:
-https://sources.debian.org/src/curl/8.14.1-2+deb13u4/
+This patch is based on curl version 8.14.1-2+deb13u5.aikido.18, which is available at:
+https://sources.debian.org/src/curl/8.14.1-2+deb13u5/
 
 ## Affected CVEs:
 - CVE-2025-10966
