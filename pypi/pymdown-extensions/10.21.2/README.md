@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-46338
+- CVE-2026-67422
 
 ## How to Apply:
 1. Clone or download the source code for pymdown-extensions
