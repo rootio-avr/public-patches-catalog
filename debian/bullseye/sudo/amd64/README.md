@@ -1,10 +1,11 @@
-# sudo : 1.9.5p2-3+deb11u4.aikido.7
+# sudo : 1.9.5p2-3+deb11u4.aikido.8
 
-This patch is based on sudo version 1.9.5p2-3+deb11u4.aikido.7, which is available at:
+This patch is based on sudo version 1.9.5p2-3+deb11u4.aikido.8, which is available at:
 https://sources.debian.org/src/sudo/1.9.5p2-3+deb11u4/
 
 ## Affected CVEs:
 - CVE-2023-42465
+- CVE-2026-82474
 
 ## How to Apply:
 1. Obtain the source package: `apt source sudo`
