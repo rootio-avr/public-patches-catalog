@@ -8,6 +8,7 @@ unknown
 - CVE-2024-47874
 - CVE-2026-54283
 - CVE-2026-48818
+- GHSA-93gm-qmq6-w238
 
 ## How to Apply:
 1. Clone or download the source code for starlette
