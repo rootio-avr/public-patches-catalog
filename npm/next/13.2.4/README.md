@@ -8,6 +8,8 @@ unknown
 - CVE-2025-29927
 - CVE-2026-44573
 - CVE-2026-64645
+- CVE-2026-64641
+- GHSA-h25m-26qc-wcjf
 - GHSA-8h8q-6873-q5fj
 
 ## How to Apply:
