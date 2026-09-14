@@ -7,6 +7,7 @@ unknown
 - CVE-2026-27699
 - CVE-2026-41324
 - CVE-2026-44240
+- AIKIDO-2026-424618
 - GHSA-6v7q-wjvx-w8wg
 
 ## How to Apply:
