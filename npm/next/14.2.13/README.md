@@ -13,6 +13,11 @@ unknown
 - CVE-2026-64641
 - CVE-2025-29927
 - CVE-2026-44573
+- AIKIDO-2026-553733
+- CVE-2026-75604
+- GHSA-q4gf-8mx6-v5v3
+- CVE-2026-64645
+- CVE-2026-44578
 
 ## How to Apply:
 1. Clone or download the source code for next
