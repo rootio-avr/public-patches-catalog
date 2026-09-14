@@ -1,11 +1,10 @@
-# util-linux : 2.41.5-0+deb13u1.aikido.7
+# util-linux : 2.41.5-0+deb13u1.aikido.8
 
-This patch is based on util-linux version 2.41.5-0+deb13u1.aikido.7, which is available at:
+This patch is based on util-linux version 2.41.5-0+deb13u1.aikido.8, which is available at:
 https://sources.debian.org/src/util-linux/2.41.5-0+deb13u1/
 
 ## Affected CVEs:
 - CVE-2026-3184
-- CVE-2026-53615
 - CVE-2026-76642
 - CVE-2026-78408
 - CVE-2026-78409
