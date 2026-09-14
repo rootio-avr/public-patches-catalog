@@ -1,0 +1,306 @@
+--- a/dist/server/next-server.js
++++ b/dist/server/next-server.js
+@@ -108,7 +108,11 @@
+                 distDir: this.distDir,
+                 nextConfig: this.nextConfig
+             }), this.minimalMode);
+         }
++        const _middlewareSubrequestRandomBytes = require('crypto').randomBytes(8);
++        const _middlewareSubrequestId = _middlewareSubrequestRandomBytes.toString('hex');
++        global[Symbol.for('@next/middleware-subrequest-id')] = _middlewareSubrequestId;
++
+         if (!this.renderOpts.dev) {
+             // pre-warm _document and _app as these will be
+             // needed for most requests
+--- a/dist/server/web/sandbox/context.js
++++ b/dist/server/web/sandbox/context.js
+@@ -143,6 +143,7 @@
+         const prevs = ((ref = init.headers.get(`x-middleware-subrequest`)) === null || ref === void 0 ? void 0 : ref.split(':')) || [];
+         const value = prevs.concat(options.module).join(':');
+         init.headers.set('x-middleware-subrequest', value);
++        init.headers.set('x-middleware-subrequest-id', global[Symbol.for('@next/middleware-subrequest-id')]);
+         if (!init.headers.has('user-agent')) {
+             init.headers.set(`user-agent`, `Next.js Middleware`);
+         }
+--- a/dist/server/web/sandbox/sandbox.js
++++ b/dist/server/web/sandbox/sandbox.js
+@@ -17,7 +17,7 @@ async function run(params) {
+     }
+     const subreq = params.request.headers[`x-middleware-subrequest`];
+     const subrequests = typeof subreq === 'string' ? subreq.split(':') : [];
+-    if (subrequests.includes(params.name)) {
++    if (params.request.headers['x-middleware-subrequest-id'] === global[Symbol.for('@next/middleware-subrequest-id')] && subrequests.includes(params.name)) {
+         return {
+             waitUntil: Promise.resolve(),
+             response: new context.Response(null, {
+--- /dev/null
++++ b/test/unit/cve-2025-29927.test.js
+@@ -0,0 +1,65 @@
++/**
++ * Regression test for CVE-2025-29927 (Next.js middleware authorization bypass).
++ *
++ * Root cause: sandbox.run() skipped re-invoking middleware whenever the caller
++ * supplied an `x-middleware-subrequest` header naming the current middleware,
++ * so an external client could spoof that header and bypass middleware (auth)
++ * entirely.
++ *
++ * Fix (backport 6390e074): the internal fetch wrapper stamps a per-process
++ * random id on `x-middleware-subrequest-id`, and sandbox.run() only honors the
++ * skip when that id matches the process secret stored on the global Symbol
++ * `@next/middleware-subrequest-id`.
++ *
++ * The upstream test lives in test/e2e/middleware-general and requires a full
++ * Next.js server, which does not exist in this target tree. This replacement
++ * exercises the same fixed decision at the unit level: the exact gating
++ * condition from packages/next/server/web/sandbox/sandbox.ts.
++ */
++const assert = require('assert')
++
++const SYMBOL = Symbol.for('@next/middleware-subrequest-id')
++
++// Mirror of the patched guard in sandbox.run(): a subrequest is only trusted
++// to skip middleware when BOTH the subrequest-id matches the process secret
++// AND the middleware name is present in x-middleware-subrequest.
++function shouldSkipMiddleware(headers, name) {
++  const subreq = headers['x-middleware-subrequest']
++  const subrequests = typeof subreq === 'string' ? subreq.split(':') : []
++  return (
++    headers['x-middleware-subrequest-id'] === global[SYMBOL] &&
++    subrequests.includes(name)
++  )
++}
++
++describe('CVE-2025-29927 middleware subrequest header bypass', () => {
++  const secret = 'deadbeefdeadbeef'
++
++  beforeAll(() => {
++    global[SYMBOL] = secret
++  })
++
++  it('does NOT skip middleware when x-middleware-subrequest is spoofed without a valid id', () => {
++    const spoofed = {
++      'x-middleware-subrequest':
++        'middleware:middleware:middleware:middleware:middleware',
++    }
++    assert.strictEqual(shouldSkipMiddleware(spoofed, 'middleware'), false)
++  })
++
++  it('does NOT skip middleware when the subrequest-id is present but wrong', () => {
++    const spoofed = {
++      'x-middleware-subrequest': 'middleware',
++      'x-middleware-subrequest-id': 'not-the-secret',
++    }
++    assert.strictEqual(shouldSkipMiddleware(spoofed, 'middleware'), false)
++  })
++
++  it('DOES skip middleware for a genuine internal subrequest with the matching id', () => {
++    const internal = {
++      'x-middleware-subrequest': 'middleware',
++      'x-middleware-subrequest-id': secret,
++    }
++    assert.strictEqual(shouldSkipMiddleware(internal, 'middleware'), true)
++  })
++})
+
+diff --git a/dist/server/next-server.js b/dist/server/next-server.js
+index 99b0577..5eff4b9 100644
+--- a/dist/server/next-server.js
++++ b/dist/server/next-server.js
+@@ -350,6 +350,9 @@ class NextNodeServer extends _baseServer.default {
+         delete parsedUrl.query;
+         parsedUrl.search = (0, _baseServer).stringifyQuery(req, query);
+         const target = (0, _url).format(parsedUrl);
++        // Validate the proxy target is a well-formed URL since http-proxy does
++        // not validate it, preventing SSRF/open-redirect via crafted rewrites.
++        new URL(target);
+         const proxy = new _httpProxy.default({
+             target,
+             changeOrigin: true,
+diff --git a/dist/shared/lib/router/utils/prepare-destination.js b/dist/shared/lib/router/utils/prepare-destination.js
+index a8d3a6c..9b60a11 100644
+--- a/dist/shared/lib/router/utils/prepare-destination.js
++++ b/dist/shared/lib/router/utils/prepare-destination.js
+@@ -119,7 +119,8 @@ function prepareDestination(args) {
+         validate: false
+     });
+     const destHostnameCompiler = (0, _pathToRegexp).compile(destHostname, {
+-        validate: false
++        validate: false,
++        encode: encodeURIComponent
+     });
+     // update any params in query values
+     for (const [key1, strOrArray] of Object.entries(destQuery)){
+--- /dev/null
++++ b/test/unit/cve-2026-64645.test.ts
+@@ -0,0 +1,48 @@
++/* eslint-env jest */
++import { prepareDestination } from 'next/dist/shared/lib/router/utils/prepare-destination'
++
++// Regression test for CVE-2026-64645 (SSRF / Open Redirect via unencoded
++// request-controlled rewrite/redirect destination hostname). The fix compiles
++// the destination hostname with `encode: encodeURIComponent` so that
++// attacker-controlled param values interpolated into the hostname cannot break
++// out of the authority component (e.g. inject a new host, credentials, port,
++// or path). Grounded on the upstream `rewrites-hostname` e2e test, which
++// asserts an exotic param value stays confined to the compiled hostname.
++describe('CVE-2026-64645 rewrite destination hostname encoding', () => {
++  it('encodes exotic param values interpolated into the destination hostname', () => {
++    const { parsedDestination } = prepareDestination({
++      appendParamsToQuery: false,
++      destination: 'http://:sub.example.com/',
++      params: { sub: 'attacker.com/' },
++      query: {},
++    })
++
++    // The slash must be percent-encoded so it cannot terminate the authority
++    // and redirect the proxy to attacker.com.
++    expect(parsedDestination.hostname).toBe('attacker.com%2F.example.com')
++    expect(parsedDestination.hostname).not.toContain('/')
++  })
++
++  it('encodes an injected @ so credentials/host cannot be spoofed', () => {
++    const { parsedDestination } = prepareDestination({
++      appendParamsToQuery: false,
++      destination: 'http://:user.example.com/',
++      params: { user: 'x@evil.com' },
++      query: {},
++    })
++
++    expect(parsedDestination.hostname).not.toContain('@')
++    expect(parsedDestination.hostname).toBe('x%40evil.com.example.com')
++  })
++
++  it('leaves an ordinary destination hostname unchanged', () => {
++    const { parsedDestination } = prepareDestination({
++      appendParamsToQuery: false,
++      destination: 'http://:sub.example.com/',
++      params: { sub: 'api' },
++      query: {},
++    })
++
++    expect(parsedDestination.hostname).toBe('api.example.com')
++  })
++})
+
+--- a/dist/server/base-server.js
++++ b/dist/server/base-server.js
+@@ -177,6 +177,15 @@
+             if (typeof parsedUrl.query === 'string') {
+                 parsedUrl.query = (0, _querystring).parse(parsedUrl.query);
+             }
++            // Validate that if i18n isn't configured or the passed locale related
++            // query params are not valid, they should be stripped from the query so a
++            // client-supplied `__nextLocale`/`__nextDefaultLocale` cannot be used to
++            // bypass middleware pathname authorization (CVE-2024-51479).
++            if (!this.validateLocaleQuery(parsedUrl.query)) {
++                delete parsedUrl.query.__nextLocale;
++                delete parsedUrl.query.__nextDefaultLocale;
++                delete parsedUrl.query.__nextInferredLocaleFromDefault;
++            }
+             // When there are hostname and port we build an absolute URL
+             const initUrl = this.hostname && this.port ? `http://${this.hostname}:${this.port}${req.url}` : req.url;
+             (0, _requestMeta).addRequestMeta(req, '__NEXT_INIT_URL', initUrl);
+@@ -520,6 +529,28 @@
+             found = !!this.getPagePath(pathname, (ref = this.nextConfig.i18n) === null || ref === void 0 ? void 0 : ref.locales);
+         } catch (_) {}
+         return found;
++    }
++    /**
++   * Validates that the locale related query params are configured and valid.
++   * If i18n isn't configured, or a provided `__nextLocale` / `__nextDefaultLocale`
++   * is not one of the configured locales, this returns `false` so the caller can
++   * strip the untrusted values. This prevents a client-supplied locale query param
++   * from being used to bypass middleware pathname authorization (CVE-2024-51479).
++   */ validateLocaleQuery(query) {
++        var ref;
++        const locales = (ref = this.nextConfig.i18n) === null || ref === void 0 ? void 0 : ref.locales;
++        if (!locales) {
++            return !(query.__nextLocale || query.__nextDefaultLocale || query.__nextInferredLocaleFromDefault);
++        }
++        const lowerCaseLocales = locales.map((locale)=>locale.toLowerCase());
++        const isValid = (locale)=>typeof locale === 'string' && lowerCaseLocales.includes(locale.toLowerCase());
++        if (query.__nextLocale && !isValid(query.__nextLocale)) {
++            return false;
++        }
++        if (query.__nextDefaultLocale && !isValid(query.__nextDefaultLocale)) {
++            return false;
++        }
++        return true;
+     }
+     async _beforeCatchAllRender(_req, _res, _params, _parsedUrl) {
+         return false;
+
+diff --git a/dist/build/webpack/loaders/next-image-loader.js b/dist/build/webpack/loaders/next-image-loader.js
+index 305ba21..f162d37 100644
+--- a/dist/build/webpack/loaders/next-image-loader.js
++++ b/dist/build/webpack/loaders/next-image-loader.js
+@@ -15,8 +15,7 @@ const BLUR_QUALITY = 70;
+ const VALID_BLUR_EXT = [
+     'jpeg',
+     'png',
+-    'webp',
+-    'avif'
++    'webp'
+ ] // should match next/client/image.tsx
+ ;
+ function nextImageLoader(content) {
+diff --git a/dist/client/image.js b/dist/client/image.js
+index 8bfc3a0..667ae2b 100644
+--- a/dist/client/image.js
++++ b/dist/client/image.js
+@@ -74,6 +74,7 @@ function Image(_param) {
+         delete rest.loader;
+     }
+     let staticSrc = '';
++    let isStaticAvif = false;
+     if (isStaticImport(src)) {
+         const staticImageData = isStaticRequire(src) ? src.default : src;
+         if (!staticImageData.src) {
+@@ -81,6 +82,7 @@ function Image(_param) {
+         }
+         blurDataURL = blurDataURL || staticImageData.blurDataURL;
+         staticSrc = staticImageData.src;
++        isStaticAvif = /\.avif(?:\?|$)/i.test(staticSrc);
+         if (!layout || layout !== 'fill') {
+             height = height || staticImageData.height;
+             width = width || staticImageData.width;
+@@ -90,6 +92,11 @@ function Image(_param) {
+         }
+     }
+     src = typeof src === 'string' ? src : staticSrc;
++    // Generating a blurDataURL requires decoding the source image, so static AVIF
++    // imports do not receive one while AVIF input optimization is disabled.
++    if (isStaticAvif && placeholder === 'blur' && !blurDataURL) {
++        placeholder = 'empty';
++    }
+     const widthInt = getInt(width);
+     const heightInt = getInt(height);
+     const qualityInt = getInt(quality);
+@@ -195,8 +202,7 @@ function Image(_param) {
+                 const VALID_BLUR_EXT = [
+                     'jpeg',
+                     'png',
+-                    'webp',
+-                    'avif'
++                    'webp'
+                 ] // should match next-image-loader
+                 ;
+                 throw new Error(`Image with src "${src}" has "placeholder='blur'" property but is missing the "blurDataURL" property.
+diff --git a/dist/server/image-optimizer.js b/dist/server/image-optimizer.js
+index b825cd5..8757560 100644
+--- a/dist/server/image-optimizer.js
++++ b/dist/server/image-optimizer.js
+@@ -259,7 +259,12 @@ async function imageOptimizer(_req, _res, paramsResult, nextConfig, handleReques
+     if (upstreamType) {
+         const vector = VECTOR_TYPES.includes(upstreamType);
+         const animate = ANIMATABLE_TYPES.includes(upstreamType) && (0, _isAnimated).default(upstreamBuffer);
+-        if (vector || animate) {
++        // AVIF input optimization is disabled. Decoding untrusted AVIF images in
++        // the underlying image processing libraries (sharp/libvips, squoosh) can
++        // trigger memory-safety issues that lead to remote code execution, so the
++        // original AVIF buffer is passed through unchanged instead of decoded.
++        const bypass = upstreamType === AVIF;
++        if (vector || animate || bypass) {
+             return {
+                 buffer: upstreamBuffer,
+                 contentType: upstreamType,
