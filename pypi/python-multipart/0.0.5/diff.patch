@@ -1,0 +1,602 @@
+--- a/multipart/multipart.py
++++ b/multipart/multipart.py
+@@ -22,6 +22,7 @@ import logging
+ import tempfile
+ from io import BytesIO
+ from numbers import Number
++from email.message import Message
+ 
+ # Unique missing object.
+ _missing = object()
+@@ -99,39 +100,38 @@ def parse_options_header(value):
+     Parses a Content-Type header into a value in the following format:
+         (content_type, {parameters})
+     """
++    # Uses email.message.Message to parse the header as described in PEP 594.
++    # Ref: https://peps.python.org/pep-0594/#cgi
+     if not value:
+         return (b'', {})
+ 
+-    # If we are passed a string, we assume that it conforms to WSGI and does
+-    # not contain any code point that's not in latin-1.
+-    if isinstance(value, text_type):            # pragma: no cover
+-        value = value.encode('latin-1')
++    # If we are passed bytes, we assume that it conforms to WSGI, encoding in latin-1.
++    if isinstance(value, binary_type):  # pragma: no cover
++        value = value.decode('latin-1')
++
++    # For types
++    assert isinstance(value, text_type), 'Value should be a string by now'
+ 
+     # If we have no options, return the string as-is.
+-    if b';' not in value:
+-        return (value.lower().strip(), {})
++    if ";" not in value:
++        return (value.lower().strip().encode('latin-1'), {})
+ 
+     # Split at the first semicolon, to get our value and then options.
+-    ctype, rest = value.split(b';', 1)
++    message = Message()
++    message['content-type'] = value
++    params = message.get_params()
++    # If there were no parameters, this would have already returned above
++    assert params, 'At least the content type value should be present'
++    ctype = params.pop(0)[0].encode('latin-1')
+     options = {}
+-
+-    # Parse the options.
+-    for match in OPTION_RE.finditer(rest):
+-        key = match.group(1).lower()
+-        value = match.group(2)
+-        if value[0] == QUOTE and value[-1] == QUOTE:
+-            # Unquote the value.
+-            value = value[1:-1]
+-            value = value.replace(b'\\\\', b'\\').replace(b'\\"', b'"')
+-
++    for param in params:
++        key, value = param
+         # If the value is a filename, we need to fix a bug on IE6 that sends
+         # the full file path instead of the filename.
+-        if key == b'filename':
+-            if value[1:3] == b':\\' or value[:2] == b'\\\\':
+-                value = value.split(b'\\')[-1]
+-
+-        options[key] = value
+-
++        if key == 'filename':
++            if value[1:3] == ':\\' or value[:2] == '\\\\':
++                value = value.split('\\')[-1]
++        options[key.encode('latin-1')] = value.encode('latin-1')
+     return ctype, options
+ 
+ 
+--- /dev/null
++++ b/tests/test_cve_2024_24762.py
+@@ -0,0 +1,60 @@
++"""Regression test for CVE-2024-24762 (ReDoS in parse_options_header).
++
++The vulnerable implementation parsed Content-Type header options with a
++custom regular expression (OPTION_RE) that exhibited catastrophic
++backtracking on crafted input, enabling a denial of service (CWE-400).
++The fix replaces the regex with the standard library email header parser.
++
++These assertions are grounded on the upstream TestParseOptionsHeader suite
++and additionally verify that a malicious ReDoS payload parses in bounded
++time.
++"""
++
++import time
++
++from multipart.multipart import parse_options_header
++
++
++def test_simple():
++    t, p = parse_options_header('application/json')
++    assert t == b'application/json'
++    assert p == {}
++
++
++def test_blank():
++    t, p = parse_options_header('')
++    assert t == b''
++    assert p == {}
++
++
++def test_single_param():
++    t, p = parse_options_header('application/json;par=val')
++    assert t == b'application/json'
++    assert p == {b'par': b'val'}
++
++
++def test_multiple_params():
++    t, p = parse_options_header(b'application/json;par=val;asdf=foo')
++    assert t == b'application/json'
++    assert p == {b'par': b'val', b'asdf': b'foo'}
++
++
++def test_quoted_param_with_semicolon():
++    t, p = parse_options_header(b'application/json;param="quoted;with;semicolons"')
++    assert p[b'param'] == b'quoted;with;semicolons'
++
++
++def test_handles_ie6_bug():
++    t, p = parse_options_header(
++        b'text/plain; filename="C:\\this\\is\\a\\path\\file.txt"')
++    assert p[b'filename'] == b'file.txt'
++
++
++def test_redos_payload_parses_in_bounded_time():
++    # Crafted payload that triggered catastrophic backtracking in the old
++    # regex-based parser. It must parse quickly and not hang.
++    payload = b'application/json' + b';' + b'a' * 5000 + b'"' * 5000
++    start = time.time()
++    parse_options_header(payload)
++    elapsed = time.time() - start
++    assert elapsed < 1.0, "parse_options_header took too long: %f s" % elapsed
+
+--- a/multipart/multipart.py
++++ b/multipart/multipart.py
+@@ -1435,9 +1435,14 @@
+                     i -= 1
+ 
+             elif state == STATE_END:
+-                # Do nothing and just consume a byte in the end state.
+-                if c not in (CR, LF):
+-                    self.logger.warning("Consuming a byte '0x%x' in the end state", c)
++                # Don't do anything if chunk ends with CRLF.
++                if c == CR and i + 1 < length and data[i + 1] == LF:
++                    i += 2
++                    continue
++                # Skip data after the last boundary.
++                self.logger.warning("Skipping data after last boundary")
++                i = length
++                break
+ 
+             else:                   # pragma: no cover (error case)
+                 # We got into a strange state somehow!  Just stop processing.
+--- a/multipart/tests/test_multipart.py
++++ b/multipart/tests/test_multipart.py
+@@ -1056,6 +1056,50 @@
+         with self.assertRaises(MultipartParseError):
+             i = self.f.write(data)
+ 
++    def test_data_after_last_boundary_no_per_byte_warning(self):
++        # Regression test for CVE-2024-53981: data after the last boundary
++        # must not emit one log warning per byte (a DoS vector).  The parser
++        # should emit at most a single "Skipping data after last boundary"
++        # warning and then stop consuming the trailing bytes.
++        self.make('boundary')
++
++        data = (
++            b'--boundary\r\n'
++            b'Content-Disposition: form-data; name="file"; filename="f.txt"\r\n'
++            b'Content-Type: text/plain\r\n\r\n'
++            b'hello\r\n'
++            b'--boundary--\r\n'
++        )
++        # A large trailing junk payload after the terminating boundary.
++        data += b'A' * 100000
++
++        logger = logging.getLogger('multipart.multipart')
++        with patch.object(logger, 'warning') as mock_warning:
++            self.f.write(data)
++
++        # Before the fix this produced ~100000 warnings (one per byte).
++        self.assertLessEqual(mock_warning.call_count, 1)
++
++    def test_data_end_with_crlf_no_warning(self):
++        # Regression test for CVE-2024-53981 (PR #193): a well-formed body
++        # that ends with a trailing CRLF after the last boundary must not
++        # produce any warning.
++        self.make('boundary')
++
++        data = (
++            b'--boundary\r\n'
++            b'Content-Disposition: form-data; name="file"; filename="f.txt"\r\n'
++            b'Content-Type: text/plain\r\n\r\n'
++            b'hello\r\n'
++            b'--boundary--\r\n'
++        )
++
++        logger = logging.getLogger('multipart.multipart')
++        with patch.object(logger, 'warning') as mock_warning:
++            self.f.write(data)
++
++        self.assertEqual(mock_warning.call_count, 0)
++
+     def test_octet_stream(self):
+         files = []
+         def on_file(f):
+
+--- a/multipart/multipart.py
++++ b/multipart/multipart.py
+@@ -336,7 +336,9 @@ class File(object):
+
+         # Split the extension from the filename.
+         if file_name is not None:
+-            base, ext = os.path.splitext(file_name)
++            # Extract just the basename to avoid directory traversal
++            basename = os.path.basename(file_name)
++            base, ext = os.path.splitext(basename)
+             self._file_base = base
+             self._ext = ext
+
+--- a/multipart/tests/test_multipart.py
++++ b/multipart/tests/test_multipart.py
+@@ -210,6 +210,28 @@ class TestFile(unittest.TestCase):
+         self.assertEqual(ext, b'.txt')
+         self.assert_exists()
+
++    def test_file_full_name_with_leading_slash(self):
++        # Regression test for CVE-2026-24486: a file_name containing a
++        # directory path (e.g. a leading slash) must not be able to escape
++        # the configured UPLOAD_DIR via directory traversal.  Only the
++        # basename should be used when building the on-disk filename.
++        c = {}
++        d = force_bytes(tempfile.mkdtemp())
++        c['UPLOAD_DIR'] = d
++        c['UPLOAD_KEEP_FILENAME'] = True
++        c['UPLOAD_KEEP_EXTENSIONS'] = True
++        c['MAX_MEMORY_FILE_SIZE'] = 10
++
++        f = File(b'/foo.txt', config=c)
++        f.write(b'12345678901')
++        self.assertFalse(f.in_memory)
++
++        # The saved file must keep only the basename and stay inside UPLOAD_DIR.
++        self.assertEqual(f.actual_file_name, b'foo.txt')
++        full_path = os.path.join(d, f.actual_file_name)
++        self.assertTrue(os.path.exists(full_path))
++        self.assertEqual(os.path.dirname(full_path), d)
++
+     def test_invalid_dir_with_name(self):
+         # Write to this dir.
+         self.c['UPLOAD_DIR'] = force_bytes(os.path.join('/', 'tmp', 'notexisting'))
+
+--- a/multipart/multipart.py
++++ b/multipart/multipart.py
+@@ -56,6 +56,12 @@
+ FLAG_PART_BOUNDARY              = 1
+ FLAG_LAST_BOUNDARY              = 2
+ 
++# Default limits used to protect against maliciously-crafted multipart headers
++# that can exhaust memory/CPU (CVE-2026-42561).  These cap the number of
++# headers allowed per part and the size of a single header line.
++DEFAULT_MAX_HEADER_COUNT = 8
++DEFAULT_MAX_HEADER_SIZE = 4096 + 128
++
+ # Get constants.  Since iterating over a str on Python 2 gives you a 1-length
+ # string, but iterating over a bytes object on Python 3 gives you an integer,
+ # we need to save these constants.
+@@ -1010,7 +1016,9 @@
+                      i.e. unbounded.
+     """
+ 
+-    def __init__(self, boundary, callbacks={}, max_size=float('inf')):
++    def __init__(self, boundary, callbacks={}, max_size=float('inf'),
++                 max_header_count=DEFAULT_MAX_HEADER_COUNT,
++                 max_header_size=DEFAULT_MAX_HEADER_SIZE):
+         # Initialize parser state.
+         super(MultipartParser, self).__init__()
+         self.state = STATE_START
+@@ -1024,6 +1032,13 @@
+         self.max_size = max_size
+         self._current_size = 0
+ 
++        # Limits to protect against maliciously-crafted headers.
++        self.max_header_count = max_header_count
++        self._current_header_count = 0
++
++        self.max_header_size = max_header_size
++        self._current_header_size = 0
++
+         # Setup marks.  These are used to track the state of data recieved.
+         self.marks = {}
+ 
+@@ -1089,9 +1104,25 @@
+         index = self.index
+         flags = self.flags
+ 
++        # Running header-count and header-size counters.  These are persisted
++        # between calls via self._current_header_*.  We keep the size in a
++        # single-element list so the nested advance_header_size() closure can
++        # mutate it without relying on 'nonlocal' (unavailable on Python 2).
++        header_count = [self._current_header_count]
++        header_size = [self._current_header_size]
++
+         # Our index defaults to 0.
+         i = 0
+ 
++        # Increment the size of the current header line, raising an error if it
++        # exceeds the configured maximum (CVE-2026-42561).
++        def advance_header_size(amount=1):
++            header_size[0] += amount
++            if header_size[0] > self.max_header_size:
++                e = MultipartParseError("Maximum header size exceeded")
++                e.offset = i
++                raise e
++
+         # Set a mark.
+         def set_mark(name):
+             self.marks[name] = i
+@@ -1169,6 +1200,10 @@
+                     # Callback for the start of a part.
+                     self.callback('part_begin')
+ 
++                    # Reset per-part header counters.
++                    header_count[0] = 0
++                    header_size[0] = 0
++
+                     # Move to the next character and state.
+                     state = STATE_HEADER_FIELD_START
+ 
+@@ -1190,6 +1225,18 @@
+                 # continue parsing our header field.
+                 index = 0
+ 
++                # If this isn't the terminating CR (which signals the end of
++                # the headers), we're starting a new header line.  Enforce the
++                # maximum header count and reset the per-line size counter
++                # (CVE-2026-42561).
++                if c != CR:
++                    header_count[0] += 1
++                    if header_count[0] > self.max_header_count:
++                        e = MultipartParseError("Maximum header count exceeded")
++                        e.offset = i
++                        raise e
++                    header_size[0] = 0
++
+                 # Set a mark of our header field.
+                 set_mark('header_field')
+ 
+@@ -1210,6 +1257,10 @@
+                 # Increment our index in the header.
+                 index += 1
+ 
++                # Count this character towards the current header line size
++                # (CVE-2026-42561).
++                advance_header_size()
++
+                 # Do nothing if we encounter a hyphen.
+                 if c == HYPHEN:
+                     pass
+@@ -1245,6 +1296,9 @@
+             elif state == STATE_HEADER_VALUE_START:
+                 # Skip leading spaces.
+                 if c == SPACE:
++                    # Count skipped leading spaces towards the header size
++                    # (CVE-2026-42561).
++                    advance_header_size()
+                     i += 1
+                     continue
+ 
+@@ -1261,7 +1315,13 @@
+                 if c == CR:
+                     data_callback('header_value')
+                     self.callback('header_end')
++                    # The header line is complete; reset the per-line size
++                    # counter (CVE-2026-42561).
++                    header_size[0] = 0
+                     state = STATE_HEADER_VALUE_ALMOST_DONE
++                else:
++                    # Count this character towards the header line size.
++                    advance_header_size()
+ 
+             elif state == STATE_HEADER_VALUE_ALMOST_DONE:
+                 # The last character should be a LF.  If not, it's an error.
+@@ -1385,6 +1445,10 @@
+                             self.callback('part_end')
+                             self.callback('part_begin')
+ 
++                            # Reset per-part header counters.
++                            header_count[0] = 0
++                            header_size[0] = 0
++
+                             # Move to parsing new headers.
+                             index = 0
+                             state = STATE_HEADER_FIELD_START
+@@ -1466,6 +1530,8 @@
+         self.state = state
+         self.index = index
+         self.flags = flags
++        self._current_header_count = header_count[0]
++        self._current_header_size = header_size[0]
+ 
+         # Return our data length to indicate no errors, and that we processed
+         # all of it.
+@@ -1542,6 +1608,8 @@
+     #: Note: all file sizes should be in bytes.
+     DEFAULT_CONFIG = {
+         'MAX_BODY_SIZE': float('inf'),
++        'MAX_HEADER_COUNT': DEFAULT_MAX_HEADER_COUNT,
++        'MAX_HEADER_SIZE': DEFAULT_MAX_HEADER_SIZE,
+         'MAX_MEMORY_FILE_SIZE': 1 * 1024 * 1024,
+         'UPLOAD_DIR': None,
+         'UPLOAD_KEEP_FILENAME': False,
+@@ -1772,8 +1840,12 @@
+             }
+ 
+             # Instantiate a multipart parser.
+-            parser = MultipartParser(boundary, callbacks,
+-                                     max_size=self.config['MAX_BODY_SIZE'])
++            parser = MultipartParser(
++                boundary, callbacks,
++                max_size=self.config['MAX_BODY_SIZE'],
++                max_header_count=self.config['MAX_HEADER_COUNT'],
++                max_header_size=self.config['MAX_HEADER_SIZE'],
++            )
+ 
+         else:
+             self.logger.warning("Unknown Content-Type: %r", content_type)
+--- a/multipart/tests/test_multipart.py
++++ b/multipart/tests/test_multipart.py
+@@ -1290,6 +1290,67 @@
+ 
+ 
+ 
++class TestMultipartParserHeaderLimits(unittest.TestCase):
++    """Regression tests for CVE-2026-42561.
++
++    A maliciously-crafted multipart body could contain an unbounded number of
++    headers, or a single header line of unbounded length, allowing an attacker
++    to exhaust server memory/CPU.  The parser now enforces a maximum header
++    count per part and a maximum size for a single header line.
++    """
++
++    boundary = b'boundary'
++
++    def _build_body(self, headers):
++        body = b'--' + self.boundary + b'\r\n'
++        for name, value in headers:
++            body += name + b': ' + value + b'\r\n'
++        body += b'\r\ndata\r\n--' + self.boundary + b'--\r\n'
++        return body
++
++    def test_too_many_headers_raises(self):
++        # More headers than DEFAULT_MAX_HEADER_COUNT (8) must be rejected.
++        headers = [(b'abc' + bytes(bytearray([ord('a') + i])), b'value')
++                   for i in range(DEFAULT_MAX_HEADER_COUNT + 5)]
++        parser = MultipartParser(self.boundary, {})
++        with self.assertRaises(MultipartParseError):
++            parser.write(self._build_body(headers))
++            parser.finalize()
++
++    def test_oversized_single_header_raises(self):
++        # A single header line larger than DEFAULT_MAX_HEADER_SIZE must be
++        # rejected.
++        big_value = b'A' * (DEFAULT_MAX_HEADER_SIZE + 100)
++        parser = MultipartParser(self.boundary, {})
++        with self.assertRaises(MultipartParseError):
++            parser.write(self._build_body([(b'abc', big_value)]))
++            parser.finalize()
++
++    def test_within_limits_parses(self):
++        # A well-formed request within the limits must still parse cleanly.
++        collected = []
++        callbacks = {
++            'on_header_field': lambda d, s, e: None,
++            'on_header_value': lambda d, s, e: None,
++            'on_headers_finished': lambda: None,
++            'on_part_data': lambda d, s, e: collected.append(d[s:e]),
++        }
++        headers = [(b'abc' + bytes(bytearray([ord('a') + i])), b'value')
++                   for i in range(DEFAULT_MAX_HEADER_COUNT - 2)]
++        parser = MultipartParser(self.boundary, callbacks)
++        parser.write(self._build_body(headers))
++        parser.finalize()
++        self.assertEqual(b''.join(collected), b'data')
++
++    def test_custom_limits_are_honored(self):
++        # Explicit lower limits should be enforced.
++        headers = [(b'aaa', b'value'), (b'bbb', b'value'), (b'ccc', b'value')]
++        parser = MultipartParser(self.boundary, {}, max_header_count=2)
++        with self.assertRaises(MultipartParseError):
++            parser.write(self._build_body(headers))
++            parser.finalize()
++
++
+ def suite():
+     suite = unittest.TestSuite()
+     suite.addTest(unittest.makeSuite(TestFile))
+@@ -1301,6 +1362,7 @@
+     suite.addTest(unittest.makeSuite(TestQuotedPrintableDecoder))
+     suite.addTest(unittest.makeSuite(TestFormParser))
+     suite.addTest(unittest.makeSuite(TestHelperFunctions))
++    suite.addTest(unittest.makeSuite(TestMultipartParserHeaderLimits))
+ 
+     return suite
+ 
+
+# CVE-2026-53539: treat only `&` as urlencoded field separator (not `;`)
+# Backport of upstream commit d69df35cd2cad9c72794c2c340db646afae957d8
+# (PR https://github.com/Kludex/python-multipart/pull/290), released as 0.0.30.
+# Adapted to the python-multipart 0.0.5 layout (multipart/ package, single-quote
+# byte literals). Drops the cosmetic CHANGELOG.md hunk; keeps the 4 functional
+# hunks in multipart/multipart.py and the renamed/rewritten regression test.
+--- a/multipart/multipart.py
++++ b/multipart/multipart.py
+@@ -65,7 +65,6 @@
+ SPACE = b' '[0]
+ HYPHEN = b'-'[0]
+ AMPERSAND = b'&'[0]
+-SEMICOLON = b';'[0]
+ LOWER_A = b'a'[0]
+ LOWER_Z = b'z'[0]
+ NULL = b'\x00'[0]
+@@ -812,19 +811,19 @@
+                 # yet reached a seperator, and thus, if we do, we need to skip
+                 # it as it will be the boundary between fields that's supposed
+                 # to be there.
+-                if ch == AMPERSAND or ch == SEMICOLON:
++                if ch == AMPERSAND:
+                     if found_sep:
+                         # If we're parsing strictly, we disallow blank chunks.
+                         if strict_parsing:
+                             e = QuerystringParseError(
+-                                "Skipping duplicate ampersand/semicolon at "
++                                "Skipping duplicate ampersand at "
+                                 "%d" % i
+                             )
+                             e.offset = i
+                             raise e
+                         else:
+-                            self.logger.debug("Skipping duplicate ampersand/"
+-                                         "semicolon at %d", i)
++                            self.logger.debug("Skipping duplicate ampersand "
++                                         "at %d", i)
+                     else:
+                         # This case is when we're skipping the (first)
+                         # seperator between fields, so we just set our flag
+@@ -842,9 +841,7 @@
+             elif state == STATE_FIELD_NAME:
+                 # Try and find a seperator - we ensure that, if we do, we only
+                 # look for the equal sign before it.
+-                sep_pos = data.find(b'&', i)
+-                if sep_pos == -1:
+-                    sep_pos = data.find(b';', i)
++                sep_pos = data.find(b'&', i, length)
+ 
+                 # See if we can find an equals sign in the remaining data.  If
+                 # so, we can immedately emit the field name and jump to the
+@@ -852,7 +849,7 @@
+                 if sep_pos != -1:
+                     equals_pos = data.find(b'=', i, sep_pos)
+                 else:
+-                    equals_pos = data.find(b'=', i)
++                    equals_pos = data.find(b'=', i, length)
+ 
+                 if equals_pos != -1:
+                     # Emit this name.
+@@ -901,11 +898,8 @@
+                         i = length
+ 
+             elif state == STATE_FIELD_DATA:
+-                # Try finding either an ampersand or a semicolon after this
+-                # position.
+-                sep_pos = data.find(b'&', i)
+-                if sep_pos == -1:
+-                    sep_pos = data.find(b';', i)
++                # Try finding an ampersand after this position.
++                sep_pos = data.find(b'&', i, length)
+ 
+                 # If we found it, callback this bit as data and then go back
+                 # to expecting to find a field.
+--- a/multipart/tests/test_multipart.py
++++ b/multipart/tests/test_multipart.py
+@@ -395,12 +395,12 @@
+             (b'asdf', b'baz')
+         )
+ 
+-    def test_semicolon_seperator(self):
+-        self.p.write(b'foo=bar;asdf=baz')
++    def test_semicolon_is_data_not_a_field_separator(self):
++        self.p.write(b'role=user&x=;role=admin')
+ 
+         self.assert_fields(
+-            (b'foo', b'bar'),
+-            (b'asdf', b'baz')
++            (b'role', b'user'),
++            (b'x', b';role=admin')
+         )
+ 
+     def test_too_large_field(self):

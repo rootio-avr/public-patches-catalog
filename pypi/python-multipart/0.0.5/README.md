@@ -1,0 +1,20 @@
+# python-multipart : 0.0.5
+
+This patch is based on python-multipart version 0.0.5, which is available at:
+unknown
+
+## Affected CVEs:
+- CVE-2024-24762
+- CVE-2024-53981
+- CVE-2026-24486
+- CVE-2026-42561
+- CVE-2026-53539
+
+## How to Apply:
+1. Clone or download the source code for python-multipart
+2. Apply the patch: `patch -p1 < diff.patch`
+3. Build the package: `python -m build` or `pip install -e .`
+
+## License:
+This patch is provided under GPLv3, in compliance with the original license of the package.
+The full GPLv3 license can be found at: https://www.gnu.org/licenses/gpl-3.0.txt
