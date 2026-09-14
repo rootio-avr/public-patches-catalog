@@ -12,6 +12,8 @@ unknown
 - CVE-2026-44578
 - CVE-2026-64649
 - CVE-2026-64645
+- AIKIDO-2026-553733
+- CVE-2026-75604
 
 ## How to Apply:
 1. Clone or download the source code for next
