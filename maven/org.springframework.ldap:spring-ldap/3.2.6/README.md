@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-38829
+- CVE-2026-41720
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework.ldap:spring-ldap
