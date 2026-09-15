@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2022-1471
 - CVE-2022-25857
+- CVE-2017-18640
 
 ## How to Apply:
 1. Clone or download the source code for org.yaml:snakeyaml
