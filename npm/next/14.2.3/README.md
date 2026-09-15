@@ -7,10 +7,17 @@ unknown
 - GHSA-5j59-xgg2-r9c4
 - CVE-2026-75604
 - CVE-2026-64641
+- GHSA-q4gf-8mx6-v5v3
 - GHSA-mwv6-3258-q52c
 - GHSA-8h8q-6873-q5fj
 - CVE-2025-29927
 - CVE-2026-64649
+- CVE-2024-51479
+- CVE-2026-44573
+- CVE-2024-46982
+- CVE-2026-64645
+- CVE-2026-44578
+- GHSA-h25m-26qc-wcjf
 
 ## How to Apply:
 1. Clone or download the source code for next
