@@ -4,6 +4,7 @@ This patch is based on strawberry-graphql version 0.155.3, which is available at
 unknown
 
 ## Affected CVEs:
+- CVE-2026-35523
 - CVE-2026-35526
 
 ## How to Apply:
