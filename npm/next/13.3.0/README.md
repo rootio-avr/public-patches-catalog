@@ -4,7 +4,10 @@ This patch is based on next version 13.3.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2024-51479
+- CVE-2026-64645
 - GHSA-q4gf-8mx6-v5v3
+- GHSA-mwv6-3258-q52c
 
 ## How to Apply:
 1. Clone or download the source code for next
