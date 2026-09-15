@@ -10,6 +10,12 @@ unknown
 - CVE-2026-71871
 - CVE-2026-71869
 - CVE-2026-71867
+- CVE-2026-72716
+- CVE-2026-62682
+- CVE-2026-71864
+- CVE-2026-71868
+- CVE-2026-72717
+- CVE-2026-71865
 
 ## How to Apply:
 1. Clone or download the source code for orval

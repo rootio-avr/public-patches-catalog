@@ -412,3 +412,513 @@
 +does not define `getKey`.
 +
 +Remediation belongs on `@orval/core`.
+
+--- a/packages/core/src/utils/string.ts
++++ b/packages/core/src/utils/string.ts
+@@ -152,6 +152,25 @@
+   str?.replace(char, `\\${char}`);
+ 
+ /**
++ * Escape a spec-controlled string so it can be safely embedded inside a
++ * generated backtick template literal without allowing code injection.
++ *
++ * Neutralizes the three characters that are special inside a template literal:
++ *  - `\`  (backslash)  -> `\\`
++ *  - `` ` `` (backtick) -> `` \` ``
++ *  - `${` (interpolation start) -> `\${`
++ *
++ * Backslash MUST be escaped first so the escapes added afterwards are not
++ * themselves re-escaped. This is intentionally NOT idempotent, so callers must
++ * escape a raw value exactly once.
++ */
++export const jsTemplateLiteralEscape = (input: string): string =>
++  input
++    .replaceAll('\\', '\\\\')
++    .replaceAll('`', '\\`')
++    .replaceAll('${', '\\${');
++
++/**
+  * Escape all characters not included in SingleStringCharacters and
+  * DoubleStringCharacters on
+  * http://www.ecma-international.org/ecma-262/5.1/#sec-7.8.4
+--- a/packages/core/src/getters/route.ts
++++ b/packages/core/src/getters/route.ts
+@@ -1,16 +1,31 @@
+ import type { ServerObject } from 'openapi3-ts/oas31';
+ 
+-import { TEMPLATE_TAG_REGEX } from '../constants';
+ import type { BaseUrlFromConstant, BaseUrlFromSpec } from '../types';
+-import { camel, sanitize } from '../utils';
++import { camel, jsTemplateLiteralEscape, sanitize } from '../utils';
+ 
+-const TEMPLATE_TAG_IN_PATH_REGEX = /\/([\w]+)(?:\$\{)/g; // all dynamic parts of path
+-
+ const hasParam = (path: string): boolean => /[^{]*{[\w*_-]*}.*/.test(path);
+ 
++// Escape a static, spec-controlled path segment so it cannot break out of the
++// generated backtick template literal (CVE-2026-72716 / GHSA-p4cg-3328-rvfg).
++const esc = (str: string): string => jsTemplateLiteralEscape(str);
++
+ const getRoutePath = (path: string): string => {
++  // Don't treat ${...} as an OpenAPI path param — the $ makes it literal text,
++  // not a {param} template. Escape the ${...} block and continue processing
++  // any legitimate {param} segments after it.
++  const braceIdx = path.indexOf('{');
++  if (braceIdx > 0 && path[braceIdx - 1] === '$') {
++    const closeIdx = path.indexOf('}', braceIdx);
++    if (closeIdx === -1) return esc(path);
++    const before = esc(path.slice(0, closeIdx + 1));
++    const rest = path.slice(closeIdx + 1);
++    return hasParam(rest)
++      ? `${before}${getRoutePath(rest)}`
++      : `${before}${esc(rest)}`;
++  }
++
+   const matches = /([^{]*){?([\w*_-]*)}?(.*)/.exec(path);
+-  if (!matches?.length) return path; // impossible due to regexp grouping here, but for TS
++  if (!matches?.length) return esc(path); // impossible due to regexp grouping here, but for TS
+ 
+   const prev = matches[1];
+   const param = sanitize(camel(matches[2]), {
+@@ -19,13 +34,17 @@
+     dash: true,
+     dot: true,
+   });
+-  const next = hasParam(matches[3]) ? getRoutePath(matches[3]) : matches[3];
++  const rest = matches[3];
++  const next = hasParam(rest) ? getRoutePath(rest) : esc(rest);
+ 
+   return hasParam(path)
+-    ? `${prev}\${${param}}${next}`
+-    : `${prev}${param}${next}`;
++    ? `${esc(prev)}\${${param}}${next}`
++    : `${esc(prev)}${param}${next}`;
+ };
+ 
++// Converts an OpenAPI path (`{param}`) to a template-literal route (`${param}`),
++// escaping static segments so spec-controlled text is safe inside a backtick
++// string. The `route` arg must be a raw OpenAPI path.
+ export const getRoute = (route: string) => {
+   const splittedRoute = route.split('/');
+ 
+@@ -35,13 +54,18 @@
+     }
+ 
+     if (!path.includes('{')) {
+-      return `${acc}/${path}`;
++      return `${acc}/${esc(path)}`;
+     }
+ 
+     return `${acc}/${getRoutePath(path)}`;
+   }, '');
+ };
+ 
++// Prepends a base URL to an already-processed route.
++//
++// `route` is the output of `getRoute` (already escaped for template literals),
++// so it is NOT re-escaped here (the escaping is not idempotent). Only the
++// spec-controlled server URL is escaped, after variable substitution.
+ export const getFullRoute = (
+   route: string,
+   servers: ServerObject[] | undefined,
+@@ -60,7 +84,7 @@
+         Math.min(baseUrl.index ?? 0, servers.length - 1),
+       );
+       if (!server) return '';
+-      if (!server.variables) return server.url;
++      if (!server.variables) return esc(server.url);
+ 
+       let url = server.url;
+       const variables = baseUrl.variables;
+@@ -80,7 +104,7 @@
+           url = url.replaceAll(`{${variableKey}}`, String(variable.default));
+         }
+       }
+-      return url;
++      return esc(url);
+     }
+     return baseUrl.baseUrl;
+   };
+@@ -99,12 +123,21 @@
+ // Creates a mixed use array with path variables and string from template string route
+ export const getRouteAsArray = (route: string): string =>
+   route
+-    .replaceAll(TEMPLATE_TAG_IN_PATH_REGEX, '/$1/${')
+     .split('/')
+     .filter((i) => i !== '')
+-    .map((i) =>
+-      // @note - array is mixed with string and var
+-      i.includes('${') ? i.replace(TEMPLATE_TAG_REGEX, '$1') : `'${i}'`,
+-    )
+-    .join(',')
+-    .replace(',,', '');
++    .flatMap((segment) => {
++      if (!segment.includes('${')) {
++        // @note - array is mixed with string and var
++        return [`'${segment.replaceAll("'", "\\'")}'`];
++      }
++      // Split by template tags, keeping the delimiters.
++      // (?<!\\) prevents matching \${...} (escaped) as a live template tag.
++      return segment
++        .split(/(?<!\\)(\$\{.+?\})/g)
++        .filter(Boolean)
++        .map((part) => {
++          const match = /^(?<!\\)\$\{(.+?)\}$/.exec(part);
++          return match ? match[1] : `'${part.replaceAll("'", "\\'")}'`;
++        });
++    })
++    .join(',');
+--- a/packages/core/src/getters/keys.ts
++++ b/packages/core/src/getters/keys.ts
+@@ -1,5 +1,10 @@
+ import { keyword } from 'esutils';
+ 
++import { jsStringEscape } from '../utils';
++
+ export const getKey = (key: string) => {
+-  return keyword.isIdentifierNameES5(key) ? key : `'${key}'`;
++  // Escape the key before wrapping in single quotes so a spec-controlled
++  // property name cannot break out of the string literal and inject code
++  // (CVE-2026-72716 / GHSA-2w86-xfrc-g85r).
++  return keyword.isIdentifierNameES5(key) ? key : `'${jsStringEscape(key)}'`;
+ };
+--- /dev/null
++++ b/packages/core/src/getters/keys.test.ts
+@@ -0,0 +1,32 @@
++import { describe, expect, it } from 'vitest';
++
++import { getKey } from './keys';
++
++describe('getKey getter', () => {
++  it('returns a valid ES5 identifier unquoted', () => {
++    expect(getKey('validName')).toBe('validName');
++    expect(getKey('_private')).toBe('_private');
++    expect(getKey('$dollar')).toBe('$dollar');
++  });
++
++  it('single-quotes a non-identifier key', () => {
++    expect(getKey('with-dash')).toBe("'with-dash'");
++    expect(getKey('123')).toBe("'123'");
++  });
++
++  // Regression test for CVE-2026-72716 / GHSA-2w86-xfrc-g85r:
++  // a spec-controlled property name wrapped in single quotes must be escaped
++  // so it cannot break out of the string literal and inject code.
++  describe('single-quote injection (CVE-2026-72716)', () => {
++    it("escapes a single quote so the key can't break out", () => {
++      const result = getKey("evil'+process.exit(1)+'");
++      expect(result).not.toBe("'evil'+process.exit(1)+''");
++      // The inner single quotes must be backslash-escaped.
++      expect(result).toBe("'evil\\'+process.exit(1)+\\''");
++    });
++
++    it('escapes a backslash in the key', () => {
++      expect(getKey('a\\b')).toBe("'a\\\\b'");
++    });
++  });
++});
+--- a/packages/core/src/getters/route.test.ts
++++ b/packages/core/src/getters/route.test.ts
+@@ -177,3 +177,68 @@
+     expect(getRouteAsArray(input)).toEqual(output);
+   });
+ });
++
++// Regression tests for CVE-2026-72716 / GHSA-p4cg-3328-rvfg:
++// spec-controlled path segments and server URLs must be neutralized so they
++// cannot break out of the generated backtick template literal and inject code.
++describe('getRoute template-literal injection (CVE-2026-72716)', () => {
++  it('escapes a backtick in a static path segment', () => {
++    const result = getRoute('/api/`+process.exit(1)+`/users');
++    expect(result).not.toContain('`+process.exit(1)+`');
++    expect(result).toBe('/api/\\`+process.exit(1)+\\`/users');
++  });
++
++  it('escapes a ${...} interpolation embedded in a static segment', () => {
++    const result = getRoute('/api/${globalThis.process.exit(1)}/users');
++    // The literal ${...} must be escaped (backslash before $) so it is not
++    // evaluated when the generated module is imported.
++    expect(result).toContain('\\${globalThis.process.exit(1)}');
++  });
++
++  it('still converts genuine {param} segments after an escaped ${...}', () => {
++    const result = getRoute('/api/${evil}/{id}');
++    expect(result).toContain('\\${evil}');
++    expect(result).toContain('${id}');
++  });
++
++  it('escapes a backslash in a static segment', () => {
++    const result = getRoute('/api/a\\b/users');
++    expect(result).toBe('/api/a\\\\b/users');
++  });
++});
++
++describe('getFullRoute server URL injection (CVE-2026-72716)', () => {
++  it('escapes a backtick/${} in a spec server url with no variables', () => {
++    const servers: ServerObject[] = [
++      { url: 'https://`+process.exit(1)+`.example.com/${evil}' },
++    ];
++    const result = getFullRoute('/path', servers, {
++      getBaseUrlFromSpecification: true,
++    } as BaseUrlFromSpec);
++    expect(result).not.toContain('`+process.exit(1)+`');
++    expect(result).toContain('\\`+process.exit(1)+\\`');
++    expect(result).toContain('\\${evil}');
++  });
++
++  it('escapes injection in a spec server url after variable substitution', () => {
++    const servers: ServerObject[] = [
++      {
++        url: 'https://{environment}.example.com/${evil}',
++        variables: { environment: { default: '`+bad+`' } },
++      },
++    ];
++    const result = getFullRoute('/path', servers, {
++      getBaseUrlFromSpecification: true,
++    } as BaseUrlFromSpec);
++    expect(result).not.toContain('`+bad+`');
++    expect(result).toContain('\\${evil}');
++  });
++});
++
++describe('getRouteAsArray injection (CVE-2026-72716)', () => {
++  it("escapes single quotes so a static segment can't break out", () => {
++    const result = getRouteAsArray("/a'+process.exit(1)+'/b");
++    expect(result).not.toContain("'a'+process.exit(1)+'");
++    expect(result).toBe("'a\\'+process.exit(1)+\\'','b'");
++  });
++});
+--- a/packages/zod/src/index.ts
++++ b/packages/zod/src/index.ts
+@@ -189,31 +189,40 @@
+       context.output.override.useDates;
+ 
+     if (isDateType) {
+-      defaultValue = `new Date("${escape(schema.default)}")`;
++      // JSON.stringify safely quotes/escapes the spec-controlled default so it
++      // cannot break out of the string literal (CVE-2026-72716).
++      defaultValue = `new Date(${JSON.stringify(schema.default)})`;
+     } else if (isObject(schema.default)) {
+       const entries = Object.entries(schema.default)
+         .map(([key, value]) => {
++          // Escape both the key and string values so a spec-controlled
++          // property name/value cannot inject code (CVE-2026-72716).
++          const safeKey = JSON.stringify(key);
+           if (isString(value)) {
+-            return `${key}: "${escape(value)}"`;
++            return `${safeKey}: ${JSON.stringify(value)}`;
+           }
+ 
+           if (Array.isArray(value)) {
+             const arrayItems = value.map((item) =>
+-              isString(item) ? `"${escape(item)}"` : `${item}`,
++              isString(item) ? JSON.stringify(item) : `${item}`,
+             );
+-            return `${key}: [${arrayItems.join(', ')}]`;
++            return `${safeKey}: [${arrayItems.join(', ')}]`;
+           }
+ 
+-          return `${key}: ${value}`;
++          return `${safeKey}: ${value}`;
+         })
+         .join(', ');
+       defaultValue = `{ ${entries} }`;
++    } else if (isString(schema.default)) {
++      defaultValue = JSON.stringify(schema.default);
++    } else if (Array.isArray(schema.default)) {
++      const arrayItems = schema.default.map((item) =>
++        isString(item) ? JSON.stringify(item) : `${item}`,
++      );
++      defaultValue = `[${arrayItems.join(', ')}]`;
+     } else {
+       const rawStringified = stringify(schema.default);
+-      defaultValue =
+-        rawStringified === undefined
+-          ? 'null'
+-          : rawStringified.replaceAll("'", '"');
++      defaultValue = rawStringified === undefined ? 'null' : rawStringified;
+     }
+     consts.push(`export const ${defaultVarName} = ${defaultValue};`);
+   }
+@@ -633,7 +642,10 @@
+       .map(parseProperty)
+       .join('');
+     consts += (schema as ZodValidationSchemaDefinition).consts.join('\n');
+-    return `  "${key}": ${value.startsWith('.') ? 'zod' : ''}${value}`;
++    // JSON.stringify safely quotes/escapes the spec-controlled property name so
++    // it cannot break out of the object-key string and inject code
++    // (CVE-2026-72716).
++    return `  ${JSON.stringify(key)}: ${value.startsWith('.') ? 'zod' : ''}${value}`;
+   })
+   .join(',\n')}
+ })`;
+--- a/packages/zod/src/zod.test.ts
++++ b/packages/zod/src/zod.test.ts
+@@ -604,7 +604,7 @@
+           ['default', 'testObjectDefaultDefault'],
+         ],
+         consts: [
+-          'export const testObjectDefaultDefault = { name: "Fluffy", age: 3 };',
++          'export const testObjectDefaultDefault = { "name": "Fluffy", "age": 3 };',
+         ],
+       });
+ 
+@@ -619,7 +619,7 @@
+         'zod.object({\n  "name": zod.string().optional(),\n  "age": zod.number().optional()\n}).default(testObjectDefaultDefault)',
+       );
+       expect(parsed.consts).toBe(
+-        'export const testObjectDefaultDefault = { name: "Fluffy", age: 3 };',
++        'export const testObjectDefaultDefault = { "name": "Fluffy", "age": 3 };',
+       );
+     });
+ 
+@@ -1768,6 +1768,93 @@
+ 
+     expect(result.implementation).toBe(
+       'export const testBody = zod.object({\n  "type": zod.literal("WILD").optional()\n})\n\n',
++    );
++  });
++});
++
++// Regression tests for CVE-2026-72716 / GHSA-p4cg-3328-rvfg:
++// spec-controlled object keys and string defaults must be neutralized so they
++// cannot break out of the generated string/object-key literal and inject code.
++describe('zod injection hardening (CVE-2026-72716)', () => {
++  const context: ContextSpecs = {
++    output: {
++      override: {
++        useDates: false,
++      },
++    },
++  } as ContextSpecs;
++
++  it('escapes a malicious object property name via JSON.stringify', () => {
++    const malicious = '"]: (() => process.exit(1))(), ["x';
++    const schema: ZodValidationSchemaDefinition = {
++      functions: [
++        [
++          'object',
++          {
++            [malicious]: {
++              functions: [['string', undefined]],
++              consts: [],
++            },
++          },
++        ],
++      ],
++      consts: [],
++    };
++
++    const parsed = parseZodValidationSchemaDefinition(
++      schema,
++      context,
++      false,
++      false,
++      false,
++    );
++
++    // The key must be emitted as a single JSON.stringify-escaped string, not as
++    // a raw `"..."` that lets the double quote break out of the key.
++    expect(parsed.zod).toContain(`${JSON.stringify(malicious)}: zod.string()`);
++    expect(parsed.zod).not.toContain('(() => process.exit(1))(),');
++  });
++
++  it('escapes a malicious string default via JSON.stringify', () => {
++    const result = generateZodValidationSchemaDefinition(
++      {
++        type: 'string',
++        default: '`+(process.exit(1))+`',
++      } as SchemaObject,
++      context,
++      'evilStringDefault',
++      false,
++      false,
++      { required: false },
++    );
++
++    const constLine = result.consts.join('\n');
++    expect(constLine).toContain(
++      `export const evilStringDefaultDefault = ${JSON.stringify(
++        '`+(process.exit(1))+`',
++      )};`,
++    );
++    expect(constLine).not.toContain('= `+(process.exit(1))+`;');
++  });
++
++  it('escapes malicious object-default keys via JSON.stringify', () => {
++    const result = generateZodValidationSchemaDefinition(
++      {
++        type: 'object',
++        properties: { safe: { type: 'string' } },
++        default: { '": (()=>process.exit(1))(), "x': 'v' },
++      } as SchemaObject,
++      context,
++      'evilObjectDefault',
++      false,
++      false,
++      { required: false },
++    );
++
++    const constLine = result.consts.join('\n');
++    expect(constLine).not.toContain('(()=>process.exit(1))(),');
++    expect(constLine).toContain(
++      JSON.stringify('": (()=>process.exit(1))(), "x'),
+     );
+   });
+ });
+
+--- /dev/null
++++ b/packages/orval/cve-notes/CVE-2026-62682.md
+@@ -0,0 +1,8 @@
++# CVE-2026-62682
++
++getKey single-quote escaping, getRoute/getFullRoute/getRouteAsArray
++template-literal escaping, and JSON.stringify for generated zod object
++keys / defaults are applied by CVE-2026-72716.
++
++The supplied source patch cannot apply after that commit because it
++targets the same files with overlapping hunks.
+
+--- /dev/null
++++ b/packages/orval/cve-notes/CVE-2026-71864.md
+@@ -0,0 +1,7 @@
++# CVE-2026-71864
++
++Object / property-key injection in generated `zod.object({...})` is
++fixed by CVE-2026-72716 (`JSON.stringify(key)` in
++`packages/zod/src/index.ts`).
++
++The supplied dist/index.js patch is not used: this unit is source-based.
+
+--- /dev/null
++++ b/packages/orval/cve-notes/CVE-2026-71868.md
+@@ -0,0 +1,6 @@
++# CVE-2026-71868
++
++Spec-controlled zod `default` values (string, array, date, and object
++string fields) are emitted with `JSON.stringify` by CVE-2026-72716.
++
++The supplied packages/zod hunks cannot apply after that overlapping fix.
+
+--- /dev/null
++++ b/packages/orval/cve-notes/CVE-2026-72717.md
+@@ -0,0 +1,8 @@
++# CVE-2026-72717
++
++Object-key and default-value injection in generated zod code is
++applied by CVE-2026-72716 using `JSON.stringify` (double-quoted
++literals) rather than adding a `jsesc` dependency.
++
++The supplied jsesc-based patch cannot apply after that overlapping
++fix, and the JSON.stringify emission keeps `${` / backtick inert.
+
+--- /dev/null
++++ b/packages/orval/cve-notes/CVE-2026-71865.md
+@@ -0,0 +1,7 @@
++# CVE-2026-71865
++
++Route / getKey / zod-default escaping is applied by CVE-2026-72716
++(`jsTemplateLiteralEscape` in getRoute/getFullRoute/getRouteAsArray,
++`jsStringEscape` in getKey, and `JSON.stringify` in packages/zod).
++
++The supplied overlapping source patch cannot apply after that commit.
