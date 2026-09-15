@@ -4,6 +4,7 @@ This patch is based on immutable version 3.8.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-59879
 - CVE-2026-59880
 
 ## How to Apply:
