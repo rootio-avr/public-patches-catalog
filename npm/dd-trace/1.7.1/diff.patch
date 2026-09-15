@@ -1,0 +1,151 @@
+--- a/packages/dd-trace/src/opentracing/propagation/text_map.js
++++ b/packages/dd-trace/src/opentracing/propagation/text_map.js
+@@ -27,6 +27,21 @@ const ddKeys = [traceKey, spanKey, samplingKey, originKey]
+ const b3Keys = [b3TraceKey, b3SpanKey, b3ParentKey, b3SampledKey, b3FlagsKey, b3HeaderKey]
+ const logKeys = ddKeys.concat(b3Keys)
+ 
++// CVE-2026-50272 (CWE-770): cap the number and total byte size of baggage
++// items accepted when extracting from an incoming carrier, mirroring the
++// DD_TRACE_BAGGAGE_MAX_ITEMS / DD_TRACE_BAGGAGE_MAX_BYTES limits that are
++// otherwise only applied on injection. Without these caps a remote,
++// unauthenticated attacker can supply an excessive number/size of
++// ot-baggage-* headers, causing unbounded per-item processing and resource
++// exhaustion during extraction.
++function baggageLimit (envName, fallback) {
++  const raw = parseInt(process.env[envName], 10)
++  return Number.isInteger(raw) && raw >= 0 ? raw : fallback
++}
++
++const baggageMaxItems = baggageLimit('DD_TRACE_BAGGAGE_MAX_ITEMS', 64)
++const baggageMaxBytes = baggageLimit('DD_TRACE_BAGGAGE_MAX_BYTES', 8192)
++
+ class TextMapPropagator {
+   constructor (config) {
+     this._config = config
+@@ -224,13 +239,42 @@ class TextMapPropagator {
+   }
+ 
+   _extractBaggageItems (carrier, spanContext) {
++    let itemCount = 0
++    let byteCount = 0
++    let capped = false
++
+     Object.keys(carrier).forEach(key => {
++      if (capped) return
++
+       const match = key.match(baggageExpr)
+ 
+       if (match) {
+-        spanContext._baggageItems[match[1]] = carrier[key]
++        // CVE-2026-50272 (CWE-770): enforce item-count and byte-size caps on
++        // extracted baggage so a malicious carrier cannot force unbounded
++        // per-item processing / memory growth.
++        if (itemCount >= baggageMaxItems) {
++          capped = true
++          return
++        }
++
++        const value = carrier[key]
++        const entryBytes = Buffer.byteLength(String(match[1]), 'utf8') +
++          Buffer.byteLength(String(value), 'utf8')
++
++        if (byteCount + entryBytes > baggageMaxBytes) {
++          capped = true
++          return
++        }
++
++        spanContext._baggageItems[match[1]] = value
++        itemCount += 1
++        byteCount += entryBytes
+       }
+     })
++
++    if (capped) {
++      log.debug(() => 'Dropped baggage items exceeding DD_TRACE_BAGGAGE_MAX_ITEMS/DD_TRACE_BAGGAGE_MAX_BYTES during extraction.')
++    }
+   }
+ 
+   _extractSamplingPriority (carrier, spanContext) {
+--- /dev/null
++++ b/packages/dd-trace/test/opentracing/propagation/text_map_cve_2026_50272.spec.js
+@@ -0,0 +1,80 @@
++'use strict'
++
++// Regression test for CVE-2026-50272 (CWE-770): the baggage extraction path
++// (TextMapPropagator._extractBaggageItems) must enforce the
++// DD_TRACE_BAGGAGE_MAX_ITEMS / DD_TRACE_BAGGAGE_MAX_BYTES caps so a malicious
++// carrier with an excessive number/size of ot-baggage-* headers cannot cause
++// unbounded per-item processing and resource exhaustion.
++
++describe('TextMapPropagator baggage extraction caps (CVE-2026-50272)', () => {
++  const propagationModulePath = require.resolve('../../../src/opentracing/propagation/text_map')
++
++  let TextMapPropagator
++  let propagator
++
++  const baseCarrier = {
++    'x-datadog-trace-id': '123',
++    'x-datadog-parent-id': '18446744073709551160'
++  }
++
++  function loadPropagator () {
++    delete require.cache[propagationModulePath]
++    TextMapPropagator = require('../../../src/opentracing/propagation/text_map')
++    propagator = new TextMapPropagator({ experimental: { b3: false } })
++  }
++
++  afterEach(() => {
++    delete process.env.DD_TRACE_BAGGAGE_MAX_ITEMS
++    delete process.env.DD_TRACE_BAGGAGE_MAX_BYTES
++    delete require.cache[propagationModulePath]
++  })
++
++  it('caps the number of extracted baggage items at DD_TRACE_BAGGAGE_MAX_ITEMS', () => {
++    process.env.DD_TRACE_BAGGAGE_MAX_ITEMS = '5'
++    process.env.DD_TRACE_BAGGAGE_MAX_BYTES = '1000000'
++    loadPropagator()
++
++    const carrier = Object.assign({}, baseCarrier)
++    for (let i = 0; i < 1000; i++) {
++      carrier[`ot-baggage-k${i}`] = `v${i}`
++    }
++
++    const spanContext = propagator.extract(carrier)
++    const items = Object.keys(spanContext._baggageItems)
++
++    // Must not accept all 1000 attacker-supplied items.
++    expect(items.length).to.equal(5)
++  })
++
++  it('caps the total byte size of extracted baggage at DD_TRACE_BAGGAGE_MAX_BYTES', () => {
++    process.env.DD_TRACE_BAGGAGE_MAX_ITEMS = '1000000'
++    process.env.DD_TRACE_BAGGAGE_MAX_BYTES = '50'
++    loadPropagator()
++
++    const carrier = Object.assign({}, baseCarrier)
++    for (let i = 0; i < 1000; i++) {
++      carrier[`ot-baggage-key${i}`] = 'x'.repeat(20)
++    }
++
++    const spanContext = propagator.extract(carrier)
++    const items = Object.keys(spanContext._baggageItems)
++
++    // Byte budget of 50 admits only a couple of small entries, never all 1000.
++    expect(items.length).to.be.greaterThan(0)
++    expect(items.length).to.be.lessThan(5)
++  })
++
++  it('still extracts legitimately sized baggage unchanged', () => {
++    loadPropagator()
++
++    const carrier = Object.assign({}, baseCarrier, {
++      'ot-baggage-foo': 'bar',
++      'ot-baggage-hello': 'world'
++    })
++
++    const spanContext = propagator.extract(carrier)
++
++    expect(spanContext._baggageItems).to.have.property('foo', 'bar')
++    expect(spanContext._baggageItems).to.have.property('hello', 'world')
++  })
++})
