@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-169371
+- CVE-2024-4367
 
 ## How to Apply:
 1. Clone or download the source code for pdfjs-dist
