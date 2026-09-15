@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2024-51479
 - CVE-2026-64645
+- CVE-2026-64641
 - GHSA-q4gf-8mx6-v5v3
 - GHSA-mwv6-3258-q52c
 
