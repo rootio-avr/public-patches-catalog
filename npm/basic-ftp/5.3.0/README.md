@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-424618
+- CVE-2026-44240
 
 ## How to Apply:
 1. Clone or download the source code for basic-ftp
