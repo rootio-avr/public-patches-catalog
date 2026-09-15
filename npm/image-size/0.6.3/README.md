@@ -4,6 +4,7 @@ This patch is based on image-size version 0.6.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2025-71329
 - CVE-2025-71330
 
 ## How to Apply:
