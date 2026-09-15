@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - GHSA-2p49-hgcm-8545
 - CVE-2026-73650
+- AIKIDO-2026-858273
 
 ## How to Apply:
 1. Clone or download the source code for svgo
