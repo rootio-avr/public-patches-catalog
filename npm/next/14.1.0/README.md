@@ -16,6 +16,8 @@ unknown
 - GHSA-5j59-xgg2-r9c4
 - GHSA-mwv6-3258-q52c
 - GHSA-8h8q-6873-q5fj
+- GHSA-h25m-26qc-wcjf
+- CVE-2025-29927
 
 ## How to Apply:
 1. Clone or download the source code for next
