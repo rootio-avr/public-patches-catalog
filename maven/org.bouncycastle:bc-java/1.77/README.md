@@ -4,13 +4,18 @@ This patch is based on org.bouncycastle:bc-java version 1.77, which is available
 unknown
 
 ## Affected CVEs:
-- CVE-2026-5588
-- CVE-2025-8916
-- CVE-2026-59639
-- CVE-2026-12802
-- CVE-2026-59642
+- CVE-2024-29857
+- CVE-2024-30171
+- CVE-2024-30172
+- CVE-2024-34447
 - CVE-2025-14813
+- CVE-2025-8885
+- CVE-2025-8916
 - CVE-2026-0636
+- CVE-2026-12802
+- CVE-2026-5588
+- CVE-2026-59639
+- CVE-2026-59642
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-java
