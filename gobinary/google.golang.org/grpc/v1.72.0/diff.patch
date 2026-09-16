@@ -603,3 +603,251 @@
 +		}
  	}
  }
+
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -527,6 +527,19 @@ func (t *http2Server) operateHeaders(ctx context.Context, frame *http2.MetaHeade
+ 		delete(mdata, "host")
+ 	}
+ 
++	// If :authority is still missing, i.e. no host or :authority header is
++	// present, reject the request as invalid.
++	if len(mdata[":authority"]) == 0 {
++		t.controlBuf.put(&earlyAbortStream{
++			httpStatus:     http.StatusBadRequest,
++			streamID:       streamID,
++			contentSubtype: s.contentSubtype,
++			status:         status.New(codes.Internal, "no host or :authority header present"),
++			rst:            !frame.StreamEnded(),
++		})
++		return nil
++	}
++
+ 	if frame.StreamEnded() {
+ 		// s is just created by the caller. No lock needed.
+ 		s.state = streamReadDone
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -2016,6 +2016,22 @@ func (s) TestHeadersHTTPStatusGRPCStatus(t *testing.T) {
+ 			grpcStatusWant:  "13",
+ 			grpcMessageWant: "both must only have 1 value as per HTTP/2 spec",
+ 		},
++		// If neither :authority nor host header is present on a gRPC request, the
++		// request should be rejected with HTTP Status 400 and gRPC status Internal.
++		{
++			name: "Missing authority and host header grpc",
++			headers: []struct {
++				name   string
++				values []string
++			}{
++				{name: ":method", values: []string{"POST"}},
++				{name: ":path", values: []string{"foo"}},
++				{name: "content-type", values: []string{"application/grpc"}},
++			},
++			httpStatusWant:  "400",
++			grpcStatusWant:  "13",
++			grpcMessageWant: "no host or :authority header present",
++		},
+ 		// If the client sends an HTTP/2 request with a :method header with a
+ 		// value other than POST, as specified in the gRPC over HTTP/2
+ 		// specification, the server should fail the RPC.
+--- a/test/end2end_test.go
++++ b/test/end2end_test.go
+@@ -5974,18 +5974,6 @@ func (s) TestAuthorityHeader(t *testing.T) {
+ 			},
+ 			wantAuthority: "localhost",
+ 		},
+-		{
+-			name: "Missing :authority and host",
+-			// Codepath triggered by incoming headers with no :authority and no
+-			// host.
+-			headers: []string{
+-				":method", "POST",
+-				":path", "/grpc.testing.TestService/UnaryCall",
+-				"content-type", "application/grpc",
+-				"te", "trailers",
+-			},
+-			wantAuthority: "",
+-		},
+ 		// "If :authority is present, Host must be discarded." - A41
+ 		{
+ 			name: ":authority and host present",
+@@ -6048,6 +6036,73 @@ func (s) TestAuthorityHeader(t *testing.T) {
+ 	}
+ }
+ 
++// TestMissingAuthorityAndHostHeader tests that an incoming HTTP/2 request with
++// neither :authority nor host header is rejected with HTTP status 400 and gRPC
++// status Internal.
++func (s) TestMissingAuthorityAndHostHeader(t *testing.T) {
++	lis, err := net.Listen("tcp", "localhost:0")
++	if err != nil {
++		t.Fatalf("Failed to listen: %v", err)
++	}
++	defer lis.Close()
++	server := grpc.NewServer()
++	defer server.Stop()
++	go server.Serve(lis)
++
++	conn, err := net.DialTimeout("tcp", lis.Addr().String(), defaultTestTimeout)
++	if err != nil {
++		t.Fatalf("Failed to dial server: %v", err)
++	}
++	defer conn.Close()
++
++	st := newServerTesterFromConn(t, conn)
++	st.greet()
++
++	st.writeHeaders(http2.HeadersFrameParam{
++		StreamID: 1,
++		BlockFragment: st.encodeHeader(
++			":method", "POST",
++			":path", "/grpc.testing.TestService/UnaryCall",
++			"content-type", "application/grpc",
++			"te", "trailers",
++		),
++		EndStream:  false,
++		EndHeaders: true,
++	})
++
++	for {
++		frame, err := st.readFrame()
++		if err != nil {
++			t.Fatalf("Error reading frame: %v", err)
++		}
++		hf, ok := frame.(*http2.MetaHeadersFrame)
++		if !ok {
++			continue
++		}
++		var httpStatus, grpcStatus, grpcMessage string
++		for _, h := range hf.Fields {
++			switch h.Name {
++			case ":status":
++				httpStatus = h.Value
++			case "grpc-status":
++				grpcStatus = h.Value
++			case "grpc-message":
++				grpcMessage = h.Value
++			}
++		}
++		if httpStatus != "400" {
++			t.Fatalf("Got HTTP status %v, want 400", httpStatus)
++		}
++		if grpcStatus != "13" {
++			t.Fatalf("Got gRPC status %v, want 13 (Internal)", grpcStatus)
++		}
++		if !strings.Contains(grpcMessage, "no host or :authority header present") {
++			t.Fatalf("Got gRPC message %q, want 'no host or :authority header present'", grpcMessage)
++		}
++		return
++	}
++}
++
+ // wrapCloseListener tracks Accepts/Closes and maintains a counter of the
+ // number of open connections.
+ type wrapCloseListener struct {
+--- a/test/servertester.go
++++ b/test/servertester.go
+@@ -275,6 +275,7 @@ func (st *serverTester) writeHeadersGRPC(streamID uint32, path string, endStream
+ 		BlockFragment: st.encodeHeader(
+ 			":method", "POST",
+ 			":path", path,
++			":authority", "localhost",
+ 			"content-type", "application/grpc",
+ 			"te", "trailers",
+ 		),
+--- a/xds/server.go
++++ b/xds/server.go
+@@ -269,8 +269,12 @@ func routeAndProcess(ctx context.Context) error {
+ 	}
+ 	// A41 added logic to the core grpc implementation to guarantee that once
+ 	// the RPC gets to this point, there will be a single, unambiguous authority
+-	// present in the header map.
++	// present in the header map. But add a defensive check to ensure the
++	// authority header is present before indexing into it.
+ 	authority := md.Get(":authority")
++	if len(authority) == 0 {
++		return rc.StatusErrWithNodeID(codes.Internal, "no :authority header present")
++	}
+ 	vh := xdsresource.FindBestMatchingVirtualHostServer(authority[0], rc.VHS)
+ 	if vh == nil {
+ 		return rc.StatusErrWithNodeID(codes.Unavailable, "the incoming RPC did not match a configured Virtual Host")
+--- /dev/null
++++ b/xds/server_routing_authority_test.go
+@@ -0,0 +1,76 @@
++/*
++ *
++ * Copyright 2026 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package xds
++
++import (
++	"context"
++	"net"
++	"strings"
++	"testing"
++
++	"google.golang.org/grpc"
++	"google.golang.org/grpc/codes"
++	"google.golang.org/grpc/internal/transport"
++	"google.golang.org/grpc/metadata"
++	"google.golang.org/grpc/status"
++	"google.golang.org/grpc/xds/internal/xdsclient/xdsresource"
++)
++
++// authorityTestConn is a fake net.Conn that also exposes a usable route
++// configuration, mirroring the interface routeAndProcess expects from the xDS
++// connection wrapper.
++type authorityTestConn struct {
++	net.Conn
++	urc xdsresource.UsableRouteConfiguration
++}
++
++func (c *authorityTestConn) UsableRouteConfiguration() xdsresource.UsableRouteConfiguration {
++	return c.urc
++}
++
++// authorityTestStream is a minimal grpc.ServerTransportStream used to supply a
++// method name to routeAndProcess.
++type authorityTestStream struct {
++	method string
++}
++
++func (s *authorityTestStream) Method() string               { return s.method }
++func (s *authorityTestStream) SetHeader(metadata.MD) error  { return nil }
++func (s *authorityTestStream) SendHeader(metadata.MD) error { return nil }
++func (s *authorityTestStream) SetTrailer(metadata.MD) error { return nil }
++
++// TestRouteAndProcessMissingAuthority verifies that routeAndProcess rejects an
++// incoming RPC whose metadata carries no :authority header instead of panicking
++// while indexing into the (empty) authority slice (CWE-129).
++func (s) TestRouteAndProcessMissingAuthority(t *testing.T) {
++	cw := &authorityTestConn{urc: xdsresource.UsableRouteConfiguration{}}
++	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
++	defer cancel()
++	ctx = transport.SetConnection(ctx, cw)
++	ctx = grpc.NewContextWithServerTransportStream(ctx, &authorityTestStream{method: "/test.Service/Method"})
++	ctx = metadata.NewIncomingContext(ctx, metadata.MD{})
++
++	err := routeAndProcess(ctx)
++	if status.Code(err) != codes.Internal {
++		t.Fatalf("routeAndProcess() returned error code %v, want %v", status.Code(err), codes.Internal)
++	}
++	if !strings.Contains(err.Error(), "no :authority header present") {
++		t.Fatalf("routeAndProcess() returned error %q, want it to contain %q", err.Error(), "no :authority header present")
++	}
++}
