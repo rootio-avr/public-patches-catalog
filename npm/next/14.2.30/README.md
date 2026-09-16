@@ -12,6 +12,8 @@ unknown
 - GHSA-8h8q-6873-q5fj
 - GHSA-h25m-26qc-wcjf
 - GHSA-q4gf-8mx6-v5v3
+- GHSA-mwv6-3258-q52c
+- CVE-2026-64645
 
 ## How to Apply:
 1. Clone or download the source code for next
