@@ -16,6 +16,7 @@ unknown
 - CVE-2025-29927
 - CVE-2026-44573
 - GHSA-5j59-xgg2-r9c4
+- GHSA-2xp9-vwfh-vxw4
 
 ## How to Apply:
 1. Clone or download the source code for next
