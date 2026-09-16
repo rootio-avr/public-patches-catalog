@@ -13,6 +13,8 @@ unknown
 - CVE-2026-71869
 - CVE-2026-72717
 - CVE-2026-62680
+- CVE-2026-62681
+- AIKIDO-2026-939997
 
 ## How to Apply:
 1. Clone or download the source code for orval
