@@ -343,3 +343,426 @@ index 0000000..7390355
 +
 +Object-key and template-literal injection hardening is applied by
 +CVE-2026-71867, CVE-2026-71866, CVE-2026-71868 and CVE-2026-62682.
+
+--- a/packages/core/src/types.ts
++++ b/packages/core/src/types.ts
+@@ -237,6 +237,25 @@ export type OutputOptions = {
+ 
+ export type SwaggerParserOptions = Omit<SwaggerParser.Options, 'validate'> & {
+   validate?: boolean;
++  /**
++   * Control how external `$ref` targets (local files or remote URLs) are
++   * resolved.
++   *
++   * By default, orval refuses to resolve any external `$ref` and prints a
++   * config snippet you can paste into your `parserOptions` (GHSA-cxq5-97v7-87j8
++   * / CVE-2026-62680).
++   */
++  externalRefs?: {
++    /**
++     * External `$ref` document targets to allow. Each entry should be the
++     * document part of the `$ref` (without the `#/...` fragment). File paths
++     * are relative to the spec file. Use `['*']` to allow all external refs.
++     *
++     * @default []
++     */
++    allow?: string[];
++    // TODO: add `deny?: string[]` when users need "allow all except X"
++  };
+ };
+ 
+ export type InputFiltersOption = {
+new file mode 100644
+--- /dev/null
++++ b/packages/orval/src/import-specs.test.ts
+@@ -0,0 +1,119 @@
++import { mkdtemp, rm, writeFile } from 'node:fs/promises';
++import os from 'node:os';
++import path from 'node:path';
++
++import * as orvalCore from '@orval/core';
++import { afterEach, describe, expect, it, vi } from 'vitest';
++
++import { importSpecs } from './import-specs';
++import { normalizeOptions } from './utils';
++
++// Regression test for GHSA-cxq5-97v7-87j8 / CVE-2026-62680.
++// External `$ref` values inside an OpenAPI spec are untrusted input. Orval must
++// refuse to resolve them by default (blocking LFI/SSRF/RFI) and only resolve
++// them when the user explicitly opts in via
++// parserOptions.externalRefs.allow.
++describe('externalRefs allow-list (CVE-2026-62680)', () => {
++  async function createExternalRefWorkspace() {
++    const workspace = await mkdtemp(path.join(os.tmpdir(), 'orval-allow-'));
++    const specPath = path.join(workspace, 'spec.yaml');
++    const externalPath = path.join(workspace, 'external.yaml');
++    const external = {
++      openapi: '3.0.2',
++      info: { title: 'ext', version: '1.0' },
++      paths: {},
++      components: { schemas: { Foo: { type: 'string' } } },
++    };
++    const spec = {
++      openapi: '3.0.2',
++      info: { title: 'main', version: '1.0' },
++      paths: {
++        '/x': {
++          get: {
++            operationId: 'getX',
++            responses: {
++              '200': {
++                description: 'ok',
++                content: {
++                  'application/json': {
++                    schema: { $ref: 'external.yaml#/components/schemas/Foo' },
++                  },
++                },
++              },
++            },
++          },
++        },
++      },
++    };
++    await writeFile(externalPath, JSON.stringify(external), 'utf8');
++    await writeFile(specPath, JSON.stringify(spec), 'utf8');
++    return { workspace, specPath };
++  }
++
++  afterEach(() => {
++    vi.restoreAllMocks();
++  });
++
++  it('blocks external $ref by default and prints a config snippet', async () => {
++    const { workspace, specPath } = await createExternalRefWorkspace();
++    try {
++      const normalizedOptions = await normalizeOptions(
++        { output: { target: '' }, input: { target: specPath } },
++        workspace,
++        {},
++      );
++      await expect(importSpecs(workspace, normalizedOptions)).rejects.toThrow(
++        /External \$ref targets are not allowed by default/,
++      );
++    } finally {
++      await rm(workspace, { recursive: true, force: true });
++    }
++  });
++
++  it('resolves external $ref when explicitly allowed', async () => {
++    const { workspace, specPath } = await createExternalRefWorkspace();
++    try {
++      const normalizedOptions = await normalizeOptions(
++        {
++          output: { target: '' },
++          input: {
++            target: specPath,
++            parserOptions: { externalRefs: { allow: ['external.yaml'] } },
++          },
++        },
++        workspace,
++        {},
++      );
++      const spec = await importSpecs(workspace, normalizedOptions);
++      expect(spec.verbOptions).toHaveProperty('getX');
++    } finally {
++      await rm(workspace, { recursive: true, force: true });
++    }
++  });
++
++  it('resolves all external $refs with wildcard and emits a warning', async () => {
++    const { workspace, specPath } = await createExternalRefWorkspace();
++    const logSpy = vi.spyOn(orvalCore, 'log').mockImplementation(() => {});
++    try {
++      const normalizedOptions = await normalizeOptions(
++        {
++          output: { target: '' },
++          input: {
++            target: specPath,
++            parserOptions: { externalRefs: { allow: ['*'] } },
++          },
++        },
++        workspace,
++        {},
++      );
++      const spec = await importSpecs(workspace, normalizedOptions);
++      expect(spec.verbOptions).toHaveProperty('getX');
++
++      const warnings = logSpy.mock.calls.map(([msg]) => msg).join('\n');
++      expect(warnings).toContain('External $ref documents being resolved');
++      expect(warnings).toContain('external.yaml');
++    } finally {
++      await rm(workspace, { recursive: true, force: true });
++    }
++  });
++});
+--- a/packages/orval/src/import-specs.ts
++++ b/packages/orval/src/import-specs.ts
+@@ -1,5 +1,8 @@
++import nodePath from 'node:path';
++
+ import SwaggerParser from '@apidevtools/swagger-parser';
+ import {
++  isObject,
+   isString,
+   isUrl,
+   log,
+@@ -14,12 +17,196 @@ import yaml from 'js-yaml';
+ 
+ import { importOpenApi } from './import-open-api';
+ 
++// ─── External ref allow-list enforcement (GHSA-cxq5-97v7-87j8 / CVE-2026-62680)
++//
++// External `$ref` values inside an OpenAPI spec are untrusted input. Left
++// unchecked, SwaggerParser.resolve()/validate() will happily fetch remote URLs
++// (SSRF/RFI) or read arbitrary local files (LFI) referenced from the spec and
++// inline their contents into the generated client. By default orval now refuses
++// to resolve any external `$ref` found in the top-level (user-provided) spec and
++// prints a pasteable config snippet. Users opt in via
++// parserOptions.externalRefs.allow — either listing specific document targets or
++// using ['*'] for the old behavior (with a warning).
++
++/**
++ * Strip the JSON pointer fragment (`#/...`) from a `$ref` value, leaving only
++ * the document target (file path or URL).
++ */
++const getRefDocument = (ref: string): string => {
++  const hashIndex = ref.indexOf('#');
++  return hashIndex === -1 ? ref : ref.slice(0, hashIndex);
++};
++
++/**
++ * Collect all external `$ref` document targets from a spec object. A `$ref` is
++ * external when it does not start with `#` (an in-document pointer). Returns
++ * deduplicated ref strings in their raw form (before fragment stripping).
++ */
++const collectExternalRefs = (obj: unknown): string[] => {
++  const refs = new Set<string>();
++  const walk = (val: unknown) => {
++    if (Array.isArray(val)) {
++      val.forEach(walk);
++      return;
++    }
++    if (isObject(val)) {
++      if ('$ref' in val && isString(val.$ref) && !val.$ref.startsWith('#')) {
++        refs.add(val.$ref);
++      }
++      Object.values(val).forEach(walk);
++    }
++  };
++  walk(obj);
++  return [...refs];
++};
++
++/**
++ * Resolve a ref document target (the part before `#`) to a canonical path or
++ * URL, so it can be compared against allow-list entries resolved the same way.
++ */
++const resolveRefTarget = (ref: string, origin?: string): string => {
++  const doc = getRefDocument(ref);
++  if (isUrl(doc)) return new URL(doc).href;
++  if (origin && isUrl(origin)) {
++    return new URL(doc, origin).href;
++  }
++  if (origin) {
++    return nodePath.resolve(nodePath.dirname(origin), doc);
++  }
++  return nodePath.resolve(doc);
++};
++
++/**
++ * Check whether a `$ref` is allowed by the user's allow-list. Both the ref and
++ * the allow-list entries are resolved against the spec origin so that
++ * `./schemas/pet.yaml` in the spec matches `./schemas/pet.yaml` in the config.
++ */
++const isAllowedRef = (
++  ref: string,
++  allowedExternalRefs: string[],
++  origin?: string,
++): boolean => {
++  const resolved = resolveRefTarget(ref, origin);
++  return allowedExternalRefs.some(
++    (entry) => resolveRefTarget(entry, origin) === resolved,
++  );
++};
++
++const formatDisallowedRefsError = (
++  disallowed: string[],
++  currentAllowed: string[],
++): string => {
++  const docs = [...new Set(disallowed.map(getRefDocument))];
++  const all = [...new Set([...currentAllowed, ...docs])];
++  const configSnippet = JSON.stringify(
++    {
++      input: {
++        parserOptions: { externalRefs: { allow: all } },
++      },
++    },
++    null,
++    2,
++  );
++  return (
++    `External $ref targets are not allowed by default.\n` +
++    `Add them to your config, or use externalRefs.allow: ['*'] to allow all.\n\n` +
++    `Disallowed refs:\n${disallowed.map((r) => `  - ${r}`).join('\n')}\n\n` +
++    `Suggested config:\n${configSnippet}`
++  );
++};
++
++/**
++ * Load the top-level spec text so we can scan it for external `$ref`s before
++ * SwaggerParser resolves them. The top-level target is trusted
++ * (user-configured `input.target`); only the `$ref` values inside the spec are
++ * untrusted.
++ */
++const loadSpecObject = async (
++  path: string,
++  _isUrl: boolean,
++): Promise<Record<string, unknown> | undefined> => {
++  let text: string;
++  if (_isUrl) {
++    const response = await fetch(path);
++    if (!response.ok) {
++      throw new Error(
++        `Failed to fetch OpenAPI spec from ${path}: ${response.status} ${response.statusText}`,
++      );
++    }
++    text = await response.text();
++  } else {
++    text = await fs.readFile(path, 'utf8');
++  }
++  const result = yaml.load(text);
++  return isObject(result) ? (result as Record<string, unknown>) : undefined;
++};
++
++/**
++ * Enforce the external `$ref` allow-list on the top-level spec before it is
++ * handed to SwaggerParser for resolution. Throws when a disallowed external
++ * `$ref` is present and the allow-list does not opt in.
++ */
++const enforceExternalRefPolicy = async (
++  path: string,
++  parserOptions: SwaggerParserOptions,
++  _isUrl: boolean,
++): Promise<void> => {
++  const allowedRefs = parserOptions?.externalRefs?.allow ?? [];
++  const isWildcard = allowedRefs.includes('*');
++
++  let specData: Record<string, unknown> | undefined;
++  try {
++    specData = await loadSpecObject(path, _isUrl);
++  } catch (error) {
++    // A fetch/HTTP failure for a remote top-level spec is a hard error; a
++    // local read/parse failure is left for SwaggerParser to report.
++    if (_isUrl) {
++      throw error;
++    }
++    return;
++  }
++
++  if (!specData) {
++    return;
++  }
++
++  const refs = collectExternalRefs(specData);
++  if (refs.length === 0) {
++    return;
++  }
++
++  if (isWildcard) {
++    const docs = [...new Set(refs.map(getRefDocument))];
++    log(
++      chalk.yellow(
++        `⚠️  External $ref documents being resolved:\n` +
++          docs.map((d) => `  - ${d}`).join('\n'),
++      ),
++    );
++    return;
++  }
++
++  const origin = path;
++  const disallowed = refs.filter(
++    (ref) => !isAllowedRef(ref, allowedRefs, origin),
++  );
++  if (disallowed.length > 0) {
++    throw new Error(formatDisallowedRefsError(disallowed, allowedRefs));
++  }
++};
++
+ const resolveSpecs = async (
+   path: string,
+-  { validate, ...options }: SwaggerParserOptions,
++  { validate, externalRefs, ...options }: SwaggerParserOptions,
+   _isUrl: boolean,
+   isOnlySchema: boolean,
+ ) => {
++  // Gate untrusted external $ref resolution before SwaggerParser fetches/reads
++  // any referenced document (GHSA-cxq5-97v7-87j8 / CVE-2026-62680). This runs
++  // outside the try/catch below so a disallowed ref aborts generation instead
++  // of silently falling back to a raw read.
++  await enforceExternalRefPolicy(path, { validate, externalRefs }, _isUrl);
++
+   try {
+     if (validate) {
+       try {
+--- a/tests/configs/default.config.ts
++++ b/tests/configs/default.config.ts
+@@ -456,12 +456,16 @@ export default defineConfig({
+         '../generated/default/multi-files-with-same-import-names/endpoints.ts',
+       schemas: '../generated/default/multi-files-with-same-import-names/model',
+     },
+-    input: '../specifications/multi-files-with-same-import-names/api.yaml',
++    input: {
++      target: '../specifications/multi-files-with-same-import-names/api.yaml',
++      parserOptions: { externalRefs: { allow: ['*'] } },
++    },
+   },
+   'external-ref': {
+     input: {
+       target: '../specifications/external-ref.yaml',
+       parserOptions: {
++        externalRefs: { allow: ['*'] },
+         resolve: {
+           external: true,
+           http: {},
+--- a/tests/configs/fetch.config.ts
++++ b/tests/configs/fetch.config.ts
+@@ -198,7 +198,10 @@ export default defineConfig({
+       schemas: '../generated/fetch/importFromSubdirectory/model',
+       client: 'fetch',
+     },
+-    input: '../specifications/import-from-subdirectory/petstore.yaml',
++    input: {
++      target: '../specifications/import-from-subdirectory/petstore.yaml',
++      parserOptions: { externalRefs: { allow: ['*'] } },
++    },
+   },
+   defaultOnlyResponse: {
+     output: {
+--- a/tests/configs/react-query.config.ts
++++ b/tests/configs/react-query.config.ts
+@@ -429,7 +429,10 @@ export default defineConfig({
+       mode: 'split',
+       mock: true,
+     },
+-    input: '../specifications/import-from-subdirectory/petstore.yaml',
++    input: {
++      target: '../specifications/import-from-subdirectory/petstore.yaml',
++      parserOptions: { externalRefs: { allow: ['*'] } },
++    },
+   },
+   deprecated: {
+     output: {
+--- a/tests/configs/zod.config.ts
++++ b/tests/configs/zod.config.ts
+@@ -167,7 +167,10 @@ export default defineConfig({
+       target: '../generated/zod/import-from-subdirectory.ts',
+       client: 'zod',
+     },
+-    input: '../specifications/import-from-subdirectory/petstore.yaml',
++    input: {
++      target: '../specifications/import-from-subdirectory/petstore.yaml',
++      parserOptions: { externalRefs: { allow: ['*'] } },
++    },
+   },
+   dateTimeOptions: {
+     output: {
