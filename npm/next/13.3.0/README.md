@@ -10,6 +10,7 @@ unknown
 - CVE-2026-44573
 - CVE-2025-29927
 - GHSA-q4gf-8mx6-v5v3
+- GHSA-h25m-26qc-wcjf
 - GHSA-mwv6-3258-q52c
 - GHSA-8h8q-6873-q5fj
 
