@@ -1,6 +1,6 @@
-# glibc : 2.36-9+deb12u14.aikido.21
+# glibc : 2.36-9+deb12u14.aikido.22
 
-This patch is based on glibc version 2.36-9+deb12u14.aikido.21, which is available at:
+This patch is based on glibc version 2.36-9+deb12u14.aikido.22, which is available at:
 https://sources.debian.org/src/glibc/2.36-9+deb12u14/
 
 ## Affected CVEs:
