@@ -7,6 +7,7 @@ unknown
 - CVE-2026-33186
 - CVE-2026-84304
 - GHSA-hrxh-6v49-42gf
+- CVE-2026-84445
 
 ## How to Apply:
 1. Clone or download the source code for google.golang.org/grpc
