@@ -10,6 +10,7 @@ unknown
 - CVE-2026-64645
 - CVE-2026-64649
 - CVE-2026-64641
+- CVE-2026-75604
 - GHSA-q4gf-8mx6-v5v3
 - GHSA-mwv6-3258-q52c
 - GHSA-h25m-26qc-wcjf
