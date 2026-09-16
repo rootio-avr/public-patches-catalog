@@ -1,6 +1,6 @@
-# curl : 8.4.0-r00071
+# curl : 8.5.0-r00072
 
-This patch is based on curl version 8.4.0-r00071, which is available at:
+This patch is based on curl version 8.5.0-r00072, which is available at:
 unknown
 
 ## Affected CVEs:
