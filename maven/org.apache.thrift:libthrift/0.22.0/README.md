@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-43869
+- CVE-2026-43871
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.thrift:libthrift
