@@ -1,0 +1,792 @@
+diff --git a/lib/make-middleware.js b/lib/make-middleware.js
+--- a/lib/make-middleware.js
++++ b/lib/make-middleware.js
+@@ -164,10 +164,14 @@ function makeMiddleware (setup) {
+     busboy.on('file', function (fieldname, fileStream, { filename, encoding, mimeType }) {
+       var pendingWritesIncremented = false
+ 
++      function decrementPendingWrites () {
++        if (!pendingWritesIncremented) return
++        pendingWritesIncremented = false
++        pendingWrites.decrement()
++      }
++
+       fileStream.on('error', function (err) {
+-        if (pendingWritesIncremented) {
+-          pendingWrites.decrement()
+-        }
++        decrementPendingWrites()
+         abortWithError(err)
+       })
+ 
+@@ -230,12 +234,12 @@ function makeMiddleware (setup) {
+           if (aborting) {
+             appender.removePlaceholder(placeholder)
+             uploadedFiles.push({ ...file, ...info })
+-            return pendingWrites.decrement()
++            return decrementPendingWrites()
+           }
+ 
+           if (err) {
+             appender.removePlaceholder(placeholder)
+-            pendingWrites.decrement()
++            decrementPendingWrites()
+             return abortWithError(err)
+           }
+ 
+@@ -243,7 +247,7 @@ function makeMiddleware (setup) {
+ 
+           appender.replacePlaceholder(placeholder, fileInfo)
+           uploadedFiles.push(fileInfo)
+-          pendingWrites.decrement()
++          decrementPendingWrites()
+           indicateDone()
+         })
+       })
+diff --git a/lib/multer-error.js b/lib/multer-error.js
+--- a/lib/multer-error.js
++++ b/lib/multer-error.js
+@@ -9,7 +9,8 @@ var errorMessages = {
+   LIMIT_FIELD_COUNT: 'Too many fields',
+   LIMIT_UNEXPECTED_FILE: 'Unexpected field',
+   MISSING_FIELD_NAME: 'Field name missing',
+-  LIMIT_FIELD_NESTING: 'Field name nesting too deep'
++  LIMIT_FIELD_NESTING: 'Field name nesting too deep',
++  STREAM_DESTROYED: 'File stream was destroyed'
+ }
+ 
+ function MulterError (code, field) {
+diff --git a/storage/disk.js b/storage/disk.js
+--- a/storage/disk.js
++++ b/storage/disk.js
+@@ -2,6 +2,12 @@ var fs = require('fs')
+ var os = require('os')
+ var path = require('path')
+ var crypto = require('crypto')
++var pipeline = require('stream').pipeline
++var MulterError = require('../lib/multer-error')
++
++// Write streams still open for a file, so _removeFile can wait for the
++// descriptor to be closed before unlinking (Windows refuses to unlink open files).
++var openStreams = new WeakMap()
+ 
+ function getFilename (req, file, cb) {
+   crypto.randomBytes(16, function (err, raw) {
+@@ -35,15 +41,17 @@ DiskStorage.prototype._handleFile = function _handleFile (req, file, cb) {
+ 
+       var finalPath = path.join(destination, filename)
+ 
+-      if (file.stream.destroyed) return
++      if (file.stream.destroyed) return cb(new MulterError('STREAM_DESTROYED'))
+ 
+       var outStream = fs.createWriteStream(finalPath)
+ 
+       file.path = finalPath
++      openStreams.set(file, outStream)
++      outStream.once('close', function () { openStreams.delete(file) })
++
++      pipeline(file.stream, outStream, function (err) {
++        if (err) return cb(err)
+ 
+-      file.stream.pipe(outStream)
+-      outStream.on('error', cb)
+-      outStream.on('finish', function () {
+         cb(null, {
+           destination: destination,
+           filename: filename,
+@@ -62,7 +70,26 @@ DiskStorage.prototype._removeFile = function _removeFile (req, file, cb) {
+   delete file.filename
+   delete file.path
+ 
+-  fs.unlink(path, cb)
++  var outStream = openStreams.get(file)
++  if (!outStream) return fs.unlink(path, cb)
++
++  // Unlink only once the descriptor has been released. `closed` is set when
++  // the descriptor is closed on every supported Node.js version, whereas
++  // 'close' is not emitted after a write stream is destroyed with an error on
++  // Node.js < 14 (emitClose defaults to false there), so wait for 'close' or
++  // 'error', whichever comes first. destroy() is a no-op if the stream is
++  // already being torn down.
++  if (outStream.closed) return fs.unlink(path, cb)
++
++  function onReleased () {
++    outStream.removeListener('close', onReleased)
++    outStream.removeListener('error', onReleased)
++    fs.unlink(path, cb)
++  }
++
++  outStream.once('close', onReleased)
++  outStream.once('error', onReleased)
++  outStream.destroy()
+ }
+ 
+ module.exports = function (opts) {
+diff --git a/test/abort-destroyed-stream-callback.js b/test/abort-destroyed-stream-callback.js
+new file mode 100644
+--- /dev/null
++++ b/test/abort-destroyed-stream-callback.js
+@@ -0,0 +1,47 @@
++/* eslint-env mocha */
++
++var stream = require('stream')
++
++var multer = require('../')
++var rimraf = require('rimraf')
++var temp = require('fs-temp')
++
++// @see https://github.com/expressjs/multer/security/advisories/GHSA-qfvm-cv95-jqjf
++
++describe('disk storage _handleFile with an already-destroyed source stream', function () {
++  var uploadDir
++
++  beforeEach(function (done) {
++    temp.mkdir(function (err, dir) {
++      if (err) return done(err)
++      uploadDir = dir
++      done()
++    })
++  })
++
++  afterEach(function (done) {
++    rimraf(uploadDir, done)
++  })
++
++  it('should always invoke the callback', function (done) {
++    this.timeout(2000)
++
++    var storage = multer.diskStorage({ destination: uploadDir })
++
++    var source = new stream.PassThrough()
++    source.destroy()
++
++    var file = {
++      fieldname: 'file',
++      originalname: 'destroyed.bin',
++      stream: source
++    }
++
++    // If the callback is never invoked (the pre-write guard returning without
++    // settling), mocha fails this test with a timeout. A double invocation is
++    // caught by mocha's "done() called multiple times".
++    storage._handleFile({}, file, function () {
++      done()
++    })
++  })
++})
+diff --git a/test/abort-fd-leak.js b/test/abort-fd-leak.js
+new file mode 100644
+--- /dev/null
++++ b/test/abort-fd-leak.js
+@@ -0,0 +1,133 @@
++/* eslint-env mocha */
++
++var assert = require('assert')
++var fs = require('fs')
++var path = require('path')
++var http = require('http')
++
++var express = require('express')
++var multer = require('../')
++var rimraf = require('rimraf')
++var temp = require('fs-temp')
++
++// @see https://github.com/expressjs/multer/security/advisories/GHSA-qfvm-cv95-jqjf
++
++// Count open file descriptors that point at a now-deleted file inside `dir`.
++// Linux exposes these via /proc/self/fd as symlinks whose target ends with
++// " (deleted)". Returns -1 when /proc/self/fd is unavailable (non-Linux).
++function countLeakedFds (dir) {
++  var fdDir = '/proc/self/fd'
++  var entries
++
++  try {
++    entries = fs.readdirSync(fdDir)
++  } catch (e) {
++    return -1
++  }
++
++  var leaked = 0
++
++  for (var i = 0; i < entries.length; i++) {
++    var target
++
++    try {
++      target = fs.readlinkSync(path.join(fdDir, entries[i]))
++    } catch (e) {
++      continue
++    }
++
++    if (target.indexOf(dir) === 0 && / \(deleted\)$/.test(target)) {
++      leaked++
++    }
++  }
++
++  return leaked
++}
++
++describe('file descriptor leak on aborted uploads', function () {
++  var uploadDir, server, port
++
++  beforeEach(function (done) {
++    temp.mkdir(function (err, dir) {
++      if (err) return done(err)
++
++      uploadDir = dir
++      var upload = multer({ dest: dir })
++      var app = express()
++
++      app.post('/upload', upload.single('file'), function (req, res) {
++        res.json({ success: true })
++      })
++
++      app.use(function (err, req, res, next) {
++        res.status(400).json({ error: err.message || err.code })
++      })
++
++      server = app.listen(0, function () {
++        port = server.address().port
++        done()
++      })
++    })
++  })
++
++  afterEach(function (done) {
++    server.close(function () {
++      rimraf(uploadDir, done)
++    })
++  })
++
++  it('should not leak file descriptors when uploads abort mid-write', function (done) {
++    this.timeout(20000)
++
++    if (countLeakedFds(uploadDir) === -1) return this.skip()
++
++    var attempts = 15
++
++    function abortOnce (next) {
++      var boundary = 'FdLeakBound' + Date.now() + Math.random().toString(16).slice(2)
++      var preamble =
++        '--' + boundary + '\r\n' +
++        'Content-Disposition: form-data; name="file"; filename="leak.bin"\r\n' +
++        'Content-Type: application/octet-stream\r\n\r\n'
++      var chunk = Buffer.alloc(64 * 1024, 0x5a)
++
++      var req = http.request({
++        hostname: 'localhost',
++        port: port,
++        path: '/upload',
++        method: 'POST',
++        headers: {
++          'Content-Type': 'multipart/form-data; boundary=' + boundary,
++          'Content-Length': Buffer.byteLength(preamble) + (chunk.length * 10)
++        }
++      })
++
++      req.on('error', function () {})
++      req.write(preamble)
++      req.write(chunk)
++
++      setTimeout(function () {
++        req.destroy()
++        setTimeout(next, 100)
++      }, 30)
++    }
++
++    var i = 0
++
++    function loop () {
++      if (i++ >= attempts) {
++        // give multer's abort cleanup time to run
++        setTimeout(function () {
++          var leaked = countLeakedFds(uploadDir)
++          assert.strictEqual(leaked, 0, 'leaked ' + leaked + ' deleted-file descriptor(s) after ' + attempts + ' aborted uploads')
++          done()
++        }, 500)
++        return
++      }
++
++      abortOnce(loop)
++    }
++
++    loop()
++  })
++})
+diff --git a/test/abort-unlink-after-close.js b/test/abort-unlink-after-close.js
+new file mode 100644
+--- /dev/null
++++ b/test/abort-unlink-after-close.js
+@@ -0,0 +1,125 @@
++/* eslint-env mocha */
++
++var assert = require('assert')
++var fs = require('fs')
++var path = require('path')
++var http = require('http')
++
++var express = require('express')
++var multer = require('../')
++var rimraf = require('rimraf')
++var temp = require('fs-temp')
++
++// @see https://github.com/expressjs/multer/security/advisories/GHSA-qfvm-cv95-jqjf
++//
++// Windows (before Node.js 22) refuses to unlink a file that is still open, so
++// the abort cleanup must close the disk write stream before removing the
++// partial file. Emulate that rule on Linux: while the test runs, fs.unlink
++// fails with EPERM whenever this process still holds the target open (checked
++// through /proc/self/fd). Skipped where /proc/self/fd is unavailable.
++
++function isOpenByThisProcess (target) {
++  var fdDir = '/proc/self/fd'
++  var entries
++
++  try {
++    entries = fs.readdirSync(fdDir)
++  } catch (e) {
++    return false
++  }
++
++  var resolved = path.resolve(target)
++
++  for (var i = 0; i < entries.length; i++) {
++    try {
++      if (fs.readlinkSync(path.join(fdDir, entries[i])) === resolved) return true
++    } catch (e) {
++      continue
++    }
++  }
++
++  return false
++}
++
++var hasProcFd = fs.existsSync('/proc/self/fd')
++var describeOnLinux = hasProcFd ? describe : describe.skip
++
++describeOnLinux('unlink after close on aborted uploads', function () {
++  var uploadDir, server, port
++  var realUnlink = fs.unlink
++
++  beforeEach(function (done) {
++    fs.unlink = function (target, cb) {
++      if (isOpenByThisProcess(target)) {
++        var err = new Error('EPERM: operation not permitted, unlink (file is open)')
++        err.code = 'EPERM'
++        return process.nextTick(cb, err)
++      }
++      return realUnlink.apply(fs, arguments)
++    }
++
++    temp.mkdir(function (err, dir) {
++      if (err) return done(err)
++
++      uploadDir = dir
++      var upload = multer({ dest: dir })
++      var app = express()
++
++      app.post('/upload', upload.single('file'), function (req, res) {
++        res.json({ success: true })
++      })
++
++      app.use(function (err, req, res, next) {
++        res.status(500).json({ error: err.message })
++      })
++
++      server = app.listen(0, function () {
++        port = server.address().port
++        done()
++      })
++    })
++  })
++
++  afterEach(function (done) {
++    fs.unlink = realUnlink
++    server.close(function () {
++      rimraf(uploadDir, done)
++    })
++  })
++
++  it('should close the write stream before unlinking when the client aborts', function (done) {
++    this.timeout(5000)
++
++    var boundary = 'AbortBound' + Date.now()
++    var preamble =
++      '--' + boundary + '\r\n' +
++      'Content-Disposition: form-data; name="file"; filename="test.bin"\r\n' +
++      'Content-Type: application/octet-stream\r\n\r\n'
++    var chunk = Buffer.alloc(64 * 1024, 0x5a)
++
++    var req = http.request({
++      hostname: 'localhost',
++      port: port,
++      path: '/upload',
++      method: 'POST',
++      headers: {
++        'Content-Type': 'multipart/form-data; boundary=' + boundary,
++        'Content-Length': Buffer.byteLength(preamble) + (chunk.length * 10)
++      }
++    })
++
++    req.on('error', function () {})
++    req.write(preamble)
++    req.write(chunk)
++
++    setTimeout(function () {
++      req.destroy()
++
++      setTimeout(function () {
++        var files = fs.readdirSync(uploadDir)
++        assert.strictEqual(files.length, 0, 'orphan files after client abort: ' + files.join(', '))
++        done()
++      }, 500)
++    }, 50)
++  })
++})
+diff --git a/test/pending-writes.js b/test/pending-writes.js
+new file mode 100644
+--- /dev/null
++++ b/test/pending-writes.js
+@@ -0,0 +1,88 @@
++/* eslint-env mocha */
++
++var assert = require('assert')
++var fs = require('fs')
++var path = require('path')
++
++var multer = require('../')
++var util = require('./_util')
++var temp = require('fs-temp')
++var rimraf = require('rimraf')
++var FormData = require('form-data')
++
++// A file's error can be reported twice: via the stream 'error' event and via
++// the storage callback (disk storage does this on aborted uploads). Each file
++// must decrement pendingWrites at most once, or cleanup runs while another
++// write is still in flight and leaves an orphan on disk.
++describe('pending writes counter', function () {
++  var uploadDir
++
++  beforeEach(function (done) {
++    temp.mkdir(function (err, dir) {
++      if (err) return done(err)
++      uploadDir = dir
++      done()
++    })
++  })
++
++  afterEach(function (done) {
++    rimraf(uploadDir, done)
++  })
++
++  it('should wait for in-flight writes when another file reports its error twice', function (done) {
++    var slowFileSettled = false
++
++    var storage = {
++      _handleFile: function (req, file, cb) {
++        file.stream.resume()
++
++        if (file.originalname === 'boom.dat') {
++          // Simulate disk storage during an abort: the source stream errors,
++          // then the write pipeline reports the same failure to the callback.
++          var err = new Error('boom')
++          setImmediate(function () {
++            file.stream.emit('error', err)
++            setImmediate(function () { cb(err) })
++          })
++          return
++        }
++
++        // Slow file: its write is still in flight while boom.dat errors.
++        setTimeout(function () {
++          var dest = path.join(uploadDir, 'slow.dat')
++          fs.writeFile(dest, 'SLOW CONTENT', function (writeErr) {
++            if (writeErr) return cb(writeErr)
++            slowFileSettled = true
++            cb(null, { path: dest })
++          })
++        }, 100)
++      },
++      _removeFile: function (req, file, cb) {
++        fs.unlink(file.path, cb)
++      }
++    }
++
++    var upload = multer({ storage: storage }).array('file', 2)
++
++    var form = new FormData()
++    form.append('file', Buffer.from('SLOW CONTENT'), 'slow.dat')
++    form.append('file', Buffer.from('BOOM'), 'boom.dat')
++
++    util.submitForm(upload, form, function (err) {
++      assert.ok(err, 'middleware should fail')
++      assert.strictEqual(err.message, 'boom')
++
++      // The middleware must not report the error until every pending write
++      // has settled; finishing early means cleanup missed the slow file.
++      assert.strictEqual(slowFileSettled, true,
++        'middleware finished while a write was still in flight (pendingWrites double decrement)')
++
++      // Give any stray late write a chance to land, then check for orphans.
++      setTimeout(function () {
++        var files = fs.readdirSync(uploadDir)
++        assert.strictEqual(files.length, 0, 'orphan files left behind: ' + files.join(', '))
++        done()
++      }, 200)
++    })
++  })
++})
+
+--- a/lib/make-middleware.js
++++ b/lib/make-middleware.js
+@@ -156,7 +156,11 @@ function makeMiddleware (setup) {
+       if (limits && Object.prototype.hasOwnProperty.call(limits, 'fieldNestingDepth')) {
+         if (fieldname.split('[').length - 1 > limits.fieldNestingDepth) return abortWithCode('LIMIT_FIELD_NESTING', fieldname)
+       }
+ 
+-      appendField(req.body, fieldname, value)
++      try {
++        appendField(req.body, fieldname, value)
++      } catch {
++        return abortWithCode('INVALID_FIELD_NAME', fieldname)
++      }
+     })
+ 
+     // handle files
+--- a/lib/multer-error.js
++++ b/lib/multer-error.js
+@@ -10,4 +10,5 @@ var errorMessages = {
+   MISSING_FIELD_NAME: 'Field name missing',
+   LIMIT_FIELD_NESTING: 'Field name nesting too deep',
+-  STREAM_DESTROYED: 'File stream was destroyed'
++  STREAM_DESTROYED: 'File stream was destroyed',
++  INVALID_FIELD_NAME: 'Invalid field name'
+ }
+ 
+--- /dev/null
++++ b/test/crafted-field-names.js
+@@ -0,0 +1,26 @@
++/* eslint-env mocha */
++
++var assert = require('assert')
++
++var util = require('./_util')
++var multer = require('../')
++var FormData = require('form-data')
++
++// @see https://github.com/expressjs/multer/security/advisories/GHSA-wc9g-mqfw-jrwm
++
++describe('crafted multipart field names', function () {
++  it('should not crash when a field name overflows the maximum array length', function (done) {
++    var form = new FormData()
++    // items[4294967294] creates a sparse array with length 4294967295 (JS max);
++    // items[] then pushes past it, which throws RangeError inside appendField.
++    form.append('items[4294967294]', 'x')
++    form.append('items[]', 'y')
++
++    util.submitForm(multer().none(), form, function (err) {
++      // The overflow must be handled (surfaced as an error), not crash the process.
++      assert.ok(err, 'expected the request to be rejected with an error')
++      assert.strictEqual(err.code, 'INVALID_FIELD_NAME')
++      done()
++    })
++  })
++})
+
+--- a/README.md
++++ b/README.md
+@@ -280,6 +280,7 @@ Key | Description | Default
+ `parts` | For multipart forms, the max number of parts (fields + files) | Infinity
+ `headerPairs` | For multipart forms, the max number of header key=>value pairs to parse | 2000
+ `fieldNestingDepth` | Max number of nesting levels for field names (e.g. `a[b][c]` has 2 levels) | Infinity
++`fieldArrayIndexLimit` | Max numeric array index accepted inside a field name (e.g. `a[3]` uses index 3) | Infinity
+ 
+ Specifying the limits can help protect your site against denial of service (DoS) attacks.
+ 
+--- a/lib/make-middleware.js
++++ b/lib/make-middleware.js
+@@ -7,6 +7,28 @@ var MulterError = require('./multer-error')
+ var FileAppender = require('./file-appender')
+ var removeUploadedFiles = require('./remove-uploaded-files')
+ 
++// append-field turns a bracket group whose contents are all digits into an
++// array index, so `a[3]` produces an array of length 4. The index itself is
++// unbounded, which means a single field name can materialize a sparse array
++// with a very large length. That costs append-field almost nothing, but it is
++// the application that pays when it later iterates or serializes req.body, and
++// until now there was no limit to opt into.
++function exceedsArrayIndexLimit (fieldname, limit) {
++  // Only field names append-field parses as a bracket path build an array;
++  // names it stores as a literal key (e.g. a[6]suffix, [6]) never do, so they
++  // must not be rejected by the index limit.
++  if (!/^[^[]+(?:\[[^\]]+\])*(?:\[\])?$/.test(fieldname)) return false
++
++  var pattern = /\[(\d+)\]/g
++  var match
++
++  while ((match = pattern.exec(fieldname)) !== null) {
++    if (Number(match[1]) > limit) return true
++  }
++
++  return false
++}
++
+ function drainStream (stream) {
+   stream.on('readable', () => {
+     while (stream.read() !== null) {}
+@@ -156,6 +178,12 @@ function makeMiddleware (setup) {
+       if (limits && Object.prototype.hasOwnProperty.call(limits, 'fieldNestingDepth')) {
+         if (fieldname.split('[').length - 1 > limits.fieldNestingDepth) return abortWithCode('LIMIT_FIELD_NESTING', fieldname)
+       }
+ 
++      if (limits && Object.prototype.hasOwnProperty.call(limits, 'fieldArrayIndexLimit')) {
++        if (exceedsArrayIndexLimit(fieldname, limits.fieldArrayIndexLimit)) {
++          return abortWithCode('LIMIT_FIELD_ARRAY_INDEX', fieldname)
++        }
++      }
++
+       try {
+         appendField(req.body, fieldname, value)
+       } catch {
+--- a/lib/multer-error.js
++++ b/lib/multer-error.js
+@@ -10,6 +10,7 @@ var errorMessages = {
+   LIMIT_UNEXPECTED_FILE: 'Unexpected field',
+   MISSING_FIELD_NAME: 'Field name missing',
+   LIMIT_FIELD_NESTING: 'Field name nesting too deep',
++  LIMIT_FIELD_ARRAY_INDEX: 'Field name array index too large',
+   STREAM_DESTROYED: 'File stream was destroyed',
+   INVALID_FIELD_NAME: 'Invalid field name'
+ }
+ 
+--- /dev/null
++++ b/test/array-index-limit.js
+@@ -0,0 +1,129 @@
++/* eslint-env mocha */
++
++var assert = require('assert')
++
++var util = require('./_util')
++var multer = require('../')
++var FormData = require('form-data')
++
++describe('Field name array index limit', function () {
++  it('should reject an array index above fieldArrayIndexLimit', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 1000 } }).none()
++    var form = new FormData()
++
++    form.append('a[4294967294]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ok(err, 'should have returned an error')
++      assert.strictEqual(err.code, 'LIMIT_FIELD_ARRAY_INDEX')
++      assert.strictEqual(err.field, 'a[4294967294]')
++      done()
++    })
++  })
++
++  it('should reject an oversized index nested behind object keys', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 10 } }).none()
++    var form = new FormData()
++
++    form.append('a[b][c][99999]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ok(err, 'should have returned an error')
++      assert.strictEqual(err.code, 'LIMIT_FIELD_ARRAY_INDEX')
++      done()
++    })
++  })
++
++  it('should allow an index at exactly the limit', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 5 } }).none()
++    var form = new FormData()
++
++    form.append('a[5]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      assert.strictEqual(req.body.a.length, 6)
++      done()
++    })
++  })
++
++  it('should reject an array index one above the limit', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 5 } }).none()
++    var form = new FormData()
++
++    form.append('a[6]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ok(err, 'should have returned an error')
++      assert.strictEqual(err.code, 'LIMIT_FIELD_ARRAY_INDEX')
++      done()
++    })
++  })
++
++  it('should bound a numeric key even when the limit is zero', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 0 } }).none()
++    var form = new FormData()
++
++    form.append('a[99999999]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ok(err, 'a numeric key should still be bounded at zero')
++      assert.strictEqual(err.code, 'LIMIT_FIELD_ARRAY_INDEX')
++      done()
++    })
++  })
++
++  it('should leave object keys alone', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 0 } }).none()
++    var form = new FormData()
++
++    form.append('a[99999999x]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      assert.strictEqual(req.body.a['99999999x'], 'value')
++      done()
++    })
++  })
++
++  it('should allow bracketed digits in a name stored as a literal key', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 5 } }).none()
++    var form = new FormData()
++
++    // Trailing text makes append-field store the whole name as a literal key
++    // rather than an array path, so no array is built and the limit must not fire.
++    form.append('a[6]suffix', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      assert.strictEqual(req.body['a[6]suffix'], 'value')
++      done()
++    })
++  })
++
++  it('should allow a nested array index within the limit', function (done) {
++    var parser = multer({ limits: { fieldArrayIndexLimit: 100 } }).none()
++    var form = new FormData()
++
++    form.append('a[b][3]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      assert.strictEqual(req.body.a.b[3], 'value')
++      done()
++    })
++  })
++
++  it('should be unbounded when the limit is not set', function (done) {
++    var parser = multer({ limits: {} }).none()
++    var form = new FormData()
++
++    form.append('a[4294967294]', 'value')
++
++    util.submitForm(parser, form, function (err, req) {
++      assert.ifError(err)
++      assert.strictEqual(req.body.a.length, 4294967295)
++      done()
++    })
++  })
++})
