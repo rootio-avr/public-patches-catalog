@@ -16,6 +16,7 @@ unknown
 - GHSA-h25m-26qc-wcjf
 - CVE-2025-29927
 - GHSA-q4gf-8mx6-v5v3
+- AIKIDO-2026-553733
 
 ## How to Apply:
 1. Clone or download the source code for next
