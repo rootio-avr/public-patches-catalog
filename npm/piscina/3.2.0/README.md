@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-55388
+- AIKIDO-2026-266277
 
 ## How to Apply:
 1. Clone or download the source code for piscina
