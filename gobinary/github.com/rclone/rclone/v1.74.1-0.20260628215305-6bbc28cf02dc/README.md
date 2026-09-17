@@ -9,6 +9,7 @@ unknown
 - CVE-2026-59733
 - CVE-2026-71309
 - CVE-2026-71312
+- CVE-2026-88044
 
 ## How to Apply:
 1. Clone or download the source code for github.com/rclone/rclone
