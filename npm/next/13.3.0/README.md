@@ -13,6 +13,7 @@ unknown
 - GHSA-h25m-26qc-wcjf
 - GHSA-mwv6-3258-q52c
 - GHSA-8h8q-6873-q5fj
+- AIKIDO-2026-553733
 
 ## How to Apply:
 1. Clone or download the source code for next
