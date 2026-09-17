@@ -9,6 +9,7 @@ unknown
 - GHSA-wqvq-jvpq-h66f
 - GHSA-r7g4-qg5f-qqm2
 - GHSA-268h-hp4c-crq3
+- AIKIDO-2026-645479
 
 ## How to Apply:
 1. Clone or download the source code for nodemailer
