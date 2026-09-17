@@ -18,6 +18,7 @@ unknown
 - CVE-2026-64645
 - CVE-2026-44578
 - GHSA-h25m-26qc-wcjf
+- AIKIDO-2026-553733
 
 ## How to Apply:
 1. Clone or download the source code for next
