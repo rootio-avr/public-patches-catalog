@@ -4,6 +4,7 @@ This patch is based on langchain version 1.2.15, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-55443
 - GHSA-gr75-jv2w-4656
 
 ## How to Apply:
