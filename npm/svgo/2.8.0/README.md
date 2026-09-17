@@ -7,6 +7,7 @@ unknown
 - CVE-2026-29074
 - GHSA-2p49-hgcm-8545
 - CVE-2026-73650
+- CVE-2026-84370
 
 ## How to Apply:
 1. Clone or download the source code for svgo
