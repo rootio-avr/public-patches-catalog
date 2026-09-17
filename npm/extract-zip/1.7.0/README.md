@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-56876
+- CVE-2026-19693
 
 ## How to Apply:
 1. Clone or download the source code for extract-zip
