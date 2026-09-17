@@ -4,7 +4,6 @@ This patch is based on next version 13.5.6, which is available at:
 unknown
 
 ## Affected CVEs:
-- GHSA-q4gf-8mx6-v5v3
 - CVE-2026-64645
 - CVE-2024-46982
 - CVE-2024-51479
@@ -17,7 +16,9 @@ unknown
 - GHSA-8h8q-6873-q5fj
 - GHSA-h25m-26qc-wcjf
 - GHSA-5j59-xgg2-r9c4
+- GHSA-q4gf-8mx6-v5v3
 - CVE-2025-29927
+- AIKIDO-2026-553733
 
 ## How to Apply:
 1. Clone or download the source code for next
