@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-1597
+- CVE-2026-42198
 
 ## How to Apply:
 1. Clone or download the source code for org.postgresql:postgresql
