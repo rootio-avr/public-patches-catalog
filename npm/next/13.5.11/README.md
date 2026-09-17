@@ -4,7 +4,6 @@ This patch is based on next version 13.5.11, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2025-59471
 - CVE-2026-44573
 - CVE-2026-44578
 - CVE-2026-44580
@@ -13,7 +12,6 @@ unknown
 - CVE-2026-64645
 - CVE-2026-64647
 - CVE-2026-75604
-- GHSA-h25m-26qc-wcjf
 - AIKIDO-2025-10936
 - AIKIDO-2026-10757
 - AIKIDO-2026-10758
@@ -21,13 +19,20 @@ unknown
 - CVE-2024-47831
 - AIKIDO-2026-10754
 - CVE-2025-55173
+- CVE-2025-59471
 - CVE-2025-57752
 - CVE-2025-57822
 - AIKIDO-2026-10755
 - AIKIDO-2026-10756
 - GHSA-q4gf-8mx6-v5v3
 - GHSA-8h8q-6873-q5fj
+- GHSA-h25m-26qc-wcjf
+- AIKIDO-2026-10095
+- AIKIDO-2026-10762
 - GHSA-2xp9-vwfh-vxw4
+- AIKIDO-2026-553733
+- CVE-2024-34351
+- CVE-2024-51479
 
 ## How to Apply:
 1. Clone or download the source code for next
