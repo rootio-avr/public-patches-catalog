@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-553733
+- GHSA-2xp9-vwfh-vxw4
 - CVE-2024-51479
 - CVE-2025-29927
 - CVE-2026-44573
