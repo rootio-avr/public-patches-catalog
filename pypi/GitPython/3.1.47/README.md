@@ -23,6 +23,24 @@ unknown
 - GHSA-wvpp-8hx9-p66j
 - GHSA-9rj7-rf2p-w77r
 - GHSA-4gmw-gg2m-w46p
+- CVE-2026-67322
+- CVE-2026-76218
+- CVE-2026-76219
+- CVE-2026-76220
+- CVE-2026-78676
+- GHSA-9557-234j-7rv9
+- GHSA-7r39-6q8m-qw68
+- GHSA-3vrx-526r-64rm
+- GHSA-4vpg-pfj8-m33q
+- GHSA-wv46-xpj8-pw53
+- GHSA-298h-jpq4-m665
+- GHSA-7jx3-jqcp-hhgc
+- GHSA-w672-239g-c3gr
+- GHSA-crmc-f4m7-33fj
+- GHSA-6r2r-ww24-7h52
+- GHSA-89ff-m8wv-p99r
+- GHSA-m4f3-g4cq-hqrx
+- GHSA-6rj2-96f5-chj9
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
