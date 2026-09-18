@@ -4,6 +4,7 @@ This patch is based on nodemailer version 7.0.13, which is available at:
 unknown
 
 ## Affected CVEs:
+- GHSA-h3hj-cmcx-xc66
 - AIKIDO-2026-645479
 
 ## How to Apply:
