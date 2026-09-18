@@ -19,6 +19,7 @@ unknown
 - GHSA-8h8q-6873-q5fj
 - GHSA-h25m-26qc-wcjf
 - AIKIDO-2026-553733
+- GHSA-2xp9-vwfh-vxw4
 - CVE-2026-75604
 
 ## How to Apply:
