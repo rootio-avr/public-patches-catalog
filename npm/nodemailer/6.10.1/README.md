@@ -8,6 +8,7 @@ unknown
 - AIKIDO-2026-10942
 - CVE-2025-13033
 - CVE-2025-14874
+- GHSA-h3hj-cmcx-xc66
 - AIKIDO-2026-645479
 - GHSA-268h-hp4c-crq3
 - GHSA-jj37-3377-m6vv
