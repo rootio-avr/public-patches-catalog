@@ -1,0 +1,237 @@
+Description: CVE-2026-78376 - Fix use-after-free of JSCValue function parameters
+ Processing malicious web content could trigger memory corruption because the
+ JSValueRef arguments accumulated during variadic parameter conversion in the
+ JavaScriptCore GLib API (jsObjectCall / jscValueCallFunction) were held in a
+ plain Vector<JSValueRef> that did not root its contents for the garbage
+ collector. Converting a later parameter can allocate and trigger a collection
+ that frees an earlier argument still needed by the call (CWE-416).
+ .
+ This backports upstream WebKit commit 9fa946d9a72f (319867@main, bug 322290)
+ to webkitgtk 2.52.6. The upstream fix switches the accumulator to
+ JSC::MarkedVector<JSValueRef>, but that generalized template does not compile
+ against 2.52.6 (MarkedVector<T>::append() calls JSValue::encode(v), which has
+ no JSValueRef overload). The GC-rooting guarantee is instead reimplemented
+ with the target-native, GC-rooted JSC::MarkedJSValueRefArray. Because that
+ container needs its element count at construction, jscValueCallFunction's
+ variadic va_arg loop is restructured into a two-pass count-then-fill approach
+ (a va_copy pre-pass counts the parameters via G_VALUE_COLLECT_SKIP). The
+ std::span<const JSValueRef> signature cleanup of jsObjectCall is ported as-is,
+ and the three fixed-arity call sites pass their (already-rooted) Vector via
+ span(). A regression test (testJSCFunctionCallParameterLifetime) exercising
+ the parameter lifetime is added.
+Origin: upstream, https://github.com/WebKit/WebKit/commit/9fa946d9a72f9ebd5703e0a301849482f6c8463b
+Bug: https://bugs.webkit.org/show_bug.cgi?id=322290
+Author: Justin Michaud <jmichaud@igalia.com>
+Last-Update: 2026-08-28
+---
+--- a/Source/JavaScriptCore/API/glib/JSCValue.cpp
++++ b/Source/JavaScriptCore/API/glib/JSCValue.cpp
+@@ -31,10 +31,12 @@
+ #include "JSRetainPtr.h"
+ #include "JSTypedArray.h"
+ #include "LiteralParser.h"
++#include "MarkedJSValueRefArray.h"
+ #include "OpaqueJSString.h"
+ #include "TypedArrayType.h"
+ #include <array>
+ #include <gobject/gvaluecollector.h>
++#include <span>
+ #include <wtf/glib/GRefPtr.h>
+ #include <wtf/glib/GSpanExtras.h>
+ #include <wtf/glib/GUniquePtr.h>
+@@ -873,16 +875,16 @@
+     return result.leakSpan().data();
+ }
+ 
+-static JSValueRef jsObjectCall(JSGlobalContextRef jsContext, JSObjectRef function, JSC::JSCCallbackFunction::Type functionType, JSObjectRef thisObject, const Vector<JSValueRef>& arguments, JSValueRef* exception)
++static JSValueRef jsObjectCall(JSGlobalContextRef jsContext, JSObjectRef function, JSC::JSCCallbackFunction::Type functionType, JSObjectRef thisObject, std::span<const JSValueRef> arguments, JSValueRef* exception)
+ {
+     switch (functionType) {
+     case JSC::JSCCallbackFunction::Type::Constructor:
+-        return JSObjectCallAsConstructor(jsContext, function, arguments.size(), arguments.span().data(), exception);
++        return JSObjectCallAsConstructor(jsContext, function, arguments.size(), arguments.data(), exception);
+     case JSC::JSCCallbackFunction::Type::Method:
+         ASSERT(thisObject);
+         [[fallthrough]];
+     case JSC::JSCCallbackFunction::Type::Function:
+-        return JSObjectCallAsFunction(jsContext, function, thisObject, arguments.size(), arguments.span().data(), exception);
++        return JSObjectCallAsFunction(jsContext, function, thisObject, arguments.size(), arguments.data(), exception);
+     }
+     RELEASE_ASSERT_NOT_REACHED();
+ }
+@@ -895,7 +897,32 @@
+     JSC::JSLockHolder locker(globalObject);
+ 
+     JSValueRef exception = nullptr;
+-    Vector<JSValueRef> arguments;
++
++    // The JSValueRef values produced while converting the variadic parameters must stay
++    // reachable by the garbage collector for the whole duration of the call: converting a
++    // later parameter can allocate and trigger a collection that would otherwise free an
++    // earlier, still-referenced argument (CVE-2026-78376, use-after-free). Accumulate the
++    // arguments in a JSC::MarkedJSValueRefArray, which roots every slot for the GC. That
++    // container needs its element count up front, so first walk a copy of the va_list to
++    // count the parameters (advancing past each collected value with G_VALUE_COLLECT_SKIP)
++    // and only then collect and convert them into the rooted buffer.
++    unsigned parameterCount = 0;
++    {
++        va_list argsCopy;
++        va_copy(argsCopy, args);
++        GType countType = firstParameterType;
++        WTF_ALLOW_UNSAFE_BUFFER_USAGE_BEGIN // GLib port
++        while (countType != G_TYPE_NONE) {
++            G_VALUE_COLLECT_SKIP(countType, argsCopy);
++            ++parameterCount;
++            countType = va_arg(argsCopy, GType);
++        }
++        WTF_ALLOW_UNSAFE_BUFFER_USAGE_END
++        va_end(argsCopy);
++    }
++
++    JSC::MarkedJSValueRefArray arguments(jsContext, parameterCount);
++    unsigned argumentIndex = 0;
+     GType parameterType = firstParameterType;
+     while (parameterType != G_TYPE_NONE) {
+         GValue parameter;
+@@ -914,11 +941,11 @@
+         if (jscContextHandleExceptionIfNeeded(priv->context.get(), exception))
+             return jscContextGetOrCreateValue(priv->context.get(), jsValue);
+ 
+-        arguments.append(jsValue);
++        arguments[argumentIndex++] = jsValue;
+         parameterType = va_arg(args, GType);
+     }
+ 
+-    auto result = jsObjectCall(jsContext, function, functionType, thisObject, arguments, &exception);
++    auto result = jsObjectCall(jsContext, function, functionType, thisObject, std::span<const JSValueRef> { arguments.data(), arguments.size() }, &exception);
+     if (jscContextHandleExceptionIfNeeded(priv->context.get(), exception))
+         return adoptGRef(jsc_value_new_undefined(priv->context.get()));
+ 
+@@ -1017,7 +1044,7 @@
+         return jscValueGetJSValue(parametersSpan[i]);
+     });
+ 
+-    auto result = jsObjectCall(jsContext, function, JSC::JSCCallbackFunction::Type::Method, object, arguments, &exception);
++    auto result = jsObjectCall(jsContext, function, JSC::JSCCallbackFunction::Type::Method, object, arguments.span(), &exception);
+     if (jscContextHandleExceptionIfNeeded(priv->context.get(), exception))
+         return jsc_value_new_undefined(priv->context.get());
+ 
+@@ -1368,7 +1395,7 @@
+         return jscValueGetJSValue(parametersSpan[i]);
+     });
+ 
+-    auto result = jsObjectCall(jsContext, function, JSC::JSCCallbackFunction::Type::Function, nullptr, arguments, &exception);
++    auto result = jsObjectCall(jsContext, function, JSC::JSCCallbackFunction::Type::Function, nullptr, arguments.span(), &exception);
+     if (jscContextHandleExceptionIfNeeded(priv->context.get(), exception))
+         return jsc_value_new_undefined(priv->context.get());
+ 
+@@ -1452,7 +1479,7 @@
+         return jscValueGetJSValue(parametersSpan[i]);
+     });
+ 
+-    auto result = jsObjectCall(jsContext, function, JSC::JSCCallbackFunction::Type::Constructor, nullptr, arguments, &exception);
++    auto result = jsObjectCall(jsContext, function, JSC::JSCCallbackFunction::Type::Constructor, nullptr, arguments.span(), &exception);
+     if (jscContextHandleExceptionIfNeeded(priv->context.get(), exception))
+         return jsc_value_new_undefined(priv->context.get());
+ 
+--- a/Tools/TestWebKitAPI/Tests/JavaScriptCore/glib/TestJSC.cpp
++++ b/Tools/TestWebKitAPI/Tests/JavaScriptCore/glib/TestJSC.cpp
+@@ -25,6 +25,7 @@
+ #undef JSC_COMPILATION
+ 
+ #include <JavaScriptCore/JSContextRef.h>
++#include <array>
+ #include <jsc/jsc.h>
+ #include <wtf/HashSet.h>
+ #include <wtf/Threading.h>
+@@ -4819,6 +4820,51 @@
+     }
+ }
+ 
++static constexpr unsigned varargsParameterCount = 16;
++static constexpr unsigned varargsParameterLength = 512 * 1024;
++
++// Regression test for CVE-2026-78376: use-after-free of JSCValue function parameters.
++// Each parameter is large enough that converting the next one triggers a collection, when
++// the earlier ones are only referenced from the argument list. Before the fix the argument
++// accumulator was a plain Vector<JSValueRef> that did not root its contents for the GC, so
++// an earlier parameter could be collected while later ones were still being converted.
++static void testJSCFunctionCallParameterLifetime()
++{
++    LeakChecker checker;
++    GRefPtr<JSCContext> context = adoptGRef(jsc_context_new());
++    checker.watch(context.get());
++    ExceptionHandler exceptionHandler(context.get());
++
++    GUniquePtr<char> script(g_strdup_printf(
++        "(function() {\n"
++        "    for (var i = 0; i < arguments.length; i++) {\n"
++        "        if (arguments[i] !== String.fromCharCode(65 + i).repeat(%u))\n"
++        "            return 'parameter ' + i + ' did not survive';\n"
++        "    }\n"
++        "    return 'ok';\n"
++        "})", varargsParameterLength));
++    GRefPtr<JSCValue> function = adoptGRef(jsc_context_evaluate(context.get(), script.get(), -1));
++    checker.watch(function.get());
++    g_assert_true(jsc_value_is_function(function.get()));
++
++    std::array<GUniquePtr<char>, varargsParameterCount> parameters;
++    for (unsigned i = 0; i < varargsParameterCount; ++i)
++        parameters[i].reset(g_strnfill(varargsParameterLength, static_cast<char>('A' + i)));
++
++#define STRING_PARAMETER(index) G_TYPE_STRING, parameters[index].get()
++    GRefPtr<JSCValue> result = adoptGRef(jsc_value_function_call(function.get(),
++        STRING_PARAMETER(0), STRING_PARAMETER(1), STRING_PARAMETER(2), STRING_PARAMETER(3),
++        STRING_PARAMETER(4), STRING_PARAMETER(5), STRING_PARAMETER(6), STRING_PARAMETER(7),
++        STRING_PARAMETER(8), STRING_PARAMETER(9), STRING_PARAMETER(10), STRING_PARAMETER(11),
++        STRING_PARAMETER(12), STRING_PARAMETER(13), STRING_PARAMETER(14), STRING_PARAMETER(15),
++        G_TYPE_NONE));
++#undef STRING_PARAMETER
++
++    checker.watch(result.get());
++    GUniquePtr<char> resultString(jsc_value_to_string(result.get()));
++    g_assert_cmpstr(resultString.get(), ==, "ok");
++}
++
+ int main(int argc, char** argv)
+ {
+     g_test_init(&argc, &argv, nullptr);
+@@ -4846,6 +4892,7 @@
+     g_test_add_func("/jsc/autocleanups", testsJSCAutocleanups);
+ #endif
+     g_test_add_func("/jsc/json", testJSCJSON);
++    g_test_add_func("/jsc/function-call-parameter-lifetime", testJSCFunctionCallParameterLifetime);
+ 
+     return g_test_run();
+ }
+Description: CVE-2026-83596 - Validate the full FeatureList array once in OpenTypeVerticalData findFeature
+ Bounds the entire FeatureList array upfront by checking the record past the
+ last one before iterating. Previously only the beginning of each FeatureRecord
+ was validated with isValidEnd() while the read fields (featureTag,
+ featureOffset) extended into the following record's space, allowing an
+ out-of-bounds read when parsing a crafted OpenType font.
+Origin: upstream, https://github.com/WebKit/WebKit/commit/f095a382daee0c095c6b0454507ca46a8420b52c
+Bug: https://bugs.webkit.org/show_bug.cgi?id=322969
+Author: WebKit
+Last-Update: 2026-09-11
+---
+--- a/Source/WebCore/platform/graphics/opentype/OpenTypeVerticalData.cpp
++++ b/Source/WebCore/platform/graphics/opentype/OpenTypeVerticalData.cpp
+@@ -240,11 +240,14 @@ struct FeatureListTable : TableBase {
+
+     const FeatureTable* findFeature(OpenType::Tag tag, const SharedBuffer& buffer) const
+     {
+-        for (uint16_t i = 0; i < featureCount; ++i) {
+-            if (isValidEnd(buffer, &features[i]) && features[i].featureTag == tag)
++        uint16_t count = featureCount;
++        if (!isValidEnd(buffer, &features[count]))
++            return nullptr;
++        for (uint16_t i = 0; i < count; ++i) {
++            if (features[i].featureTag == tag)
+                 return validateOffset<FeatureTable>(buffer, features[i].featureOffset);
+         }
+-        return 0;
++        return nullptr;
+     }
+ };
+
