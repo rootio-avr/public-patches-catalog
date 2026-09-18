@@ -4,8 +4,9 @@ This patch is based on svgo version 3.3.2, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-73650
 - CVE-2026-29074
+- CVE-2026-73650
+- CVE-2026-84370
 
 ## How to Apply:
 1. Clone or download the source code for svgo
