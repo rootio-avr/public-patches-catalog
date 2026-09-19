@@ -4,6 +4,7 @@ This patch is based on org.springframework.security:spring-security version 6.5.
 unknown
 
 ## Affected CVEs:
+- CVE-2025-41248
 - CVE-2026-22732
 
 ## How to Apply:
