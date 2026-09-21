@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-645479
+- AIKIDO-2026-50889
 
 ## How to Apply:
 1. Clone or download the source code for nodemailer
