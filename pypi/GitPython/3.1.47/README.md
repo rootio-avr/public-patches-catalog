@@ -41,6 +41,11 @@ unknown
 - GHSA-89ff-m8wv-p99r
 - GHSA-m4f3-g4cq-hqrx
 - GHSA-6rj2-96f5-chj9
+- CVE-2026-76222
+- CVE-2026-67323
+- CVE-2026-78675
+- CVE-2026-78677
+- CVE-2026-67325
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
