@@ -4,6 +4,7 @@ This patch is based on gitpython version 3.1.47, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-78675
 - CVE-2026-78677
 - CVE-2026-67325
 
