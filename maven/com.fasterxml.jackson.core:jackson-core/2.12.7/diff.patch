@@ -761,3 +761,209 @@
      </plugins>
    </build>
  
+
+--- a/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParser.java
++++ b/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingJsonParser.java
+@@ -33,6 +33,20 @@ public class NonBlockingJsonParser
+     private final static int FEAT_MASK_ALLOW_JAVA_COMMENTS = Feature.ALLOW_COMMENTS.getMask();
+     private final static int FEAT_MASK_ALLOW_YAML_COMMENTS = Feature.ALLOW_YAML_COMMENTS.getMask();
+ 
++    /**
++     * [core#1556] (GHSA-r7wm-3cxj-wff9): maximum number of characters allowed to
++     * accumulate for the integer part of a number on the non-blocking (async)
++     * streaming path before a parse error is raised. Without this cap an attacker
++     * can feed an unterminated stream of digit-only chunks and force the text
++     * buffer to grow without bound while the parser keeps returning
++     * {@code NOT_AVAILABLE}.
++     *<p>
++     * Value mirrors the default {@code StreamReadConstraints.maxNumberLength}
++     * (1000) introduced in later Jackson releases; this backport hard-codes the
++     * default because 2.12.x predates the {@code StreamReadConstraints} framework.
++     */
++    private final static int MAX_INT_NUMBER_LENGTH = 1000;
++
+     // This is the main input-code lookup table, fetched eagerly
+     private final static int[] _icUTF8 = CharTypes.getInputCodeUtf8();
+ 
+@@ -1347,6 +1361,8 @@ public class NonBlockingJsonParser
+             if (++_inputPtr >= _inputEnd) {
+                 _minorState = MINOR_NUMBER_INTEGER_DIGITS;
+                 _textBuffer.setCurrentLength(outPtr);
++                // [core#1556] (GHSA-r7wm-3cxj-wff9): enforce integer-length limit
++                _verifyStreamingIntLength(outPtr);
+                 return (_currToken = JsonToken.NOT_AVAILABLE);
+             }
+             ch = _inputBuffer[_inputPtr] & 0xFF;
+@@ -1413,6 +1429,9 @@ public class NonBlockingJsonParser
+             if (++_inputPtr >= _inputEnd) {
+                 _minorState = MINOR_NUMBER_INTEGER_DIGITS;
+                 _textBuffer.setCurrentLength(outPtr);
++                // [core#1556] (GHSA-r7wm-3cxj-wff9): enforce integer-length limit
++                // (outPtr includes the leading '-' sign, so discount it)
++                _verifyStreamingIntLength(outPtr-1);
+                 return (_currToken = JsonToken.NOT_AVAILABLE);
+             }
+             ch = _inputBuffer[_inputPtr] & 0xFF;
+@@ -1592,6 +1611,25 @@ public class NonBlockingJsonParser
+         }
+     }
+ 
++    /**
++     * [core#1556] (GHSA-r7wm-3cxj-wff9): validates the number of integer digits
++     * accumulated so far on the streaming (async) integer path. Called on every
++     * exit that yields {@code NOT_AVAILABLE} while still inside the integer part,
++     * so that a stream of digit-only chunks cannot grow the text buffer without
++     * bound before the value is ever completed.
++     *
++     * @param intLen Number of integer-part characters accumulated so far
++     *   (excluding any leading minus sign)
++     */
++    private void _verifyStreamingIntLength(int intLen) throws IOException
++    {
++        if (intLen > MAX_INT_NUMBER_LENGTH) {
++            reportInvalidNumber(String.format(
++                    "Number value length (%d) exceeds the maximum allowed (%d)",
++                    intLen, MAX_INT_NUMBER_LENGTH));
++        }
++    }
++
+     protected JsonToken _finishNumberIntegralPart(char[] outBuf, int outPtr) throws IOException
+     {
+         int negMod = _numberNegative ? -1 : 0;
+@@ -1600,6 +1638,10 @@ public class NonBlockingJsonParser
+             if (_inputPtr >= _inputEnd) {
+                 _minorState = MINOR_NUMBER_INTEGER_DIGITS;
+                 _textBuffer.setCurrentLength(outPtr);
++                // [core#1556] (GHSA-r7wm-3cxj-wff9): enforce integer-length limit before
++                // yielding NOT_AVAILABLE; otherwise a stream of digit-only chunks can grow
++                // the buffer past the intended maximum number length.
++                _verifyStreamingIntLength(outPtr + negMod);
+                 return (_currToken = JsonToken.NOT_AVAILABLE);
+             }
+             int ch = _inputBuffer[_inputPtr] & 0xFF;
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/core/json/async/AsyncNumberLengthLimitTest.java
+@@ -0,0 +1,123 @@
++package com.fasterxml.jackson.core.json.async;
++
++import com.fasterxml.jackson.core.JsonFactory;
++import com.fasterxml.jackson.core.JsonParseException;
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.core.JsonToken;
++import com.fasterxml.jackson.core.async.AsyncTestBase;
++import com.fasterxml.jackson.core.async.ByteArrayFeeder;
++
++/**
++ * Regression test for GHSA-r7wm-3cxj-wff9 (upstream jackson-core issue #1556 /
++ * PR #1611): the non-blocking (async) parser failed to enforce any bound on the
++ * integer part of a number when digit-only input is fed across multiple chunks
++ * with no terminator. An attacker could stream unterminated digit chunks and
++ * grow the internal text buffer without limit while the parser kept returning
++ * {@link JsonToken#NOT_AVAILABLE}.
++ *<p>
++ * This is a replacement for the upstream test
++ * ({@code AsyncNumberLengthConsistencyTest}), which is not portable to 2.12.x:
++ * that test depends on the {@code StreamReadConstraints}/{@code maxNumberLength}
++ * API and JUnit 5, neither of which exist in this release. The 2.12.x backport
++ * hard-codes the same default limit (1000), so this test drives the same
++ * streaming attack shape and asserts the parser now aborts promptly with a
++ * {@link JsonParseException} instead of accumulating unbounded input.
++ */
++public class AsyncNumberLengthLimitTest extends AsyncTestBase
++{
++    private final JsonFactory JSON_F = new JsonFactory();
++
++    // Well above the hard-coded 1000-char integer cap in NonBlockingJsonParser,
++    // but bounded so a regressed build cannot OOM CI.
++    private static final int CHUNK_SIZE = 4 * 1024;
++    private static final int MAX_CHUNKS = 32;
++
++    // Streams the integer portion of a positive number across many digit-only
++    // chunks (no terminator, no endOfInput). Must abort once the accumulated
++    // integer length exceeds the cap, rather than growing the buffer forever.
++    public void testStreamingIntegerRejectedBeyondLimit() throws Exception
++    {
++        JsonParser ap = JSON_F.createNonBlockingByteArrayParser();
++        try {
++            ByteArrayFeeder feeder = (ByteArrayFeeder) ap;
++
++            // Open an object and field name; value has no terminator.
++            byte[] preamble = _jsonDoc("{\"v\":");
++            feeder.feedInput(preamble, 0, preamble.length);
++
++            // Drain preamble tokens up to the point the parser is starved.
++            JsonToken t;
++            while ((t = ap.nextToken()) != JsonToken.NOT_AVAILABLE) {
++                if (t == null) {
++                    fail("Parser ended unexpectedly while draining preamble");
++                }
++            }
++
++            byte[] digits = new byte[CHUNK_SIZE];
++            for (int i = 0; i < digits.length; i++) {
++                digits[i] = (byte) ('1' + (i % 9));
++            }
++
++            int chunksFed = 0;
++            try {
++                for (int c = 0; c < MAX_CHUNKS; c++) {
++                    feeder.feedInput(digits, 0, digits.length);
++                    chunksFed++;
++                    JsonToken tt = ap.nextToken();
++                    if (tt != JsonToken.NOT_AVAILABLE) {
++                        fail("Expected NOT_AVAILABLE while streaming integer digits, got: " + tt);
++                    }
++                }
++                fail("Async parser accepted " + (CHUNK_SIZE * MAX_CHUNKS)
++                        + " integer digits without raising; expected JsonParseException");
++            } catch (JsonParseException e) {
++                verifyException(e, "Number value length");
++                verifyException(e, "exceeds the maximum allowed");
++                // Must fire promptly: CHUNK_SIZE > cap, so it should abort on the
++                // first chunk past the limit, not after all MAX_CHUNKS were read.
++                assertTrue("StreamConstraints check raised too late: after " + chunksFed
++                                + " chunks of " + CHUNK_SIZE + " digits",
++                        chunksFed <= 2);
++            }
++        } finally {
++            ap.close();
++        }
++    }
++
++    // A number whose integer part stays comfortably under the cap must still
++    // parse normally when streamed across chunks (no false positives).
++    public void testStreamingIntegerUnderLimitAccepted() throws Exception
++    {
++        StringBuilder sb = new StringBuilder();
++        sb.append('[');
++        for (int i = 0; i < 500; i++) { // 500 digits, well under the 1000 cap
++            sb.append((char) ('1' + (i % 9)));
++        }
++        sb.append(']');
++        byte[] doc = _jsonDoc(sb.toString());
++
++        JsonParser ap = JSON_F.createNonBlockingByteArrayParser();
++        try {
++            ByteArrayFeeder feeder = (ByteArrayFeeder) ap;
++            // Feed the document one byte at a time to exercise the streaming
++            // (multi-chunk) integer path; the value must still parse cleanly.
++            assertToken(JsonToken.NOT_AVAILABLE, ap.nextToken());
++            for (int ptr = 0; ptr < doc.length; ptr++) {
++                feeder.feedInput(doc, ptr, ptr + 1);
++                // Drain whatever is now available; NOT_AVAILABLE just means "feed more".
++                ap.nextToken();
++            }
++            feeder.endOfInput();
++            // After end-of-input the pending number value must complete normally.
++            JsonToken tok = ap.currentToken();
++            if (tok != JsonToken.VALUE_NUMBER_INT) {
++                tok = ap.nextToken();
++            }
++            assertToken(JsonToken.VALUE_NUMBER_INT, tok);
++            assertEquals(500, ap.getText().length());
++            assertToken(JsonToken.END_ARRAY, ap.nextToken());
++        } finally {
++            ap.close();
++        }
++    }
++}
