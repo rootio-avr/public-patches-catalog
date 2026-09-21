@@ -4,6 +4,7 @@ This patch is based on tornado version 6.5.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-35536
 - CVE-2026-49855
 - CVE-2026-82397
 - CVE-2026-31958
