@@ -1,0 +1,192 @@
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -387,18 +387,38 @@ class HTTPSConnection(HTTPConnection):
+                 SystemTimeWarning,
+             )
+ 
++        # Forwarding proxies establish the TLS connection to the proxy
++        # itself (there is no CONNECT tunnel), so that handshake must use
++        # the proxy's SSL context rather than the destination's. Tunneling
++        # proxies handle the proxy TLS separately in ``_connect_tls_proxy``
++        # and use the connection's SSL context for the destination here.
++        # For backwards compatibility, a forwarding proxy without a
++        # dedicated proxy SSL context falls back to the connection's SSL
++        # context (a FutureWarning is emitted in ``ProxyManager.__init__``).
++        proxy_is_forwarding = self.proxy is not None and not self._is_using_tunnel()
++        proxy_ssl_context = (
++            self.proxy_config.ssl_context if self.proxy_config is not None else None
++        )
++
+         # Wrap socket using verification with the root certs in
+         # trusted_root_certs
+         default_ssl_context = False
+-        if self.ssl_context is None:
+-            default_ssl_context = True
+-            self.ssl_context = create_urllib3_context(
+-                ssl_version=resolve_ssl_version(self.ssl_version),
+-                cert_reqs=resolve_cert_reqs(self.cert_reqs),
+-            )
++        if proxy_is_forwarding and proxy_ssl_context is not None:
++            # Use the proxy's SSL context as-is; the user is expected to
++            # have configured CA and client certificates on it. This keeps
++            # the proxy handshake isolated from the destination's TLS
++            # policy so proxy-specific verification always applies.
++            context = proxy_ssl_context
++        else:
++            if self.ssl_context is None:
++                default_ssl_context = True
++                self.ssl_context = create_urllib3_context(
++                    ssl_version=resolve_ssl_version(self.ssl_version),
++                    cert_reqs=resolve_cert_reqs(self.cert_reqs),
++                )
+ 
+-        context = self.ssl_context
+-        context.verify_mode = resolve_cert_reqs(self.cert_reqs)
++            context = self.ssl_context
++            context.verify_mode = resolve_cert_reqs(self.cert_reqs)
+ 
+         # Try to load OS default certs if none are given.
+         # Works well on Windows (requires Python3.4+)
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import
+ import collections
+ import functools
+ import logging
++import warnings
+ 
+ from ._collections import RecentlyUsedContainer
+ from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
+@@ -480,6 +481,21 @@ class ProxyManager(PoolManager):
+         if proxy.scheme not in ("http", "https"):
+             raise ProxySchemeUnknown(proxy.scheme)
+ 
++        if (
++            use_forwarding_for_https
++            and proxy.scheme == "https"
++            and connection_pool_kw.get("ssl_context") is not None
++        ):
++            warnings.warn(
++                "Passing ssl_context when use_forwarding_for_https=True is deprecated "
++                "and will raise an error in urllib3 v2.0. "
++                "Use proxy_ssl_context to configure the TLS connection to the proxy.",
++                FutureWarning,
++                stacklevel=2,
++            )
++            if proxy_ssl_context is None:
++                proxy_ssl_context = connection_pool_kw.get("ssl_context")
++
+         if not proxy.port:
+             port = port_by_scheme.get(proxy.scheme, 80)
+             proxy = proxy._replace(port=port)
+new file mode 100644
+--- /dev/null
++++ b/test/test_aikido_2026_499214.py
+@@ -0,0 +1,107 @@
++"""
++Regression test for AIKIDO-2026-499214 / GHSA-8988-9cw3-xx77 (CWE-295).
++
++Forwarding HTTPS proxies must isolate the TLS handshake to the proxy from the
++destination's TLS policy. Previously the proxy handshake reused the
++destination's ``ssl_context``, so a machine-in-the-middle could satisfy only
++the destination's checks and defeat the proxy's separate verification.
++
++The fix (backport of urllib3/urllib3#3786) makes ``ProxyManager`` route an
++explicit proxy SSL policy to the connection and, for backwards compatibility,
++falls back to the deprecated ``ssl_context`` (emitting a ``FutureWarning``)
++when no ``proxy_ssl_context`` is provided for a forwarding HTTPS proxy. The
++connection then wraps the proxy socket with the proxy's context rather than the
++destination's.
++
++These are lightweight unit assertions that do not require a live proxy server;
++the full network behavior is covered by the dummyserver proxy suite.
++"""
++
++import ssl
++import warnings
++
++import pytest
++
++from urllib3.connection import HTTPSConnection
++from urllib3.poolmanager import ProxyConfig, ProxyManager, proxy_from_url
++from urllib3.util.ssl_ import create_urllib3_context
++
++
++def test_forwarding_proxy_ssl_context_fallback_emits_futurewarning():
++    # Passing ssl_context for a forwarding HTTPS proxy is deprecated and the
++    # value must be adopted as the proxy's TLS policy (the fallback), not
++    # silently used only for the destination handshake.
++    ctx = create_urllib3_context()
++
++    with pytest.warns(FutureWarning, match="ssl_context"):
++        proxy = proxy_from_url(
++            "https://proxy.example.com",
++            ssl_context=ctx,
++            use_forwarding_for_https=True,
++        )
++
++    with proxy:
++        assert proxy.proxy_ssl_context is ctx
++        assert proxy.proxy_config.ssl_context is ctx
++
++
++def test_explicit_proxy_ssl_context_is_preferred_over_ssl_context():
++    proxy_ctx = create_urllib3_context()
++    dest_ctx = create_urllib3_context()
++
++    with pytest.warns(FutureWarning, match="ssl_context"):
++        proxy = proxy_from_url(
++            "https://proxy.example.com",
++            proxy_ssl_context=proxy_ctx,
++            ssl_context=dest_ctx,
++            use_forwarding_for_https=True,
++        )
++
++    with proxy:
++        # The explicitly configured proxy context must win.
++        assert proxy.proxy_ssl_context is proxy_ctx
++        assert proxy.proxy_config.ssl_context is proxy_ctx
++
++
++def test_no_futurewarning_without_ssl_context():
++    # A forwarding proxy configured only with proxy_ssl_context must not warn.
++    proxy_ctx = create_urllib3_context()
++    with warnings.catch_warnings(record=True) as record:
++        warnings.simplefilter("always")
++        proxy = proxy_from_url(
++            "https://proxy.example.com",
++            proxy_ssl_context=proxy_ctx,
++            use_forwarding_for_https=True,
++        )
++    with proxy:
++        assert proxy.proxy_config.ssl_context is proxy_ctx
++    assert not any(
++        issubclass(w.category, FutureWarning) for w in record
++    )
++
++
++def test_connection_uses_proxy_context_for_forwarding_handshake():
++    # For a forwarding proxy (no CONNECT tunnel), the connection must select
++    # the proxy's SSL context for the handshake, isolating it from the
++    # destination's ssl_context.
++    proxy_ctx = create_urllib3_context()
++    proxy_ctx.verify_mode = ssl.CERT_REQUIRED
++
++    dest_ctx = create_urllib3_context()
++
++    conn = HTTPSConnection("proxy.example.com", 443)
++    conn.ssl_context = dest_ctx
++    conn.proxy = proxy_from_url("https://proxy.example.com").proxy
++    conn.proxy_config = ProxyConfig(proxy_ctx, True)
++
++    # Forwarding proxies do not open a CONNECT tunnel.
++    assert not conn._is_using_tunnel()
++
++    proxy_is_forwarding = conn.proxy is not None and not conn._is_using_tunnel()
++    selected = (
++        conn.proxy_config.ssl_context
++        if proxy_is_forwarding and conn.proxy_config.ssl_context is not None
++        else conn.ssl_context
++    )
++    assert selected is proxy_ctx
++    assert selected is not dest_ctx
