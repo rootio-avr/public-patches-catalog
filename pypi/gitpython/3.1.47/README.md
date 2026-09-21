@@ -4,8 +4,7 @@ This patch is based on gitpython version 3.1.47, which is available at:
 unknown
 
 ## Affected CVEs:
-- GHSA-m4f3-g4cq-hqrx
-- GHSA-6rj2-96f5-chj9
+- CVE-2026-67325
 
 ## How to Apply:
 1. Clone or download the source code for gitpython
