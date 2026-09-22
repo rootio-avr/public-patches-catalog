@@ -4,6 +4,7 @@ This patch is based on robrichards/xmlseclibs version 3.1.5, which is available 
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-134354
 - AIKIDO-2026-21741
 
 ## How to Apply:
