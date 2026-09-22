@@ -31,6 +31,7 @@ unknown
 - CVE-2026-56745
 - CVE-2026-56819
 - CVE-2026-59901
+- CVE-2026-75595
 
 ## How to Apply:
 1. Clone or download the source code for io.netty:netty-parent
