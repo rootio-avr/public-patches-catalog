@@ -1,0 +1,659 @@
+--- a/src/Sanitizer.php
++++ b/src/Sanitizer.php
+@@ -228,6 +228,11 @@ class Sanitizer
+             $dirty = preg_replace('/<\?(=|php)(.+?)\?>/i', '', $dirty);
+         } while (preg_match('/<\?(=|php)(.+?)\?>/i', $dirty) != 0);
+ 
++        // Strip any DOCTYPE/DTD before parsing. This prevents custom entity
++        // definitions (which can collide with HTML5 named character references)
++        // and DTD-defaulted attributes from ever reaching libxml.
++        $dirty = $this->removeDoctype($dirty);
++
+         $this->resetInternal();
+         $this->setUpBefore();
+ 
+@@ -267,6 +272,72 @@ class Sanitizer
+         return $clean;
+     }
+ 
++    /**
++     * Remove any DOCTYPE declaration (and its internal subset) from the input
++     * string before it reaches the XML parser.
++     *
++     * The internal subset is scanned with balanced brackets so that a `>`
++     * appearing inside an entity value cannot prematurely terminate the match.
++     *
++     * @param string $dirty
++     * @return string
++     */
++    protected function removeDoctype($dirty)
++    {
++        if (stripos($dirty, '<!DOCTYPE') === false) {
++            return $dirty;
++        }
++
++        $output = '';
++        $offset = 0;
++        $length = strlen($dirty);
++
++        while (($start = stripos($dirty, '<!DOCTYPE', $offset)) !== false) {
++            $output .= substr($dirty, $offset, $start - $offset);
++            $i = $start + strlen('<!DOCTYPE');
++            $depth = 0;
++            for (; $i < $length; $i++) {
++                $char = $dirty[$i];
++
++                // Skip over DTD comments so a bracket or '>' inside them is not counted.
++                if ($char === '<' && substr($dirty, $i, 4) === '<!--') {
++                    $commentEnd = strpos($dirty, '-->', $i + 4);
++                    if ($commentEnd === false) {
++                        $i = $length;
++                        break;
++                    }
++                    $i = $commentEnd + 2; // loop's $i++ steps past the closing '>'
++                    continue;
++                }
++
++                // Skip over quoted strings so a bracket or '>' inside them is not counted.
++                if ($char === '"' || $char === "'") {
++                    $stringEnd = strpos($dirty, $char, $i + 1);
++                    if ($stringEnd === false) {
++                        $i = $length;
++                        break;
++                    }
++                    $i = $stringEnd; // loop's $i++ steps past the closing quote
++                    continue;
++                }
++
++                if ($char === '[') {
++                    $depth++;
++                } elseif ($char === ']') {
++                    if ($depth > 0) {
++                        $depth--;
++                    }
++                } elseif ($char === '>' && $depth === 0) {
++                    $i++;
++                    break;
++                }
++            }
++            $offset = $i;
++        }
++
++        return $output . substr($dirty, $offset);
++    }
++
+     /**
+      * Set up libXML before we start
+      */
+@@ -345,6 +416,13 @@ class Sanitizer
+                     continue;
+                 }
+ 
++                // Strip remote @import / url() references from inline <style> text.
++                // The text content of <style> is never otherwise inspected, so remote
++                // CSS references would pass straight through.
++                if (strtolower($currentElement->tagName) === 'style' && $this->removeRemoteReferences) {
++                    $currentElement->textContent = $this->stripRemoteCssReferences($currentElement->textContent);
++                }
++
+                 $this->cleanHrefs( $currentElement );
+ 
+                 $this->cleanXlinkHrefs( $currentElement );
+@@ -414,6 +492,11 @@ class Sanitizer
+                     'message' => 'Suspicious attribute \'' . $attrName . '\'',
+                     'line' => $element->getLineNo(),
+                 );
++
++                // Once removed, skip the remaining checks for this attribute so the
++                // same name can never be passed to removeAttribute() twice in one
++                // iteration (a DTD-defaulted attribute could otherwise re-materialise).
++                continue;
+             }
+ 
+             /**
+@@ -434,8 +517,11 @@ class Sanitizer
+ 
+             // Do we want to strip remote references?
+             if($this->removeRemoteReferences) {
+-                // Remove attribute if it has a remote reference
+-                if (isset($element->attributes->item($x)->value) && $this->hasRemoteReference($element->attributes->item($x)->value)) {
++                $attr = $element->attributes->item($x);
++                $value = ($attr !== null && isset($attr->value)) ? $attr->value : '';
++                // Remove attribute if it embeds a remote url()/@import reference, or
++                // if the value is itself a remote URL (e.g. a bare href/src).
++                if ($this->hasRemoteReference($value) || $this->isRemoteUrl($value)) {
+                     $element->removeAttribute($attrName);
+                     $this->xmlIssues[] = array(
+                         'message' => 'Suspicious attribute \'' . $attrName . '\'',
+@@ -576,7 +662,12 @@ class Sanitizer
+     }
+ 
+     /**
+-     * Does this attribute value have a remote reference?
++     * Does this attribute value embed a remote reference anywhere within it?
++     *
++     * Detects a remote `url(...)` or remote `@import` regardless of quoting and
++     * regardless of where it appears in the value (e.g. amongst other CSS
++     * declarations in a `style` attribute). Only remote targets are flagged, so
++     * local (`/x`) and fragment (`#x`) references are preserved.
+      *
+      * @param $value
+      * @return bool
+@@ -585,14 +676,126 @@ class Sanitizer
+     {
+         $value = $this->removeNonPrintableCharacters($value);
+ 
+-        $wrapped_in_url = preg_match('~^url\(\s*[\'"]\s*(.*)\s*[\'"]\s*\)$~xi', $value, $match);
+-        if (!$wrapped_in_url){
+-            return false;
++        if (preg_match('~url\(\s*[\'"]?\s*((?:https?|ftp|file):)?//~xi', $value)) {
++            return true;
+         }
+ 
+-        $value = trim($match[1], '\'"');
++        if (preg_match('~@import\s+(?:url\(\s*)?[\'"]?\s*((?:https?|ftp|file):)?//~xi', $value)) {
++            return true;
++        }
++
++        return false;
++    }
++
++    /**
++     * Is the value itself a remote URL (a bare href/src rather than a url() wrapper)?
++     *
++     * Flags absolute (`http(s)`/`ftp`/`file`) and protocol-relative (`//`) URLs while
++     * leaving local (`/x`) and fragment (`#x`) references untouched.
++     *
++     * @param $value
++     * @return bool
++     */
++    protected function isRemoteUrl($value)
++    {
++        $value = $this->removeNonPrintableCharacters($value);
++
++        return (bool) preg_match('~^\s*(?:(?:https?|ftp|file):)?//~i', $value);
++    }
++
++    /**
++     * Strip remote @import / url() references from CSS text (used for inline
++     * <style> content when removeRemoteReferences is enabled).
++     *
++     * CSS escapes and comments are resolved first so obfuscated remote references
++     * (e.g. `\75 rl(` or `@\69 mport`) cannot hide from the token match. This is a
++     * best-effort measure: a regex-based stripper cannot see through every possible
++     * CSS obfuscation, so untrusted CSS should still be isolated at the embedding
++     * boundary.
++     *
++     * @param string $css
++     * @return string
++     */
++    protected function stripRemoteCssReferences($css)
++    {
++        $normalized = $this->normalizeCss($css);
++
++        // Only rewrite from the normalized form when obfuscation was used to hide a
++        // remote reference; otherwise strip the original as-is so that legitimate
++        // escaped CSS is preserved untouched.
++        $source = ($normalized !== $css && $this->hasRemoteReference($normalized)) ? $normalized : $css;
++
++        $source = preg_replace('~@import\b[^;]*;?~i', '', $source);
++        $source = preg_replace('~url\(\s*[\'"]?\s*(?:(?:https?|ftp|file):)?//[^)]*\)~i', '', $source);
++
++        return $source;
++    }
++
++    /**
++     * Resolve CSS escapes and comments so obfuscated tokens can be matched.
++     *
++     * @param string $css
++     * @return string
++     */
++    protected function normalizeCss($css)
++    {
++        $css = $this->decodeCssEscapes($css);
++        // Replace comments with a space so they can neither glue nor split tokens.
++        $css = preg_replace('~/\*.*?\*/~s', ' ', $css);
++
++        return $css;
++    }
++
++    /**
++     * Decode CSS escape sequences (`\XX` hex escapes and `\c` literal escapes)
++     * into the characters they represent.
++     *
++     * @param string $css
++     * @return string
++     */
++    protected function decodeCssEscapes($css)
++    {
++        return preg_replace_callback(
++            '~\\\\([0-9A-Fa-f]{1,6})[ \t\r\n\f]?|\\\\(.)~s',
++            function ($matches) {
++                if ($matches[1] !== '') {
++                    $codepoint = hexdec($matches[1]);
++                    if ($codepoint === 0 || $codepoint > 0x10FFFF) {
++                        return "\xEF\xBF\xBD"; // U+FFFD replacement character
++                    }
++                    return $this->codepointToUtf8($codepoint);
++                }
++                return $matches[2];
++            },
++            $css
++        );
++    }
+ 
+-        return preg_match('~^((https?|ftp|file):)?//~xi', $value);
++    /**
++     * Encode a Unicode code point as a UTF-8 byte sequence (avoids an mbstring
++     * dependency, which the library does not otherwise require).
++     *
++     * @param int $codepoint
++     * @return string
++     */
++    protected function codepointToUtf8($codepoint)
++    {
++        if ($codepoint < 0x80) {
++            return chr($codepoint);
++        }
++        if ($codepoint < 0x800) {
++            return chr(0xC0 | ($codepoint >> 6))
++                . chr(0x80 | ($codepoint & 0x3F));
++        }
++        if ($codepoint < 0x10000) {
++            return chr(0xE0 | ($codepoint >> 12))
++                . chr(0x80 | (($codepoint >> 6) & 0x3F))
++                . chr(0x80 | ($codepoint & 0x3F));
++        }
++        return chr(0xF0 | ($codepoint >> 18))
++            . chr(0x80 | (($codepoint >> 12) & 0x3F))
++            . chr(0x80 | (($codepoint >> 6) & 0x3F))
++            . chr(0x80 | ($codepoint & 0x3F));
+     }
+ 
+     /**
+--- a/tests/SanitizerTest.php
++++ b/tests/SanitizerTest.php
+@@ -100,20 +100,23 @@ class SanitizerTest extends TestCase
+         $sanitizer = new Sanitizer();
+         $cleanData = $sanitizer->sanitize($initialData);
+ 
++        // Malformed XML must be rejected outright.
+         self::assertFalse($cleanData);
+-        self::assertEquals(
+-            [
+-                [
+-                    'message' => 'Opening and ending tag mismatch: line line 8 and svg',
+-                    'line' => 15,
+-                ],
+-                [
+-                    'message' => 'Premature end of data in tag svg line 4',
+-                    'line' => 16,
+-                ],
+-            ],
+-            $sanitizer->getXmlIssues()
+-        );
++
++        // The exact set and wording of libxml parse errors varies by libxml version
++        // (newer libxml stops after the first fatal error), so assert that the key
++        // error is reported rather than requiring an exact, version-specific list.
++        $issues = $sanitizer->getXmlIssues();
++        self::assertNotEmpty($issues);
++
++        $reportedTagMismatch = false;
++        foreach ($issues as $issue) {
++            if (stripos($issue['message'], 'Opening and ending tag mismatch') !== false) {
++                $reportedTagMismatch = true;
++                break;
++            }
++        }
++        self::assertTrue($reportedTagMismatch, 'Expected a tag-mismatch parse error to be reported');
+     }
+ 
+     /**
+@@ -259,20 +262,195 @@ class SanitizerTest extends TestCase
+     }
+ 
+     /**
++     * The DTD is now stripped before parsing, so a document that references a custom
++     * entity ends up referencing an *undefined* entity. libxml rejects it and the
++     * sanitizer returns false (fail-safe) rather than a cleaned string.
++     *
+      * @test
+      */
+     public function doctypeAndEntityAreRemoved()
+     {
+         $dataDirectory = __DIR__ . '/data';
+         $initialData = file_get_contents($dataDirectory . '/entityTest.svg');
+-        $expected = file_get_contents($dataDirectory . '/entityClean.svg');
+ 
+         $sanitizer = new Sanitizer();
+         $sanitizer->minify(false);
+         $sanitizer->removeRemoteReferences(true);
+         $cleanData = $sanitizer->sanitize($initialData);
+ 
+-        self::assertSame($expected, $cleanData);
++        self::assertFalse($cleanData);
++
++        // Rejected for the right reason: the custom entity is no longer defined.
++        $rejectedForUndefinedEntity = false;
++        foreach ($sanitizer->getXmlIssues() as $issue) {
++            if (stripos($issue['message'], 'not defined') !== false) {
++                $rejectedForUndefinedEntity = true;
++                break;
++            }
++        }
++        self::assertTrue($rejectedForUndefinedEntity, 'Expected an undefined-entity parse error');
++    }
++
++    /**
++     * A PUBLIC DOCTYPE with no entity definitions (typical Illustrator/Inkscape export)
++     * must still sanitize normally after the DTD is stripped.
++     *
++     * @test
++     */
++    public function publicDoctypeWithoutEntitiesStillSanitizes()
++    {
++        $svg = "<?xml version=\"1.0\"?>\n"
++            . "<!DOCTYPE svg PUBLIC \"-//W3C//DTD SVG 1.1//EN\" \"http://www.w3.org/Graphics/SVG/1.1/DTD/svg11.dtd\">\n"
++            . "<svg xmlns=\"http://www.w3.org/2000/svg\"><rect width=\"10\" height=\"10\"/></svg>";
++
++        $sanitizer = new Sanitizer();
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false !== strpos($clean, '<svg'), 'svg root should survive');
++        self::assertTrue(false !== strpos($clean, '<rect'), 'rect should survive');
++        self::assertTrue(false === stripos($clean, '<!DOCTYPE'), 'DOCTYPE should be stripped');
++    }
++
++    /**
++     * Issue 1 (GHSA-9rjx-3jch-6vjf): a custom DTD entity that collides with an HTML5
++     * named character reference (e.g. &Tab; => U+0009) must not be able to smuggle a
++     * javascript: URL through an href. Stripping the DTD makes the entity undefined,
++     * so the document is rejected outright.
++     *
++     * @test
++     */
++    public function entityHrefBypassIsRejected()
++    {
++        $dataDirectory = __DIR__ . '/data';
++        $initialData = file_get_contents($dataDirectory . '/entityHrefBypassTest.svg');
++
++        $sanitizer = new Sanitizer();
++        $cleanData = $sanitizer->sanitize($initialData);
++
++        // Undefined entity after DTD removal -> libxml rejects -> false.
++        self::assertFalse($cleanData);
++    }
++
++    /**
++     * Issue 2 (GHSA-v383-3rw5-q8rf): a DTD #FIXED attribute default used to trigger a
++     * double removeAttribute() on a DTD-materialised attribute, corrupting libxml
++     * memory (SIGABRT on libxml < 2.9.x). After DTD stripping the attribute never
++     * materialises, so there is nothing to double-remove.
++     *
++     * NOTE: the crash only reproduces on older libxml; on newer libxml this passes
++     * even without the fix, so it serves as a regression guard rather than a
++     * red->green test on modern environments.
++     *
++     * @test
++     */
++    public function attlistFixedDefaultDoesNotCrashAndIsRemoved()
++    {
++        $dataDirectory = __DIR__ . '/data';
++        $initialData = file_get_contents($dataDirectory . '/attlistFixedDosTest.svg');
++
++        $sanitizer = new Sanitizer();
++        $cleanData = $sanitizer->sanitize($initialData);
++
++        self::assertTrue(is_string($cleanData), 'valid body should still sanitize to a string');
++        self::assertTrue(false === stripos($cleanData, 'badhref'), 'DTD-defaulted attribute must be gone');
++        self::assertTrue(false === strpos($cleanData, 'javascript:'), 'payload must not survive');
++    }
++
++    /**
++     * Issue 3 (Report 2.2): a bare remote href must be stripped under
++     * removeRemoteReferences(true).
++     *
++     * @test
++     */
++    public function removeRemoteReferencesStripsBareRemoteImageHref()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">'
++            . '<image href="https://evil.com/x.png"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false === strpos($clean, 'evil.com'), 'remote image href should be removed');
++    }
++
++    /**
++     * Issue 3 (Report 2.3): an unquoted url() remote reference must be stripped.
++     *
++     * @test
++     */
++    public function removeRemoteReferencesStripsUnquotedRemoteUrl()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<rect fill="url(https://evil.com/x)" width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false === strpos($clean, 'evil.com'), 'unquoted remote url() should be removed');
++    }
++
++    /**
++     * Issue 3 (#116): a remote url() embedded among other declarations inside a style
++     * attribute must be stripped.
++     *
++     * @test
++     */
++    public function removeRemoteReferencesStripsRemoteUrlInStyleAttribute()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<rect style="fill:url(https://evil.com/x);stroke:red" width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false === strpos($clean, 'evil.com'), 'remote url() in style attribute should be removed');
++    }
++
++    /**
++     * Issue 3: remote @import / url() inside a <style> element must be stripped, while
++     * legitimate local CSS rules are preserved.
++     *
++     * @test
++     */
++    public function removeRemoteReferencesStripsRemoteCssInStyleElement()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<style>@import url(https://evil.com/x.css); .a{fill:red}</style>'
++            . '<rect width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false === strpos($clean, 'evil.com'), 'remote @import should be removed');
++        self::assertTrue(false !== strpos($clean, 'fill:red'), 'legitimate local CSS should be preserved');
++    }
++
++    /**
++     * Regression guard: local fragment references must be preserved under
++     * removeRemoteReferences(true).
++     *
++     * @test
++     */
++    public function removeRemoteReferencesKeepsLocalFragmentUrl()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<rect fill="url(#grad)" width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false !== strpos($clean, '#grad'), 'local fragment reference should be kept');
+     }
+ 
+     /**
+@@ -412,4 +590,123 @@ class SanitizerTest extends TestCase
+             }
+         }
+     }
++
++    /**
++     * Issue 3 follow-up: a remote url() hidden behind CSS escapes ("\75 rl(")
++     * inside a <style> element must still be stripped.
++     *
++     * @test
++     */
++    public function removeRemoteReferencesStripsEscapedRemoteUrlInStyleElement()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<style>x{background:\\75 rl(https://evil.com/track)}</style>'
++            . '<rect width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false === strpos($clean, 'evil.com'), 'escape-obfuscated remote url() should be removed');
++    }
++
++    /**
++     * Issue 3 follow-up: an escaped @import ("@\69 mport") inside a <style>
++     * element must still be stripped.
++     *
++     * @test
++     */
++    public function removeRemoteReferencesStripsEscapedRemoteImportInStyleElement()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<style>@\\69 mport "https://evil.com/track";</style>'
++            . '<rect width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false === strpos($clean, 'evil.com'), 'escape-obfuscated @import should be removed');
++    }
++
++    /**
++     * Issue 3 follow-up: a remote reference hidden behind a CSS comment inside a
++     * <style> element must still be stripped.
++     *
++     * @test
++     */
++    public function removeRemoteReferencesStripsCommentObfuscatedRemoteImport()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<style>@import/* x */url(https://evil.com/track);</style>'
++            . '<rect width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false === strpos($clean, 'evil.com'), 'comment-obfuscated remote reference should be removed');
++    }
++
++    /**
++     * Regression: legitimate escaped CSS in a <style> block with no remote
++     * reference must be preserved untouched under removeRemoteReferences(true).
++     *
++     * @test
++     */
++    public function removeRemoteReferencesPreservesLegitimateEscapedCss()
++    {
++        $svg = '<svg xmlns="http://www.w3.org/2000/svg">'
++            . '<style>.foo\\:bar{color:red}</style>'
++            . '<rect width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $sanitizer->removeRemoteReferences(true);
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean));
++        self::assertTrue(false !== strpos($clean, 'color:red'), 'legitimate CSS should be preserved');
++        self::assertTrue(false !== strpos($clean, 'foo\\:bar'), 'escaped selector should be preserved untouched');
++    }
++
++    /**
++     * removeDoctype() must fully strip the DTD even when a "]" appears inside a
++     * DTD comment, so no internal-subset fragment leaks past the parser.
++     *
++     * @test
++     */
++    public function doctypeWithBracketInCommentIsFullyStripped()
++    {
++        $svg = "<!DOCTYPE svg [ <!-- ] --> <!ENTITY x \"y\"> ]>\n"
++            . '<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean), 'document should remain valid after a full DTD strip');
++        self::assertTrue(false !== strpos($clean, '<rect'), 'body should survive');
++        self::assertTrue(false === stripos($clean, '<!ENTITY'), 'no DTD fragment should leak');
++    }
++
++    /**
++     * removeDoctype() must fully strip the DTD even when a "]" appears inside an
++     * entity value string.
++     *
++     * @test
++     */
++    public function doctypeWithBracketInEntityValueIsFullyStripped()
++    {
++        $svg = "<!DOCTYPE svg [ <!ENTITY x \"a]b\"> ]>\n"
++            . '<svg xmlns="http://www.w3.org/2000/svg"><rect width="1" height="1"/></svg>';
++
++        $sanitizer = new Sanitizer();
++        $clean = $sanitizer->sanitize($svg);
++
++        self::assertTrue(is_string($clean), 'document should remain valid after a full DTD strip');
++        self::assertTrue(false !== strpos($clean, '<rect'), 'body should survive');
++        self::assertTrue(false === stripos($clean, '<!ENTITY'), 'no DTD fragment should leak');
++    }
+ }
+--- /dev/null
++++ b/tests/data/attlistFixedDosTest.svg
+@@ -0,0 +1,5 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE svg [
++  <!ATTLIST svg badhref CDATA #FIXED "javascript:alert(1)">
++]>
++<svg xmlns="http://www.w3.org/2000/svg"><rect width="10" height="10"/></svg>
+--- a/tests/data/entityClean.svg
++++ /dev/null
+@@ -1,4 +0,0 @@
+-<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+-<svg xmlns="http://www.w3.org/2000/svg">
+-  <text x="0" y="20" font-size="20"></text>
+-</svg>
+--- /dev/null
++++ b/tests/data/entityHrefBypassTest.svg
+@@ -0,0 +1,7 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE svg [
++  <!ENTITY Tab "#">
++]>
++<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
++  <a xlink:href="&Tab;javascript:alert(1)"><text x="10" y="20">click</text></a>
++</svg>
