@@ -47,6 +47,7 @@ unknown
 - GHSA-w672-239g-c3gr
 - GHSA-wv46-xpj8-pw53
 - GHSA-wvpp-8hx9-p66j
+- GHSA-89ff-m8wv-p99r
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
