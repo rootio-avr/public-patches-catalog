@@ -1,0 +1,798 @@
+--- a/lib/client.js
++++ b/lib/client.js
+@@ -79,6 +79,15 @@ const errors = {
+   162: 'Wildcard Subscriptions not supported'
+ }
+ 
++// MQTT 5 reason code 0x82, "Protocol Error"
++const PROTOCOL_ERROR = 130
++// MQTT 5 reason code 0x93, "Receive Maximum exceeded"
++const RECEIVE_MAXIMUM_EXCEEDED = 147
++// MQTT 5 reason code 0x94, "Topic Alias invalid"
++const TOPIC_ALIAS_INVALID = 148
++// MQTT 5 Receive Maximum is a 16 bit value, and 65535 when not given
++const MAX_RECEIVE_MAXIMUM = 0xffff
++
+ function defaultId () {
+   return 'mqttjs_' + Math.random().toString(16).substr(2, 8)
+ }
+@@ -277,6 +286,45 @@ function MqttClient (streamBuilder, options) {
+   this.outgoingStore = options.outgoingStore || new Store()
+   this.incomingStore = options.incomingStore || new Store()
+ 
++  // Message ids of the inbound QoS 2 PUBLISH packets held in `incomingStore`.
++  // Used to enforce the MQTT 5 Receive Maximum and to purge store entries that
++  // belong to a session the broker did not resume (GHSA-h8jm-hm87-fqw3). It
++  // shares the store's lifetime: an id is added with the store entry and
++  // dropped with it.
++  this._incomingQoS2Ids = new Set()
++
++  // Latch the enforced Receive Maximum now: reading it per packet would let a
++  // caller mutating `options` disable the check, and `receiveMaximum: 0` or a
++  // non-number would break it outright.
++  this._receiveMaximum = MAX_RECEIVE_MAXIMUM
++  const receiveMaximum = options.properties && options.properties.receiveMaximum
++  if (typeof receiveMaximum !== 'undefined') {
++    if (Number.isInteger(receiveMaximum) && receiveMaximum >= 1 && receiveMaximum <= MAX_RECEIVE_MAXIMUM) {
++      this._receiveMaximum = receiveMaximum
++    } else {
++      debug('MqttClient :: options.properties.receiveMaximum %o is not an integer between 1 and %d, enforcing %d instead', receiveMaximum, MAX_RECEIVE_MAXIMUM, MAX_RECEIVE_MAXIMUM)
++    }
++  }
++
++  // Properties the broker sent in the CONNACK of the current connection, kept
++  // per connection and never merged into `options`, which belongs to the
++  // caller (GHSA-gfxc-3w7m-8ch4).
++  this._serverProperties = undefined
++
++  // The Authentication Method sent in this connection's CONNECT, latched when
++  // the CONNECT is written. Used to reject unsolicited/mismatched AUTH packets
++  // (GHSA-fwrw-4mhv-wxvm).
++  this._authenticationMethod = undefined
++
++  // True once a CONNACK has been handled on the current network connection,
++  // accepted or refused ([MQTT-3.2.0-2] allows only one). Reset per network
++  // connection in _setupStream (GHSA-8phv-jwjm-93rr).
++  this.connackReceived = false
++
++  // Set while a refused CONNACK is torn down, so neither `_cleanUp` nor the
++  // `close` handler arms a retry the broker actively denied.
++  this.reconnectSuppressed = false
++
+   // Should QoS zero messages be queued when the connection is broken?
+   this.queueQoSZero = options.queueQoSZero === undefined ? true : options.queueQoSZero
+ 
+@@ -374,6 +422,10 @@ function MqttClient (streamBuilder, options) {
+       that.pingTimer = null
+     }
+ 
++    // the broker properties describe the connection that just went away, they
++    // must not leak into the next one (GHSA-gfxc-3w7m-8ch4)
++    this._serverProperties = undefined
++
+     if (this.topicAliasRecv) {
+       this.topicAliasRecv.clear()
+     }
+@@ -388,6 +440,33 @@ function MqttClient (streamBuilder, options) {
+ }
+ inherits(MqttClient, EventEmitter)
+ 
++/**
++ * Properties the broker sent in the CONNACK of the current connection, or
++ * `undefined` when there is none. Read only: kept per connection and never
++ * merged into `options`, which belongs to the caller (GHSA-gfxc-3w7m-8ch4).
++ */
++Object.defineProperty(MqttClient.prototype, 'serverProperties', {
++  get: function () {
++    return this._serverProperties
++  }
++})
++
++/**
++ * Effective keepalive (in seconds): the `Server Keep Alive` the broker sent in
++ * the CONNACK that opened the current connection when there is one, the
++ * configured `keepalive` otherwise. Replaces the previous behaviour of
++ * overwriting `options.keepalive` with the broker value (GHSA-gfxc-3w7m-8ch4).
++ */
++Object.defineProperty(MqttClient.prototype, 'keepalive', {
++  get: function () {
++    // Only an accepted CONNACK opens a connection to keep alive.
++    const serverKeepAlive = this.connected && this._serverProperties ? this._serverProperties.serverKeepAlive : undefined
++    // a configured keepalive of 0 disables it and the broker cannot turn it
++    // back on; a `serverKeepAlive` of 0 is the broker declining to set one
++    return serverKeepAlive && this.options.keepalive ? serverKeepAlive : this.options.keepalive
++  }
++})
++
+ /**
+  * setup the event handlers in the inner stream.
+  *
+@@ -400,6 +479,34 @@ MqttClient.prototype._setupStream = function () {
+   let completeParse = null
+   const packets = []
+ 
++  // A new network connection, so the broker may send one CONNACK again. This
++  // runs for both the first connect and every reconnect, and before the stream
++  // exists, so no CONNACK can slip in ahead of it (GHSA-8phv-jwjm-93rr).
++  this.connackReceived = false
++  this.reconnectSuppressed = false
++
++  // A refused CONNACK emits no `close` with the default
++  // reconnectOnConnackError: false, so without this the properties of a
++  // connection that is gone would still be readable while the next one is being
++  // negotiated (GHSA-gfxc-3w7m-8ch4).
++  this._serverProperties = undefined
++
++  // This stream's packet pump. Handlers that tear a connection down use this to
++  // drop the parsed-but-unhandled rest of the current TCP chunk, and to tell
++  // whether the client has already moved on to a later connection. A single TCP
++  // chunk is parsed in full into `packets` before its first packet is handled,
++  // so a broker we just declared in violation could otherwise keep delivering
++  // the packets it packed behind the offending one against a destroyed stream.
++  const pump = {
++    discardParsedPackets: function () {
++      packets.length = 0
++    },
++    isCurrent: function () {
++      return that._currentPump === pump
++    }
++  }
++  this._currentPump = pump
++
+   debug('_setupStream :: calling method to clear reconnect')
+   this._clearReconnect()
+ 
+@@ -423,11 +530,21 @@ MqttClient.prototype._setupStream = function () {
+ 
+   function work () {
+     debug('work :: getting next packet in queue')
++
++    // Once the client has moved on to a later connection, whatever is still
++    // queued here was parsed on a stream that is gone. Handling it would run
++    // one connection's packets against another. Dropping the queue is the only
++    // safe reading of it (GHSA-8phv-jwjm-93rr).
++    if (that._currentPump !== pump) {
++      debug('work :: pump superseded, dropping %d queued packets', packets.length)
++      packets.length = 0
++    }
++
+     const packet = packets.shift()
+ 
+     if (packet) {
+       debug('work :: packet pulled from queue')
+-      that._handlePacket(packet, nextTickWork)
++      that._handlePacket(packet, nextTickWork, pump)
+     } else {
+       debug('work :: no packets in queue')
+       const done = completeParse
+@@ -475,14 +592,32 @@ MqttClient.prototype._setupStream = function () {
+   debug('_setupStream: sending packet `connect`')
+   const connectPacket = Object.create(this.options)
+   connectPacket.cmd = 'connect'
++  // Shallow copy: the values below are written into this object, and writing
++  // them into `this.options.properties` (which `connectPacket` inherits by
++  // prototype) would mutate the object the caller passed in -- the outbound
++  // half of the CONNACK leak this fixes on the inbound side
++  // (GHSA-gfxc-3w7m-8ch4).
++  if (this.options.properties) {
++    connectPacket.properties = xtend({}, this.options.properties)
++  }
+   if (this.topicAliasRecv) {
+     if (!connectPacket.properties) {
+       connectPacket.properties = {}
+     }
+-    if (this.topicAliasRecv) {
+-      connectPacket.properties.topicAliasMaximum = this.topicAliasRecv.max
+-    }
++    connectPacket.properties.topicAliasMaximum = this.topicAliasRecv.max
++  }
++  if (connectPacket.properties && typeof connectPacket.properties.receiveMaximum !== 'undefined') {
++    // Advertise the quota that is enforced, not the one that was asked for: a
++    // rejected `receiveMaximum: 0` on the wire is itself a protocol error
++    // (MQTT 5 3.2.2.3.3) that the broker would blame us for (GHSA-h8jm-hm87-fqw3).
++    connectPacket.properties.receiveMaximum = this._receiveMaximum
+   }
++
++  // What this connection actually offered in CONNECT, latched so a caller
++  // mutating `options` mid-exchange cannot move the goalposts of the AUTH check
++  // (GHSA-fwrw-4mhv-wxvm).
++  this._authenticationMethod = this.options.properties && this.options.properties.authenticationMethod
++
+   // avoid message queue
+   sendPacket(this, connectPacket)
+ 
+@@ -513,7 +648,7 @@ MqttClient.prototype._setupStream = function () {
+   }, this.options.connectTimeout)
+ }
+ 
+-MqttClient.prototype._handlePacket = function (packet, done) {
++MqttClient.prototype._handlePacket = function (packet, done, pump) {
+   const options = this.options
+ 
+   if (options.protocolVersion === 5 && options.properties && options.properties.maximumPacketSize && options.properties.maximumPacketSize < packet.length) {
+@@ -526,7 +661,7 @@ MqttClient.prototype._handlePacket = function (packet, done) {
+ 
+   switch (packet.cmd) {
+     case 'publish':
+-      this._handlePublish(packet, done)
++      this._handlePublish(packet, done, pump)
+       break
+     case 'puback':
+     case 'pubrec':
+@@ -540,11 +675,11 @@ MqttClient.prototype._handlePacket = function (packet, done) {
+       this._handlePubrel(packet, done)
+       break
+     case 'connack':
+-      this._handleConnack(packet)
++      this._handleConnack(packet, pump)
+       done()
+       break
+     case 'auth':
+-      this._handleAuth(packet)
++      this._handleAuth(packet, pump)
+       done()
+       break
+     case 'pingresp':
+@@ -643,6 +778,7 @@ MqttClient.prototype.publish = function (topic, message, opts, callback) {
+         // Add to callbacks
+         that.outgoing[packet.messageId] = {
+           volatile: false,
++          cmd: 'publish',
+           cb: callback || nop
+         }
+         debug('MqttClient:publish: packet cmd: %s', packet.cmd)
+@@ -820,9 +956,25 @@ MqttClient.prototype.subscribe = function () {
+ 
+     that.outgoing[packet.messageId] = {
+       volatile: true,
++      cmd: 'subscribe',
+       cb: function (err, packet) {
+         if (!err) {
+           const granted = packet.granted
++          // A SUBACK carries exactly one reason code per topic filter sent
++          // (MQTT-3.8.4-6, MQTT-3.8.4-5 in 3.1.1), so the count must match.
++          // Extra codes used to index past the end of `subs` (leaving
++          // undefined entries the caller sees), missing ones used to leave the
++          // unanswered topics reported as granted at the qos asked for, hiding
++          // a subscription that never was (GHSA-rj8f-4655-cgg2).
++          if (granted.length !== subs.length) {
++            const mismatch = new Error('Protocol error: suback granted ' + granted.length + ' reason code(s) for ' + subs.length + ' subscription(s)')
++            // A count mismatch is a protocol violation; 3.1.1 makes closing
++            // mandatory [MQTT-4.8.0-1]. Not `end()`: that would clear the
++            // reconnect timer and make a broker bug permanent.
++            callback(mismatch, subs)
++            that._cleanUp(true)
++            return
++          }
+           for (let i = 0; i < granted.length; i += 1) {
+             subs[i].qos = granted[i]
+           }
+@@ -918,6 +1070,7 @@ MqttClient.prototype.unsubscribe = function () {
+ 
+     that.outgoing[packet.messageId] = {
+       volatile: true,
++      cmd: 'unsubscribe',
+       cb: callback
+     }
+ 
+@@ -978,6 +1131,7 @@ MqttClient.prototype.end = function (force, opts, cb) {
+   function closeStores () {
+     debug('end :: closeStores: closing incoming and outgoing stores')
+     that.disconnected = true
++    that._incomingQoS2Ids.clear()
+     that.incomingStore.close(function (e1) {
+       that.outgoingStore.close(function (e2) {
+         debug('end :: closeStores: emitting end')
+@@ -1070,6 +1224,7 @@ MqttClient.prototype.reconnect = function (opts) {
+     }
+     that.incomingStore = that.options.incomingStore || new Store()
+     that.outgoingStore = that.options.outgoingStore || new Store()
++    that._incomingQoS2Ids.clear()
+     that.disconnecting = false
+     that.disconnected = false
+     that._deferredReconnect = null
+@@ -1106,7 +1261,7 @@ MqttClient.prototype._reconnect = function () {
+ MqttClient.prototype._setupReconnect = function () {
+   const that = this
+ 
+-  if (!that.disconnecting && !that.reconnectTimer && (that.options.reconnectPeriod > 0)) {
++  if (!that.disconnecting && !that.reconnectSuppressed && !that.reconnectTimer && (that.options.reconnectPeriod > 0)) {
+     if (!this.reconnecting) {
+       debug('_setupReconnect :: emit `offline` state')
+       this.emit('offline')
+@@ -1292,14 +1447,14 @@ MqttClient.prototype._storePacket = function (packet, cb, cbStorePut) {
+  * @api private
+  */
+ MqttClient.prototype._setupPingTimer = function () {
+-  debug('_setupPingTimer :: keepalive %d (seconds)', this.options.keepalive)
++  debug('_setupPingTimer :: keepalive %d (seconds)', this.keepalive)
+   const that = this
+ 
+-  if (!this.pingTimer && this.options.keepalive) {
++  if (!this.pingTimer && this.keepalive) {
+     this.pingResp = true
+     this.pingTimer = reInterval(function () {
+       that._checkPing()
+-    }, this.options.keepalive * 1000)
++    }, this.keepalive * 1000)
+   }
+ }
+ 
+@@ -1309,8 +1464,8 @@ MqttClient.prototype._setupPingTimer = function () {
+  * @api private
+  */
+ MqttClient.prototype._shiftPingInterval = function () {
+-  if (this.pingTimer && this.options.keepalive && this.options.reschedulePings) {
+-    this.pingTimer.reschedule(this.options.keepalive * 1000)
++  if (this.pingTimer && this.keepalive && this.options.reschedulePings) {
++    this.pingTimer.reschedule(this.keepalive * 1000)
+   }
+ }
+ /**
+@@ -1340,24 +1495,122 @@ MqttClient.prototype._handlePingresp = function () {
+   this.pingResp = true
+ }
+ 
++/**
++ * _trackIncomingQoS2Publish - records an inbound QoS 2 PUBLISH about to be put
++ * in `incomingStore`, and on MQTT 5 takes a Receive Maximum slot for it. A
++ * re-delivery of an id already in flight reuses its entry, so only distinct ids
++ * count against the quota (GHSA-h8jm-hm87-fqw3).
++ *
++ * @returns {Boolean} false when the quota is exceeded and the connection is
++ *   going down
++ * @api private
++ */
++MqttClient.prototype._trackIncomingQoS2Publish = function (messageId, done, pump) {
++  if (this._incomingQoS2Ids.has(messageId)) {
++    return true
++  }
++
++  // Receive Maximum is an MQTT 5 negotiation; 3.1 and 3.1.1 have no such limit.
++  if (this.options.protocolVersion === 5 && this._incomingQoS2Ids.size >= this._receiveMaximum) {
++    debug('_trackIncomingQoS2Publish :: inbound QoS 2 messages exceeded receiveMaximum %d', this._receiveMaximum)
++    // Order matters: drop the rest of the parsed chunk, then tear down, then
++    // call `done` (the pump callback that completes the pending write), then
++    // emit. `_cleanUp` before the emit because the emit may throw.
++    if (pump) { pump.discardParsedPackets() }
++    if (!pump || pump.isCurrent()) {
++      this._cleanUp(true)
++    }
++    done()
++    const err = new Error(errors[RECEIVE_MAXIMUM_EXCEEDED] + ': ' + (this._incomingQoS2Ids.size + 1) + ' inbound QoS 2 messages in flight, receiveMaximum is ' + this._receiveMaximum)
++    err.code = RECEIVE_MAXIMUM_EXCEEDED
++    this.emit('error', err)
++    return false
++  }
++
++  this._incomingQoS2Ids.add(messageId)
++  return true
++}
++
++/**
++ * _releaseIncomingQoS2Publish - releases the slot taken above, once the store
++ * entry is gone.
++ * @api private
++ */
++MqttClient.prototype._releaseIncomingQoS2Publish = function (messageId) {
++  this._incomingQoS2Ids.delete(messageId)
++}
++
++/**
++ * _discardIncomingQoS2State - drops the inbound QoS 2 messages kept for a
++ * session the broker did not resume, store entries and Receive Maximum slots
++ * together. Their PUBRELs are never coming (GHSA-h8jm-hm87-fqw3).
++ * @api private
++ */
++MqttClient.prototype._discardIncomingQoS2State = function () {
++  if (this._incomingQoS2Ids.size === 0) {
++    return
++  }
++
++  debug('_discardIncomingQoS2State :: session not resumed, dropping %d inbound QoS 2 message(s)', this._incomingQoS2Ids.size)
++
++  const that = this
++  this._incomingQoS2Ids.forEach(function (messageId) {
++    that.incomingStore.del({ messageId: messageId }, nop)
++  })
++  this._incomingQoS2Ids.clear()
++}
++
+ /**
+  * _handleConnack
+  *
+  * @param {Object} packet
+  * @api private
+  */
+-MqttClient.prototype._handleConnack = function (packet) {
++MqttClient.prototype._handleConnack = function (packet, pump) {
+   debug('_handleConnack')
+   const options = this.options
+   const version = options.protocolVersion
+   const rc = version === 5 ? packet.reasonCode : packet.returnCode
+ 
++  // [MQTT-3.2.0-2] the server must not send more than one CONNACK per network
++  // connection: re-running `_onConnect` on a live session would reset the
++  // message id state and resend still-unacked messages. The gate is "a CONNACK
++  // was already handled on this connection", not `connected`: a refused CONNACK
++  // never sets `connected`, so a broker could otherwise follow a refusal with
++  // an accepting CONNACK -- in the same chunk, ahead of the teardown below --
++  // and get a connected client the application already treated as failed
++  // (GHSA-8phv-jwjm-93rr).
++  if (this.connackReceived) {
++    const dupErr = new Error('Protocol error: duplicate CONNACK on the same network connection')
++    dupErr.code = PROTOCOL_ERROR
++    // Drop the rest of the chunk, then tear down, then emit. `_cleanUp` runs
++    // before the emit because `emit('error')` throws when nothing is listening
++    // and an application handler may throw too; either way the teardown would
++    // otherwise be skipped.
++    if (pump) { pump.discardParsedPackets() }
++    this._cleanUp(true)
++    this.emit('error', dupErr)
++    return
++  }
++  this.connackReceived = true
++
+   clearTimeout(this.connackTimer)
+   delete this.topicAliasSend
+ 
++  // Kept for the whole CONNACK, accepted or not: a refusal is where
++  // `reasonString` and `serverReference` show up. Never merged into `options`,
++  // which belongs to the caller (GHSA-gfxc-3w7m-8ch4).
++  this._serverProperties = packet.properties
++
+   if (packet.properties) {
+     if (packet.properties.topicAliasMaximum) {
+       if (packet.properties.topicAliasMaximum > 0xffff) {
++        // Unreachable over the wire (mqtt-packet parses topicAliasMaximum as a
++        // uint16), but without the teardown the client would wedge here: the
++        // connack timer is cleared and `connackReceived` latched, so no later
++        // CONNACK and no timeout can move it on.
++        if (pump) { pump.discardParsedPackets() }
++        this._cleanUp(true)
+         this.emit('error', new Error('topicAliasMaximum from broker is out of range'))
+         return
+       }
+@@ -1365,53 +1618,128 @@ MqttClient.prototype._handleConnack = function (packet) {
+         this.topicAliasSend = new TopicAliasSend(packet.properties.topicAliasMaximum)
+       }
+     }
++    // Broker keepalive/maximumPacketSize are read from `_serverProperties` via
++    // the effective-keepalive getter and _handlePacket; they are no longer
++    // written back into the caller's `options` object.
+     if (packet.properties.serverKeepAlive && options.keepalive) {
+-      options.keepalive = packet.properties.serverKeepAlive
+       this._shiftPingInterval()
+     }
+-    if (packet.properties.maximumPacketSize) {
+-      if (!options.properties) { options.properties = {} }
+-      options.properties.maximumPacketSize = packet.properties.maximumPacketSize
+-    }
+   }
+ 
+   if (rc === 0) {
+     this.reconnecting = false
+     this._onConnect(packet)
+   } else if (rc > 0) {
++    debug('_handleConnack :: connection refused with reason code %d', rc)
+     const err = new Error('Connection refused: ' + errors[rc])
+     err.code = rc
+-    this.emit('error', err)
++    // A refused CONNACK always tears the connection down. Leaving the socket
++    // open (what happened whenever `reconnectOnConnackError` was off, the
++    // default) left a client with the connack timer cleared, no keepalive and
++    // no reconnect armed, while a broker kept streaming PUBLISHes as `message`
++    // events to an application that had just been told "Connection refused".
++    if (pump) { pump.discardParsedPackets() }
++    // Neither `_cleanUp` nor the `close` handler may arm the retry here: it is
++    // armed below instead, after the `error`.
++    this.reconnectSuppressed = true
++    this._cleanUp(true)
++    try {
++      this.emit('error', err)
++    } finally {
++      if (options.reconnectOnConnackError) {
++        this.reconnectSuppressed = false
++        this._setupReconnect()
++      }
++    }
+   }
+ }
+ 
+-MqttClient.prototype._handleAuth = function (packet) {
++MqttClient.prototype._handleAuth = function (packet, pump) {
+   const options = this.options
+   const version = options.protocolVersion
+   const rc = version === 5 ? packet.reasonCode : packet.returnCode
++  const that = this
++
++  // Drops the connection on an AUTH exchange that cannot go on, and tells the
++  // application why. Emitting `error` alone leaves a hostile broker free to
++  // keep sending on a socket whose connack timer is already cleared. Teardown
++  // runs before the emit because the emit may throw (GHSA-fwrw-4mhv-wxvm).
++  function rejectAuth (error) {
++    debug('handleAuth :: %s', error.message)
++    if (pump) { pump.discardParsedPackets() }
++    if (!pump || pump.isCurrent()) {
++      that._cleanUp(true)
++    }
++    that.emit('error', error)
++  }
+ 
+   if (version !== 5) {
+     const err = new Error('Protocol error: Auth packets are only supported in MQTT 5. Your version:' + version)
+-    err.code = rc
+-    this.emit('error', err)
++    err.code = PROTOCOL_ERROR
++    rejectAuth(err)
+     return
+   }
+ 
+-  const that = this
+-  this.handleAuth(packet, function (err, packet) {
++  // What this connection actually offered in CONNECT, not what `options` says
++  // now: a caller mutating it mid-exchange must not move the goalposts.
++  const authenticationMethod = this._authenticationMethod
++
++  // MQTT-4.12.0-6: the broker must not send AUTH when the client did not offer
++  // an Authentication Method in CONNECT, so an AUTH outside an enhanced
++  // authentication exchange is a protocol violation. Reading straight from
++  // options and dereferencing an undefined callback path used to crash the
++  // process (GHSA-fwrw-4mhv-wxvm).
++  if (!authenticationMethod) {
++    const err = new Error('Protocol error: Auth packet received but enhanced authentication was not requested')
++    err.code = PROTOCOL_ERROR
++    rejectAuth(err)
++    return
++  }
++
++  // MQTT-4.12.0-3: the Authentication Method has to stay the one sent in
++  // CONNECT. Without this a broker can switch it mid-exchange and steer a
++  // custom `handleAuth` down a weaker path.
++  if (!(packet.properties && packet.properties.authenticationMethod === authenticationMethod)) {
++    const err = new Error('Protocol error: Auth packet Authentication Method does not match the "' + authenticationMethod + '" sent in CONNECT')
++    err.code = PROTOCOL_ERROR
++    rejectAuth(err)
++    return
++  }
++
++  this.handleAuth(packet, function (err, packet2) {
+     if (err) {
+-      that.emit('error', err)
++      // `handleAuth` refused the broker's packet, so the exchange cannot go on.
++      rejectAuth(err)
++      return
++    }
++
++    // MQTT 5 3.15.2.1: reason code 0 on AUTH means the broker accepted the
++    // authentication. Nothing left to send, connection stays up.
++    if (rc === 0) {
++      debug('handleAuth :: authentication exchange completed successfully')
+       return
+     }
+ 
+     if (rc === 24) {
++      if (!packet2) {
++        // `handleAuth` completed without a packet (the default does), so there
++        // is nothing to continue the exchange with.
++        const noPkt = new Error('Protocol error: No auth packet to continue the authentication exchange')
++        noPkt.code = PROTOCOL_ERROR
++        rejectAuth(noPkt)
++        return
++      }
+       that.reconnecting = false
+-      that._sendPacket(packet)
+-    } else {
+-      const error = new Error('Connection refused: ' + errors[rc])
+-      err.code = rc
+-      that.emit('error', error)
++      that._sendPacket(packet2)
++      return
+     }
++
++    // MQTT 5 3.15.2.1 defines exactly three AUTH reason codes: 0 and 24 (both
++    // handled above) and 25 "Re-authenticate" (only a client may send).
++    // Anything left is the broker breaking the protocol.
++    const badRc = new Error('Protocol error: Auth packet reason code ' + rc + ' is not one a broker may send')
++    badRc.code = PROTOCOL_ERROR
++    rejectAuth(badRc)
+   })
+ }
+ 
+@@ -1454,7 +1782,7 @@ default:
+ 
+ for now i just suppressed the warnings
+ */
+-MqttClient.prototype._handlePublish = function (packet, done) {
++MqttClient.prototype._handlePublish = function (packet, done, pump) {
+   debug('_handlePublish: packet %o', packet)
+   done = typeof done !== 'undefined' ? done : nop
+   let topic = packet.topic.toString()
+@@ -1464,34 +1792,63 @@ MqttClient.prototype._handlePublish = function (packet, done) {
+   const that = this
+   const options = this.options
+   const validReasonCodes = [0, 16, 128, 131, 135, 144, 145, 151, 153]
++
++  // Reject a PUBLISH whose Topic Alias breaks the protocol: tear the connection
++  // down (so reconnect logic runs) and tell the application. Drop the rest of
++  // the parsed chunk first, then tear down, then call `done`, then emit -- the
++  // same load-bearing order the upstream fix relies on (GHSA-c8jq-r765-cq7g).
++  function rejectTopicAlias (message, reasonCode) {
++    if (pump) { pump.discardParsedPackets() }
++    if (!pump || pump.isCurrent()) {
++      that._cleanUp(true)
++    }
++    done()
++    const err = new Error(message)
++    err.code = typeof reasonCode !== 'undefined' ? reasonCode : TOPIC_ALIAS_INVALID
++    that.emit('error', err)
++  }
++
+   if (this.options.protocolVersion === 5) {
+     let alias
+     if (packet.properties) {
+       alias = packet.properties.topicAlias
+     }
+     if (typeof alias !== 'undefined') {
++      const topicAliasRecv = this.topicAliasRecv
++      if (!topicAliasRecv) {
++        // The client never advertised a Topic Alias Maximum (defaults to 0), so
++        // per MQTT 5 it must not receive any Topic Alias. A broker sending one
++        // is violating the protocol: reject it instead of dereferencing the
++        // uninitialized receiver, which would throw an uncaught TypeError and
++        // crash the process (GHSA-c8jq-r765-cq7g).
++        debug('_handlePublish :: received unexpected topic alias. alias: %d', alias)
++        rejectTopicAlias('Received a PUBLISH Topic Alias but no Topic Alias Maximum was advertised')
++        return
++      }
+       if (topic.length === 0) {
+         if (alias > 0 && alias <= 0xffff) {
+-          const gotTopic = this.topicAliasRecv.getTopicByAlias(alias)
++          const gotTopic = topicAliasRecv.getTopicByAlias(alias)
+           if (gotTopic) {
+             topic = gotTopic
+             debug('_handlePublish :: topic complemented by alias. topic: %s - alias: %d', topic, alias)
+           } else {
+             debug('_handlePublish :: unregistered topic alias. alias: %d', alias)
+-            this.emit('error', new Error('Received unregistered Topic Alias'))
++            // 3.3.4 3)a): no mapping for this alias and a zero length Topic Name
++            // is a Protocol Error (0x82), not 0x94.
++            rejectTopicAlias('Received unregistered Topic Alias', PROTOCOL_ERROR)
+             return
+           }
+         } else {
+           debug('_handlePublish :: topic alias out of range. alias: %d', alias)
+-          this.emit('error', new Error('Received Topic Alias is out of range'))
++          rejectTopicAlias('Received Topic Alias is out of range')
+           return
+         }
+       } else {
+-        if (this.topicAliasRecv.put(topic, alias)) {
++        if (topicAliasRecv.put(topic, alias)) {
+           debug('_handlePublish :: registered topic: %s - alias: %d', topic, alias)
+         } else {
+-          debug('_handlePublish :: topic alias out of range. alias: %d', alias)
+-          this.emit('error', new Error('Received Topic Alias is out of range'))
++          debug('_handlePublish :: topic alias outside the advertised maximum. alias: %d - max: %d', alias, topicAliasRecv.max)
++          rejectTopicAlias('Received Topic Alias is out of range')
+           return
+         }
+       }
+@@ -1510,6 +1867,17 @@ MqttClient.prototype._handlePublish = function (packet, done) {
+         if (code) {
+           that._sendPacket({ cmd: 'pubrec', messageId: messageId, reasonCode: code }, done)
+         } else {
++          // Record the message id before retaining another inbound QoS 2
++          // message, so the entry can be purged with the session it belongs to.
++          // On MQTT 5 this also takes a Receive Maximum slot: without it a
++          // broker can send unlimited distinct-messageId QoS 2 PUBLISH packets
++          // before PUBREL and grow the incoming store past the advertised bound
++          // (GHSA-h8jm-hm87-fqw3).
++          if (!that._trackIncomingQoS2Publish(messageId, done, pump)) {
++            // Quota exceeded. The connection has been torn down, the rest of
++            // the parsed chunk dropped and `done` already called.
++            return
++          }
+           that.incomingStore.put(packet, function () {
+             that._sendPacket({ cmd: 'pubrec', messageId: messageId }, done)
+           })
+@@ -1573,7 +1941,8 @@ MqttClient.prototype._handleAck = function (packet) {
+   const messageId = packet.messageId
+   const type = packet.cmd
+   let response = null
+-  const cb = this.outgoing[messageId] ? this.outgoing[messageId].cb : null
++  const pending = this.outgoing[messageId]
++  const cb = pending ? pending.cb : null
+   const that = this
+   let err
+ 
+@@ -1594,6 +1963,26 @@ MqttClient.prototype._handleAck = function (packet) {
+     return
+   }
+ 
++  // An ack answers the request that allocated its message id and nothing else.
++  // `outgoing` is keyed by id alone, so without this check a SUBACK carrying a
++  // pending PUBLISH's id ran the suback branch below: it freed the id and
++  // called the publish callback while never calling `outgoingStore.del`, so the
++  // entry was replayed on every reconnect and the freed id let the next publish
++  // overwrite it. A mismatched ack is dropped, not turned into a failure of the
++  // pending request (GHSA-rj8f-4655-cgg2).
++  const acksForPendingCmd = {
++    publish: ['puback', 'pubrec', 'pubcomp'],
++    pubrel: ['pubcomp'],
++    subscribe: ['suback'],
++    unsubscribe: ['unsuback']
++  }
++  const allowed = pending.cmd && acksForPendingCmd[pending.cmd]
++  if (allowed && allowed.indexOf(type) === -1) {
++    debug('_handleAck :: %s does not answer the pending %s on message id %d. Ignoring.', type, pending.cmd, messageId)
++    that.emit('error', new Error('Protocol error: ' + type + ' does not answer the ' + pending.cmd + ' pending on message id ' + messageId))
++    return
++  }
++
+   // Process
+   debug('_handleAck :: packet type', type)
+   switch (type) {
+@@ -1684,12 +2073,23 @@ MqttClient.prototype._handlePubrel = function (packet, callback) {
+       that.emit('message', pub.topic, pub.payload, pub)
+       that.handleMessage(pub, function (err) {
+         if (err) {
++          // Keep the packet in the incoming store and send no PUBCOMP: the
++          // broker retransmits the PUBREL and the application gets another
++          // chance. Its Receive Maximum slot stays taken too.
+           return callback(err)
+         }
+         that.incomingStore.del(pub, nop)
++        // Release the Receive Maximum slot once the store entry is gone
++        // (GHSA-h8jm-hm87-fqw3).
++        that._releaseIncomingQoS2Publish(messageId)
+         that._sendPacket(comp, callback)
+       })
+     } else {
++      // No slot is released here: `IStore.get` reports "not found" and a
++      // transient read failure the same way, and freeing a slot whose entry is
++      // still in the store would break the quota. Nothing is lost: a slot is
++      // only taken alongside a store entry and released when that entry is
++      // deleted.
+       that._sendPacket(comp, callback)
+     }
+   })
+@@ -1766,11 +2166,27 @@ MqttClient.prototype._onConnect = function (packet) {
+   const that = this
+ 
+   this.connackPacket = packet
++
++  // A session is resumed only if we asked to keep one and the broker kept it.
++  // A clean start discards the previous session locally, unconditionally
++  // (MQTT-3.1.2-6). With `clean: false` the broker's Session Present decides.
++  // When the session is not resumed, drop the inbound QoS 2 store entries kept
++  // for it: their PUBRELs are never coming, and keeping them would pin their
++  // Receive Maximum slots for the client's lifetime (GHSA-h8jm-hm87-fqw3).
++  const sessionResumed = !this.options.clean &&
++    (this.options.protocolVersion < 4 || packet.sessionPresent === true)
++  if (!sessionResumed) {
++    this._discardIncomingQoS2State()
++  }
++
+   this.messageIdProvider.clear()
+-  this._setupPingTimer()
+ 
++  // before `_setupPingTimer`: the effective `keepalive` getter only reports the
++  // broker `serverKeepAlive` once the connection is up
+   this.connected = true
+ 
++  this._setupPingTimer()
++
+   function startStreamProcess () {
+     let outStore = that.outgoingStore.createStream()
+ 
+@@ -1822,6 +2238,9 @@ MqttClient.prototype._onConnect = function (packet) {
+         cb = that.outgoing[packet.messageId] ? that.outgoing[packet.messageId].cb : null
+         that.outgoing[packet.messageId] = {
+           volatile: false,
++          // the outgoing store holds publishes and pubrels, and the two are
++          // waiting for different acks
++          cmd: packet.cmd,
+           cb: function (err, status) {
+             // Ensure that the original callback passed in to publish gets invoked
+             if (cb) {
