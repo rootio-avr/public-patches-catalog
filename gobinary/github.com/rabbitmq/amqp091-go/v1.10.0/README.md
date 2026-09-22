@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-79921
+- CVE-2026-77412
 
 ## How to Apply:
 1. Clone or download the source code for github.com/rabbitmq/amqp091-go
