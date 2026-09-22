@@ -6,6 +6,12 @@ unknown
 ## Affected CVEs:
 - CVE-2026-26171
 - CVE-2026-33116
+- CVE-2026-32203
+- CVE-2026-50648
+- CVE-2026-47302
+- CVE-2026-47304
+- CVE-2026-50525
+- CVE-2026-50527
 
 ## How to Apply:
 1. Clone or download the source code for System.Security.Cryptography.Xml
