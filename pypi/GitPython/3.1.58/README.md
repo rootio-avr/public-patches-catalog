@@ -11,6 +11,7 @@ unknown
 - CVE-2026-78676
 - GHSA-9557-234j-7rv9
 - CVE-2026-78677
+- CVE-2026-78675
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
