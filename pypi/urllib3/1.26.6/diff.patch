@@ -1,0 +1,871 @@
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -107,6 +107,10 @@ class HTTPConnection(_HTTPConnection, object):
+     #: Whether this connection verifies the host's certificate.
+     is_verified = False
+ 
++    #: Whether this proxy connection (if used) verifies the proxy host's
++    #: certificate.
++    proxy_is_verified = None
++
+     def __init__(self, *args, **kw):
+         if not six.PY2:
+             kw.pop("strict", None)
+@@ -389,25 +389,61 @@ class HTTPSConnection(HTTPConnection):
+                 SystemTimeWarning,
+             )
+ 
++        # When this connection is a forwarding HTTPS proxy connection (an
++        # HTTPS proxy used without a CONNECT tunnel), the TLS handshake below
++        # is performed against the *proxy*, not the destination server. In that
++        # case we must prefer the proxy's own certificate policy so that the
++        # destination's (possibly relaxed) TLS settings cannot weaken -- or
++        # persistently overwrite in place -- the verification configured for
++        # the proxy connection.
++        proxy_is_forwarding = (
++            self.proxy is not None
++            and self.proxy_config is not None
++            and not self._is_using_tunnel()
++        )
++        proxy_ssl_context = (
++            self.proxy_config.ssl_context if proxy_is_forwarding else None
++        )
++
+         # Wrap socket using verification with the root certs in
+         # trusted_root_certs
+         default_ssl_context = False
+-        if self.ssl_context is None:
+-            default_ssl_context = True
+-            self.ssl_context = create_urllib3_context(
+-                ssl_version=resolve_ssl_version(self.ssl_version),
+-                cert_reqs=resolve_cert_reqs(self.cert_reqs),
+-            )
++        if proxy_ssl_context is not None:
++            # Prefer the proxy's SSL context and preserve its own verify
++            # policy; never overwrite it with the destination's cert_reqs.
++            # When a dedicated proxy SSL context is provided we rely on it for
++            # the CA and client-certificate material and must not mix in the
++            # destination connection's certificate settings.
++            context = proxy_ssl_context
++            ca_certs = None
++            ca_cert_dir = None
++            ca_cert_data = None
++            key_file = None
++            cert_file = None
++            key_password = None
++        else:
++            if self.ssl_context is None:
++                default_ssl_context = True
++                self.ssl_context = create_urllib3_context(
++                    ssl_version=resolve_ssl_version(self.ssl_version),
++                    cert_reqs=resolve_cert_reqs(self.cert_reqs),
++                )
+ 
+-        context = self.ssl_context
+-        context.verify_mode = resolve_cert_reqs(self.cert_reqs)
++            context = self.ssl_context
++            context.verify_mode = resolve_cert_reqs(self.cert_reqs)
++            ca_certs = self.ca_certs
++            ca_cert_dir = self.ca_cert_dir
++            ca_cert_data = self.ca_cert_data
++            key_file = self.key_file
++            cert_file = self.cert_file
++            key_password = self.key_password
+ 
+         # Try to load OS default certs if none are given.
+         # Works well on Windows (requires Python3.4+)
+         if (
+-            not self.ca_certs
+-            and not self.ca_cert_dir
+-            and not self.ca_cert_data
++            not ca_certs
++            and not ca_cert_dir
++            and not ca_cert_data
+             and default_ssl_context
+             and hasattr(context, "load_default_certs")
+         ):
+@@ -415,12 +451,12 @@ class HTTPSConnection(HTTPConnection):
+ 
+         self.sock = ssl_wrap_socket(
+             sock=conn,
+-            keyfile=self.key_file,
+-            certfile=self.cert_file,
+-            key_password=self.key_password,
+-            ca_certs=self.ca_certs,
+-            ca_cert_dir=self.ca_cert_dir,
+-            ca_cert_data=self.ca_cert_data,
++            keyfile=key_file,
++            certfile=cert_file,
++            key_password=key_password,
++            ca_certs=ca_certs,
++            ca_cert_dir=ca_cert_dir,
++            ca_cert_data=ca_cert_data,
+             server_hostname=server_hostname,
+             ssl_context=context,
+             tls_in_tls=tls_in_tls,
+@@ -468,11 +504,22 @@ class HTTPSConnection(HTTPConnection):
+                 )
+             _match_hostname(cert, self.assert_hostname or server_hostname)
+ 
+-        self.is_verified = (
++        verified = (
+             context.verify_mode == ssl.CERT_REQUIRED
+             or self.assert_fingerprint is not None
+         )
+ 
++        if proxy_is_forwarding:
++            # This TLS handshake was performed against the forwarding proxy,
++            # not the destination server, so the destination is not verified
++            # here. Record the proxy's verification result separately so the
++            # pool can warn on an unverified proxy connection.
++            self.is_verified = False
++            if self.proxy_is_verified is None:
++                self.proxy_is_verified = verified
++        else:
++            self.is_verified = verified
++
+     def _connect_tls_proxy(self, hostname, conn):
+         """
+         Establish a TLS connection to the proxy using the provided SSL context.
+--- /dev/null
++++ b/test/test_aikido_2026_499214.py
+@@ -0,0 +1,106 @@
++"""Regression test for AIKIDO-2026-499214.
++
++A forwarding HTTPS proxy connection (``use_forwarding_for_https=True``, no
++CONNECT tunnel) must perform its TLS handshake against the *proxy* using the
++proxy's own certificate policy. Before the fix, ``HTTPSConnection.connect()``
++wrapped the proxy socket with the *destination* server's ``ssl_context`` and
++overwrote that context's ``verify_mode`` in place with the destination's
++``cert_reqs``. Setting a target's ``verify_mode`` to ``CERT_NONE`` could then
++persistently disable verification of the proxy connection, enabling proxy
++impersonation.
++
++This test does not touch the network: it stubs ``ssl_wrap_socket`` and records
++which SSL context the proxy handshake was performed with.
++"""
++import ssl
++
++import pytest
++
++import urllib3.connection as connection_module
++from urllib3.poolmanager import ProxyManager
++
++
++class _FakeTLSSocket(object):
++    def version(self):
++        return "TLSv1.3"
++
++    def getpeercert(self, binary_form=False):
++        return {}
++
++    def selected_alpn_protocol(self):
++        return None
++
++
++def _build_forwarding_proxy_conn(monkeypatch, proxy_context, target_context):
++    calls = []
++
++    def recording_wrapper(*args, **kwargs):
++        calls.append(kwargs.get("ssl_context"))
++        return _FakeTLSSocket()
++
++    monkeypatch.setattr(connection_module, "ssl_wrap_socket", recording_wrapper)
++
++    manager = ProxyManager(
++        "https://proxy.invalid:443",
++        proxy_ssl_context=proxy_context,
++        use_forwarding_for_https=True,
++        ssl_context=target_context,
++        cert_reqs=ssl.CERT_NONE,
++    )
++    pool = manager.connection_from_url("https://target.invalid:443")
++    conn = pool._new_conn()
++    # Avoid opening a real socket.
++    monkeypatch.setattr(conn, "_new_conn", lambda: object())
++    conn.connect()
++    return conn, calls
++
++
++def test_forwarding_proxy_prefers_proxy_ssl_context(monkeypatch):
++    proxy_context = ssl.create_default_context()
++    assert proxy_context.verify_mode == ssl.CERT_REQUIRED
++
++    target_context = ssl.create_default_context()
++    target_context.check_hostname = False
++    target_context.verify_mode = ssl.CERT_NONE
++
++    conn, calls = _build_forwarding_proxy_conn(
++        monkeypatch, proxy_context, target_context
++    )
++
++    # Exactly one TLS handshake happened (to the proxy) and it used the
++    # proxy's own SSL context -- not the destination's relaxed context.
++    assert len(calls) == 1
++    assert calls[0] is proxy_context
++
++    # The destination's CERT_NONE policy must not have overwritten the
++    # proxy context's verify_mode in place.
++    assert proxy_context.verify_mode == ssl.CERT_REQUIRED
++
++    # The proxy connection is recorded as verified; the destination is not
++    # verified by this proxy handshake.
++    assert conn.proxy_is_verified is True
++    assert conn.is_verified is False
++
++
++def test_forwarding_proxy_records_unverified_proxy(monkeypatch):
++    # A proxy context configured with CERT_NONE should surface as an
++    # unverified proxy connection (so the pool can warn), independent of the
++    # destination's settings.
++    proxy_context = ssl.create_default_context()
++    proxy_context.check_hostname = False
++    proxy_context.verify_mode = ssl.CERT_NONE
++
++    target_context = ssl.create_default_context()
++
++    conn, calls = _build_forwarding_proxy_conn(
++        monkeypatch, proxy_context, target_context
++    )
++
++    assert len(calls) == 1
++    assert calls[0] is proxy_context
++    assert proxy_context.verify_mode == ssl.CERT_NONE
++    assert conn.proxy_is_verified is False
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__, "-v"]))
+
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -217,7 +217,7 @@
+     RETRY_AFTER_STATUS_CODES = frozenset([413, 429, 503])
+
+     #: Default headers to be used for ``remove_headers_on_redirect``
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])
+
+     #: Maximum backoff time.
+     BACKOFF_MAX = 120
+--- a/test/test_retry.py
++++ b/test/test_retry.py
+@@ -293,12 +293,12 @@
+     def test_retry_default_remove_headers_on_redirect(self):
+         retry = Retry()
+
+-        assert list(retry.remove_headers_on_redirect) == ["authorization"]
++        assert retry.remove_headers_on_redirect == {"authorization", "cookie"}
+
+     def test_retry_set_remove_headers_on_redirect(self):
+         retry = Retry(remove_headers_on_redirect=["X-API-Secret"])
+
+-        assert list(retry.remove_headers_on_redirect) == ["x-api-secret"]
++        assert retry.remove_headers_on_redirect == {"x-api-secret"}
+
+     @pytest.mark.parametrize("value", ["-1", "+1", "1.0", six.u("\xb2")])  # \xb2 = ^2
+     def test_parse_retry_after_invalid(self, value):
+--- a/test/test_retry_deprecated.py
++++ b/test/test_retry_deprecated.py
+@@ -295,7 +295,7 @@
+     def test_retry_default_remove_headers_on_redirect(self):
+         retry = Retry()
+
+-        assert list(retry.remove_headers_on_redirect) == ["authorization"]
++        assert retry.remove_headers_on_redirect == {"authorization", "cookie"}
+
+     def test_retry_set_remove_headers_on_redirect(self):
+         retry = Retry(remove_headers_on_redirect=["X-API-Secret"])
+--- a/test/with_dummyserver/test_poolmanager.py
++++ b/test/with_dummyserver/test_poolmanager.py
+@@ -141,7 +141,7 @@
+                 "GET",
+                 "%s/redirect" % self.base_url,
+                 fields={"target": "%s/headers" % self.base_url_alt},
+-                headers={"Authorization": "foo"},
++                headers={"Authorization": "foo", "Cookie": "foo=bar"},
+             )
+
+             assert r.status == 200
+@@ -149,12 +149,13 @@
+             data = json.loads(r.data.decode("utf-8"))
+
+             assert "Authorization" not in data
++            assert "Cookie" not in data
+
+             r = http.request(
+                 "GET",
+                 "%s/redirect" % self.base_url,
+                 fields={"target": "%s/headers" % self.base_url_alt},
+-                headers={"authorization": "foo"},
++                headers={"authorization": "foo", "cookie": "foo=bar"},
+             )
+
+             assert r.status == 200
+@@ -163,6 +164,8 @@
+
+             assert "authorization" not in data
+             assert "Authorization" not in data
++            assert "cookie" not in data
++            assert "Cookie" not in data
+
+     def test_redirect_cross_host_no_remove_headers(self):
+         with PoolManager() as http:
+@@ -170,7 +173,7 @@
+                 "GET",
+                 "%s/redirect" % self.base_url,
+                 fields={"target": "%s/headers" % self.base_url_alt},
+-                headers={"Authorization": "foo"},
++                headers={"Authorization": "foo", "Cookie": "foo=bar"},
+                 retries=Retry(remove_headers_on_redirect=[]),
+             )
+
+@@ -179,6 +182,7 @@
+             data = json.loads(r.data.decode("utf-8"))
+
+             assert data["Authorization"] == "foo"
++            assert data["Cookie"] == "foo=bar"
+
+     def test_redirect_cross_host_set_removed_headers(self):
+         with PoolManager() as http:
+@@ -186,7 +190,11 @@
+                 "GET",
+                 "%s/redirect" % self.base_url,
+                 fields={"target": "%s/headers" % self.base_url_alt},
+-                headers={"X-API-Secret": "foo", "Authorization": "bar"},
++                headers={
++                    "X-API-Secret": "foo",
++                    "Authorization": "bar",
++                    "Cookie": "foo=bar",
++                },
+                 retries=Retry(remove_headers_on_redirect=["X-API-Secret"]),
+             )
+
+@@ -196,12 +204,17 @@
+
+             assert "X-API-Secret" not in data
+             assert data["Authorization"] == "bar"
++            assert data["Cookie"] == "foo=bar"
+
+             r = http.request(
+                 "GET",
+                 "%s/redirect" % self.base_url,
+                 fields={"target": "%s/headers" % self.base_url_alt},
+-                headers={"x-api-secret": "foo", "authorization": "bar"},
++                headers={
++                    "x-api-secret": "foo",
++                    "authorization": "bar",
++                    "cookie": "foo=bar",
++                },
+                 retries=Retry(remove_headers_on_redirect=["X-API-Secret"]),
+             )
+
+@@ -212,6 +225,7 @@
+             assert "x-api-secret" not in data
+             assert "X-API-Secret" not in data
+             assert data["Authorization"] == "bar"
++            assert data["Cookie"] == "foo=bar"
+
+     def test_redirect_without_preload_releases_connection(self):
+         with PoolManager(block=True, maxsize=2) as http:
+
+--- a/src/urllib3/_collections.py
++++ b/src/urllib3/_collections.py
+@@ -268,6 +268,24 @@
+         else:
+             return vals[1:]
+
++    def _prepare_for_method_change(self):
++        """
++        Remove content-specific header fields before changing the request
++        method to GET or HEAD according to RFC 9110, Section 15.4.
++        """
++        content_specific_headers = [
++            "Content-Encoding",
++            "Content-Language",
++            "Content-Location",
++            "Content-Type",
++            "Content-Length",
++            "Digest",
++            "Last-Modified",
++        ]
++        for header in content_specific_headers:
++            self.discard(header)
++        return self
++
+     # Backwards compatibility for httplib
+     getheaders = getlist
+     getallmatchingheaders = getlist
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -9,6 +9,7 @@
+ from socket import error as SocketError
+ from socket import timeout as SocketTimeout
+
++from ._collections import HTTPHeaderDict
+ from .connection import (
+     BaseSSLError,
+     BrokenPipeError,
+@@ -800,7 +801,11 @@
+         redirect_location = redirect and response.get_redirect_location()
+         if redirect_location:
+             if response.status == 303:
++                # Change the method according to RFC 9110, Section 15.4.4.
+                 method = "GET"
++                # And lose the body not to transfer anything sensitive.
++                body = None
++                headers = HTTPHeaderDict(headers)._prepare_for_method_change()
+
+             try:
+                 retries = retries.increment(method, url, response=response, _pool=self)
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -4,7 +4,7 @@
+ import functools
+ import logging
+
+-from ._collections import RecentlyUsedContainer
++from ._collections import HTTPHeaderDict, RecentlyUsedContainer
+ from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
+ from .exceptions import (
+     LocationValueError,
+@@ -382,10 +382,13 @@
+         # Support relative URLs for redirecting.
+         redirect_location = urljoin(url, redirect_location)
+
+-        # RFC 7231, Section 6.4.4
+         if response.status == 303:
++            # Change the method according to RFC 9110, Section 15.4.4.
+             method = "GET"
++            # And lose the body not to transfer anything sensitive.
++            kw["body"] = None
++            kw["headers"] = HTTPHeaderDict(kw["headers"])._prepare_for_method_change()
+
+         retries = kw.get("retries")
+         if not isinstance(retries, Retry):
+             retries = Retry.from_int(retries, redirect=redirect)
+
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -217,7 +217,7 @@
+     RETRY_AFTER_STATUS_CODES = frozenset([413, 429, 503])
+ 
+     #: Default headers to be used for ``remove_headers_on_redirect``
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization", "Proxy-Authorization"])
+ 
+     #: Maximum backoff time.
+     BACKOFF_MAX = 120
+
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -168,7 +168,23 @@
+     proxy_config = None
+ 
+     def __init__(self, num_pools=10, headers=None, **connection_pool_kw):
+         RequestMethods.__init__(self, headers)
++        if "retries" in connection_pool_kw:
++            retries = connection_pool_kw["retries"]
++            if not isinstance(retries, Retry):
++                # When Retry is initialized, raise_on_redirect is based
++                # on a redirect boolean value.
++                # But requests made via a pool manager always set
++                # redirect to False, and raise_on_redirect always ends
++                # up being False consequently.
++                # Here we fix the issue by setting raise_on_redirect to
++                # a value needed by the pool manager without considering
++                # the redirect boolean.
++                raise_on_redirect = retries is not False
++                retries = Retry.from_int(retries, redirect=False)
++                retries.raise_on_redirect = raise_on_redirect
++                connection_pool_kw = connection_pool_kw.copy()
++                connection_pool_kw["retries"] = retries
+         self.connection_pool_kw = connection_pool_kw
+         self.pools = RecentlyUsedContainer(num_pools, dispose_func=lambda p: p.close())
+ 
+@@ -393,7 +409,7 @@
+             kw["body"] = None
+             kw["headers"] = HTTPHeaderDict(kw["headers"])._prepare_for_method_change()
+ 
+-        retries = kw.get("retries")
++        retries = kw.get("retries", response.retries)
+         if not isinstance(retries, Retry):
+             retries = Retry.from_int(retries, redirect=redirect)
+ 
+
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -129,8 +129,18 @@
+         they were applied.
+     """
+
++    # Maximum allowed number of chained HTTP encodings in the
++    # Content-Encoding header.
++    max_decode_links = 5
++
+     def __init__(self, modes):
+-        self._decoders = [_get_decoder(m.strip()) for m in modes.split(",")]
++        encodings = [m.strip() for m in modes.split(",")]
++        if len(encodings) > self.max_decode_links:
++            raise DecodeError(
++                "Too many content encodings in the chain: "
++                "%d > %d" % (len(encodings), self.max_decode_links)
++            )
++        self._decoders = [_get_decoder(e) for e in encodings]
+
+     def flush(self):
+         return self._decoders[0].flush()
+
+diff --git a/src/urllib3/response.py b/src/urllib3/response.py
+index 2777e9c..a1b5a3e 100644
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -2,6 +2,7 @@ from __future__ import absolute_import
+ 
+ import io
+ import logging
++import warnings
+ import zlib
+ from contextlib import contextmanager
+ from socket import error as SocketError
+@@ -17,6 +18,7 @@ from .connection import BaseSSLError, HTTPException
+ from .exceptions import (
+     BodyNotHttplibCompatible,
+     DecodeError,
++    DependencyWarning,
+     HTTPError,
+     IncompleteRead,
+     InvalidChunkLength,
+@@ -35,33 +37,53 @@ log = logging.getLogger(__name__)
+ class DeflateDecoder(object):
+     def __init__(self):
+         self._first_try = True
+-        self._data = b""
++        self._first_try_data = b""
++        self._unfed_data = b""
+         self._obj = zlib.decompressobj()
+ 
+     def __getattr__(self, name):
+         return getattr(self._obj, name)
+ 
+-    def decompress(self, data):
+-        if not data:
++    def decompress(self, data, max_length=-1):
++        data = self._unfed_data + data
++        self._unfed_data = b""
++        if not data and not self._obj.unconsumed_tail:
+             return data
+ 
++        original_max_length = max_length
++        if original_max_length < 0:
++            # No limit; pass 0 which is zlib's "no limit" default.
++            max_length = 0
++        elif original_max_length == 0:
++            # Caller wants nothing now; save for next call.
++            self._unfed_data = data
++            return b""
++
+         if not self._first_try:
+-            return self._obj.decompress(data)
++            return self._obj.decompress(
++                self._obj.unconsumed_tail + data, max_length
++            )
+ 
+-        self._data += data
++        self._first_try_data += data
+         try:
+-            decompressed = self._obj.decompress(data)
++            decompressed = self._obj.decompress(data, max_length)
+             if decompressed:
+                 self._first_try = False
+-                self._data = None
++                self._first_try_data = b""
+             return decompressed
+         except zlib.error:
+             self._first_try = False
+             self._obj = zlib.decompressobj(-zlib.MAX_WBITS)
+             try:
+-                return self.decompress(self._data)
++                return self.decompress(self._first_try_data, original_max_length)
+             finally:
+-                self._data = None
++                self._first_try_data = b""
++
++    @property
++    def has_unconsumed_tail(self):
++        return bool(self._unfed_data) or (
++            bool(self._obj.unconsumed_tail) and not self._first_try
++        )
+ 
+ 
+ class GzipDecoderState(object):
+@@ -75,30 +97,59 @@ class GzipDecoder(object):
+     def __init__(self):
+         self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+         self._state = GzipDecoderState.FIRST_MEMBER
++        self._unconsumed_tail = b""
+ 
+     def __getattr__(self, name):
+         return getattr(self._obj, name)
+ 
+-    def decompress(self, data):
++    def decompress(self, data, max_length=-1):
+         ret = bytearray()
+-        if self._state == GzipDecoderState.SWALLOW_DATA or not data:
++        if self._state == GzipDecoderState.SWALLOW_DATA:
+             return bytes(ret)
++
++        if max_length == 0:
++            # Caller wants nothing now; save for next call.
++            self._unconsumed_tail += data
++            return b""
++
++        # zlib requires passing unconsumed tail to continue decompression.
++        data = self._unconsumed_tail + data
++        self._unconsumed_tail = b""
++        if not data and self._obj.eof:
++            return bytes(ret)
++
++        # max_length < 0 means no limit; pass 0 (zlib's "no limit") in that case.
++        zlib_max = max_length if max_length > 0 else 0
++
+         while True:
+             try:
+-                ret += self._obj.decompress(data)
++                chunk_limit = max(zlib_max - len(ret), 0) if zlib_max > 0 else 0
++                ret += self._obj.decompress(data, chunk_limit)
+             except zlib.error:
+                 previous_state = self._state
+-                # Ignore data after the first error
+                 self._state = GzipDecoderState.SWALLOW_DATA
++                self._unconsumed_tail = b""
+                 if previous_state == GzipDecoderState.OTHER_MEMBERS:
+-                    # Allow trailing garbage acceptable in other gzip clients
+                     return bytes(ret)
+                 raise
+-            data = self._obj.unused_data
++
++            self._unconsumed_tail = data = (
++                self._obj.unconsumed_tail or self._obj.unused_data
++            )
++            if max_length > 0 and len(ret) >= max_length:
++                break
++
+             if not data:
+                 return bytes(ret)
+-            self._state = GzipDecoderState.OTHER_MEMBERS
+-            self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
++            if self._obj.eof:
++                self._state = GzipDecoderState.OTHER_MEMBERS
++                self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
++
++        return bytes(ret)
++
++    @property
++    def has_unconsumed_tail(self):
++        return bool(self._unconsumed_tail)
+ 
+ 
+ if brotli is not None:
+@@ -110,9 +161,31 @@ if brotli is not None:
+         def __init__(self):
+             self._obj = brotli.Decompressor()
+             if hasattr(self._obj, "decompress"):
+-                self.decompress = self._obj.decompress
++                self._decompress = self._obj.decompress
+             else:
+-                self.decompress = self._obj.process
++                self._decompress = self._obj.process
++
++        def decompress(self, data, max_length=-1):
++            try:
++                if max_length > 0:
++                    return self._decompress(data, output_buffer_limit=max_length)
++                else:
++                    return self._decompress(data)
++            except TypeError:
++                # Fallback for Brotli/brotlicffi/brotlipy without
++                # the output_buffer_limit parameter (< 1.2.0).
++                warnings.warn(
++                    "Brotli >= 1.2.0 is required to prevent decompression bombs.",
++                    DependencyWarning,
++                )
++                return self._decompress(data)
++
++        @property
++        def has_unconsumed_tail(self):
++            try:
++                return not self._obj.can_accept_more_data()
++            except AttributeError:
++                return False
+ 
+         def flush(self):
+             if hasattr(self._obj, "flush"):
+@@ -145,10 +218,27 @@ class MultiDecoder(object):
+     def flush(self):
+         return self._decoders[0].flush()
+ 
+-    def decompress(self, data):
+-        for d in reversed(self._decoders):
+-            data = d.decompress(data)
+-        return data
++    def decompress(self, data, max_length=-1):
++        if max_length <= 0:
++            for d in reversed(self._decoders):
++                data = d.decompress(data)
++            return data
++
++        ret = bytearray()
++        while True:
++            any_data = False
++            for d in reversed(self._decoders):
++                data = d.decompress(data, max_length - len(ret))
++                if data:
++                    any_data = True
++            ret += data
++            if not any_data or len(ret) >= max_length:
++                return bytes(ret)
++            data = b""
++
++    @property
++    def has_unconsumed_tail(self):
++        return any(d.has_unconsumed_tail for d in self._decoders)
+ 
+ 
+ def _get_decoder(mode):
+@@ -243,6 +333,7 @@ class HTTPResponse(io.IOBase):
+         self._fp_bytes_read = 0
+         self.msg = msg
+         self._request_url = request_url
++        self._decoded_buffer = b""
+ 
+         if body and isinstance(body, (six.string_types, bytes)):
+             self._body = body
+@@ -399,16 +490,20 @@ class HTTPResponse(io.IOBase):
+     if brotli is not None:
+         DECODER_ERROR_CLASSES += (brotli.error,)
+ 
+-    def _decode(self, data, decode_content, flush_decoder):
++    def _decode(self, data, decode_content, flush_decoder, max_length=-1):
+         """
+         Decode the data passed in and potentially flush the decoder.
+         """
+         if not decode_content:
+             return data
+ 
++        # Do not limit when flushing; consume all remaining data.
++        if flush_decoder:
++            max_length = -1
++
+         try:
+             if self._decoder:
+-                data = self._decoder.decompress(data)
++                data = self._decoder.decompress(data, max_length)
+         except self.DECODER_ERROR_CLASSES as e:
+             content_encoding = self.headers.get("content-encoding", "").lower()
+             raise DecodeError(
+@@ -526,6 +621,19 @@ class HTTPResponse(io.IOBase):
+                 flush_decoder = True
+             else:
+                 cache_content = False
++
++                # Serve previously buffered decoded data before hitting the network.
++                if decode_content and self._decoder and self._decoder.has_unconsumed_tail:
++                    chunk = self._decode(
++                        b"", decode_content, False,
++                        max_length=amt - len(self._decoded_buffer)
++                    )
++                    self._decoded_buffer += chunk
++                if len(self._decoded_buffer) >= amt:
++                    result = self._decoded_buffer[:amt]
++                    self._decoded_buffer = self._decoded_buffer[amt:]
++                    return result
++
+                 data = self._fp.read(amt) if not fp_closed else b""
+                 if (
+                     amt != 0 and not data
+@@ -555,6 +663,29 @@ class HTTPResponse(io.IOBase):
+             if self.length_remaining is not None:
+                 self.length_remaining -= len(data)
+ 
++            if amt is not None:
++                decoded_chunk = self._decode(
++                    data, decode_content, flush_decoder,
++                    max_length=amt - len(self._decoded_buffer)
++                )
++                self._decoded_buffer += decoded_chunk
++
++                # Drain any remaining unconsumed tail up to the requested limit.
++                while (
++                    self._decoder
++                    and self._decoder.has_unconsumed_tail
++                    and len(self._decoded_buffer) < amt
++                ):
++                    chunk = self._decode(
++                        b"", decode_content, False,
++                        max_length=amt - len(self._decoded_buffer)
++                    )
++                    self._decoded_buffer += chunk
++
++                result = self._decoded_buffer[:amt]
++                self._decoded_buffer = self._decoded_buffer[amt:]
++                return result
++
+             data = self._decode(data, decode_content, flush_decoder)
+ 
+             if cache_content:
+@@ -582,7 +713,11 @@ class HTTPResponse(io.IOBase):
+             for line in self.read_chunked(amt, decode_content=decode_content):
+                 yield line
+         else:
+-            while not is_fp_closed(self._fp):
++            while (
++                not is_fp_closed(self._fp)
++                or len(self._decoded_buffer) > 0
++                or (self._decoder and self._decoder.has_unconsumed_tail)
++            ):
+                 data = self.read(amt=amt, decode_content=decode_content)
+ 
+                 if data:
+@@ -776,7 +911,8 @@ class HTTPResponse(io.IOBase):
+                     break
+                 chunk = self._handle_chunk(amt)
+                 decoded = self._decode(
+-                    chunk, decode_content=decode_content, flush_decoder=False
++                    chunk, decode_content=decode_content, flush_decoder=False,
++                    max_length=amt
+                 )
+                 if decoded:
+                     yield decoded
+
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -286,7 +286,7 @@
+         Unread data in the HTTPResponse connection blocks the connection from being released back to the pool.
+         """
+         try:
+-            self.read()
++            self.read(decode_content=False)
+         except (HTTPError, SocketError, BaseSSLError, HTTPException):
+             pass
+
+
+--- a/src/urllib3/connectionpool.py
++++ b/src/urllib3/connectionpool.py
+@@ -799,5 +799,16 @@
+         # Handle redirect?
+         redirect_location = redirect and response.get_redirect_location()
+         if redirect_location:
++            # Strip headers marked as unsafe to forward to the redirected location.
++            # Check remove_headers_on_redirect to avoid a potential network call within
++            # self.is_same_host() which may use socket.gethostbyname() in the future.
++            if retries.remove_headers_on_redirect and not self.is_same_host(
++                redirect_location
++            ):
++                headers = dict(headers or {})
++                for header in list(six.iterkeys(headers)):
++                    if header.lower() in retries.remove_headers_on_redirect:
++                        headers.pop(header, None)
++
+             if response.status == 303:
+                 method = "GET"
