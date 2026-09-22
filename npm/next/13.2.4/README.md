@@ -10,6 +10,7 @@ unknown
 - CVE-2026-64645
 - CVE-2026-64641
 - GHSA-h25m-26qc-wcjf
+- GHSA-q4gf-8mx6-v5v3
 - GHSA-8h8q-6873-q5fj
 - AIKIDO-2026-553733
 - GHSA-2xp9-vwfh-vxw4
