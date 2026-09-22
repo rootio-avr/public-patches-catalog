@@ -8226,6 +8226,269 @@ index cd1814f..5728c4c 100644
  if (!localReflectSetPrototypeOf(context, localObject.prototype)) throw localUnexpected();
  
 
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -920,14 +920,108 @@ if (typeof OriginalCallSite === 'function') {
+ const localSuppressedErrorProto = typeof SuppressedError === 'function' ? SuppressedError.prototype : null;
+ const localAggregateErrorProto = typeof AggregateError === 'function' ? AggregateError.prototype : null;
+ 
++// SECURITY (GHSA-m283-3h24-438v / CVE-2026-47686): a host-wrapped bridge
++// proxy exposes an `isProxy` marker via its BaseHandler `get` trap
++// (see lib/bridge.js); reading it returns `true` only for a host-wrapped
++// carrier, `undefined` for a genuine sandbox-realm object.
++function isHostWrapped(e) {
++	try {
++		return e.isProxy === true;
++	} catch (_) {
++		// A sandbox-side object with an `isProxy` accessor that throws is
++		// treated as sandbox-realm.
++		return false;
++	}
++}
++
++// SECURITY (GHSA-m283-3h24-438v / CVE-2026-47686): ES2022 added `Error.cause`,
++// a free-form property that can carry an arbitrary host reference
++// (`new Error('wrap', { cause: process })`). When an embedder-exposed host
++// function throws such an error, the host Error reaches the sandbox catch as a
++// bridge proxy whose `get` trap wraps `.cause` on read -- but the resulting
++// bridge proxy of `process` is FULLY FUNCTIONAL, so sandbox code can chain
++// `e.cause.mainModule.require('child_process').execSync(...)` for host RCE.
++// The bridge wraps for realm isolation, not capability restriction, so the
++// reference must be removed from sandbox reach entirely.
++function sanitizeErrorCause(e, visited) {
++	if (isHostWrapped(e)) {
++		// Host-wrapped carrier: overwrite the host-side `.cause` with a sealed
++		// (`writable:false, configurable:false`) descriptor. Routing through
++		// the proxy `defineProperty` trap lands the write on the underlying
++		// host object; `defineProperty` (not `delete`) flattens accessor-shaped
++		// `.cause` definitions to a data property rather than leaving a getter
++		// in place. A non-configurable + non-writable descriptor also forces
++		// the ECMA-262 Proxy get/defineProperty invariants, so a lying proxy
++		// cannot pretend success and later re-deliver the host reference.
++		let stripped = false;
++		try {
++			stripped = localReflectDefineProperty(e, 'cause', {
++				__proto__: null,
++				value: undefined,
++				writable: false,
++				enumerable: false,
++				configurable: false
++			}) === true;
++		} catch (_) {
++			/* engine threw on a proxy invariant violation -- fall through to
++			 * substitution below. */
++		}
++		if (!stripped) {
++			// The carrier itself is unsafe; substitute a sandbox-realm Error
++			// preserving only its `.message` string.
++			let safeMsg = '';
++			try {
++				const m = e.message;
++				if (typeof m === 'string') safeMsg = m;
++			} catch (_) { /* hostile accessor -- ignore */ }
++			return new LocalError(safeMsg);
++		}
++		return e;
++	}
++	// Sandbox-realm carrier: read `.cause` once, recurse if non-primitive so a
++	// nested host-wrapped sub-error gets its own `.cause` stripped, then
++	// re-install the sanitized value as a data property (which also defeats any
++	// sandbox-side accessor `.cause` returning different values on later reads).
++	let causeVal;
++	try {
++		causeVal = e.cause;
++	} catch (_) {
++		return e;
++	}
++	if (causeVal === undefined || causeVal === null) return e;
++	const t = typeof causeVal;
++	if (t !== 'object' && t !== 'function') return e;
++	const sanitized = handleException(causeVal, visited);
++	try {
++		localReflectDefineProperty(e, 'cause', {
++			__proto__: null,
++			value: sanitized,
++			writable: true,
++			enumerable: false,
++			configurable: true
++		});
++	} catch (_) {
++		try {
++			e.cause = sanitized;
++		} catch (_) { /* best effort */ }
++	}
++	return e;
++}
++
+ function handleException(e, visited) {
+ 	e = ensureThis(e);
+ 	if (e === null || (typeof e !== 'object' && typeof e !== 'function')) return e;
+-	if (localSuppressedErrorProto === null && localAggregateErrorProto === null) return e;
+ 	if (!visited) visited = new LocalWeakMap();
+ 	// Cycle detection: if we've already visited this object, stop recursing
+ 	if (localReflectApply(localWeakMapGet, visited, [e])) return e;
+ 	localReflectApply(localWeakMapSet, visited, [e, true]);
++	// SECURITY (GHSA-m283-3h24-438v / CVE-2026-47686): strip/sanitize any
++	// host reference carried on `Error.cause` before the error is exposed to
++	// sandbox code. Runs for every error object, independent of the
++	// SuppressedError / AggregateError handling below.
++	e = sanitizeErrorCause(e, visited);
++	if (e === null || (typeof e !== 'object' && typeof e !== 'function')) return e;
++	if (localSuppressedErrorProto === null && localAggregateErrorProto === null) return e;
+ 	let proto;
+ 	try {
+ 		proto = localReflectGetPrototypeOf(e);
+--- /dev/null
++++ b/test/cve-2026-47686.test.js
+@@ -0,0 +1,147 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++/*
++ * CVE-2026-47686 / GHSA-m283-3h24-438v — Missing Error.cause sanitization.
++ *
++ * ES2022 `Error.cause` is a free-form property that can carry an arbitrary host
++ * reference (`new Error('wrap', { cause: process })`). When an embedder-exposed
++ * host function throws such an error, the host Error reaches the sandbox catch
++ * as a fully-functional bridge proxy; before the fix, sandbox code could pivot
++ * through `e.cause.mainModule.require('child_process').execSync(...)` to host
++ * RCE. The fix strips `.cause` from host-wrapped error carriers in
++ * handleException (lib/setup-sandbox.js) using the `isProxy` marker exposed by
++ * the bridge (lib/bridge.js). This test is grounded in the upstream regression
++ * test test/ghsa/GHSA-m283-3h24-438v/repro.js from fix commit 7e3faaf5.
++ */
++
++const assert = require('assert');
++const {VM} = require('..');
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++const NODE_MINOR = parseInt(process.versions.node.split('.')[1], 10);
++// Error.cause shipped in V8 9.3 / Node 16.9. Older Nodes silently drop the
++// `cause` option, so the exploit primitive does not exist there.
++const HAS_ERROR_CAUSE = NODE_MAJOR > 16 || (NODE_MAJOR === 16 && NODE_MINOR >= 9);
++
++describe('CVE-2026-47686 (Error.cause leaks host references -> RCE)', function () {
++
++	(HAS_ERROR_CAUSE ? it : it.skip)('canonical PoC: host function throws Error with cause=process; sandbox cannot reach child_process', function () {
++		const probe = {realm: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: process});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					const cp = e.cause.mainModule.require('child_process');
++					__probe.realm = 'HOST:' + cp.execSync('echo PWNED').toString().trim();
++				} catch (err) {
++					__probe.realm = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.notStrictEqual(probe.realm, 'HOST:PWNED', 'sandbox reached host child_process via Error.cause');
++	});
++
++	(HAS_ERROR_CAUSE ? it : it.skip)('e.cause on host-thrown Error is not a usable host reference', function () {
++		const probe = {mainModuleType: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: process});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.mainModuleType = e.cause && typeof e.cause.mainModule;
++				} catch (_) {
++					__probe.mainModuleType = 'THREW';
++				}
++			}
++		`);
++		assert.notStrictEqual(probe.mainModuleType, 'object', 'sandbox reached process.mainModule via Error.cause');
++		assert.notStrictEqual(probe.mainModuleType, 'function', 'sandbox reached process.mainModule via Error.cause');
++	});
++
++	(HAS_ERROR_CAUSE ? it : it.skip)('variant: cause is a host function (child_process)', function () {
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: require('child_process')});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.result = e.cause.execSync('echo PWN').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.ok(
++			probe.result === 'UNSET' || probe.result === undefined || /^BLOCKED:/.test(probe.result),
++			'cause path produced a usable host value: ' + probe.result
++		);
++	});
++
++	(HAS_ERROR_CAUSE ? it : it.skip)('variant: sandbox-realm wrapper with nested host cause is sanitized recursively', function () {
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('h', {cause: process});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				try { hostFn(); } catch (inner) { throw new Error('wrap', { cause: inner }); }
++			} catch (e) {
++				try {
++					__probe.result = 'HOST:' + e.cause.cause.mainModule.require('child_process').execSync('echo X').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.notStrictEqual(String(probe.result).slice(0, 5), 'HOST:', 'nested host reference reachable via e.cause.cause');
++	});
++
++	it('benign sandbox-realm Error.cause is preserved', function () {
++		const vm = new VM();
++		const out = vm.run(`
++			try { throw new Error('boom', { cause: { code: 42 } }); }
++			catch (e) { e.message + '|' + (e.cause && e.cause.code); }
++		`);
++		// Only meaningful when the runtime supports Error.cause; otherwise the
++		// option is silently dropped and cause is undefined.
++		if (HAS_ERROR_CAUSE) {
++			assert.strictEqual(out, 'boom|42');
++		} else {
++			assert.strictEqual(out, 'boom|undefined');
++		}
++	});
++
++});
+
 diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
 index 768e879..850e771 100644
 --- a/lib/setup-sandbox.js
