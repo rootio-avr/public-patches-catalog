@@ -5,6 +5,9 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-8885
+- CVE-2026-13505
+- CVE-2026-13506
+- CVE-2026-8763
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-fips
