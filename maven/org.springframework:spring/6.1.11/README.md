@@ -8,6 +8,7 @@ unknown
 - CVE-2026-41845
 - CVE-2026-41842
 - CVE-2024-38816
+- CVE-2024-38819
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework:spring
