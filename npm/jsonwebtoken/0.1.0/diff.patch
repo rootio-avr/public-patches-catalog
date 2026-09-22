@@ -146,3 +146,176 @@ Last-Update: 2026-08-02
 +    });
 +  });
 +});
+
+--- a/index.js
++++ b/index.js
+@@ -1,5 +1,83 @@
+ var jws = require('jws');
+ var moment = require('moment');
++var crypto = require('crypto');
++
++// CVE-2022-23539: jws@~0.2.2 selects the verification algorithm from the
++// attacker-controlled JWT header and performs no key-type/algorithm
++// compatibility check. The helpers below let verify() reject mismatched
++// key-type/algorithm pairings (algorithm confusion, e.g. an RSA public key
++// used as an HMAC secret, or a DSA/EC key paired with an incompatible
++// algorithm) before delegating to jws.verify().
++function keyIsPEM(secretOrPublicKey) {
++  if (secretOrPublicKey == null) return false;
++  var s = Buffer.isBuffer(secretOrPublicKey) ?
++    secretOrPublicKey.toString('ascii') : String(secretOrPublicKey);
++  return s.indexOf('-----BEGIN') !== -1;
++}
++
++function detectAsymmetricKeyType(secretOrPublicKey) {
++  try {
++    var s = Buffer.isBuffer(secretOrPublicKey) ?
++      secretOrPublicKey.toString('ascii') : String(secretOrPublicKey);
++    if (s.indexOf('CERTIFICATE-----') !== -1 &&
++        typeof crypto.X509Certificate === 'function') {
++      return new crypto.X509Certificate(secretOrPublicKey).publicKey.asymmetricKeyType;
++    }
++    if (s.indexOf('PRIVATE KEY-----') !== -1 &&
++        typeof crypto.createPrivateKey === 'function') {
++      return crypto.createPrivateKey(secretOrPublicKey).asymmetricKeyType;
++    }
++    if (typeof crypto.createPublicKey === 'function') {
++      return crypto.createPublicKey(secretOrPublicKey).asymmetricKeyType;
++    }
++  } catch (e) {
++    // Key type could not be determined; fine-grained pairing check is skipped.
++  }
++  return null;
++}
++
++function validateAlgorithmKeyPairing(alg, secretOrPublicKey, options) {
++  if (!alg || typeof alg !== 'string')
++    return new Error('missing or invalid algorithm in header');
++
++  // Optional caller-supplied allow-list of acceptable algorithms.
++  if (options.algorithms) {
++    if (options.algorithms.indexOf(alg) === -1)
++      return new Error('invalid algorithm');
++  }
++
++  var isPEM = keyIsPEM(secretOrPublicKey);
++  var isHmac = alg.indexOf('HS') === 0;
++  var isAsymmetric = alg.indexOf('RS') === 0 ||
++                     alg.indexOf('PS') === 0 ||
++                     alg.indexOf('ES') === 0;
++
++  // Coarse anti-confusion guard (string-based, always reliable):
++  // an asymmetric (PEM) key must never be used with an HMAC algorithm,
++  // and a symmetric secret must never be used with an asymmetric algorithm.
++  if (isPEM && isHmac)
++    return new Error('asymmetric key cannot be used with an HMAC algorithm');
++  if (!isPEM && isAsymmetric)
++    return new Error('symmetric secret cannot be used with an asymmetric algorithm');
++
++  // Fine-grained key-type/algorithm pairing (the exact CVE issue). Best
++  // effort: only enforced when the asymmetric key type can be determined,
++  // so legitimate keys are never rejected. Can be bypassed intentionally
++  // via allowInvalidAsymmetricKeyTypes (parity with upstream 9.0.0).
++  if (isAsymmetric && !options.allowInvalidAsymmetricKeyTypes) {
++    var keyType = detectAsymmetricKeyType(secretOrPublicKey);
++    if (keyType) {
++      var wantsRsa = alg.indexOf('RS') === 0 || alg.indexOf('PS') === 0;
++      var wantsEc = alg.indexOf('ES') === 0;
++      if (wantsRsa && keyType !== 'rsa' && keyType !== 'rsa-pss')
++        return new Error('invalid key type "' + keyType + '" for algorithm ' + alg);
++      if (wantsEc && keyType !== 'ec')
++        return new Error('invalid key type "' + keyType + '" for algorithm ' + alg);
++    }
++  }
++
++  return null;
++}
+ 
+ module.exports.decode = function (jwt) {
+   return jws.decode(jwt).payload;
+@@ -32,6 +110,23 @@ module.exports.verify = function(jwtString, secretOrPublicKey, options, callback
+   if ((typeof options === 'function') && !callback) callback = options;
+   if (!options) options = {};
+ 
++  // CVE-2022-23539: enforce key-type/algorithm compatibility using the
++  // algorithm declared in the token header before verifying the signature.
++  // This defeats algorithm-confusion and mismatched key-type forgery that
++  // jws@~0.2.2 would otherwise accept. Skip only when the header cannot be
++  // decoded, in which case jws.verify handles the malformed token as before.
++  var decoded;
++  try {
++    decoded = jws.decode(jwtString);
++  } catch (e) {
++    decoded = null;
++  }
++  if (decoded && decoded.header && decoded.header.alg) {
++    var pairingError = validateAlgorithmKeyPairing(decoded.header.alg, secretOrPublicKey, options);
++    if (pairingError)
++      return callback(pairingError);
++  }
++
+   var valid;
+   try {
+     valid = jws.verify(jwtString, secretOrPublicKey);
+@@ -62,5 +157,3 @@ module.exports.verify = function(jwtString, secretOrPublicKey, options, callback
+ 
+   callback(null, payload);
+ };
+-
+-
+--- /dev/null
++++ b/test/jwt.cve_2022_23539.tests.js
+@@ -0,0 +1,53 @@
++// Regression test for CVE-2022-23539 (CWE-327).
++// jsonwebtoken@0.1.0 delegated verification to jws@~0.2.2, which selects the
++// algorithm from the attacker-controlled JWT header with no key-type/algorithm
++// compatibility check. verify() now rejects mismatched key-type/algorithm
++// pairings (algorithm confusion) before delegating to jws.verify().
++var jwt = require('../index');
++var fs = require('fs');
++var path = require('path');
++var assert = require('chai').assert;
++
++describe('CVE-2022-23539 key-type/algorithm confusion', function() {
++  var pub = fs.readFileSync(path.join(__dirname, 'pub.pem'));
++
++  it('rejects an HS256 token verified with an asymmetric (PEM) public key', function(done) {
++    // Attacker forges an HS256 token using the victim's PUBLIC key as the
++    // HMAC shared secret. Pre-fix jws would accept it; verify() must reject.
++    var forged = jwt.sign({ foo: 'bar' }, pub, { algorithm: 'HS256' });
++    jwt.verify(forged, pub, function(err, decoded) {
++      assert.isUndefined(decoded);
++      assert.isNotNull(err);
++      done();
++    });
++  });
++
++  it('rejects an RS256 token verified with a symmetric string secret', function(done) {
++    // Inverse confusion: asymmetric algorithm declared but a symmetric secret
++    // supplied for verification must be rejected before touching jws.
++    var forged = jwt.sign({ foo: 'bar' }, 'shhhhhh', { algorithm: 'RS256' });
++    jwt.verify(forged, 'shhhhhh', function(err, decoded) {
++      assert.isUndefined(decoded);
++      assert.isNotNull(err);
++      done();
++    });
++  });
++
++  it('enforces an explicit algorithms allow-list', function(done) {
++    var token = jwt.sign({ foo: 'bar' }, 'shhhhhh', { algorithm: 'HS256' });
++    jwt.verify(token, 'shhhhhh', { algorithms: ['HS512'] }, function(err, decoded) {
++      assert.isUndefined(decoded);
++      assert.isNotNull(err);
++      done();
++    });
++  });
++
++  it('still accepts a legitimate HS256 token with a symmetric secret', function(done) {
++    var token = jwt.sign({ foo: 'bar' }, 'shhhhhh', { algorithm: 'HS256' });
++    jwt.verify(token, 'shhhhhh', function(err, decoded) {
++      assert.isNull(err);
++      assert.equal('bar', decoded.foo);
++      done();
++    });
++  });
++});

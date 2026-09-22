@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2015-9235
 - CVE-2022-23529
+- CVE-2022-23539
 - NSWG-ECO-17
 
 ## How to Apply:
