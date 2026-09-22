@@ -10,6 +10,7 @@ unknown
 - GHSA-crmc-f4m7-33fj
 - CVE-2026-78676
 - GHSA-9557-234j-7rv9
+- CVE-2026-78677
 
 ## How to Apply:
 1. Clone or download the source code for GitPython
