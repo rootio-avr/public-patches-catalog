@@ -1,11 +1,12 @@
-# perl : 5.42.2-r00071
+# perl : 5.42.2-r00072
 
-This patch is based on perl version 5.42.2-r00071, which is available at:
+This patch is based on perl version 5.42.2-r00072, which is available at:
 unknown
 
 ## Affected CVEs:
 - CVE-2026-8376
 - CVE-2026-13221
+- CVE-2026-57432
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source perl`
