@@ -1,6 +1,6 @@
-# unbound : 1.17.1-2+deb12u4.aikido.4
+# unbound : 1.17.1-2+deb12u4.aikido.5
 
-This patch is based on unbound version 1.17.1-2+deb12u4.aikido.4, which is available at:
+This patch is based on unbound version 1.17.1-2+deb12u4.aikido.5, which is available at:
 https://sources.debian.org/src/unbound/1.17.1-2+deb12u4/
 
 ## Affected CVEs:
@@ -14,6 +14,9 @@ https://sources.debian.org/src/unbound/1.17.1-2+deb12u4/
 - CVE-2026-44690
 - CVE-2026-50252
 - CVE-2026-55973
+- CVE-2026-81634
+- CVE-2026-82717
+- CVE-2026-81642
 
 ## How to Apply:
 1. Obtain the source package: `apt source unbound`
