@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-59940
+- AIKIDO-2026-310861
 
 ## How to Apply:
 1. Clone or download the source code for seroval
