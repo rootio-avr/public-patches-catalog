@@ -1,6 +1,6 @@
-# unbound : 1.22.0-2+deb13u3.aikido.3
+# unbound : 1.22.0-2+deb13u3.aikido.4
 
-This patch is based on unbound version 1.22.0-2+deb13u3.aikido.3, which is available at:
+This patch is based on unbound version 1.22.0-2+deb13u3.aikido.4, which is available at:
 https://sources.debian.org/src/unbound/1.22.0-2+deb13u3/
 
 ## Affected CVEs:
@@ -17,6 +17,9 @@ https://sources.debian.org/src/unbound/1.22.0-2+deb13u3/
 - CVE-2026-55990
 - CVE-2026-55991
 - CVE-2026-56416
+- CVE-2026-81634
+- CVE-2026-81642
+- CVE-2026-82717
 
 ## How to Apply:
 1. Obtain the source package: `apt source unbound`
