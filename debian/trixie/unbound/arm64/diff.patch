@@ -1,3 +1,517 @@
+Description: CVE-2026-55990 - Packet of death for a DNSCrypt misconfigured Unbound
+ A misconfigured DNSCrypt-enabled Unbound (a dnscrypt-provider-cert without a
+ matching dnscrypt-secret-key) leaves certificate entries with a NULL keypair.
+ A crafted DNSCrypt query that matches such a certificate's magic_query causes
+ a NULL pointer dereference (denial of service) when the query is decrypted.
+ .
+ This fix zero-initializes the certs array, skips certificate entries that have
+ no keypair in dnsc_find_cert(), and makes dnsc_apply_cfg() fail at startup when
+ one or more provider certs have no matching secret key.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/ae1b3810cc3a8eb9b43c378289f74020b42aa7f4
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-07-28
+---
+--- a/dnscrypt/dnscrypt.c
++++ b/dnscrypt/dnscrypt.c
+@@ -663,6 +663,8 @@ dnsc_find_cert(struct dnsc_env* dnscenv,
+ 	}
+ 	dnscrypt_header = (struct dnscrypt_query_header *)sldns_buffer_begin(buffer);
+ 	for (i = 0U; i < dnscenv->signed_certs_count; i++) {
++		if(!certs[i].keypair)
++			continue;
+ 		if (memcmp(certs[i].magic_query, dnscrypt_header->magic_query,
+                    DNSCRYPT_MAGIC_HEADER_LEN) == 0) {
+ 			return &certs[i];
+@@ -804,6 +806,7 @@ dnsc_parse_keys(struct dnsc_env *env, st
+ 		sizeof *env->keypairs);
+ 	env->certs = sodium_allocarray(env->signed_certs_count,
+ 		sizeof *env->certs);
++	memset(env->certs, 0, env->signed_certs_count * sizeof(*env->certs));
+
+ 	cert_id = 0U;
+ 	keypair_id = 0U;
+@@ -963,12 +966,19 @@ dnsc_create(void)
+ int
+ dnsc_apply_cfg(struct dnsc_env *env, struct config_file *cfg)
+ {
++    int nkeys;
+     if(dnsc_parse_certs(env, cfg) <= 0) {
+         fatal_exit("dnsc_apply_cfg: no cert file loaded");
+     }
+-    if(dnsc_parse_keys(env, cfg) <= 0) {
++    nkeys = dnsc_parse_keys(env, cfg);
++    if(nkeys <= 0) {
+         fatal_exit("dnsc_apply_cfg: no key file loaded");
+     }
++    if((size_t)nkeys < env->signed_certs_count) {
++	fatal_exit("dnsc_apply_cfg: %u dnscrypt-provider-cert file(s) have no "
++		"matching dnscrypt-secret-key",
++		(unsigned)(env->signed_certs_count - (size_t)nkeys));
++    }
+     randombytes_buf(env->hash_key, sizeof env->hash_key);
+     env->provider_name = cfg->dnscrypt_provider;
+
+Description: CVE-2026-40691 - Packet of death for DNSCrypt over TCP
+ A crafted DNSCrypt query received over TCP could cause unbound to write
+ the encrypted reply past the end of the dnscrypt reply buffer, leading to
+ a buffer overflow (packet of death / denial of service).
+ .
+ The fix bounds-checks the reply length against the buffer capacity in
+ dnscrypt_server_curve() before curving, clamps max_len to the buffer
+ capacity and to 65535, and correctly flips the buffer before setting its
+ limit. For TCP DNSCrypt replies the EDNS udp_size is limited to the
+ dnscrypt buffer capacity minus the reply header instead of 65535, and
+ dnsc_handle_uncurved_request() now takes the source buffer explicitly so
+ the correct (TCP spool) buffer is curved.
+ .
+ The two upstream worker.c hunks that add sldns_buffer_copy() to the
+ FORMERR/SERVFAIL query_error paths, and the upstream testdata/*.test
+ changes, are not applicable to this version: this version drops the reply
+ (comm_point_drop_reply/return 0) on those cleartext-over-dnscrypt paths
+ rather than returning a query_error, so those code paths and the SERVFAIL
+ test expectations do not exist here.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f54e0791ba4488284d9f6059014640a3d0bd30da
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-07-28
+---
+--- a/dnscrypt/dnscrypt.c
++++ b/dnscrypt/dnscrypt.c
+@@ -474,10 +474,18 @@ dnscrypt_server_curve(const dnsccert *ce
+     uint8_t *const buf = sldns_buffer_begin(buffer);
+     size_t len = sldns_buffer_limit(buffer);
+
++    if(len + DNSCRYPT_REPLY_HEADER_SIZE > sldns_buffer_capacity(buffer))
++	return -1;
++    sldns_buffer_clear(buffer);
++
+     if(udp){
+         if (max_len > max_reply_size)
+             max_len = max_reply_size;
+     }
++    if(max_len > sldns_buffer_capacity(buffer))
++	max_len = sldns_buffer_capacity(buffer);
++    if(max_len > 65535)
++	    max_len = 65535;
+
+
+     memcpy(nonce, client_nonce, crypto_box_HALF_NONCEBYTES);
+@@ -520,6 +528,7 @@ dnscrypt_server_curve(const dnsccert *ce
+                           DNSCRYPT_MAGIC_HEADER_LEN,
+                           nonce,
+                           crypto_box_NONCEBYTES);
++    sldns_buffer_flip(buffer);
+     sldns_buffer_set_limit(buffer, len + DNSCRYPT_REPLY_HEADER_SIZE);
+     return 0;
+ }
+@@ -912,12 +921,13 @@ dnsc_handle_curved_request(struct dnsc_e
+ }
+
+ int
+-dnsc_handle_uncurved_request(struct comm_reply *repinfo)
++dnsc_handle_uncurved_request(struct comm_reply *repinfo,
++	struct sldns_buffer* buffer)
+ {
+     if(!repinfo->c->dnscrypt) {
+         return 1;
+     }
+-    sldns_buffer_copy(repinfo->c->dnscrypt_buffer, repinfo->c->buffer);
++    sldns_buffer_copy(repinfo->c->dnscrypt_buffer, buffer);
+     if(!repinfo->is_dnscrypted) {
+         return 1;
+     }
+--- a/dnscrypt/dnscrypt.h
++++ b/dnscrypt/dnscrypt.h
+@@ -128,7 +128,8 @@ int dnsc_handle_curved_request(struct dn
+  * \return 0 in case of failure.
+  */
+
+-int dnsc_handle_uncurved_request(struct comm_reply *repinfo);
++int dnsc_handle_uncurved_request(struct comm_reply *repinfo,
++	struct sldns_buffer* buffer);
+
+ /**
+  * Computes the size of the shared secret cache entry.
+--- a/util/netevent.c
++++ b/util/netevent.c
+@@ -6645,7 +6645,9 @@ comm_point_send_reply(struct comm_reply
+ 	log_assert(repinfo && repinfo->c);
+ #ifdef USE_DNSCRYPT
+ 	buffer = repinfo->c->dnscrypt_buffer;
+-	if(!dnsc_handle_uncurved_request(repinfo)) {
++	if(!dnsc_handle_uncurved_request(repinfo,
++		repinfo->c->tcp_req_info?
++		repinfo->c->tcp_req_info->spool_buffer:repinfo->c->buffer)) {
+ 		return;
+ 	}
+ #else
+--- a/daemon/worker.c
++++ b/daemon/worker.c
+@@ -1690,7 +1690,13 @@ worker_handle_request(struct comm_point*
+ 		server_stats_insquery(&worker->stats, c, qinfo.qtype,
+ 			qinfo.qclass, &edns, repinfo);
+ 	if(c->type != comm_udp)
++#ifdef USE_DNSCRYPT
++		edns.udp_size = (c->dnscrypt && repinfo->is_dnscrypted)
++			? sldns_buffer_capacity(c->buffer) - DNSCRYPT_REPLY_HEADER_SIZE
++			: 65535;
++#else
+ 		edns.udp_size = 65535; /* max size for TCP replies */
++#endif
+ 	if(qinfo.qclass == LDNS_RR_CLASS_CH && answer_chaos(worker, &qinfo,
+ 		&edns, repinfo, c->buffer)) {
+ 		regional_free_all(worker->scratchpad);
+@@ -1976,7 +1982,7 @@ send_reply_rc:
+ 		}
+ 	}
+ #ifdef USE_DNSCRYPT
+-	if(!dnsc_handle_uncurved_request(repinfo)) {
++	if(!dnsc_handle_uncurved_request(repinfo, c->buffer)) {
+ 		return 0;
+ 	}
+ #endif
+Description: CVE-2026-50046 - Fix heap use-after-free in DoT forwarded query error path
+ A possible heap use-after-free could occur in an error path when a DoT
+ forwarded query is jostled out. The waiting_tcp structure stored a bare
+ reference to the tls_auth_name owned by the serviced_query. When the
+ serviced_query was freed while the waiting_tcp still lived (e.g. jostled
+ out on an error path), the dangling pointer could be used after free.
+ This change makes waiting_tcp own a strdup'd copy of tls_auth_name and
+ frees it in waiting_tcp_delete().
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/1ad8d4c39594dcb28d636fb4922737a3640c9a65
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-07-28
+---
+--- a/services/outside_network.c
++++ b/services/outside_network.c
+@@ -195,6 +195,7 @@
+ waiting_tcp_delete(struct waiting_tcp* w)
+ {
+ 	if(!w) return;
++	free(w->tls_auth_name);
+ 	if(w->timer)
+ 		comm_timer_delete(w->timer);
+ 	free(w);
+@@ -2474,7 +2475,16 @@
+ 	w->cb = callback;
+ 	w->cb_arg = callback_arg;
+ 	w->ssl_upstream = sq->ssl_upstream;
+-	w->tls_auth_name = sq->tls_auth_name;
++	if(sq->tls_auth_name) {
++		w->tls_auth_name = strdup(sq->tls_auth_name);
++		if(!w->tls_auth_name) {
++			comm_timer_delete(w->timer);
++			free(w);
++			return NULL;
++		}
++	} else {
++		w->tls_auth_name = NULL;
++	}
+ 	w->timeout = timeout;
+ 	w->id_node.key = NULL;
+ 	w->write_wait_prev = NULL;
+--- a/services/outside_network.h
++++ b/services/outside_network.h
+@@ -412,7 +412,7 @@
+ 	void* cb_arg;
+ 	/** if it uses ssl upstream */
+ 	int ssl_upstream;
+-	/** ref to the tls_auth_name from the serviced_query */
++	/** owned copy of the tls_auth_name (malloced) */
+ 	char* tls_auth_name;
+ 	/** the packet was involved in an error, to stop looping errors */
+ 	int error_count;
+Description: CVE-2026-50251 - Attacker supplied 0.0.0.0/:: glue triggers defensive full-cache flush
+ Attacker-supplied glue records pointing at the "any" / unspecified
+ addresses (0.0.0.0/8 for IPv4, :: and the IPv4-mapped equivalents for
+ IPv6) are, on Linux, routed to the local host. Unbound would attempt to
+ query such addresses, and the resulting defensive handling could trigger
+ a full cache flush, giving a remote attacker a denial-of-service /
+ cache-poisoning aid vector (CWE-184: incomplete list of disallowed
+ inputs).
+ .
+ This backports the upstream fix by extending the built-in
+ do-not-query-address list in donotq_apply_cfg() to also cover
+ 0.0.0.0/8, ::, ::ffff:0:0/96 and ::ffff:127.0.0.0/104, so glue pointing
+ at these addresses is never queried. The change is purely additive and
+ applies unchanged against the target's donotq_apply_cfg().
+ .
+ A regression test (testdata/iter_donotq_zero.rpl) is added, adapted from
+ the target's existing iter_donotq127.rpl fixture, exercising the new
+ 0.0.0.0 glue blocking path (the upstream fixture dns_error_reporting.rpl
+ relies on the RFC 9567 DNS Error Reporting feature that does not exist in
+ this target version and is therefore not portable).
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/e180b06298d8d39a764d3c5d4d4aca472c3a97d7
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-07-31
+---
+--- a/iterator/iter_donotq.c
++++ b/iterator/iter_donotq.c
+@@ -132,6 +132,18 @@ donotq_apply_cfg(struct iter_donotq* dq, struct config_file* cfg)
+ 		if(cfg->do_ip6) {
+ 			if(!donotq_str_cfg(dq, "::1"))
+ 				return 0;
++			if(!donotq_str_cfg(dq, "::ffff:127.0.0.0/104"))
++				return 0;
++		}
++		/* RFC 1122 3.2.1.3 / RFC 6890 / RFC 4291 2.5.2: not valid as
++		 * destination; on Linux these route to the local host. */
++		if(!donotq_str_cfg(dq, "0.0.0.0/8"))
++			return 0;
++		if(cfg->do_ip6) {
++			if(!donotq_str_cfg(dq, "::"))
++				return 0;
++			if(!donotq_str_cfg(dq, "::ffff:0:0/96"))
++				return 0;
+ 		}
+ 	}
+ 	addr_tree_init_parents(&dq->tree);
+--- /dev/null
++++ b/testdata/iter_donotq_zero.rpl
+@@ -0,0 +1,139 @@
++; config options
++server:
++	qname-minimisation: "no"
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++CONFIG_END
++
++SCENARIO_BEGIN Test iterator donotquery of 0.0.0.0/8 (CVE-2026-50251).
++; The scenario presents an iteration chain that has 0.0.0.2 and
++; 0.255.255.255 as nameserver IPs, like attacker-supplied glue.
++; these are in 0.0.0.0/8 and on Linux route to the local host, so they
++; must be blocked by the built-in do-not-query-address list, causing
++; servfail. If not blocked, they cause a lookup, but this file does not
++; specify 0.* responses, so testbound will fail the test.
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++a.gtld-servers.net. IN AAAA
++SECTION ANSWER
++SECTION AUTHORITY
++net. IN SOA ns.example.com. root.example.com. 4 14400 3600 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++com. IN A
++SECTION AUTHORITY
++com.	IN NS	a.gtld-servers.net.
++SECTION ADDITIONAL
++a.gtld-servers.net.	IN 	A	192.5.6.30
++ENTRY_END
++RANGE_END
++
++; a.gtld-servers.net.
++RANGE_BEGIN 0 100
++	ADDRESS 192.5.6.30
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++com. IN NS
++SECTION ANSWER
++com.	IN NS	a.gtld-servers.net.
++SECTION ADDITIONAL
++a.gtld-servers.net.	IN 	A	192.5.6.30
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++example.com. IN A
++SECTION AUTHORITY
++example.com.	IN NS	ns.example.com.
++example.com.	IN NS	ns2.example.com.
++SECTION ADDITIONAL
++;ns.example.com.	IN 	A	1.2.3.4
++ns.example.com.		IN 	A	0.255.255.255
++ns2.example.com.	IN 	A	0.0.0.2
++ENTRY_END
++RANGE_END
++
++; ns.example.com.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++example.com. IN NS
++SECTION ANSWER
++example.com.	IN NS	ns.example.com.
++example.com.	IN NS	ns2.example.com.
++SECTION ADDITIONAL
++;ns.example.com.	IN 	A	1.2.3.4
++ns.example.com.		IN 	A	0.255.255.255
++ns2.example.com.	IN 	A	0.0.0.2
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++www.example.com. IN A
++SECTION ANSWER
++www.example.com. IN A	10.20.30.40
++SECTION AUTHORITY
++example.com.	IN NS	ns.example.com.
++SECTION ADDITIONAL
++ns.example.com.		IN 	A	1.2.3.4
++ENTRY_END
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD
++SECTION QUESTION
++www.example.com. IN A
++ENTRY_END
++
++; recursion happens here.
++STEP 10 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA SERVFAIL
++SECTION QUESTION
++www.example.com. IN A
++SECTION ANSWER
++SECTION AUTHORITY
++SECTION ADDITIONAL
++ENTRY_END
++
++SCENARIO_END
+Description: CVE-2026-55991 - Remote DNS-over-QUIC (DoQ) flow-control assertion failure
+ A remote attacker can trigger a flow-control assertion failure in libngtcp2
+ when Unbound serves DNS-over-QUIC. When ngtcp2_conn_writev_stream returns
+ NGTCP2_ERR_STREAM_DATA_BLOCKED, Unbound closed the whole connection with an
+ invalid application error code (-1) instead of handling the blocked stream
+ gracefully, which could lead to an assertion failure / denial of service.
+ .
+ This fix adds an extend_max_stream_data callback so blocked streams are
+ rescheduled for writing when the peer extends flow-control credit, removes
+ the stream from the write list and continues on NGTCP2_ERR_STREAM_DATA_BLOCKED
+ instead of tearing down the connection, and uses the valid DOQ_APP_ERROR_CODE
+ (1) application error code instead of -1.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/aac261cbb3795cbd60af2f37ef57bfa5c186aae6
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-07-28
+---
+--- a/services/listen_dnsport.c
++++ b/services/listen_dnsport.c
+@@ -4508,6 +4508,29 @@ doq_stream_reset_cb(ngtcp2_conn* ATTR_UNUSED(conn), int64_t stream_id,
+ 	return 0;
+ }
+
++/** ngtcp2 extend_max_stream_data function */
++int doq_extend_max_stream_data_cb(ngtcp2_conn* ATTR_UNUSED(conn),
++	int64_t stream_id, uint64_t max_data, void* user_data,
++	void* ATTR_UNUSED(stream_user_data))
++{
++	struct doq_conn* doq_conn = (struct doq_conn*)user_data;
++	struct doq_stream* stream;
++	verbose(VERB_ALGO, "doq extend_max_stream_data stream id %d "
++		"max_data %d ", (int)stream_id, (int)max_data);
++	if(max_data == 0)
++		return 0;
++	stream = doq_stream_find(doq_conn, stream_id);
++	if(!stream) {
++		verbose(VERB_ALGO, "doq: unknown stream %d", (int)stream_id);
++		return 0;
++	}
++	if(!stream->is_answer_available)
++		return 0;
++	doq_stream_on_write_list(doq_conn, stream);
++	doq_conn_write_enable(doq_conn);
++	return 0;
++}
++
+ /** ngtcp2 acked_stream_data_offset callback function */
+ static int
+ doq_acked_stream_data_offset_cb(ngtcp2_conn* ATTR_UNUSED(conn),
+@@ -4882,6 +4905,7 @@ doq_conn_setup(struct doq_conn* conn, uint8_t* scid, size_t scidlen,
+ 	callbacks.stream_open = doq_stream_open_cb;
+ 	callbacks.stream_close = doq_stream_close_cb;
+ 	callbacks.stream_reset = doq_stream_reset_cb;
++	callbacks.extend_max_stream_data = doq_extend_max_stream_data_cb;
+ 	callbacks.acked_stream_data_offset = doq_acked_stream_data_offset_cb;
+ 	callbacks.recv_stream_data = doq_recv_stream_data_cb;
+
+@@ -5470,26 +5494,20 @@ doq_conn_write_streams(struct comm_point* c, struct doq_conn* conn,
+ 				continue;
+ 			} else if(ret == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+ 				verbose(VERB_ALGO, "doq: ngtcp2_conn_writev_stream returned NGTCP2_ERR_STREAM_DATA_BLOCKED");
+-#ifdef HAVE_NGTCP2_CCERR_DEFAULT
+-				ngtcp2_ccerr_set_application_error(
+-					&conn->ccerr, -1, NULL, 0);
+-#else
+-				ngtcp2_connection_close_error_set_application_error(&conn->last_error, -1, NULL, 0);
+-#endif
+-				if(err_drop)
+-					*err_drop = 0;
+-				if(!doq_conn_close_error(c, conn)) {
+-					if(err_drop)
+-						*err_drop = 1;
++				if(stream) {
++					doq_stream_off_write_list(conn, stream);
++					stream = stream->write_next;
++					continue;
++				} else {
++					break;
+ 				}
+-				return 0;
+ 			} else if(ret == NGTCP2_ERR_STREAM_SHUT_WR) {
+ 				verbose(VERB_ALGO, "doq: ngtcp2_conn_writev_stream returned NGTCP2_ERR_STREAM_SHUT_WR");
+ #ifdef HAVE_NGTCP2_CCERR_DEFAULT
+ 				ngtcp2_ccerr_set_application_error(
+-					&conn->ccerr, -1, NULL, 0);
++					&conn->ccerr, DOQ_APP_ERROR_CODE, NULL, 0);
+ #else
+-				ngtcp2_connection_close_error_set_application_error(&conn->last_error, -1, NULL, 0);
++				ngtcp2_connection_close_error_set_application_error(&conn->last_error, DOQ_APP_ERROR_CODE, NULL, 0);
+ #endif
+ 				if(err_drop)
+ 					*err_drop = 0;
+--- a/testcode/doqclient.c
++++ b/testcode/doqclient.c
+@@ -1519,9 +1519,9 @@ doq_client_send_pkt(struct doq_client_data* data, uint32_t ecn, uint8_t* buf,
+ 		}
+ 		log_err("doq sendmsg: %s", strerror(errno));
+ #ifdef HAVE_NGTCP2_CCERR_DEFAULT
+-		ngtcp2_ccerr_set_application_error(&data->ccerr, -1, NULL, 0);
++		ngtcp2_ccerr_set_application_error(&data->ccerr, 1, NULL, 0);
+ #else
+-		ngtcp2_connection_close_error_set_application_error(&data->last_error, -1, NULL, 0);
++		ngtcp2_connection_close_error_set_application_error(&data->last_error, 1, NULL, 0);
+ #endif
+ 		return 0;
+ 	}
 Description: CVE-2026-50252 - Possible cache poisoning attack by mapping source port population per thread.
  Unbound shared a single population of source ports across all worker
  threads, which reduced the entropy of the (source port, query ID) tuple
@@ -1273,375 +1787,388 @@ Last-Update: 2026-07-28
 +    shared_port_test_ifs();
 +    shared_port_test_port();
  }
-Description: CVE-2026-55973 - dns-error-reporting stack buffer overflow
- A stack buffer overflow can be triggered via the RFC9567 "DNS Error
- Reporting" feature ('dns-error-reporting: yes') when a malformed agent
- domain name is processed. The upstream fix (commit 96f8755) hardens
- find_closest_of_type() in services/cache/dns.c so its label-snipping
- loop stops on a zero-length label instead of walking past the end of
- the name, and reworks dns_error_reporting() in services/mesh.c to bound
- the agent domain length by dname_valid().
+Description: CVE-2026-82717 - CNAME synthesis could lead to heap corruption.
+ When a DNAME record triggers CNAME synthesis, the packet parser sized every
+ name in the rdata from the original wire bytes while rdata_copy() later
+ re-walked those names trusting the recorded sizes. Because compression
+ pointers in the SOA rdata could target the DNAME TTL bytes, a mutation of the
+ packet buffer between the two walks (or a partially-walked name on parse
+ failure) broke that invariant, allowing rdata_copy() to write past the
+ allocated packed_rrset_data buffer -> heap corruption.
  .
- The RFC9567 DNS Error Reporting feature (dns_error_reporting(),
- LDNS_EDNS_REPORT_CHANNEL, agent_domain) was introduced upstream in
- release 1.23.0 and is entirely absent from this target
- (unbound 1.22.0-2+deb13u3, which predates the affected range
- 1.23.0-1.25.1). The services/mesh.c hunk therefore has no code to
- attach to on this version and is omitted. This patch applies the
- defensive find_closest_of_type() label-length guard from the upstream
- fix, which does textually apply here, as conservative hardening of the
- shared label-snipping loop.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/96f875552023c0ccf376ebe050519f12f3371dc9
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Bug: CVE-2026-55973
-Last-Update: 2026-08-01
----
---- a/services/cache/dns.c
-+++ b/services/cache/dns.c
-@@ -259,6 +259,8 @@ find_closest_of_type(struct module_env*
-
- 		/* snip off front label */
- 		lablen = *qname;
-+		if(lablen == 0)
-+			break;
- 		qname += lablen + 1;
- 		qnamelen -= lablen + 1;
- 	}
-Description: CVE-2026-56416 - Fix possible heap buffer overflow when validator
- canonicalizes RDATA that contains a domain name.
+ The fix hardens the two decompression walks so they can never diverge:
+ pkt_dname_len() now always restores the buffer position on failure (goto
+ fail) so callers computing the consumed length never observe a partial walk,
+ and rdata_copy() tracks the remaining destination capacity (tolen), validates
+ every dname/str/fixed field length against it before copying, and re-parses
+ each embedded dname length before the copy so the length walk and the copy
+ walk cannot disagree.
  .
- When the validator canonicalizes RDATA for record types that carry one or
- two embedded domain names (e.g. MINFO, RP, SOA, PX), a malformed or truncated
- second name could cause query_dname_tolower() to be called past the end of the
- RDATA buffer, resulting in a heap buffer overflow. The parser is hardened to
- reject RDATA that ends before all expected embedded names are seen, and the
- canonicalization only lowercases the second name when the first name length is
- valid and leaves room for a second name within the RDATA.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/4b1635e19406fd8040806f0fa4a4488c003b5d0d
+ Note on backport: the upstream commit also touches iterator/iter_scrub.c to
+ stop writing the clamped TTL back into the packet buffer. That write-back was
+ introduced by the intervening CVE-2026-77860 serve-expired/TTL refactor and
+ does not exist in unbound 1.22.0 (synth_cname_rrset() has no TTL-clamp block
+ here), so that hunk is not applicable to this target and is intentionally
+ omitted. The heap-corruption root cause is fully addressed by the
+ util/data/dname.c and util/data/msgreply.c changes below, which apply cleanly.
+ The upstream regression test testdata/dname_pkt_alter.rpl is included.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/0d4a6a63dd71050d216a467b488e28176f2599df
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/5d89e0c2a7577e78f8a8433b940b20819efc262e
+Bug: https://nlnetlabs.nl/downloads/unbound/patch_CVE-2026-82717.diff
 Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-07-28
+Last-Update: 2026-09-17
 ---
---- a/util/data/msgparse.c
-+++ b/util/data/msgparse.c
-@@ -685,6 +685,9 @@ calc_size(sldns_buffer* pkt, uint16_t ty
+--- a/util/data/dname.c
++++ b/util/data/dname.c
+@@ -192,34 +192,34 @@
+ 	while(1) {
+ 		/* read next label */
+ 		if(sldns_buffer_remaining(pkt) < 1)
+-			return 0;
++			goto fail;
+ 		labellen = sldns_buffer_read_u8(pkt);
+ 		if(LABEL_IS_PTR(labellen)) {
+ 			/* compression ptr */
+ 			uint16_t ptr;
+ 			if(sldns_buffer_remaining(pkt) < 1)
+-				return 0;
++				goto fail;
+ 			ptr = PTR_OFFSET(labellen, sldns_buffer_read_u8(pkt));
+ 			if(ptrcount++ > MAX_COMPRESS_PTRS)
+-				return 0; /* loop! */
++				goto fail; /* loop! */
+ 			if(sldns_buffer_limit(pkt) <= ptr)
+-				return 0; /* out of bounds! */
++				goto fail; /* out of bounds! */
+ 			if(!endpos)
+ 				endpos = sldns_buffer_position(pkt);
+ 			sldns_buffer_set_position(pkt, ptr);
+ 		} else {
+ 			/* label contents */
+ 			if(labellen > 0x3f)
+-				return 0; /* label too long */
++				goto fail; /* label too long */
+ 			len += 1 + labellen;
+ 			if(len > LDNS_MAX_DOMAINLEN)
+-				return 0;
++				goto fail;
+ 			if(labellen == 0) {
+ 				/* end of dname */
+ 				break;
  			}
- 			rdf++;
+ 			if(sldns_buffer_remaining(pkt) < labellen)
+-				return 0;
++				goto fail;
+ 			sldns_buffer_skip(pkt, (ssize_t)labellen);
  		}
-+		/* rdata ended before all _dname_count names were seen */
-+		if(count != 0)
-+			return 0; /* the rdata is too short. */
  	}
- 	/* remaining rdata */
- 	rr->size += pkt_len;
---- a/validator/val_sigcrypt.c
-+++ b/validator/val_sigcrypt.c
-@@ -1093,6 +1093,7 @@ canonicalize_rdata(sldns_buffer* buf, st
- 	size_t len)
- {
- 	uint8_t* datstart = sldns_buffer_current(buf)-len+2;
-+	size_t firstlen;
- 	switch(ntohs(rrset->rk.type)) {
- 		case LDNS_RR_TYPE_NXT: 
- 		case LDNS_RR_TYPE_NS:
-@@ -1112,8 +1113,9 @@ canonicalize_rdata(sldns_buffer* buf, st
- 		case LDNS_RR_TYPE_SOA:
- 			/* two names after another */
- 			query_dname_tolower(datstart);
--			query_dname_tolower(datstart + 
--				dname_valid(datstart, len-2));
-+			firstlen = dname_valid(datstart, len-2);
-+			if(firstlen && firstlen < len-2)
-+				query_dname_tolower(datstart + firstlen);
- 			return;
- 		case LDNS_RR_TYPE_RT:
- 		case LDNS_RR_TYPE_AFSDB:
-@@ -1140,8 +1142,9 @@ canonicalize_rdata(sldns_buffer* buf, st
- 				return;
- 			datstart += 2;
- 			query_dname_tolower(datstart);
--			query_dname_tolower(datstart + 
--				dname_valid(datstart, len-2-2));
-+			firstlen = dname_valid(datstart, len-2-2);
-+			if(firstlen && firstlen < len-2-2)
-+				query_dname_tolower(datstart + firstlen);
- 			return;
- 		case LDNS_RR_TYPE_NAPTR:
- 			if(len < 2+4)
-Description: CVE-2026-44690 - Cross-zone wildcard cache poisoning via RRSIG.labels manipulation
- A malicious authoritative server could poison the RRset cache of a
- validating resolver with wildcard-expanded records for names outside
- the authority of the RRSIG signer, by manipulating the RRSIG labels
- field. This fix:
-  * Rejects RRSIGs whose label count is lower than the signer name's
-    label count (dnskey_verify_rrset_sig in val_sigcrypt.c).
-  * When caching a wildcard-expanded RRset, verifies that the derived
-    canonical parent name falls within the authority of every RRSIG
-    signer (dname_subdomain_rrsig_signers in services/cache/rrset.c).
-  * Postpones the aggressive-NSEC wildcard cache update in
-    validate_positive_response until the wildcard proof has actually
-    succeeded, so bogus responses can no longer populate the cache.
- The helper rrsig_get_signer is exported from val_utils for reuse by
- the rrset cache.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f7637a4f1811f4a9331707d8a95cf0af65a97c0f
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-07-28
----
---- a/services/cache/rrset.c
-+++ b/services/cache/rrset.c
-@@ -50,6 +50,7 @@
- #include "util/regional.h"
- #include "util/alloc.h"
- #include "util/net_help.h"
-+#include "validator/val_utils.h"
-
- void
- rrset_markdel(void* key)
-@@ -243,12 +244,43 @@ rrset_cache_update(struct rrset_cache* r, struct rrset_ref* ref,
- 	return 0;
+@@ -227,6 +227,13 @@
+ 		sldns_buffer_set_position(pkt, endpos);
+ 
+ 	return len;
++fail:
++	/* Restore the position on failure too: callers (rdata_copy) compute
++	 * the consumed field length from the buffer position and must not
++	 * see a partial walk of a name that failed to parse. */
++	if(endpos)
++		sldns_buffer_set_position(pkt, endpos);
++	return 0;
  }
-
--void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache, 
-+/** See if the name is a within signer authority */
-+static int
-+dname_subdomain_rrsig_signers(uint8_t* dname,
-+	struct ub_packed_rrset_key* rrset)
-+{
-+	struct packed_rrset_data* d = (struct packed_rrset_data*)
-+		rrset->entry.data;
-+	size_t i;
-+	if(!d || !d->rrsig_count)
+ 
+ int 
+--- a/util/data/msgreply.c
++++ b/util/data/msgreply.c
+@@ -247,6 +247,7 @@
+ 	sldns_pkt_section section)
+ {
+ 	uint16_t pkt_len;
++	size_t tolen;
+ 	const sldns_rr_descriptor* desc;
+ 
+ 	*rr_ttl = sldns_read_uint32(rr->ttl_data);
+@@ -289,9 +290,13 @@
+ 		(rr->ttl_data - sldns_buffer_begin(pkt) + sizeof(uint32_t)));
+ 	/* insert decompressed size into rdata len stored in memory */
+ 	/* -2 because rdatalen bytes are not included. */
++	tolen = rr->size;
++	if(tolen < 2)
 +		return 0;
-+	for(i=0; i<d->rrsig_count; i++) {
-+		uint8_t* sname = NULL;
-+		size_t slen = 0;
-+		rrsig_get_signer(d->rr_data[d->count+i], d->rr_len[d->count+i],
-+			&sname, &slen);
-+		if(!sname || !slen)
-+			return 0; /* malformed */
-+		if(!dname_subdomain_c(dname, sname))
-+			return 0; /* not a subdomain */
-+	}
-+	return 1;
-+}
-+
-+void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache,
- 	struct ub_packed_rrset_key* rrset, uint8_t* ce, size_t ce_len,
- 	struct alloc_cache* alloc, time_t timenow)
- {
- 	struct rrset_ref ref;
- 	uint8_t wc_dname[LDNS_MAX_DOMAINLEN+3];
-+
-+	/* See if the RRSIG signer name allows this wildcard,
-+	 * the new rrset should fall within the zone of the RRSIG signer(s). */
-+	if(!dname_subdomain_rrsig_signers(ce, rrset)) {
-+		verbose(VERB_ALGO, "wildcard canonical parent outside signer authority");
-+		return;
-+	}
-+
- 	rrset = packed_rrset_copy_alloc(rrset, alloc, timenow);
- 	if(!rrset) {
- 		log_err("malloc failure in rrset_cache_update_wildcard");
---- a/validator/val_sigcrypt.c
-+++ b/validator/val_sigcrypt.c
-@@ -1653,6 +1653,13 @@ dnskey_verify_rrset_sig(struct regional* region, sldns_buffer* buf,
- 			*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
- 		return sec_status_bogus;
+ 	pkt_len = htons(rr->size - 2);
+ 	memmove(to, &pkt_len, sizeof(uint16_t));
+ 	to += 2;
++	tolen -= 2;
+ 	/* read packet rdata len */
+ 	pkt_len = sldns_buffer_read_u16(pkt);
+ 	if(sldns_buffer_remaining(pkt) < pkt_len)
+@@ -300,16 +305,29 @@
+ 	if(pkt_len > 0 && desc && desc->_dname_count > 0) {
+ 		int count = (int)desc->_dname_count;
+ 		int rdf = 0;
+-		size_t len;
+-		size_t oldpos;
++		size_t len, dlen;
++		size_t oldpos, newpos;
+ 		/* decompress dnames. */
+ 		while(pkt_len > 0 && count) {
+ 			switch(desc->_wireformat[rdf]) {
+ 			case LDNS_RDF_TYPE_DNAME:
+ 				oldpos = sldns_buffer_position(pkt);
+-				dname_pkt_copy(pkt, to, 
++				dlen = pkt_dname_len(pkt);
++				if(dlen == 0)
++					return 0; /* malformed */
++				if(dlen > tolen)
++					return 0; /* alloc mismatch */
++				newpos = sldns_buffer_position(pkt);
++				if(oldpos > newpos)
++					return 0; /* should have moved forward*/
++				sldns_buffer_set_position(pkt, oldpos);
++				dname_pkt_copy(pkt, to,
+ 					sldns_buffer_current(pkt));
+-				to += pkt_dname_len(pkt);
++				sldns_buffer_set_position(pkt, newpos);
++				to += dlen;
++				tolen -= dlen;
++				if(sldns_buffer_position(pkt)-oldpos > pkt_len)
++					return 0; /* malformed: walks diverged */
+ 				pkt_len -= sldns_buffer_position(pkt)-oldpos;
+ 				count--;
+ 				len = 0;
+@@ -322,9 +340,12 @@
+ 				break;
+ 			}
+ 			if(len) {
++				if(len > tolen)
++					return 0; /* alloc mismatch */
+ 				log_assert(len <= pkt_len);
+ 				memmove(to, sldns_buffer_current(pkt), len);
+ 				to += len;
++				tolen -= len;
+ 				sldns_buffer_skip(pkt, (ssize_t)len);
+ 				pkt_len -= len;
+ 			}
+@@ -332,8 +353,11 @@
+ 		}
  	}
-+	if((int)sig[2+3] < dname_signame_label_count(signer)) {
-+		verbose(VERB_QUERY, "verify: RRSIG label count too low for signer");
-+		*reason = "signature labelcount lower than signature signer";
-+		if(reason_bogus)
-+			*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
-+		return sec_status_bogus;
+ 	/* copy remaining rdata */
+-	if(pkt_len >  0)
++	if(pkt_len >  0) {
++		if(pkt_len > tolen)
++			return 0; /* alloc mismatch */
+ 		memmove(to, sldns_buffer_current(pkt), pkt_len);
 +	}
-
- 	/* original ttl, always ok */
-
---- a/validator/val_utils.c
-+++ b/validator/val_utils.c
-@@ -157,7 +157,7 @@ val_classify_response(uint16_t query_flags, struct query_info* origqinf,
+ 	
+ 	return 1;
  }
-
- /** Get signer name from RRSIG */
--static void
-+void
- rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname, size_t* slen)
- {
- 	/* RRSIG rdata is not allowed to be compressed, it is stored
---- a/validator/val_utils.h
-+++ b/validator/val_utils.h
-@@ -427,4 +427,8 @@ int val_favorite_ds_algo(struct ub_packed_rrset_key* ds_rrset);
- struct dns_msg* val_find_DS(struct module_env* env, uint8_t* nm, size_t nmlen,
- 	uint16_t c, struct regional* region, uint8_t* topname);
-
-+/** Get signer name from RRSIG, sname is NULL if malformed. */
-+void rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname,
-+	size_t* slen);
+--- /dev/null
++++ b/testdata/dname_pkt_alter.rpl
+@@ -0,0 +1,206 @@
++; config options
++; The island of trust is at test.
++server:
++	target-fetch-policy: "0 0 0 0 0"
++	qname-minimisation: no
++	minimal-responses: no
++	local-zone: test. nodefault
++	log-servfail: yes
++	cache-max-ttl: 86400
 +
- #endif /* VALIDATOR_VAL_UTILS_H */
---- a/validator/validator.c
-+++ b/validator/validator.c
-@@ -974,6 +974,10 @@ validate_positive_response(struct module_env* env, struct val_env* ve,
- 	uint8_t* wc = NULL;
- 	size_t wl;
- 	int wc_cached = 0;
-+	int wc_to_cache = 0;
-+	uint8_t* cache_wc = NULL;
-+	size_t cache_wl = 0;
-+	struct ub_packed_rrset_key* cache_s = NULL;
- 	int wc_NSEC_ok = 0;
- 	int nsec3s_seen = 0;
- 	size_t i;
-@@ -996,8 +1000,11 @@ validate_positive_response(struct module_env* env, struct val_env* ve,
- 			return;
- 		}
- 		if(wc && !wc_cached && env->cfg->aggressive_nsec) {
--			rrset_cache_update_wildcard(env->rrset_cache, s, wc, wl,
--				env->alloc, *env->now);
-+			/* Postpone cache adjust until proof has succeeded. */
-+			wc_to_cache = 1;
-+			cache_wc = wc;
-+			cache_wl = wl;
-+			cache_s = s;
- 			wc_cached = 1;
- 		}
-
-@@ -1059,6 +1066,10 @@ validate_positive_response(struct module_env* env, struct val_env* ve,
- 		update_reason_bogus(chase_reply, LDNS_EDE_DNSSEC_BOGUS);
- 		return;
- 	}
-+	if(wc_to_cache) {
-+		rrset_cache_update_wildcard(env->rrset_cache, cache_s,
-+			cache_wc, cache_wl, env->alloc, *env->now);
-+	}
-
- 	verbose(VERB_ALGO, "Successfully validated positive response");
- 	chase_reply->security = sec_status_secure;
-Description: CVE-2026-50248 - BOGUS configured primary hostname accepted for XFR in auth/rpz zones
- The auth zone transfer and probe lookup callbacks ignored the DNSSEC
- security status of the resolved primary (master) hostname A/AAAA
- addresses. A DNSSEC BOGUS address lookup result was still accepted and
- used to contact the primary for zone transfers, allowing an attacker who
- could spoof the address resolution to redirect XFR traffic for auth/rpz
- zones. This fix inspects the sec_status returned to the lookup callbacks
- and, when the result is bogus (or secure sentinel fail), logs the event
- and falls through to try the next lookup / next master instead of
- accepting the bogus address.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/3530c81e29e64ed19c612ae3dea21c8800d882e1
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-07-28
----
---- a/services/authzone.c
-+++ b/services/authzone.c
-@@ -5695,8 +5695,7 @@ xfr_master_add_addrs(struct auth_master*
-
- /** callback for task_transfer lookup of host name, of A or AAAA */
- void auth_xfer_transfer_lookup_callback(void* arg, int rcode, sldns_buffer* buf,
--	enum sec_status ATTR_UNUSED(sec), char* ATTR_UNUSED(why_bogus),
--	int ATTR_UNUSED(was_ratelimited))
-+	enum sec_status sec, char* why_bogus, int ATTR_UNUSED(was_ratelimited))
- {
- 	struct auth_xfer* xfr = (struct auth_xfer*)arg;
- 	struct module_env* env;
-@@ -5709,7 +5708,16 @@ void auth_xfer_transfer_lookup_callback(
- 	}
-
- 	/* process result */
--	if(rcode == LDNS_RCODE_NOERROR) {
-+	if(sec == sec_status_bogus || sec == sec_status_secure_sentinel_fail) {
-+		if(verbosity >= VERB_OPS) {
-+			char zname[LDNS_MAX_DOMAINLEN];
-+			dname_str(xfr->name, zname);
-+			verbose(VERB_OPS, "auth zone %s: primary %s address lookup is DNSSEC bogus: %s",
-+				zname, xfr->task_transfer->lookup_target->host,
-+				(why_bogus?why_bogus:""));
-+		}
-+		/* fall through to next-lookup / next-master */
-+	} else if(rcode == LDNS_RCODE_NOERROR) {
- 		uint16_t wanted_qtype = LDNS_RR_TYPE_A;
- 		struct regional* temp = env->scratch;
- 		struct query_info rq;
-@@ -6758,8 +6766,7 @@ xfr_probe_send_or_end(struct auth_xfer*
-
- /** callback for task_probe lookup of host name, of A or AAAA */
- void auth_xfer_probe_lookup_callback(void* arg, int rcode, sldns_buffer* buf,
--	enum sec_status ATTR_UNUSED(sec), char* ATTR_UNUSED(why_bogus),
--	int ATTR_UNUSED(was_ratelimited))
-+	enum sec_status sec, char* why_bogus, int ATTR_UNUSED(was_ratelimited))
- {
- 	struct auth_xfer* xfr = (struct auth_xfer*)arg;
- 	struct module_env* env;
-@@ -6772,7 +6779,16 @@ void auth_xfer_probe_lookup_callback(voi
- 	}
-
- 	/* process result */
--	if(rcode == LDNS_RCODE_NOERROR) {
-+	if(sec == sec_status_bogus || sec == sec_status_secure_sentinel_fail) {
-+		if(verbosity >= VERB_OPS) {
-+			char zname[LDNS_MAX_DOMAINLEN];
-+			dname_str(xfr->name, zname);
-+			verbose(VERB_OPS, "auth zone %s: primary %s address probe lookup is DNSSEC bogus: %s",
-+				zname, xfr->task_transfer->lookup_target->host,
-+				(why_bogus?why_bogus:""));
-+		}
-+		/* fall through to next-lookup / next-master */
-+	} else if(rcode == LDNS_RCODE_NOERROR) {
- 		uint16_t wanted_qtype = LDNS_RR_TYPE_A;
- 		struct regional* temp = env->scratch;
- 		struct query_info rq;
-Description: CVE-2026-55990 - Packet of death for a DNSCrypt misconfigured Unbound
- A misconfigured DNSCrypt-enabled Unbound (a dnscrypt-provider-cert without a
- matching dnscrypt-secret-key) leaves certificate entries with a NULL keypair.
- A crafted DNSCrypt query that matches such a certificate's magic_query causes
- a NULL pointer dereference (denial of service) when the query is decrypted.
- .
- This fix zero-initializes the certs array, skips certificate entries that have
- no keypair in dnsc_find_cert(), and makes dnsc_apply_cfg() fail at startup when
- one or more provider certs have no matching secret key.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/ae1b3810cc3a8eb9b43c378289f74020b42aa7f4
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-07-28
----
---- a/dnscrypt/dnscrypt.c
-+++ b/dnscrypt/dnscrypt.c
-@@ -663,6 +663,8 @@ dnsc_find_cert(struct dnsc_env* dnscenv,
- 	}
- 	dnscrypt_header = (struct dnscrypt_query_header *)sldns_buffer_begin(buffer);
- 	for (i = 0U; i < dnscenv->signed_certs_count; i++) {
-+		if(!certs[i].keypair)
-+			continue;
- 		if (memcmp(certs[i].magic_query, dnscrypt_header->magic_query,
-                    DNSCRYPT_MAGIC_HEADER_LEN) == 0) {
- 			return &certs[i];
-@@ -804,6 +806,7 @@ dnsc_parse_keys(struct dnsc_env *env, st
- 		sizeof *env->keypairs);
- 	env->certs = sodium_allocarray(env->signed_certs_count,
- 		sizeof *env->certs);
-+	memset(env->certs, 0, env->signed_certs_count * sizeof(*env->certs));
-
- 	cert_id = 0U;
- 	keypair_id = 0U;
-@@ -963,12 +966,19 @@ dnsc_create(void)
- int
- dnsc_apply_cfg(struct dnsc_env *env, struct config_file *cfg)
- {
-+    int nkeys;
-     if(dnsc_parse_certs(env, cfg) <= 0) {
-         fatal_exit("dnsc_apply_cfg: no cert file loaded");
-     }
--    if(dnsc_parse_keys(env, cfg) <= 0) {
-+    nkeys = dnsc_parse_keys(env, cfg);
-+    if(nkeys <= 0) {
-         fatal_exit("dnsc_apply_cfg: no key file loaded");
-     }
-+    if((size_t)nkeys < env->signed_certs_count) {
-+	fatal_exit("dnsc_apply_cfg: %u dnscrypt-provider-cert file(s) have no "
-+		"matching dnscrypt-secret-key",
-+		(unsigned)(env->signed_certs_count - (size_t)nkeys));
-+    }
-     randombytes_buf(env->hash_key, sizeof env->hash_key);
-     env->provider_name = cfg->dnscrypt_provider;
-
++stub-zone:
++	name: "."
++	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
++CONFIG_END
++
++SCENARIO_BEGIN Test DNAME for post parse packet alteration
++
++; K.ROOT-SERVERS.NET.
++RANGE_BEGIN 0 100
++	ADDRESS 193.0.14.129 
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++. IN NS
++SECTION ANSWER
++. IN NS	K.ROOT-SERVERS.NET.
++SECTION ADDITIONAL
++K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++test. IN NS
++SECTION AUTHORITY
++test.	IN NS	ns.test.
++SECTION ADDITIONAL
++ns.test. IN A 1.2.3.5
++ENTRY_END
++RANGE_END
++
++; ns.test
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.5
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++test. IN NS
++SECTION ANSWER
++test.    IN NS   ns.test
++SECTION ADDITIONAL
++ns.test. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.test. IN A
++SECTION ANSWER
++ns.test. IN A 1.2.3.5
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.test. IN AAAA
++SECTION AUTHORITY
++test. 3600 IN SOA ns.test. host.test. 20201 3600 1800 604800 3600
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode subdomain
++ADJUST copy_id copy_query
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN NS
++SECTION AUTHORITY
++example.test.    IN NS   ns.example.test.
++SECTION ADDITIONAL
++ns.example.test. IN A 1.2.3.4
++ENTRY_END
++RANGE_END
++
++; ns.example.test.
++RANGE_BEGIN 0 100
++	ADDRESS 1.2.3.4
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR NOERROR
++SECTION QUESTION
++example.test. IN NS
++SECTION ANSWER
++example.test.    IN NS   ns.example.test.
++SECTION ADDITIONAL
++ns.example.test.         IN      A       1.2.3.4
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.example.test. IN A
++SECTION ANSWER
++ns.example.test.         IN      A       1.2.3.4
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++ns.example.test. IN AAAA
++SECTION AUTHORITY
++example.test. 3600 IN SOA ns.example.test. host.example.test. 20301 3600 1800 604800 3600
++ENTRY_END
++
++; response to query of interest
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++a.d.example.test. IN CNAME
++SECTION ANSWER
++HEX_ANSWER_BEGIN
++00 00 84 00             ; QR AA
++00 01 00 02 00 01 00 00 ; QDCOUNT=1, ANCOUNT=2, NSCOUNT=1, ARCOUNT=0.
++; a.d.example.test. IN CNAME
++01 61 01 64 07 6578616d706c65 04 74657374 00 00 05 00 01
++; answer d.example.test. DNAME IN TTL=.. e.example.test.
++01 64 07 6578616d706c65 04 74657374 00 00 27 00 01 FF 00 12 34
++00 10 01 65 07 6578616d706c65 04 74657374 00
++; . TXT len to have space.
++00 00 10 00 01 00 00 00 15
++00 10
++0F 000102030405060708090A0B0C0D0E
++; auth SOA, with rdata compression pointer that points to the
++; DNAME TTL value. That gets clamped with max-ttl.
++; example.test. SOA IN ttl
++07 6578616d706c65 04 74657374 00 00 06 00 01 00 00 00 15
++00 18
++; DNAME TTL is at 36
++c0 37
++c0 0c
++00 00 00 01
++00 00 00 02
++00 00 00 03
++00 00 00 04
++00 00 00 05
++HEX_ANSWER_END
++ENTRY_END
++
++ENTRY_BEGIN
++MATCH opcode qtype qname
++ADJUST copy_id
++REPLY QR AA NOERROR
++SECTION QUESTION
++a.e.example.test. IN A
++SECTION AUTHORITY
++example.test. 3600 IN SOA ns.example.test. host.example.test. 20301 3600 1800 604800 3600
++ENTRY_END
++RANGE_END
++
++STEP 1 QUERY
++ENTRY_BEGIN
++REPLY RD DO
++SECTION QUESTION
++a.d.example.test. IN CNAME 
++ENTRY_END
++
++; The query is for type CNAME, so that the DNAME redirect is not followed,
++; but we get the processed answer from that DNAME reply.
++; The packet alteration would have changed the domain name in the SOA rdata.
++; but it should not have happened, the check below has the correct outcome,
++; where the packet data has not been altered, from its already awkward
++; contents.
++; The TXT RR has been scrubbed from the reply.
++; The malformed rdata would read something like:
++; example.test. 5 IN SOA . \001e\007example\004test\000. 1048577 21 1052416 16909060 84281096
++
++STEP 10 CHECK_ANSWER
++ENTRY_BEGIN
++MATCH all
++REPLY QR RD RA DO NOERROR
++SECTION QUESTION
++a.d.example.test. IN CNAME
++SECTION ANSWER
++d.example.test. 21 IN DNAME e.example.test.
++a.d.example.test. 21 IN CNAME a.e.example.test.
++SECTION AUTHORITY
++example.test. 3600 IN SOA . a.d.example.test. 1 2 3 4 5
++ENTRY_END
++
++SCENARIO_END
 Description: CVE-2026-50045 - 'max-global-quota' reset by DNSSEC validation restarts
  Unbound tracks the number of upstream queries generated while resolving a
  client query against the 'max-global-quota' limit. That per-request global
@@ -1919,244 +2446,279 @@ Last-Update: 2026-07-31
  	}
  	if(vq->wait_prime_ta) {
  		vq->wait_prime_ta = 0;
-Description: CVE-2026-50251 - Attacker supplied 0.0.0.0/:: glue triggers defensive full-cache flush
- Attacker-supplied glue records pointing at the "any" / unspecified
- addresses (0.0.0.0/8 for IPv4, :: and the IPv4-mapped equivalents for
- IPv6) are, on Linux, routed to the local host. Unbound would attempt to
- query such addresses, and the resulting defensive handling could trigger
- a full cache flush, giving a remote attacker a denial-of-service /
- cache-poisoning aid vector (CWE-184: incomplete list of disallowed
- inputs).
+Description: CVE-2026-81634 - Fix possible heap buffer overflow during DNSSEC canonicalization
+ During DNSSEC signature verification unbound canonicalizes an RRset into a
+ scratch buffer. The buffer bounds were not fully validated before writing the
+ RRSIG rdata, the canonical owner name and the per-RR type/class/ttl/rdata,
+ which could lead to a heap buffer overflow (CWE-122) when processing a
+ crafted RRset. This adds the missing bounds checks in rrset_canonical() and
+ rrset_canonicalize_to_buffer() so canonicalization fails safely when the
+ buffer is too small, and downgrades the log message to VERB_ALGO.
  .
- This backports the upstream fix by extending the built-in
- do-not-query-address list in donotq_apply_cfg() to also cover
- 0.0.0.0/8, ::, ::ffff:0:0/96 and ::ffff:127.0.0.0/104, so glue pointing
- at these addresses is never queried. The change is purely additive and
- applies unchanged against the target's donotq_apply_cfg().
- .
- A regression test (testdata/iter_donotq_zero.rpl) is added, adapted from
- the target's existing iter_donotq127.rpl fixture, exercising the new
- 0.0.0.0 glue blocking path (the upstream fixture dns_error_reporting.rpl
- relies on the RFC 9567 DNS Error Reporting feature that does not exist in
- this target version and is therefore not portable).
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/e180b06298d8d39a764d3c5d4d4aca472c3a97d7
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-07-31
+ Backport note: the upstream commit uses a two-argument canon_dname_tolower()
+ helper that does not exist in this version; this backport keeps the existing
+ single-argument query_dname_tolower() call and only adds the surrounding
+ bounds checks. A regression test (canon_owner_buf_test) is added to
+ testcode/unitverify.c to exercise the small-buffer path.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/3d65973d38cd7e4dcdc9d5764ef1ea40fd849d10
+Author: NLnet Labs
+Last-Update: 2026-09-17
 ---
---- a/iterator/iter_donotq.c
-+++ b/iterator/iter_donotq.c
-@@ -132,6 +132,18 @@ donotq_apply_cfg(struct iter_donotq* dq, struct config_file* cfg)
- 		if(cfg->do_ip6) {
- 			if(!donotq_str_cfg(dq, "::1"))
- 				return 0;
-+			if(!donotq_str_cfg(dq, "::ffff:127.0.0.0/104"))
-+				return 0;
-+		}
-+		/* RFC 1122 3.2.1.3 / RFC 6890 / RFC 4291 2.5.2: not valid as
-+		 * destination; on Linux these route to the local host. */
-+		if(!donotq_str_cfg(dq, "0.0.0.0/8"))
-+			return 0;
-+		if(cfg->do_ip6) {
-+			if(!donotq_str_cfg(dq, "::"))
-+				return 0;
-+			if(!donotq_str_cfg(dq, "::ffff:0:0/96"))
-+				return 0;
- 		}
+--- a/validator/val_sigcrypt.c
++++ b/validator/val_sigcrypt.c
+@@ -1291,14 +1291,31 @@
  	}
- 	addr_tree_init_parents(&dq->tree);
---- /dev/null
-+++ b/testdata/iter_donotq_zero.rpl
-@@ -0,0 +1,139 @@
-+; config options
-+server:
-+	qname-minimisation: "no"
-+stub-zone:
-+	name: "."
-+	stub-addr: 193.0.14.129 	# K.ROOT-SERVERS.NET.
-+CONFIG_END
+ 
+ 	sldns_buffer_clear(buf);
++	if(sldns_buffer_remaining(buf) < siglen || siglen < 18+1) {
++		verbose(VERB_ALGO, "verify: failed to canonicalize, "
++			"rrset too big");
++		return 0;
++	}
+ 	sldns_buffer_write(buf, sig, siglen);
+ 	/* canonicalize signer name */
+ 	query_dname_tolower(sldns_buffer_begin(buf)+18); 
 +
-+SCENARIO_BEGIN Test iterator donotquery of 0.0.0.0/8 (CVE-2026-50251).
-+; The scenario presents an iteration chain that has 0.0.0.2 and
-+; 0.255.255.255 as nameserver IPs, like attacker-supplied glue.
-+; these are in 0.0.0.0/8 and on Linux route to the local host, so they
-+; must be blocked by the built-in do-not-query-address list, causing
-+; servfail. If not blocked, they cause a lookup, but this file does not
-+; specify 0.* responses, so testbound will fail the test.
++	if(sldns_buffer_remaining(buf) < k->rk.dname_len+2) {
++		/* Check if the first can_owner name can fit in the buffer.
++		 * The length is k->rk.dname_len or k->rk.dname_len+2
++		 * if it has '*.' in prefixed. Checks the upper bound,
++		 * also realistically the rest of the rrtype, rrclass, origttl,
++		 * rdata and so on has to be inserted, so that extra space has
++		 * to be there. */
++		verbose(VERB_ALGO, "verify: failed to canonicalize, "
++			"rrset too big");
++		return 0;
++	}
+ 	RBTREE_FOR(walk, struct canon_rr*, (*sortree)) {
+ 		/* see if there is enough space left in the buffer */
+ 		if(sldns_buffer_remaining(buf) < can_owner_len + 2 + 2 + 4
+ 			+ d->rr_len[walk->rr_idx]) {
+-			log_err("verify: failed to canonicalize, "
++			verbose(VERB_ALGO, "verify: failed to canonicalize, "
+ 				"rrset too big");
+ 			return 0;
+ 		}
+@@ -1307,6 +1324,13 @@
+ 			sldns_buffer_write(buf, can_owner, can_owner_len);
+ 		else	insert_can_owner(buf, k, sig, &can_owner, 
+ 				&can_owner_len);
++		/* Check again, if the rdata can fit in the buffer */
++		if(sldns_buffer_remaining(buf) < 2 + 2 + 4
++                        + d->rr_len[walk->rr_idx]) {
++			verbose(VERB_ALGO, "verify: failed to canonicalize, "
++				"rrset too big");
++                        return 0;
++                }
+ 		sldns_buffer_write(buf, &k->rk.type, 2);
+ 		sldns_buffer_write(buf, &k->rk.rrset_class, 2);
+ 		sldns_buffer_write(buf, sig+4, 4);
+@@ -1357,11 +1381,17 @@
+ 	canonical_sort(k, d, sortree, rrs);
+ 
+ 	sldns_buffer_clear(buf);
++	if(sldns_buffer_remaining(buf) < k->rk.dname_len) {
++		/* Check if the first can_owner name can fit in the buffer. */
++		verbose(VERB_ALGO, "verify: failed to canonicalize, "
++			"rrset too big");
++		return 0;
++	}
+ 	RBTREE_FOR(walk, struct canon_rr*, sortree) {
+ 		/* see if there is enough space left in the buffer */
+ 		if(sldns_buffer_remaining(buf) < can_owner_len + 2 + 2 + 4
+ 			+ d->rr_len[walk->rr_idx]) {
+-			log_err("verify: failed to canonicalize, "
++			verbose(VERB_ALGO, "verify: failed to canonicalize, "
+ 				"rrset too big");
+ 			return 0;
+ 		}
+@@ -1374,6 +1404,13 @@
+ 			query_dname_tolower(can_owner);
+ 			can_owner_len = k->rk.dname_len;
+ 		}
++		/* Check again, if the rdata can fit in the buffer */
++		if(sldns_buffer_remaining(buf) < 2 + 2 + 4
++                        + d->rr_len[walk->rr_idx]) {
++			verbose(VERB_ALGO, "verify: failed to canonicalize, "
++				"rrset too big");
++                        return 0;
++                }
+ 		sldns_buffer_write(buf, &k->rk.type, 2);
+ 		sldns_buffer_write(buf, &k->rk.rrset_class, 2);
+ 		sldns_buffer_write_u32(buf, d->rr_ttl[walk->rr_idx]);
+--- a/testcode/unitverify.c
++++ b/testcode/unitverify.c
+@@ -500,6 +500,60 @@
+ 	sldns_buffer_free(buf);
+ }
+ 
++/** Test the rrset_canonicalize_to_buffer function to see if the
++ * size of canon_owner name is properly checked for. */
++static void
++canon_owner_buf_test(void)
++{
++	struct regional* region;
++	sldns_buffer* buf;
++	struct ub_packed_rrset_key k;
++	struct packed_rrset_data d;
++	size_t rr_len[2];
++	time_t rr_ttl[2];
++	uint8_t* rr_data[2];
++	int ret;
++	unit_show_func("validator/val_sigcrypt.c",
++		"rrset_canonicalize_to_buffer");
++	region = regional_create();
++	if(!region)
++		fatal_exit("out of memory");
++	/* Purposefully a very small buffer, to overflow it */
++	buf = sldns_buffer_new(28);
++	if(!buf)
++		fatal_exit("out of memory");
 +
-+; K.ROOT-SERVERS.NET.
-+RANGE_BEGIN 0 100
-+	ADDRESS 193.0.14.129
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+. IN NS
-+SECTION ANSWER
-+. IN NS	K.ROOT-SERVERS.NET.
-+SECTION ADDITIONAL
-+K.ROOT-SERVERS.NET.	IN	A	193.0.14.129
-+ENTRY_END
++	/* An RRset to canonicalize. The buffer is made smaller, so
++	 * it can fail on bounds checks. */
++	memset(&d, 0, sizeof(d));
++	d.ttl = 3600;
++	d.count = 1;
++	d.rrsig_count = 1;
++	d.rr_len = rr_len;
++	d.rr_ttl = rr_ttl;
++	d.rr_data = rr_data;
++	rr_len[0] = 18;
++	rr_len[1] = 36;
++	rr_ttl[0] = 3600;
++	rr_ttl[1] = 3600;
++	rr_data[0] = (uint8_t*)"\x00\x10\x0Fzzaaaaaaaaaaaaa";
++	rr_data[1] = (uint8_t*)"\x00\x24\x00\x06\x08\x3\x01\x02\x03\x04\x01\x02\x03\x04\x01\x02\x03\x04\x12\x34\x03zzz\x00zzaaaaaaaaaaa";
 +
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+a.gtld-servers.net. IN AAAA
-+SECTION ANSWER
-+SECTION AUTHORITY
-+net. IN SOA ns.example.com. root.example.com. 4 14400 3600 604800 3600
-+ENTRY_END
++	memset(&k, 0, sizeof(k));
++	k.rk.dname = (uint8_t*) "\x0f" "aaaaaaaaaaaaaaa" "\x00";
++	k.rk.dname_len = 17;
++	k.rk.type = htons(LDNS_RR_TYPE_TXT);
++	k.rk.rrset_class = htons(LDNS_RR_CLASS_IN);
++	k.entry.data = &d;
 +
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+com. IN A
-+SECTION AUTHORITY
-+com.	IN NS	a.gtld-servers.net.
-+SECTION ADDITIONAL
-+a.gtld-servers.net.	IN 	A	192.5.6.30
-+ENTRY_END
-+RANGE_END
++	/* There should be no buffer overflow, assertion failure, here */
++	ret = rrset_canonicalize_to_buffer(region, buf, &k);
++	unit_assert(ret == 0);
 +
-+; a.gtld-servers.net.
-+RANGE_BEGIN 0 100
-+	ADDRESS 192.5.6.30
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+com. IN NS
-+SECTION ANSWER
-+com.	IN NS	a.gtld-servers.net.
-+SECTION ADDITIONAL
-+a.gtld-servers.net.	IN 	A	192.5.6.30
-+ENTRY_END
++	regional_destroy(region);
++	sldns_buffer_free(buf);
++}
 +
-+ENTRY_BEGIN
-+MATCH opcode subdomain
-+ADJUST copy_id copy_query
-+REPLY QR NOERROR
-+SECTION QUESTION
-+example.com. IN A
-+SECTION AUTHORITY
-+example.com.	IN NS	ns.example.com.
-+example.com.	IN NS	ns2.example.com.
-+SECTION ADDITIONAL
-+;ns.example.com.	IN 	A	1.2.3.4
-+ns.example.com.		IN 	A	0.255.255.255
-+ns2.example.com.	IN 	A	0.0.0.2
-+ENTRY_END
-+RANGE_END
-+
-+; ns.example.com.
-+RANGE_BEGIN 0 100
-+	ADDRESS 1.2.3.4
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+example.com. IN NS
-+SECTION ANSWER
-+example.com.	IN NS	ns.example.com.
-+example.com.	IN NS	ns2.example.com.
-+SECTION ADDITIONAL
-+;ns.example.com.	IN 	A	1.2.3.4
-+ns.example.com.		IN 	A	0.255.255.255
-+ns2.example.com.	IN 	A	0.0.0.2
-+ENTRY_END
-+
-+ENTRY_BEGIN
-+MATCH opcode qtype qname
-+ADJUST copy_id
-+REPLY QR NOERROR
-+SECTION QUESTION
-+www.example.com. IN A
-+SECTION ANSWER
-+www.example.com. IN A	10.20.30.40
-+SECTION AUTHORITY
-+example.com.	IN NS	ns.example.com.
-+SECTION ADDITIONAL
-+ns.example.com.		IN 	A	1.2.3.4
-+ENTRY_END
-+RANGE_END
-+
-+STEP 1 QUERY
-+ENTRY_BEGIN
-+REPLY RD
-+SECTION QUESTION
-+www.example.com. IN A
-+ENTRY_END
-+
-+; recursion happens here.
-+STEP 10 CHECK_ANSWER
-+ENTRY_BEGIN
-+MATCH all
-+REPLY QR RD RA SERVFAIL
-+SECTION QUESTION
-+www.example.com. IN A
-+SECTION ANSWER
-+SECTION AUTHORITY
-+SECTION ADDITIONAL
-+ENTRY_END
-+
-+SCENARIO_END
-Description: CVE-2026-50046 - Fix heap use-after-free in DoT forwarded query error path
- A possible heap use-after-free could occur in an error path when a DoT
- forwarded query is jostled out. The waiting_tcp structure stored a bare
- reference to the tls_auth_name owned by the serviced_query. When the
- serviced_query was freed while the waiting_tcp still lived (e.g. jostled
- out on an error path), the dangling pointer could be used after free.
- This change makes waiting_tcp own a strdup'd copy of tls_auth_name and
- frees it in waiting_tcp_delete().
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/1ad8d4c39594dcb28d636fb4922737a3640c9a65
+ #define xstr(s) str(s)
+ #define str(s) #s
+ 
+@@ -566,4 +620,5 @@
+ #endif
+ 	nsectest();
+ 	nsec3_hash_test(SRCDIRSTR "/testdata/test_nsec3_hash.1");
++	canon_owner_buf_test();
+ }
+Description: CVE-2026-44621 - Fix libunbound abrupt termination with 'unwanted-reply-threshold'
+ Libunbound applications configured with 'unwanted-reply-threshold' could
+ eventually be abruptly terminated. When the unwanted-reply-threshold was
+ reached, libunbound calls the alloc id cleanup callback via a function
+ pointer. That function pointer (libworker_alloc_cleanup) was not present
+ in the function-pointer whitelist (fptr_whitelist_alloc_cleanup), causing
+ the fptr assertion to fail and the application to abort. This patch adds
+ the missing libworker_alloc_cleanup stubs to the non-libunbound worker
+ callback translation units and whitelists the function pointer so the
+ cleanup callback is accepted.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f52a9e864bfa0f10d8816b64130586b1d224c474
 Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
 Last-Update: 2026-07-28
 ---
---- a/services/outside_network.c
-+++ b/services/outside_network.c
-@@ -195,6 +195,7 @@
- waiting_tcp_delete(struct waiting_tcp* w)
+--- a/daemon/worker.c
++++ b/daemon/worker.c
+@@ -2477,6 +2477,11 @@ void libworker_event_done_cb(void* ATTR_
+ 	log_assert(0);
+ }
+
++void libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
++{
++	log_assert(0);
++}
++
+ int context_query_cmp(const void* ATTR_UNUSED(a), const void* ATTR_UNUSED(b))
  {
- 	if(!w) return;
-+	free(w->tls_auth_name);
- 	if(w->timer)
- 		comm_timer_delete(w->timer);
- 	free(w);
-@@ -2474,7 +2475,16 @@
- 	w->cb = callback;
- 	w->cb_arg = callback_arg;
- 	w->ssl_upstream = sq->ssl_upstream;
--	w->tls_auth_name = sq->tls_auth_name;
-+	if(sq->tls_auth_name) {
-+		w->tls_auth_name = strdup(sq->tls_auth_name);
-+		if(!w->tls_auth_name) {
-+			comm_timer_delete(w->timer);
-+			free(w);
-+			return NULL;
-+		}
-+	} else {
-+		w->tls_auth_name = NULL;
-+	}
- 	w->timeout = timeout;
- 	w->id_node.key = NULL;
- 	w->write_wait_prev = NULL;
---- a/services/outside_network.h
-+++ b/services/outside_network.h
-@@ -412,7 +412,7 @@
- 	void* cb_arg;
- 	/** if it uses ssl upstream */
- 	int ssl_upstream;
--	/** ref to the tls_auth_name from the serviced_query */
-+	/** owned copy of the tls_auth_name (malloced) */
- 	char* tls_auth_name;
- 	/** the packet was involved in an error, to stop looping errors */
- 	int error_count;
+ 	log_assert(0);
+--- a/dnstap/unbound-dnstap-socket.c
++++ b/dnstap/unbound-dnstap-socket.c
+@@ -1724,6 +1724,11 @@ void libworker_event_done_cb(void* ATTR_
+ 	log_assert(0);
+ }
+
++void libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
++{
++	log_assert(0);
++}
++
+ int context_query_cmp(const void* ATTR_UNUSED(a), const void* ATTR_UNUSED(b))
+ {
+ 	log_assert(0);
+--- a/smallapp/worker_cb.c
++++ b/smallapp/worker_cb.c
+@@ -128,6 +128,12 @@ worker_alloc_cleanup(void* ATTR_UNUSED(a
+ 	log_assert(0);
+ }
+
++void
++libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
++{
++	log_assert(0);
++}
++
+ struct outbound_entry* libworker_send_query(
+ 	struct query_info* ATTR_UNUSED(qinfo), uint16_t ATTR_UNUSED(flags),
+ 	int ATTR_UNUSED(dnssec), int ATTR_UNUSED(want_dnssec),
+--- a/testcode/doqclient.c
++++ b/testcode/doqclient.c
+@@ -2622,6 +2622,11 @@ void libworker_event_done_cb(void* ATTR_
+ 	log_assert(0);
+ }
+
++void libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
++{
++	log_assert(0);
++}
++
+ int context_query_cmp(const void* ATTR_UNUSED(a), const void* ATTR_UNUSED(b))
+ {
+ 	log_assert(0);
+--- a/util/fptr_wlist.c
++++ b/util/fptr_wlist.c
+@@ -606,6 +606,7 @@ int
+ fptr_whitelist_alloc_cleanup(void (*fptr)(void*))
+ {
+ 	if(fptr == &worker_alloc_cleanup) return 1;
++	else if(fptr == &libworker_alloc_cleanup) return 1;
+ 	return 0;
+ }
+Description: CVE-2026-81642 - Heap buffer overflow when digesting DNSKEYs
+ A heap buffer overflow and possible Remote Code Execution can occur in
+ ds_create_dnskey_digest() when digesting DNSKEY records. The DNSKEY owner
+ name and RDATA are written into the scratch buffer without verifying that
+ the buffer has enough space available, allowing a crafted DNSKEY/DS pair
+ to overflow the heap-allocated scratch buffer. This patch adds a bounds
+ check to ensure the buffer can hold the owner name plus the DNSKEY RDATA
+ (minus the 2-byte rdatalen prefix) before writing, returning 0 (failure)
+ when the buffer is too small.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/8c2e0fd6cc5b6eaa618ac72227808824b4edee7c
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-09-17
+---
+--- a/validator/val_sigcrypt.c
++++ b/validator/val_sigcrypt.c
+@@ -304,6 +304,8 @@ ds_create_dnskey_digest(struct module_env* env,
+ 	 * digest = digest_algorithm( DNSKEY owner name | DNSKEY RDATA);
+ 	 *	DNSKEY RDATA = Flags | Protocol | Algorithm | Public Key. */
+ 	sldns_buffer_clear(b);
++	if(!sldns_buffer_available(b, dnskey_rrset->rk.dname_len + dnskey_len-2))
++		return 0; /* buffer too small */
+ 	sldns_buffer_write(b, dnskey_rrset->rk.dname, 
+ 		dnskey_rrset->rk.dname_len);
+ 	query_dname_tolower(sldns_buffer_begin(b));
 Description: CVE-2026-32665 - Fix remote DNS-over-QUIC denial of service due to quic-size budget bypass
  When compiled with DoQ support (--with-libngtcp2) and quic-port configured,
  the per-stream quic-size memory budget could be bypassed. The first two
@@ -2274,306 +2836,313 @@ Last-Update: 2026-07-28
  			return NGTCP2_ERR_CALLBACK_FAILURE;
  	}
  	if((flags&NGTCP2_STREAM_DATA_FLAG_FIN)!=0) {
-Description: CVE-2026-40691 - Packet of death for DNSCrypt over TCP
- A crafted DNSCrypt query received over TCP could cause unbound to write
- the encrypted reply past the end of the dnscrypt reply buffer, leading to
- a buffer overflow (packet of death / denial of service).
+Description: CVE-2026-56416 - Fix possible heap buffer overflow when validator
+ canonicalizes RDATA that contains a domain name.
  .
- The fix bounds-checks the reply length against the buffer capacity in
- dnscrypt_server_curve() before curving, clamps max_len to the buffer
- capacity and to 65535, and correctly flips the buffer before setting its
- limit. For TCP DNSCrypt replies the EDNS udp_size is limited to the
- dnscrypt buffer capacity minus the reply header instead of 65535, and
- dnsc_handle_uncurved_request() now takes the source buffer explicitly so
- the correct (TCP spool) buffer is curved.
- .
- The two upstream worker.c hunks that add sldns_buffer_copy() to the
- FORMERR/SERVFAIL query_error paths, and the upstream testdata/*.test
- changes, are not applicable to this version: this version drops the reply
- (comm_point_drop_reply/return 0) on those cleartext-over-dnscrypt paths
- rather than returning a query_error, so those code paths and the SERVFAIL
- test expectations do not exist here.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f54e0791ba4488284d9f6059014640a3d0bd30da
+ When the validator canonicalizes RDATA for record types that carry one or
+ two embedded domain names (e.g. MINFO, RP, SOA, PX), a malformed or truncated
+ second name could cause query_dname_tolower() to be called past the end of the
+ RDATA buffer, resulting in a heap buffer overflow. The parser is hardened to
+ reject RDATA that ends before all expected embedded names are seen, and the
+ canonicalization only lowercases the second name when the first name length is
+ valid and leaves room for a second name within the RDATA.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/4b1635e19406fd8040806f0fa4a4488c003b5d0d
 Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
 Last-Update: 2026-07-28
 ---
---- a/dnscrypt/dnscrypt.c
-+++ b/dnscrypt/dnscrypt.c
-@@ -474,10 +474,18 @@ dnscrypt_server_curve(const dnsccert *ce
-     uint8_t *const buf = sldns_buffer_begin(buffer);
-     size_t len = sldns_buffer_limit(buffer);
-
-+    if(len + DNSCRYPT_REPLY_HEADER_SIZE > sldns_buffer_capacity(buffer))
-+	return -1;
-+    sldns_buffer_clear(buffer);
-+
-     if(udp){
-         if (max_len > max_reply_size)
-             max_len = max_reply_size;
-     }
-+    if(max_len > sldns_buffer_capacity(buffer))
-+	max_len = sldns_buffer_capacity(buffer);
-+    if(max_len > 65535)
-+	    max_len = 65535;
-
-
-     memcpy(nonce, client_nonce, crypto_box_HALF_NONCEBYTES);
-@@ -520,6 +528,7 @@ dnscrypt_server_curve(const dnsccert *ce
-                           DNSCRYPT_MAGIC_HEADER_LEN,
-                           nonce,
-                           crypto_box_NONCEBYTES);
-+    sldns_buffer_flip(buffer);
-     sldns_buffer_set_limit(buffer, len + DNSCRYPT_REPLY_HEADER_SIZE);
-     return 0;
- }
-@@ -912,12 +921,13 @@ dnsc_handle_curved_request(struct dnsc_e
- }
-
- int
--dnsc_handle_uncurved_request(struct comm_reply *repinfo)
-+dnsc_handle_uncurved_request(struct comm_reply *repinfo,
-+	struct sldns_buffer* buffer)
+--- a/util/data/msgparse.c
++++ b/util/data/msgparse.c
+@@ -685,6 +685,9 @@ calc_size(sldns_buffer* pkt, uint16_t ty
+ 			}
+ 			rdf++;
+ 		}
++		/* rdata ended before all _dname_count names were seen */
++		if(count != 0)
++			return 0; /* the rdata is too short. */
+ 	}
+ 	/* remaining rdata */
+ 	rr->size += pkt_len;
+--- a/validator/val_sigcrypt.c
++++ b/validator/val_sigcrypt.c
+@@ -1093,6 +1093,7 @@ canonicalize_rdata(sldns_buffer* buf, st
+ 	size_t len)
  {
-     if(!repinfo->c->dnscrypt) {
-         return 1;
-     }
--    sldns_buffer_copy(repinfo->c->dnscrypt_buffer, repinfo->c->buffer);
-+    sldns_buffer_copy(repinfo->c->dnscrypt_buffer, buffer);
-     if(!repinfo->is_dnscrypted) {
-         return 1;
-     }
---- a/dnscrypt/dnscrypt.h
-+++ b/dnscrypt/dnscrypt.h
-@@ -128,7 +128,8 @@ int dnsc_handle_curved_request(struct dn
-  * \return 0 in case of failure.
-  */
+ 	uint8_t* datstart = sldns_buffer_current(buf)-len+2;
++	size_t firstlen;
+ 	switch(ntohs(rrset->rk.type)) {
+ 		case LDNS_RR_TYPE_NXT: 
+ 		case LDNS_RR_TYPE_NS:
+@@ -1112,8 +1113,9 @@ canonicalize_rdata(sldns_buffer* buf, st
+ 		case LDNS_RR_TYPE_SOA:
+ 			/* two names after another */
+ 			query_dname_tolower(datstart);
+-			query_dname_tolower(datstart + 
+-				dname_valid(datstart, len-2));
++			firstlen = dname_valid(datstart, len-2);
++			if(firstlen && firstlen < len-2)
++				query_dname_tolower(datstart + firstlen);
+ 			return;
+ 		case LDNS_RR_TYPE_RT:
+ 		case LDNS_RR_TYPE_AFSDB:
+@@ -1140,8 +1142,9 @@ canonicalize_rdata(sldns_buffer* buf, st
+ 				return;
+ 			datstart += 2;
+ 			query_dname_tolower(datstart);
+-			query_dname_tolower(datstart + 
+-				dname_valid(datstart, len-2-2));
++			firstlen = dname_valid(datstart, len-2-2);
++			if(firstlen && firstlen < len-2-2)
++				query_dname_tolower(datstart + firstlen);
+ 			return;
+ 		case LDNS_RR_TYPE_NAPTR:
+ 			if(len < 2+4)
+Description: CVE-2026-55973 - fix stack buffer overflow in find_closest_of_type()
+ 'dns-error-reporting: yes' can lead to a stack buffer overflow. In
+ find_closest_of_type() in services/cache/dns.c the front label length is read
+ and used to advance the qname pointer without checking for a zero-length
+ (root) label. A crafted name could drive the loop past the end of the buffer,
+ causing an out-of-bounds read/overflow. Add a guard to break out of the loop
+ when a zero-length label is encountered.
+ .
+ This backport applies only the services/cache/dns.c guard from upstream commit
+ 96f875552023c0ccf376ebe050519f12f3371dc9. The accompanying services/mesh.c
+ hunk targets the RFC9567 dns-error-reporting feature (LDNS_EDNS_REPORT_CHANNEL /
+ dns_error_reporting), which does not exist in unbound 1.22.0 and is therefore
+ omitted.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/96f875552023c0ccf376ebe050519f12f3371dc9
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-09-20
+---
+--- a/services/cache/dns.c
++++ b/services/cache/dns.c
+@@ -259,6 +259,8 @@ find_closest_of_type(struct module_env*
 
--int dnsc_handle_uncurved_request(struct comm_reply *repinfo);
-+int dnsc_handle_uncurved_request(struct comm_reply *repinfo,
-+	struct sldns_buffer* buffer);
+ 		/* snip off front label */
+ 		lablen = *qname;
++		if(lablen == 0)
++			break;
+ 		qname += lablen + 1;
+ 		qnamelen -= lablen + 1;
+ 	}
+Description: CVE-2026-44690 - Cross-zone wildcard cache poisoning via RRSIG.labels manipulation
+ A malicious authoritative server could poison the RRset cache of a
+ validating resolver with wildcard-expanded records for names outside
+ the authority of the RRSIG signer, by manipulating the RRSIG labels
+ field. This fix:
+  * Rejects RRSIGs whose label count is lower than the signer name's
+    label count (dnskey_verify_rrset_sig in val_sigcrypt.c).
+  * When caching a wildcard-expanded RRset, verifies that the derived
+    canonical parent name falls within the authority of every RRSIG
+    signer (dname_subdomain_rrsig_signers in services/cache/rrset.c).
+  * Postpones the aggressive-NSEC wildcard cache update in
+    validate_positive_response until the wildcard proof has actually
+    succeeded, so bogus responses can no longer populate the cache.
+ The helper rrsig_get_signer is exported from val_utils for reuse by
+ the rrset cache.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f7637a4f1811f4a9331707d8a95cf0af65a97c0f
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-07-28
+---
+--- a/services/cache/rrset.c
++++ b/services/cache/rrset.c
+@@ -50,6 +50,7 @@
+ #include "util/regional.h"
+ #include "util/alloc.h"
+ #include "util/net_help.h"
++#include "validator/val_utils.h"
 
- /**
-  * Computes the size of the shared secret cache entry.
---- a/util/netevent.c
-+++ b/util/netevent.c
-@@ -6645,7 +6645,9 @@ comm_point_send_reply(struct comm_reply
- 	log_assert(repinfo && repinfo->c);
- #ifdef USE_DNSCRYPT
- 	buffer = repinfo->c->dnscrypt_buffer;
--	if(!dnsc_handle_uncurved_request(repinfo)) {
-+	if(!dnsc_handle_uncurved_request(repinfo,
-+		repinfo->c->tcp_req_info?
-+		repinfo->c->tcp_req_info->spool_buffer:repinfo->c->buffer)) {
+ void
+ rrset_markdel(void* key)
+@@ -243,12 +244,43 @@ rrset_cache_update(struct rrset_cache* r, struct rrset_ref* ref,
+ 	return 0;
+ }
+
+-void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache, 
++/** See if the name is a within signer authority */
++static int
++dname_subdomain_rrsig_signers(uint8_t* dname,
++	struct ub_packed_rrset_key* rrset)
++{
++	struct packed_rrset_data* d = (struct packed_rrset_data*)
++		rrset->entry.data;
++	size_t i;
++	if(!d || !d->rrsig_count)
++		return 0;
++	for(i=0; i<d->rrsig_count; i++) {
++		uint8_t* sname = NULL;
++		size_t slen = 0;
++		rrsig_get_signer(d->rr_data[d->count+i], d->rr_len[d->count+i],
++			&sname, &slen);
++		if(!sname || !slen)
++			return 0; /* malformed */
++		if(!dname_subdomain_c(dname, sname))
++			return 0; /* not a subdomain */
++	}
++	return 1;
++}
++
++void rrset_cache_update_wildcard(struct rrset_cache* rrset_cache,
+ 	struct ub_packed_rrset_key* rrset, uint8_t* ce, size_t ce_len,
+ 	struct alloc_cache* alloc, time_t timenow)
+ {
+ 	struct rrset_ref ref;
+ 	uint8_t wc_dname[LDNS_MAX_DOMAINLEN+3];
++
++	/* See if the RRSIG signer name allows this wildcard,
++	 * the new rrset should fall within the zone of the RRSIG signer(s). */
++	if(!dname_subdomain_rrsig_signers(ce, rrset)) {
++		verbose(VERB_ALGO, "wildcard canonical parent outside signer authority");
++		return;
++	}
++
+ 	rrset = packed_rrset_copy_alloc(rrset, alloc, timenow);
+ 	if(!rrset) {
+ 		log_err("malloc failure in rrset_cache_update_wildcard");
+--- a/validator/val_sigcrypt.c
++++ b/validator/val_sigcrypt.c
+@@ -1653,6 +1653,13 @@ dnskey_verify_rrset_sig(struct regional* region, sldns_buffer* buf,
+ 			*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
+ 		return sec_status_bogus;
+ 	}
++	if((int)sig[2+3] < dname_signame_label_count(signer)) {
++		verbose(VERB_QUERY, "verify: RRSIG label count too low for signer");
++		*reason = "signature labelcount lower than signature signer";
++		if(reason_bogus)
++			*reason_bogus = LDNS_EDE_DNSSEC_BOGUS;
++		return sec_status_bogus;
++	}
+
+ 	/* original ttl, always ok */
+
+--- a/validator/val_utils.c
++++ b/validator/val_utils.c
+@@ -157,7 +157,7 @@ val_classify_response(uint16_t query_flags, struct query_info* origqinf,
+ }
+
+ /** Get signer name from RRSIG */
+-static void
++void
+ rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname, size_t* slen)
+ {
+ 	/* RRSIG rdata is not allowed to be compressed, it is stored
+--- a/validator/val_utils.h
++++ b/validator/val_utils.h
+@@ -427,4 +427,8 @@ int val_favorite_ds_algo(struct ub_packed_rrset_key* ds_rrset);
+ struct dns_msg* val_find_DS(struct module_env* env, uint8_t* nm, size_t nmlen,
+ 	uint16_t c, struct regional* region, uint8_t* topname);
+
++/** Get signer name from RRSIG, sname is NULL if malformed. */
++void rrsig_get_signer(uint8_t* data, size_t len, uint8_t** sname,
++	size_t* slen);
++
+ #endif /* VALIDATOR_VAL_UTILS_H */
+--- a/validator/validator.c
++++ b/validator/validator.c
+@@ -974,6 +974,10 @@ validate_positive_response(struct module_env* env, struct val_env* ve,
+ 	uint8_t* wc = NULL;
+ 	size_t wl;
+ 	int wc_cached = 0;
++	int wc_to_cache = 0;
++	uint8_t* cache_wc = NULL;
++	size_t cache_wl = 0;
++	struct ub_packed_rrset_key* cache_s = NULL;
+ 	int wc_NSEC_ok = 0;
+ 	int nsec3s_seen = 0;
+ 	size_t i;
+@@ -996,8 +1000,11 @@ validate_positive_response(struct module_env* env, struct val_env* ve,
+ 			return;
+ 		}
+ 		if(wc && !wc_cached && env->cfg->aggressive_nsec) {
+-			rrset_cache_update_wildcard(env->rrset_cache, s, wc, wl,
+-				env->alloc, *env->now);
++			/* Postpone cache adjust until proof has succeeded. */
++			wc_to_cache = 1;
++			cache_wc = wc;
++			cache_wl = wl;
++			cache_s = s;
+ 			wc_cached = 1;
+ 		}
+
+@@ -1059,6 +1066,10 @@ validate_positive_response(struct module_env* env, struct val_env* ve,
+ 		update_reason_bogus(chase_reply, LDNS_EDE_DNSSEC_BOGUS);
  		return;
  	}
- #else
---- a/daemon/worker.c
-+++ b/daemon/worker.c
-@@ -1690,7 +1690,13 @@ worker_handle_request(struct comm_point*
- 		server_stats_insquery(&worker->stats, c, qinfo.qtype,
- 			qinfo.qclass, &edns, repinfo);
- 	if(c->type != comm_udp)
-+#ifdef USE_DNSCRYPT
-+		edns.udp_size = (c->dnscrypt && repinfo->is_dnscrypted)
-+			? sldns_buffer_capacity(c->buffer) - DNSCRYPT_REPLY_HEADER_SIZE
-+			: 65535;
-+#else
- 		edns.udp_size = 65535; /* max size for TCP replies */
-+#endif
- 	if(qinfo.qclass == LDNS_RR_CLASS_CH && answer_chaos(worker, &qinfo,
- 		&edns, repinfo, c->buffer)) {
- 		regional_free_all(worker->scratchpad);
-@@ -1976,7 +1982,7 @@ send_reply_rc:
- 		}
- 	}
- #ifdef USE_DNSCRYPT
--	if(!dnsc_handle_uncurved_request(repinfo)) {
-+	if(!dnsc_handle_uncurved_request(repinfo, c->buffer)) {
- 		return 0;
- 	}
- #endif
-Description: CVE-2026-44621 - Fix libunbound abrupt termination with 'unwanted-reply-threshold'
- Libunbound applications configured with 'unwanted-reply-threshold' could
- eventually be abruptly terminated. When the unwanted-reply-threshold was
- reached, libunbound calls the alloc id cleanup callback via a function
- pointer. That function pointer (libworker_alloc_cleanup) was not present
- in the function-pointer whitelist (fptr_whitelist_alloc_cleanup), causing
- the fptr assertion to fail and the application to abort. This patch adds
- the missing libworker_alloc_cleanup stubs to the non-libunbound worker
- callback translation units and whitelists the function pointer so the
- cleanup callback is accepted.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/f52a9e864bfa0f10d8816b64130586b1d224c474
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-07-28
----
---- a/daemon/worker.c
-+++ b/daemon/worker.c
-@@ -2477,6 +2477,11 @@ void libworker_event_done_cb(void* ATTR_
- 	log_assert(0);
- }
-
-+void libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
-+{
-+	log_assert(0);
-+}
-+
- int context_query_cmp(const void* ATTR_UNUSED(a), const void* ATTR_UNUSED(b))
- {
- 	log_assert(0);
---- a/dnstap/unbound-dnstap-socket.c
-+++ b/dnstap/unbound-dnstap-socket.c
-@@ -1724,6 +1724,11 @@ void libworker_event_done_cb(void* ATTR_
- 	log_assert(0);
- }
-
-+void libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
-+{
-+	log_assert(0);
-+}
-+
- int context_query_cmp(const void* ATTR_UNUSED(a), const void* ATTR_UNUSED(b))
- {
- 	log_assert(0);
---- a/smallapp/worker_cb.c
-+++ b/smallapp/worker_cb.c
-@@ -128,6 +128,12 @@ worker_alloc_cleanup(void* ATTR_UNUSED(a
- 	log_assert(0);
- }
-
-+void
-+libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
-+{
-+	log_assert(0);
-+}
-+
- struct outbound_entry* libworker_send_query(
- 	struct query_info* ATTR_UNUSED(qinfo), uint16_t ATTR_UNUSED(flags),
- 	int ATTR_UNUSED(dnssec), int ATTR_UNUSED(want_dnssec),
---- a/testcode/doqclient.c
-+++ b/testcode/doqclient.c
-@@ -2622,6 +2622,11 @@ void libworker_event_done_cb(void* ATTR_
- 	log_assert(0);
- }
-
-+void libworker_alloc_cleanup(void* ATTR_UNUSED(arg))
-+{
-+	log_assert(0);
-+}
-+
- int context_query_cmp(const void* ATTR_UNUSED(a), const void* ATTR_UNUSED(b))
- {
- 	log_assert(0);
---- a/util/fptr_wlist.c
-+++ b/util/fptr_wlist.c
-@@ -606,6 +606,7 @@ int
- fptr_whitelist_alloc_cleanup(void (*fptr)(void*))
- {
- 	if(fptr == &worker_alloc_cleanup) return 1;
-+	else if(fptr == &libworker_alloc_cleanup) return 1;
- 	return 0;
- }
-Description: CVE-2026-55991 - Remote DNS-over-QUIC (DoQ) flow-control assertion failure
- A remote attacker can trigger a flow-control assertion failure in libngtcp2
- when Unbound serves DNS-over-QUIC. When ngtcp2_conn_writev_stream returns
- NGTCP2_ERR_STREAM_DATA_BLOCKED, Unbound closed the whole connection with an
- invalid application error code (-1) instead of handling the blocked stream
- gracefully, which could lead to an assertion failure / denial of service.
- .
- This fix adds an extend_max_stream_data callback so blocked streams are
- rescheduled for writing when the peer extends flow-control credit, removes
- the stream from the write list and continues on NGTCP2_ERR_STREAM_DATA_BLOCKED
- instead of tearing down the connection, and uses the valid DOQ_APP_ERROR_CODE
- (1) application error code instead of -1.
-Origin: upstream, https://github.com/NLnetLabs/unbound/commit/aac261cbb3795cbd60af2f37ef57bfa5c186aae6
-Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
-Last-Update: 2026-07-28
----
---- a/services/listen_dnsport.c
-+++ b/services/listen_dnsport.c
-@@ -4508,6 +4508,29 @@ doq_stream_reset_cb(ngtcp2_conn* ATTR_UNUSED(conn), int64_t stream_id,
- 	return 0;
- }
-
-+/** ngtcp2 extend_max_stream_data function */
-+int doq_extend_max_stream_data_cb(ngtcp2_conn* ATTR_UNUSED(conn),
-+	int64_t stream_id, uint64_t max_data, void* user_data,
-+	void* ATTR_UNUSED(stream_user_data))
-+{
-+	struct doq_conn* doq_conn = (struct doq_conn*)user_data;
-+	struct doq_stream* stream;
-+	verbose(VERB_ALGO, "doq extend_max_stream_data stream id %d "
-+		"max_data %d ", (int)stream_id, (int)max_data);
-+	if(max_data == 0)
-+		return 0;
-+	stream = doq_stream_find(doq_conn, stream_id);
-+	if(!stream) {
-+		verbose(VERB_ALGO, "doq: unknown stream %d", (int)stream_id);
-+		return 0;
++	if(wc_to_cache) {
++		rrset_cache_update_wildcard(env->rrset_cache, cache_s,
++			cache_wc, cache_wl, env->alloc, *env->now);
 +	}
-+	if(!stream->is_answer_available)
-+		return 0;
-+	doq_stream_on_write_list(doq_conn, stream);
-+	doq_conn_write_enable(doq_conn);
-+	return 0;
-+}
-+
- /** ngtcp2 acked_stream_data_offset callback function */
- static int
- doq_acked_stream_data_offset_cb(ngtcp2_conn* ATTR_UNUSED(conn),
-@@ -4882,6 +4905,7 @@ doq_conn_setup(struct doq_conn* conn, uint8_t* scid, size_t scidlen,
- 	callbacks.stream_open = doq_stream_open_cb;
- 	callbacks.stream_close = doq_stream_close_cb;
- 	callbacks.stream_reset = doq_stream_reset_cb;
-+	callbacks.extend_max_stream_data = doq_extend_max_stream_data_cb;
- 	callbacks.acked_stream_data_offset = doq_acked_stream_data_offset_cb;
- 	callbacks.recv_stream_data = doq_recv_stream_data_cb;
 
-@@ -5470,26 +5494,20 @@ doq_conn_write_streams(struct comm_point* c, struct doq_conn* conn,
- 				continue;
- 			} else if(ret == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
- 				verbose(VERB_ALGO, "doq: ngtcp2_conn_writev_stream returned NGTCP2_ERR_STREAM_DATA_BLOCKED");
--#ifdef HAVE_NGTCP2_CCERR_DEFAULT
--				ngtcp2_ccerr_set_application_error(
--					&conn->ccerr, -1, NULL, 0);
--#else
--				ngtcp2_connection_close_error_set_application_error(&conn->last_error, -1, NULL, 0);
--#endif
--				if(err_drop)
--					*err_drop = 0;
--				if(!doq_conn_close_error(c, conn)) {
--					if(err_drop)
--						*err_drop = 1;
-+				if(stream) {
-+					doq_stream_off_write_list(conn, stream);
-+					stream = stream->write_next;
-+					continue;
-+				} else {
-+					break;
- 				}
--				return 0;
- 			} else if(ret == NGTCP2_ERR_STREAM_SHUT_WR) {
- 				verbose(VERB_ALGO, "doq: ngtcp2_conn_writev_stream returned NGTCP2_ERR_STREAM_SHUT_WR");
- #ifdef HAVE_NGTCP2_CCERR_DEFAULT
- 				ngtcp2_ccerr_set_application_error(
--					&conn->ccerr, -1, NULL, 0);
-+					&conn->ccerr, DOQ_APP_ERROR_CODE, NULL, 0);
- #else
--				ngtcp2_connection_close_error_set_application_error(&conn->last_error, -1, NULL, 0);
-+				ngtcp2_connection_close_error_set_application_error(&conn->last_error, DOQ_APP_ERROR_CODE, NULL, 0);
- #endif
- 				if(err_drop)
- 					*err_drop = 0;
---- a/testcode/doqclient.c
-+++ b/testcode/doqclient.c
-@@ -1519,9 +1519,9 @@ doq_client_send_pkt(struct doq_client_data* data, uint32_t ecn, uint8_t* buf,
- 		}
- 		log_err("doq sendmsg: %s", strerror(errno));
- #ifdef HAVE_NGTCP2_CCERR_DEFAULT
--		ngtcp2_ccerr_set_application_error(&data->ccerr, -1, NULL, 0);
-+		ngtcp2_ccerr_set_application_error(&data->ccerr, 1, NULL, 0);
- #else
--		ngtcp2_connection_close_error_set_application_error(&data->last_error, -1, NULL, 0);
-+		ngtcp2_connection_close_error_set_application_error(&data->last_error, 1, NULL, 0);
- #endif
- 		return 0;
+ 	verbose(VERB_ALGO, "Successfully validated positive response");
+ 	chase_reply->security = sec_status_secure;
+Description: CVE-2026-50248 - BOGUS configured primary hostname accepted for XFR in auth/rpz zones
+ The auth zone transfer and probe lookup callbacks ignored the DNSSEC
+ security status of the resolved primary (master) hostname A/AAAA
+ addresses. A DNSSEC BOGUS address lookup result was still accepted and
+ used to contact the primary for zone transfers, allowing an attacker who
+ could spoof the address resolution to redirect XFR traffic for auth/rpz
+ zones. This fix inspects the sec_status returned to the lookup callbacks
+ and, when the result is bogus (or secure sentinel fail), logs the event
+ and falls through to try the next lookup / next master instead of
+ accepting the bogus address.
+Origin: upstream, https://github.com/NLnetLabs/unbound/commit/3530c81e29e64ed19c612ae3dea21c8800d882e1
+Author: W.C.A. Wijngaards <wouter@nlnetlabs.nl>
+Last-Update: 2026-07-28
+---
+--- a/services/authzone.c
++++ b/services/authzone.c
+@@ -5695,8 +5695,7 @@ xfr_master_add_addrs(struct auth_master*
+
+ /** callback for task_transfer lookup of host name, of A or AAAA */
+ void auth_xfer_transfer_lookup_callback(void* arg, int rcode, sldns_buffer* buf,
+-	enum sec_status ATTR_UNUSED(sec), char* ATTR_UNUSED(why_bogus),
+-	int ATTR_UNUSED(was_ratelimited))
++	enum sec_status sec, char* why_bogus, int ATTR_UNUSED(was_ratelimited))
+ {
+ 	struct auth_xfer* xfr = (struct auth_xfer*)arg;
+ 	struct module_env* env;
+@@ -5709,7 +5708,16 @@ void auth_xfer_transfer_lookup_callback(
  	}
+
+ 	/* process result */
+-	if(rcode == LDNS_RCODE_NOERROR) {
++	if(sec == sec_status_bogus || sec == sec_status_secure_sentinel_fail) {
++		if(verbosity >= VERB_OPS) {
++			char zname[LDNS_MAX_DOMAINLEN];
++			dname_str(xfr->name, zname);
++			verbose(VERB_OPS, "auth zone %s: primary %s address lookup is DNSSEC bogus: %s",
++				zname, xfr->task_transfer->lookup_target->host,
++				(why_bogus?why_bogus:""));
++		}
++		/* fall through to next-lookup / next-master */
++	} else if(rcode == LDNS_RCODE_NOERROR) {
+ 		uint16_t wanted_qtype = LDNS_RR_TYPE_A;
+ 		struct regional* temp = env->scratch;
+ 		struct query_info rq;
+@@ -6758,8 +6766,7 @@ xfr_probe_send_or_end(struct auth_xfer*
+
+ /** callback for task_probe lookup of host name, of A or AAAA */
+ void auth_xfer_probe_lookup_callback(void* arg, int rcode, sldns_buffer* buf,
+-	enum sec_status ATTR_UNUSED(sec), char* ATTR_UNUSED(why_bogus),
+-	int ATTR_UNUSED(was_ratelimited))
++	enum sec_status sec, char* why_bogus, int ATTR_UNUSED(was_ratelimited))
+ {
+ 	struct auth_xfer* xfr = (struct auth_xfer*)arg;
+ 	struct module_env* env;
+@@ -6772,7 +6779,16 @@ void auth_xfer_probe_lookup_callback(voi
+ 	}
+
+ 	/* process result */
+-	if(rcode == LDNS_RCODE_NOERROR) {
++	if(sec == sec_status_bogus || sec == sec_status_secure_sentinel_fail) {
++		if(verbosity >= VERB_OPS) {
++			char zname[LDNS_MAX_DOMAINLEN];
++			dname_str(xfr->name, zname);
++			verbose(VERB_OPS, "auth zone %s: primary %s address probe lookup is DNSSEC bogus: %s",
++				zname, xfr->task_transfer->lookup_target->host,
++				(why_bogus?why_bogus:""));
++		}
++		/* fall through to next-lookup / next-master */
++	} else if(rcode == LDNS_RCODE_NOERROR) {
+ 		uint16_t wanted_qtype = LDNS_RR_TYPE_A;
+ 		struct regional* temp = env->scratch;
+ 		struct query_info rq;
