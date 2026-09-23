@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-40973
 - CVE-2026-40976
+- CVE-2026-40972
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework.boot:spring-boot
