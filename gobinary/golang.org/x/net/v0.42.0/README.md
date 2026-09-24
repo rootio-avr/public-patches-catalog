@@ -13,6 +13,7 @@ unknown
 - CVE-2026-42506
 - CVE-2025-58190
 - CVE-2025-47911
+- CVE-2026-46600
 
 ## How to Apply:
 1. Clone or download the source code for golang.org/x/net
