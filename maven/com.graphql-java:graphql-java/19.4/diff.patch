@@ -1,0 +1,557 @@
+--- a/src/main/java/graphql/execution/Execution.java
++++ b/src/main/java/graphql/execution/Execution.java
+@@ -11,6 +11,7 @@ import graphql.execution.instrumentation.InstrumentationContext;
+ import graphql.execution.instrumentation.InstrumentationState;
+ import graphql.execution.instrumentation.parameters.InstrumentationExecuteOperationParameters;
+ import graphql.execution.instrumentation.parameters.InstrumentationExecutionParameters;
++import graphql.introspection.Introspection;
+ import graphql.language.Document;
+ import graphql.language.FragmentDefinition;
+ import graphql.language.NodeUtil;
+@@ -24,6 +25,7 @@ import org.slf4j.Logger;
+ import java.util.Collections;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.concurrent.CompletableFuture;
+ 
+ import static graphql.Assert.assertShouldNeverHappen;
+@@ -137,6 +139,15 @@ public class Execution {
+ 
+         MergedSelectionSet fields = fieldCollector.collectFields(collectorParameters, operationDefinition.getSelectionSet());
+ 
++        Optional<ExecutionResult> introspectionResult = Introspection.isIntrospectionSensible(fields, executionContext);
++        if (introspectionResult.isPresent()) {
++            ExecutionResult executionResult = introspectionResult.get();
++            CompletableFuture<ExecutionResult> resultCompletableFuture = completedFuture(executionResult);
++            executeOperationCtx.onDispatched(resultCompletableFuture);
++            executeOperationCtx.onCompleted(executionResult, null);
++            return resultCompletableFuture;
++        }
++
+         ResultPath path = ResultPath.rootPath();
+         ExecutionStepInfo executionStepInfo = newExecutionStepInfo().type(operationRootType).path(path).build();
+         NonNullableFieldValidator nonNullableFieldValidator = new NonNullableFieldValidator(executionContext, executionStepInfo);
+new file mode 100644
+--- /dev/null
++++ b/src/main/java/graphql/introspection/GoodFaithIntrospection.java
+@@ -0,0 +1,167 @@
++package graphql.introspection;
++
++import com.google.common.collect.ImmutableList;
++import com.google.common.collect.ImmutableListMultimap;
++import graphql.ErrorClassification;
++import graphql.ExecutionResult;
++import graphql.ExecutionResultImpl;
++import graphql.GraphQLContext;
++import graphql.GraphQLError;
++import graphql.PublicApi;
++import graphql.execution.CoercedVariables;
++import graphql.execution.ExecutionContext;
++import graphql.language.SourceLocation;
++import graphql.normalized.ExecutableNormalizedField;
++import graphql.normalized.ExecutableNormalizedOperation;
++import graphql.normalized.ExecutableNormalizedOperationFactory;
++import graphql.schema.FieldCoordinates;
++
++import java.util.HashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.Optional;
++import java.util.concurrent.atomic.AtomicBoolean;
++
++import static graphql.schema.FieldCoordinates.coordinates;
++
++/**
++ * This helper ensures that a submitted introspection query is done in good faith.
++ * <p>
++ * There are attack vectors where a crafted introspection query can cause the engine to spend too much time
++ * producing introspection data.  This is especially true on large schemas with lots of types and fields.
++ * <p>
++ * Schemas form a cyclic graph and hence it's possible to send in introspection queries that can reference those cycles
++ * and in large schemas this can be expensive and perhaps a "denial of service".
++ * <p>
++ * This only allows one {@code __schema} field or one {@code __type} field to be present, and it does not allow the
++ * {@code __Type} fields to form a cycle, i.e., that can only be present once.  This allows the standard and common
++ * introspection queries to work so tooling such as graphiql can work.
++ */
++@PublicApi
++public class GoodFaithIntrospection {
++
++    /**
++     * Placing a boolean value under this key in the per request {@link GraphQLContext} will enable
++     * or disable Good Faith Introspection on that request.
++     */
++    public static final String GOOD_FAITH_INTROSPECTION_DISABLED = "GOOD_FAITH_INTROSPECTION_DISABLED";
++
++    private static final AtomicBoolean ENABLED_STATE = new AtomicBoolean(true);
++
++    /**
++     * This is the maximum number of executable fields that can be in a good faith introspection query
++     */
++    public static final int GOOD_FAITH_MAX_FIELDS_COUNT = 500;
++
++    /**
++     * This is the maximum depth a good faith introspection query can be
++     */
++    public static final int GOOD_FAITH_MAX_DEPTH_COUNT = 20;
++
++    /**
++     * @return true if good faith introspection is enabled
++     */
++    public static boolean isEnabledJvmWide() {
++        return ENABLED_STATE.get();
++    }
++
++    /**
++     * This allows you to disable good faith introspection, which is on by default.
++     *
++     * @param flag the desired state
++     *
++     * @return the previous state
++     */
++    public static boolean enabledJvmWide(boolean flag) {
++        return ENABLED_STATE.getAndSet(flag);
++    }
++
++    private static final Map<FieldCoordinates, Integer> ALLOWED_FIELD_INSTANCES = new HashMap<>();
++
++    static {
++        ALLOWED_FIELD_INSTANCES.put(coordinates("Query", "__schema"), 1);
++        ALLOWED_FIELD_INSTANCES.put(coordinates("Query", "__type"), 1);
++        ALLOWED_FIELD_INSTANCES.put(coordinates("__Type", "fields"), 1);
++        ALLOWED_FIELD_INSTANCES.put(coordinates("__Type", "inputFields"), 1);
++        ALLOWED_FIELD_INSTANCES.put(coordinates("__Type", "interfaces"), 1);
++        ALLOWED_FIELD_INSTANCES.put(coordinates("__Type", "possibleTypes"), 1);
++    }
++
++    public static Optional<ExecutionResult> checkIntrospection(ExecutionContext executionContext) {
++        if (isIntrospectionEnabled(executionContext.getGraphQLContext())) {
++            ExecutableNormalizedOperation operation = mkOperation(executionContext);
++            ImmutableListMultimap<FieldCoordinates, ExecutableNormalizedField> coordinatesToENFs = operation.getCoordinatesToNormalizedFields();
++            for (Map.Entry<FieldCoordinates, Integer> entry : ALLOWED_FIELD_INSTANCES.entrySet()) {
++                FieldCoordinates coordinates = entry.getKey();
++                Integer allowSize = entry.getValue();
++                ImmutableList<ExecutableNormalizedField> normalizedFields = coordinatesToENFs.get(coordinates);
++                if (normalizedFields.size() > allowSize) {
++                    BadFaithIntrospectionError error = new BadFaithIntrospectionError(coordinates.toString());
++                    return Optional.of(ExecutionResultImpl.newExecutionResult().addError(error).build());
++                }
++            }
++        }
++        return Optional.empty();
++    }
++
++    /**
++     * This makes an executable operation limited in size that suits a good faith introspection query.  This helps guard
++     * against malicious queries.
++     *
++     * @param executionContext the execution context
++     *
++     * @return an executable operation
++     */
++    private static ExecutableNormalizedOperation mkOperation(ExecutionContext executionContext) {
++        ExecutableNormalizedOperationFactory.Options options = ExecutableNormalizedOperationFactory.Options.defaultOptions()
++                .maxFieldsCount(GOOD_FAITH_MAX_FIELDS_COUNT)
++                .maxChildrenDepth(GOOD_FAITH_MAX_DEPTH_COUNT);
++
++        return ExecutableNormalizedOperationFactory.createExecutableNormalizedOperation(
++                executionContext.getGraphQLSchema(),
++                executionContext.getOperationDefinition(),
++                executionContext.getFragmentsByName(),
++                CoercedVariables.of(executionContext.getVariables()),
++                options);
++    }
++
++    private static boolean isIntrospectionEnabled(GraphQLContext graphQlContext) {
++        if (!isEnabledJvmWide()) {
++            return false;
++        }
++        return !graphQlContext.getOrDefault(GOOD_FAITH_INTROSPECTION_DISABLED, false);
++    }
++
++    public static class BadFaithIntrospectionError implements GraphQLError {
++        private final String message;
++
++        public BadFaithIntrospectionError(String qualifiedField) {
++            this.message = String.format("This request is not asking for introspection in good faith - %s is present too often!", qualifiedField);
++        }
++
++        @Override
++        public String getMessage() {
++            return message;
++        }
++
++        @Override
++        public ErrorClassification getErrorType() {
++            return new ErrorClassification() {
++                @Override
++                public Object toSpecification(GraphQLError error) {
++                    return "BadFaithIntrospection";
++                }
++
++                @Override
++                public String toString() {
++                    return "BadFaithIntrospection";
++                }
++            };
++        }
++
++        @Override
++        public List<SourceLocation> getLocations() {
++            return null;
++        }
++    }
++}
+--- a/src/main/java/graphql/introspection/Introspection.java
++++ b/src/main/java/graphql/introspection/Introspection.java
+@@ -3,8 +3,12 @@ package graphql.introspection;
+ 
+ import com.google.common.collect.ImmutableSet;
+ import graphql.Assert;
++import graphql.ExecutionResult;
+ import graphql.Internal;
+ import graphql.PublicApi;
++import graphql.execution.ExecutionContext;
++import graphql.execution.MergedField;
++import graphql.execution.MergedSelectionSet;
+ import graphql.execution.ValuesResolver;
+ import graphql.language.AstPrinter;
+ import graphql.schema.FieldCoordinates;
+@@ -37,6 +41,7 @@ import java.util.HashSet;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
++import java.util.Optional;
+ import java.util.Set;
+ import java.util.stream.Collectors;
+ 
+@@ -585,6 +590,36 @@ public class Introspection {
+             Introspection.TypeNameMetaFieldDef.getName()
+     );
+ 
++    /**
++     * This will look into the field selection set and see if there are introspection fields,
++     * and if there are, it checks whether the introspection query is being made in good faith.
++     * If not it will return an errored {@link ExecutionResult} that can be returned to the user.
++     * <p>
++     * This helps guard against maliciously crafted introspection queries that can be used as a
++     * denial of service attack vector (CWE-770 / CVE-2024-40094).
++     *
++     * @param mergedSelectionSet the fields to be executed
++     * @param executionContext   the execution context in play
++     *
++     * @return an optional error result
++     */
++    public static Optional<ExecutionResult> isIntrospectionSensible(MergedSelectionSet mergedSelectionSet, ExecutionContext executionContext) {
++        boolean isIntrospection = false;
++        for (String key : mergedSelectionSet.getKeys()) {
++            MergedField mergedField = mergedSelectionSet.getSubField(key);
++            String fieldName = mergedField.getName();
++            if (fieldName.equals(SchemaMetaFieldDef.getName())
++                    || fieldName.equals(TypeMetaFieldDef.getName())) {
++                isIntrospection = true;
++                break;
++            }
++        }
++        if (isIntrospection) {
++            return GoodFaithIntrospection.checkIntrospection(executionContext);
++        }
++        return Optional.empty();
++    }
++
+     public static final IntrospectionDataFetcher<?> SchemaMetaFieldDefDataFetcher = IntrospectionDataFetchingEnvironment::getGraphQLSchema;
+ 
+     public static final IntrospectionDataFetcher<?> TypeMetaFieldDefDataFetcher = environment -> {
+--- a/src/main/java/graphql/normalized/ExecutableNormalizedOperationFactory.java
++++ b/src/main/java/graphql/normalized/ExecutableNormalizedOperationFactory.java
+@@ -6,6 +6,7 @@ import com.google.common.collect.ImmutableMap;
+ import com.google.common.collect.ImmutableSet;
+ import graphql.Internal;
+ import graphql.collect.ImmutableKit;
++import graphql.execution.AbortExecutionException;
+ import graphql.execution.CoercedVariables;
+ import graphql.execution.ConditionalNodes;
+ import graphql.execution.MergedField;
+@@ -56,8 +57,73 @@ import static java.util.Collections.singletonList;
+ @Internal
+ public class ExecutableNormalizedOperationFactory {
+ 
++    /**
++     * Options that control how an {@link ExecutableNormalizedOperation} is created.
++     * <p>
++     * This can be used to place limits on the number of {@link ExecutableNormalizedField}s
++     * created and on the maximum depth of the operation, which helps guard against
++     * maliciously crafted operations (for example bad faith introspection queries).
++     */
++    public static class Options {
++        private final int maxChildrenDepth;
++        private final int maxFieldsCount;
++
++        private Options(int maxChildrenDepth, int maxFieldsCount) {
++            this.maxChildrenDepth = maxChildrenDepth;
++            this.maxFieldsCount = maxFieldsCount;
++        }
++
++        public static Options defaultOptions() {
++            return new Options(Integer.MAX_VALUE, Integer.MAX_VALUE);
++        }
++
++        /**
++         * Controls the maximum depth of the operation. Can be used to prevent
++         * against malicious operations.
++         *
++         * @param maxChildrenDepth the max depth
++         *
++         * @return new options object to use
++         */
++        public Options maxChildrenDepth(int maxChildrenDepth) {
++            return new Options(maxChildrenDepth, this.maxFieldsCount);
++        }
++
++        /**
++         * Controls the maximum number of ENFs created. Can be used to prevent
++         * against malicious operations.
++         *
++         * @param maxFieldsCount the max number of ENFs created
++         *
++         * @return new options object to use
++         */
++        public Options maxFieldsCount(int maxFieldsCount) {
++            return new Options(this.maxChildrenDepth, maxFieldsCount);
++        }
++
++        public int getMaxChildrenDepth() {
++            return maxChildrenDepth;
++        }
++
++        public int getMaxFieldsCount() {
++            return maxFieldsCount;
++        }
++    }
++
+     private final ConditionalNodes conditionalNodes = new ConditionalNodes();
+ 
++    private final Options options;
++    private int fieldCount = 0;
++    private int maxDepthSeen = 0;
++
++    public ExecutableNormalizedOperationFactory() {
++        this(Options.defaultOptions());
++    }
++
++    public ExecutableNormalizedOperationFactory(Options options) {
++        this.options = options;
++    }
++
+     public static ExecutableNormalizedOperation createExecutableNormalizedOperation(GraphQLSchema graphQLSchema,
+                                                                                     Document document,
+                                                                                     String operationName,
+@@ -73,6 +139,19 @@ public class ExecutableNormalizedOperationFactory {
+         return new ExecutableNormalizedOperationFactory().createNormalizedQueryImpl(graphQLSchema, operationDefinition, fragments, coercedVariableValues, null);
+     }
+ 
++    /**
++     * This creates a new {@link ExecutableNormalizedOperation} with the provided {@link Options}, which can be
++     * used to place a limit on the number of {@link ExecutableNormalizedField}s created and the maximum depth of
++     * the operation.  If those limits are exceeded an {@link AbortExecutionException} is thrown.
++     */
++    public static ExecutableNormalizedOperation createExecutableNormalizedOperation(GraphQLSchema graphQLSchema,
++                                                                                    OperationDefinition operationDefinition,
++                                                                                    Map<String, FragmentDefinition> fragments,
++                                                                                    CoercedVariables coercedVariableValues,
++                                                                                    Options options) {
++        return new ExecutableNormalizedOperationFactory(options).createNormalizedQueryImpl(graphQLSchema, operationDefinition, fragments, coercedVariableValues, null);
++    }
++
+     public static ExecutableNormalizedOperation createExecutableNormalizedOperationWithRawVariables(GraphQLSchema graphQLSchema,
+                                                                                                     Document document,
+                                                                                                     String operationName,
+@@ -154,6 +233,7 @@ public class ExecutableNormalizedOperationFactory {
+                                         ImmutableMap.Builder<ExecutableNormalizedField, MergedField> normalizedFieldToMergedField,
+                                         ImmutableListMultimap.Builder<FieldCoordinates, ExecutableNormalizedField> coordinatesToNormalizedFields,
+                                         int curLevel) {
++        checkMaxDepthExceeded(curLevel);
+         CollectNFResult nextLevel = collectFromMergedField(fieldCollectorNormalizedQueryParams, field, mergedField, curLevel + 1);
+ 
+         for (ExecutableNormalizedField child : nextLevel.children) {
+@@ -173,6 +253,13 @@ public class ExecutableNormalizedOperationFactory {
+         }
+     }
+ 
++    private void checkMaxDepthExceeded(int depthSeen) {
++        this.maxDepthSeen = Math.max(this.maxDepthSeen, depthSeen);
++        if (depthSeen > this.options.getMaxChildrenDepth()) {
++            throw new AbortExecutionException("Maximum query depth exceeded. " + depthSeen + " > " + this.options.getMaxChildrenDepth());
++        }
++    }
++
+     private void updateFieldToNFMap(ExecutableNormalizedField executableNormalizedField,
+                                     ImmutableList<FieldAndAstParent> mergedField,
+                                     ImmutableListMultimap.Builder<Field, ExecutableNormalizedField> fieldToNormalizedField) {
+@@ -298,6 +385,10 @@ public class ExecutableNormalizedOperationFactory {
+                                                CollectedFieldGroup collectedFieldGroup,
+                                                int level,
+                                                ExecutableNormalizedField parent) {
++        this.fieldCount++;
++        if (this.fieldCount > this.options.getMaxFieldsCount()) {
++            throw new AbortExecutionException("Maximum field count exceeded. " + this.fieldCount + " > " + this.options.getMaxFieldsCount());
++        }
+         Field field;
+         Set<GraphQLObjectType> objectTypes = collectedFieldGroup.objectTypes;
+         field = collectedFieldGroup.fields.iterator().next().field;
+new file mode 100644
+--- /dev/null
++++ b/src/test/groovy/graphql/introspection/GoodFaithIntrospectionTest.groovy
+@@ -0,0 +1,151 @@
++package graphql.introspection
++
++import graphql.ExecutionInput
++import graphql.GraphQL
++import graphql.TestUtil
++import graphql.execution.CoercedVariables
++import graphql.language.Document
++import graphql.normalized.ExecutableNormalizedOperationFactory
++import graphql.execution.AbortExecutionException
++import spock.lang.Specification
++
++/**
++ * Regression test for CVE-2024-40094 (CWE-770 - unbounded ENF creation via crafted introspection queries).
++ *
++ * The upstream feature test GoodFaithIntrospectionInstrumentationTest.groovy does not exist in this
++ * version, so this replacement test verifies the back-ported mitigation:
++ *   1. ExecutableNormalizedOperationFactory can cap the number of ENFs and the operation depth.
++ *   2. A bad-faith introspection query (asking for __schema more than once) is rejected at execution time.
++ *   3. A normal, good-faith introspection query still succeeds.
++ */
++class GoodFaithIntrospectionTest extends Specification {
++
++    def schema = """
++        type Query {
++            hello: String
++            foo: Foo
++        }
++        type Foo {
++            bar: Bar
++        }
++        type Bar {
++            baz: String
++        }
++    """
++
++    def "factory rejects operations that exceed the maximum field count"() {
++        given:
++        def graphQLSchema = TestUtil.schema(schema)
++        def query = """
++            query {
++                a: hello
++                b: hello
++                c: hello
++            }
++        """
++        Document document = TestUtil.parseQuery(query)
++
++        def options = ExecutableNormalizedOperationFactory.Options.defaultOptions().maxFieldsCount(2)
++
++        when:
++        ExecutableNormalizedOperationFactory.createExecutableNormalizedOperation(
++                graphQLSchema,
++                document.getDefinitionsOfType(graphql.language.OperationDefinition).get(0),
++                [:],
++                CoercedVariables.emptyVariables(),
++                options)
++
++        then:
++        def e = thrown(AbortExecutionException)
++        e.message.contains("Maximum field count exceeded")
++    }
++
++    def "factory rejects operations that exceed the maximum depth"() {
++        given:
++        def graphQLSchema = TestUtil.schema(schema)
++        def query = """
++            query {
++                foo { bar { baz } }
++            }
++        """
++        Document document = TestUtil.parseQuery(query)
++
++        def options = ExecutableNormalizedOperationFactory.Options.defaultOptions().maxChildrenDepth(2)
++
++        when:
++        ExecutableNormalizedOperationFactory.createExecutableNormalizedOperation(
++                graphQLSchema,
++                document.getDefinitionsOfType(graphql.language.OperationDefinition).get(0),
++                [:],
++                CoercedVariables.emptyVariables(),
++                options)
++
++        then:
++        def e = thrown(AbortExecutionException)
++        e.message.contains("Maximum query depth exceeded")
++    }
++
++    def "factory allows operations within the configured limits"() {
++        given:
++        def graphQLSchema = TestUtil.schema(schema)
++        def query = """
++            query {
++                foo { bar { baz } }
++            }
++        """
++        Document document = TestUtil.parseQuery(query)
++
++        def options = ExecutableNormalizedOperationFactory.Options.defaultOptions()
++                .maxFieldsCount(100)
++                .maxChildrenDepth(100)
++
++        when:
++        def operation = ExecutableNormalizedOperationFactory.createExecutableNormalizedOperation(
++                graphQLSchema,
++                document.getDefinitionsOfType(graphql.language.OperationDefinition).get(0),
++                [:],
++                CoercedVariables.emptyVariables(),
++                options)
++
++        then:
++        operation != null
++        !operation.getTopLevelFields().isEmpty()
++    }
++
++    def "bad faith introspection query asking for __schema twice is rejected"() {
++        given:
++        def graphQLSchema = TestUtil.schema(schema)
++        def graphql = GraphQL.newGraphQL(graphQLSchema).build()
++        def query = """
++            query {
++                a: __schema { queryType { name } }
++                b: __schema { queryType { name } }
++            }
++        """
++
++        when:
++        def er = graphql.execute(ExecutionInput.newExecutionInput(query).build())
++
++        then:
++        !er.errors.isEmpty()
++        er.errors[0].message.contains("not asking for introspection in good faith")
++    }
++
++    def "a normal good faith introspection query still works"() {
++        given:
++        def graphQLSchema = TestUtil.schema(schema)
++        def graphql = GraphQL.newGraphQL(graphQLSchema).build()
++        def query = """
++            query {
++                __schema { queryType { name } }
++            }
++        """
++
++        when:
++        def er = graphql.execute(ExecutionInput.newExecutionInput(query).build())
++
++        then:
++        er.errors.isEmpty()
++        er.getData() != null
++    }
++}
