@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - GHSA-2r2c-cx56-8933
 - GHSA-47qp-hqvx-6r3f
+- CVE-2026-56740
 
 ## How to Apply:
 1. Clone or download the source code for org.jline:jline-parent
