@@ -8,6 +8,8 @@ unknown
 - CVE-2025-8916
 - CVE-2026-0636
 - CVE-2026-5588
+- CVE-2026-13506
+- CVE-2026-8763
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-java
