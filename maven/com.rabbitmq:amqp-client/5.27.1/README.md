@@ -7,6 +7,7 @@ unknown
 - CVE-2026-63337
 - CVE-2026-69219
 - CVE-2026-69220
+- CVE-2026-75516
 
 ## How to Apply:
 1. Clone or download the source code for com.rabbitmq:amqp-client
