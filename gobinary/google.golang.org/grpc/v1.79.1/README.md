@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-84304
+- CVE-2026-84445
 
 ## How to Apply:
 1. Clone or download the source code for google.golang.org/grpc
