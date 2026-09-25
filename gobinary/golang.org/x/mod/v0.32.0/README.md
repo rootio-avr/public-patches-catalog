@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-56864
+- CVE-2026-56865
 
 ## How to Apply:
 1. Clone or download the source code for golang.org/x/mod
