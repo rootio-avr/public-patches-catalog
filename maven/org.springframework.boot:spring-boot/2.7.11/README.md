@@ -4,6 +4,7 @@ This patch is based on org.springframework.boot:spring-boot version 2.7.11, whic
 unknown
 
 ## Affected CVEs:
+- CVE-2023-20883
 - CVE-2026-40973
 
 ## How to Apply:
