@@ -11,6 +11,8 @@ unknown
 - CVE-2026-49485
 - CVE-2026-55470
 - CVE-2026-55471
+- CVE-2026-81876
+- CVE-2026-81875
 
 ## How to Apply:
 1. Clone or download the source code for ca.uhn.hapi.fhir:org.hl7.fhir.core
