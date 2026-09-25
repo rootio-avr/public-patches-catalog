@@ -100,3 +100,1671 @@ index 00000000..84446001
 +*Verdict: CVE-2026-84446 is a **false positive for Debian trixie (libheif 1.19.8)** —
 +the affected sequence/track code was introduced in 1.20.0 and does not exist in
 +the shipped version.*
+Description: CVE-2026-84447 - Bound derived-image reference amplification (GHSA-x8xm-cm2c-cfc8)
+ Derived images (grid/iovl/iden) can reference a shared base image through
+ indirection. The per-path cycle-detection set is copied by value, so it forks
+ at every recursion branch and never acts as a visited-memo. A shared subtree is
+ therefore re-decoded once per path that reaches it, and nested references make
+ the number of decode operations grow as branch^depth. A tiny file can thus
+ request an effectively unbounded amount of decoding work (CPU DoS), and the
+ file-open cycle check had the same defect, hanging before any decode.
+ .
+ This is a hand-adapted backport of upstream commit 30b52a4e to libheif 1.19.8,
+ whose decode API predates the upstream DecodeTraversalState construct. The same
+ defenses are reimplemented against the older, parameter-less decode_image API:
+ .
+  * libheif/file.cc: HeifFile::check_for_ref_cycle_recursion now memoizes
+    fully-verified (acyclic) items in a finished_items set, turning the
+    exponential per-path DFS into a linear white/gray/black DFS. This stops the
+    file-open hang on shared/nested derived-image references.
+  * libheif/context.{h,cc}: HeifContext now owns a shared atomic decode budget,
+    seeded once per top-level HeifContext::decode_image() at a small multiple of
+    max_items (MAX_DERIVED_IMAGE_DECODE_FACTOR). Because it is atomic it also
+    bounds the parallel tile-decode threads. A budget of 0 (limits disabled)
+    means unlimited.
+  * libheif/image-items/image_item.cc: ImageItem::decode_image(), the single
+    choke point every item decode passes through, counts each sub-image decode
+    against the shared budget and rejects with heif_suberror_Security_limit_exceeded
+    once it is exhausted. This is the structure-agnostic backstop against the
+    exponential blow-up.
+  * libheif/image-items/overlay.cc: read_overlay_spec() rejects an 'iovl' that
+    composites more than MAX_OVERLAY_IMAGES input images (hardcoded stopgap).
+  * libheif/security_limits.h: adds MAX_OVERLAY_IMAGES and
+    MAX_DERIVED_IMAGE_DECODE_FACTOR.
+ .
+ Only internal C++ signatures change; the public C API and ABI are unaffected.
+ A regression test (tests/overlay_amplification.cc, from the upstream commit) is
+ included: a deeply nested overlay gadget and an over-wide overlay are now
+ rejected in milliseconds instead of hanging, while a shallow legitimate overlay
+ still decodes.
+Origin: backport, https://github.com/strukturag/libheif/commit/30b52a4e829efe0ee6d7208e8500b99f664af5e9
+Bug: https://github.com/strukturag/libheif/security/advisories/GHSA-x8xm-cm2c-cfc8
+Author: Security Patch Team <security@example.com>
+Last-Update: 2026-09-22
+---
+--- a/libheif/context.cc
++++ b/libheif/context.cc
+@@ -1096,6 +1096,13 @@ Result<std::shared_ptr<HeifPixelImage>> HeifContext::decode_image(heif_item_id I
+   }
+ 
+ 
++  // Seed the shared decode-amplification budget once for this top-level decode.
++  // Derived images (grid/iovl/iden) can otherwise re-decode a shared subtree
++  // once per path that reaches it, growing as branch^depth. The budget is
++  // checked at the single choke point ImageItem::decode_image().
++  // (GHSA-x8xm-cm2c-cfc8)
++  reset_derived_image_decode_budget();
++
+   auto decodingResult = imgitem->decode_image(options, decode_only_tile, tx, ty);
+   if (decodingResult.error) {
+     return decodingResult.error;
+--- a/libheif/context.h
++++ b/libheif/context.h
+@@ -27,8 +27,10 @@
+ #include <string>
+ #include <vector>
+ #include <utility>
++#include <atomic>
+ 
+ #include "error.h"
++#include "security_limits.h"
+ 
+ #include "libheif/heif.h"
+ #include "libheif/heif_experimental.h"
+@@ -68,6 +70,35 @@ public:
+ 
+   [[nodiscard]] const heif_security_limits* get_security_limits() const { return &m_limits; }
+ 
++  // --- derived-image decode-amplification budget (GHSA-x8xm-cm2c-cfc8)
++  //
++  // Derived images (grid/iovl/iden) can reference the same base image through
++  // indirection. The per-path cycle guard does not prevent a shared subtree
++  // from being re-decoded once per path that reaches it, so nested references
++  // make the number of decode operations grow as branch^depth. We bound the
++  // total number of sub-image decodes for one top-level decode with a shared
++  // counter, seeded once at the top level and checked at the single choke
++  // point ImageItem::decode_image(). The counter is atomic so it also bounds
++  // the parallel tile-decode threads. A budget of 0 means "unlimited".
++
++  // Seed the budget for a new top-level decode. Called once per public decode.
++  void reset_derived_image_decode_budget() const
++  {
++    m_derived_image_decode_count.store(0, std::memory_order_relaxed);
++    uint64_t budget = static_cast<uint64_t>(m_limits.max_items) * MAX_DERIVED_IMAGE_DECODE_FACTOR;
++    m_derived_image_decode_budget = (budget > UINT32_MAX) ? UINT32_MAX : static_cast<uint32_t>(budget);
++  }
++
++  // Count one sub-image decode against the shared budget.
++  // Returns false when the budget has been exhausted.
++  bool count_derived_image_decode() const
++  {
++    if (m_derived_image_decode_budget == 0) {
++      return true;
++    }
++    return m_derived_image_decode_count.fetch_add(1, std::memory_order_relaxed) < m_derived_image_decode_budget;
++  }
++
+   Error read(const std::shared_ptr<StreamReader>& reader);
+ 
+   Error read_from_file(const char* input_filename);
+@@ -183,6 +214,12 @@ private:
+ 
+   heif_security_limits m_limits;
+ 
++  // Shared budget bounding the total number of derived-image sub-decodes per
++  // top-level decode. Mutable because decode_image() is a const method and the
++  // counter is updated during decoding. (GHSA-x8xm-cm2c-cfc8)
++  mutable std::atomic<uint32_t> m_derived_image_decode_count{0};
++  mutable uint32_t m_derived_image_decode_budget = 0;  // 0 == unlimited
++
+   std::vector<std::shared_ptr<RegionItem>> m_region_items;
+ 
+   Error interpret_heif_file();
+--- a/libheif/file.cc
++++ b/libheif/file.cc
+@@ -475,30 +475,44 @@ Error HeifFile::parse_heif_file()
+ Error HeifFile::check_for_ref_cycle(heif_item_id ID,
+                                     const std::shared_ptr<Box_iref>& iref_box) const
+ {
+-  std::unordered_set<heif_item_id> parent_items;
+-  return check_for_ref_cycle_recursion(ID, iref_box, parent_items);
++  std::unordered_set<heif_item_id> parent_items;    // items on the current DFS path
++  std::unordered_set<heif_item_id> finished_items;  // items whose subtree is known acyclic
++  return check_for_ref_cycle_recursion(ID, iref_box, parent_items, finished_items);
+ }
+ 
+ 
+ Error HeifFile::check_for_ref_cycle_recursion(heif_item_id ID,
+                                     const std::shared_ptr<Box_iref>& iref_box,
+-                                    std::unordered_set<heif_item_id>& parent_items) const {
++                                    std::unordered_set<heif_item_id>& parent_items,
++                                    std::unordered_set<heif_item_id>& finished_items) const {
+   if (parent_items.find(ID) != parent_items.end()) {
+     return Error(heif_error_Invalid_input,
+                  heif_suberror_Item_reference_cycle,
+                  "Image reference cycle");
+   }
++
++  // An item whose subtree we have already fully verified as acyclic cannot be
++  // part of a cycle when reached again through a different path. Without this
++  // memo the DFS visits every distinct root-to-item path, which is exponential
++  // for shared/nested derived-image references (e.g. many 'iden' items pointing
++  // at a common base), turning a tiny file into a file-open CPU DoS.
++  // (GHSA-x8xm-cm2c-cfc8)
++  if (finished_items.find(ID) != finished_items.end()) {
++    return Error::Ok;
++  }
++
+   parent_items.insert(ID);
+ 
+   std::vector<heif_item_id> image_references = iref_box->get_references(ID, fourcc("dimg"));
+   for (heif_item_id reference_idx : image_references) {
+-    Error error = check_for_ref_cycle_recursion(reference_idx, iref_box, parent_items);
++    Error error = check_for_ref_cycle_recursion(reference_idx, iref_box, parent_items, finished_items);
+     if (error) {
+       return error;
+     }
+   }
+ 
+   parent_items.erase(ID);
++  finished_items.insert(ID);
+   return Error::Ok;
+ }
+ 
+--- a/libheif/file.h
++++ b/libheif/file.h
+@@ -254,7 +254,8 @@ private:
+ 
+   Error check_for_ref_cycle_recursion(heif_item_id ID,
+                                       const std::shared_ptr<Box_iref>& iref_box,
+-                                      std::unordered_set<heif_item_id>& parent_items) const;
++                                      std::unordered_set<heif_item_id>& parent_items,
++                                      std::unordered_set<heif_item_id>& finished_items) const;
+ };
+ 
+ #endif
+--- a/libheif/image-items/image_item.cc
++++ b/libheif/image-items/image_item.cc
+@@ -771,6 +771,19 @@ Error ImageItem::transform_requested_tile_position_to_original_tile_position(uin
+ Result<std::shared_ptr<HeifPixelImage>> ImageItem::decode_image(const struct heif_decoding_options& options,
+                                                                 bool decode_tile_only, uint32_t tile_x0, uint32_t tile_y0) const
+ {
++  // Bound the total number of sub-image decodes for this top-level decode.
++  // Derived images (grid/iovl/iden) can reference the same base image through
++  // indirection, and because the cycle-detection is per-path, a shared subtree
++  // is otherwise re-decoded once per path that reaches it, which grows as
++  // branch^depth for nested references. This is the single choke point that
++  // every item decode passes through. The budget is seeded once per top-level
++  // decode in HeifContext::decode_image(). (GHSA-x8xm-cm2c-cfc8)
++  if (!get_context()->count_derived_image_decode()) {
++    return Error{heif_error_Invalid_input,
++                 heif_suberror_Security_limit_exceeded,
++                 "Too many derived-image decode operations (possible reference amplification)"};
++  }
++
+   // --- check whether image size (according to 'ispe') exceeds maximum
+ 
+   if (!decode_tile_only) {
+--- a/libheif/image-items/overlay.cc
++++ b/libheif/image-items/overlay.cc
+@@ -242,6 +242,17 @@ Error ImageItem_Overlay::read_overlay_spec()
+ 
+   m_overlay_image_ids = iref_box->get_references(get_id(), fourcc("dimg"));
+ 
++  // Limit the number of images composited into a single overlay. This is a
++  // hardcoded stopgap (see MAX_OVERLAY_IMAGES) until a configurable limit can be
++  // added to heif_security_limits in the next major release. Skipped when the
++  // security limits are disabled. (GHSA-x8xm-cm2c-cfc8)
++  if (get_context()->get_security_limits()->max_items != 0 &&
++      m_overlay_image_ids.size() > MAX_OVERLAY_IMAGES) {
++    return Error(heif_error_Invalid_input,
++                 heif_suberror_Security_limit_exceeded,
++                 "'iovl' image composites more input images than allowed");
++  }
++
+   /* TODO: probably, it is valid that an iovl image has no references ?
+ 
+   if (image_references.empty()) {
+--- a/libheif/security_limits.h
++++ b/libheif/security_limits.h
+@@ -38,6 +38,23 @@ static const int64_t MAX_LARGE_BOX_SIZE = 0x0FFFFFFFFFFFFFFF;
+ static const int64_t MAX_FILE_POS = 0x007FFFFFFFFFFFFFLL; // maximum file position
+ static const int MAX_FRACTION_VALUE = 0x10000;
+ 
++// Maximum number of input images that a single 'iovl' overlay may composite.
++// This is a hardcoded stopgap until a configurable security-limit field can be
++// added to heif_security_limits in the next major release (that is an API/ABI
++// change and cannot go into a point release).  (GHSA-x8xm-cm2c-cfc8)
++static const uint32_t MAX_OVERLAY_IMAGES = 5;
++
++// Factor applied to max_items to bound the total number of sub-image decode
++// operations triggered by a single top-level decode. Derived images (grid,
++// iovl, iden) can reference the same base image through indirection, so a
++// shared subtree can be re-decoded once per path that reaches it. Nested
++// sharing makes the number of decode operations grow as branch^depth. Because
++// a well-formed file decodes each of its (<= max_items) items a small number
++// of times, capping the total at a modest multiple of max_items stops the
++// exponential blow-up while leaving every realistic file untouched.
++// (GHSA-x8xm-cm2c-cfc8, variants V1/V2.)
++static const uint32_t MAX_DERIVED_IMAGE_DECODE_FACTOR = 2;
++
+ 
+ Error check_for_valid_image_size(const heif_security_limits* limits, uint32_t width, uint32_t height);
+ 
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -57,6 +57,7 @@ endif()
+ 
+ add_libheif_test(encode)
+ add_libheif_test(extended_type)
++add_libheif_test(overlay_amplification)
+ add_libheif_test(region)
+ 
+ if (WITH_OPENJPH_ENCODER AND SUPPORTS_J2K_HT_ENCODING)
+--- /dev/null
++++ b/tests/overlay_amplification.cc
+@@ -0,0 +1,356 @@
++/*
++  libheif unit tests
++
++  MIT License
++
++  Copyright (c) 2026 Dirk Farin <dirk.farin@gmail.com>
++
++  Permission is hereby granted, free of charge, to any person obtaining a copy
++  of this software and associated documentation files (the "Software"), to deal
++  in the Software without restriction, including without limitation the rights
++  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++  copies of the Software, and to permit persons to whom the Software is
++  furnished to do so, subject to the following conditions:
++
++  The above copyright notice and this permission notice shall be included in all
++  copies or substantial portions of the Software.
++
++  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++  SOFTWARE.
++*/
++
++// Regression tests for GHSA-x8xm-cm2c-cfc8: derived-image (grid/iovl/iden)
++// reference chains could decode a shared base image an unbounded number of
++// times. Because the cycle-detection set is copied per recursion path, a shared
++// subtree is re-decoded once per path that reaches it, and nested references
++// make the number of decodes grow as branch^depth. A tiny file could thus pin a
++// CPU for minutes (linear amplification) or effectively forever (exponential,
++// via nested overlays). These tests build the amplification structures out of
++// 'iovl' overlays over an 'mski' base (which needs no codec plugin) and check
++// that decoding is rejected quickly instead of blowing up.
++
++#include "catch_amalgamated.hpp"
++#include "libheif/heif.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace {
++
++void put_u32_be(std::vector<uint8_t>& out, uint32_t v) {
++  out.push_back(static_cast<uint8_t>(v >> 24));
++  out.push_back(static_cast<uint8_t>(v >> 16));
++  out.push_back(static_cast<uint8_t>(v >> 8));
++  out.push_back(static_cast<uint8_t>(v));
++}
++
++void put_u16_be(std::vector<uint8_t>& out, uint16_t v) {
++  out.push_back(static_cast<uint8_t>(v >> 8));
++  out.push_back(static_cast<uint8_t>(v));
++}
++
++void append_fourcc(std::vector<uint8_t>& out, const char fourcc[4]) {
++  out.insert(out.end(), fourcc, fourcc + 4);
++}
++
++void append(std::vector<uint8_t>& out, const std::vector<uint8_t>& v) {
++  out.insert(out.end(), v.begin(), v.end());
++}
++
++std::vector<uint8_t> make_box(const char fourcc[4],
++                              const std::vector<uint8_t>& payload,
++                              bool is_full_box = false,
++                              uint8_t version = 0,
++                              uint32_t flags = 0) {
++  std::vector<uint8_t> body;
++  if (is_full_box) {
++    body.push_back(version);
++    body.push_back(static_cast<uint8_t>(flags >> 16));
++    body.push_back(static_cast<uint8_t>(flags >> 8));
++    body.push_back(static_cast<uint8_t>(flags));
++  }
++  body.insert(body.end(), payload.begin(), payload.end());
++
++  std::vector<uint8_t> box;
++  put_u32_be(box, static_cast<uint32_t>(8 + body.size()));
++  append_fourcc(box, fourcc);
++  box.insert(box.end(), body.begin(), body.end());
++  return box;
++}
++
++// ImageOverlay payload (ISO/IEC 23008-12): version, flags, 4x background color,
++// canvas width/height, and one (x,y) offset per composited image. flags=0 uses
++// 16-bit fields. All composited images are placed at (0,0) here.
++std::vector<uint8_t> make_overlay_spec(uint16_t canvas_w, uint16_t canvas_h, size_t num_images) {
++  std::vector<uint8_t> s;
++  s.push_back(0);           // version
++  s.push_back(0);           // flags (16-bit fields)
++  for (int i = 0; i < 4; i++) { put_u16_be(s, 0); }  // background color RGBA
++  put_u16_be(s, canvas_w);
++  put_u16_be(s, canvas_h);
++  for (size_t i = 0; i < num_images; i++) {
++    put_u16_be(s, 0);       // x offset
++    put_u16_be(s, 0);       // y offset
++  }
++  return s;
++}
++
++struct Item {
++  uint16_t id = 0;
++  std::string type;                 // "mski", "iovl", "iden"
++  std::vector<uint16_t> dimg;       // 'dimg' references (iovl/iden)
++  std::vector<uint8_t> data;        // idat payload (mski pixels / iovl spec); empty for iden
++};
++
++// Assemble a minimal, self-contained HEIF file from an explicit item list. Every
++// item carries an 8x8 'ispe'; the single 'mski' base additionally carries a
++// 'mskC'. Items with data store it in 'idat' (construction_method 1).
++std::vector<uint8_t> build_file(const std::vector<Item>& items, uint16_t primary_id) {
++  const uint32_t W = 8, H = 8;
++
++  std::vector<uint8_t> ftyp_payload;
++  append_fourcc(ftyp_payload, "heic");
++  put_u32_be(ftyp_payload, 0);
++  append_fourcc(ftyp_payload, "mif1");
++  append_fourcc(ftyp_payload, "heic");
++  auto ftyp = make_box("ftyp", ftyp_payload);
++
++  std::vector<uint8_t> hdlr_payload;
++  put_u32_be(hdlr_payload, 0);
++  append_fourcc(hdlr_payload, "pict");
++  put_u32_be(hdlr_payload, 0);
++  put_u32_be(hdlr_payload, 0);
++  put_u32_be(hdlr_payload, 0);
++  hdlr_payload.push_back(0);
++  auto hdlr = make_box("hdlr", hdlr_payload, /*full=*/true);
++
++  std::vector<uint8_t> pitm_payload;
++  put_u16_be(pitm_payload, primary_id);
++  auto pitm = make_box("pitm", pitm_payload, /*full=*/true);
++
++  // iinf
++  std::vector<uint8_t> iinf_payload;
++  put_u16_be(iinf_payload, static_cast<uint16_t>(items.size()));
++  for (const auto& it : items) {
++    std::vector<uint8_t> infe_payload;
++    put_u16_be(infe_payload, it.id);
++    put_u16_be(infe_payload, 0);
++    append_fourcc(infe_payload, it.type.c_str());
++    infe_payload.push_back(0);
++    append(iinf_payload, make_box("infe", infe_payload, /*full=*/true, /*version=*/2));
++  }
++  auto iinf = make_box("iinf", iinf_payload, /*full=*/true);
++
++  // iprp / ipco: one ispe(8x8) per item, plus one shared mskC for the base.
++  // Property indices are 1-based in the order boxes appear in ipco.
++  std::vector<uint8_t> ispe_payload;
++  put_u32_be(ispe_payload, W);
++  put_u32_be(ispe_payload, H);
++  auto ispe = make_box("ispe", ispe_payload, /*full=*/true);
++
++  std::vector<uint8_t> mskC_payload;
++  mskC_payload.push_back(8);  // bits_per_pixel
++  auto mskC = make_box("mskC", mskC_payload, /*full=*/true);
++
++  std::vector<uint8_t> ipco_payload;
++  append(ipco_payload, ispe);   // property 1: ispe(8x8), shared by all items
++  append(ipco_payload, mskC);   // property 2: mskC, for the base
++  auto ipco = make_box("ipco", ipco_payload);
++
++  std::vector<uint8_t> ipma_payload;
++  put_u32_be(ipma_payload, static_cast<uint32_t>(items.size()));  // entry_count
++  for (const auto& it : items) {
++    put_u16_be(ipma_payload, it.id);
++    if (it.type == "mski") {
++      ipma_payload.push_back(2);          // association_count
++      ipma_payload.push_back(0x80 | 1);   // essential, ispe
++      ipma_payload.push_back(0x80 | 2);   // essential, mskC
++    }
++    else {
++      ipma_payload.push_back(1);
++      ipma_payload.push_back(0x80 | 1);   // essential, ispe
++    }
++  }
++  auto ipma = make_box("ipma", ipma_payload, /*full=*/true);
++
++  std::vector<uint8_t> iprp_payload;
++  append(iprp_payload, ipco);
++  append(iprp_payload, ipma);
++  auto iprp = make_box("iprp", iprp_payload);
++
++  // idat + iloc: concatenate the data of all items that have any.
++  std::vector<uint8_t> idat_payload;
++  struct Extent { uint16_t id; uint32_t off; uint32_t len; };
++  std::vector<Extent> extents;
++  for (const auto& it : items) {
++    if (!it.data.empty()) {
++      extents.push_back({it.id, static_cast<uint32_t>(idat_payload.size()),
++                         static_cast<uint32_t>(it.data.size())});
++      append(idat_payload, it.data);
++    }
++  }
++  auto idat = make_box("idat", idat_payload);
++
++  std::vector<uint8_t> iloc_payload;
++  iloc_payload.push_back((4 << 4) | 4);   // offset_size=4, length_size=4
++  iloc_payload.push_back((0 << 4) | 0);   // base_offset_size=0, index_size=0
++  put_u16_be(iloc_payload, static_cast<uint16_t>(extents.size()));  // item_count
++  for (const auto& e : extents) {
++    put_u16_be(iloc_payload, e.id);
++    put_u16_be(iloc_payload, 0x0001);     // reserved(12) + construction_method=1 (idat)
++    put_u16_be(iloc_payload, 0);          // data_reference_index
++    put_u16_be(iloc_payload, 1);          // extent_count
++    put_u32_be(iloc_payload, e.off);      // extent_offset (within idat)
++    put_u32_be(iloc_payload, e.len);      // extent_length
++  }
++  auto iloc = make_box("iloc", iloc_payload, /*full=*/true, /*version=*/1);
++
++  // iref: one 'dimg' entry per item that references others.
++  std::vector<uint8_t> iref_children;
++  for (const auto& it : items) {
++    if (!it.dimg.empty()) {
++      std::vector<uint8_t> dimg_payload;
++      put_u16_be(dimg_payload, it.id);
++      put_u16_be(dimg_payload, static_cast<uint16_t>(it.dimg.size()));
++      for (uint16_t to : it.dimg) { put_u16_be(dimg_payload, to); }
++      append(iref_children, make_box("dimg", dimg_payload));
++    }
++  }
++  auto iref = make_box("iref", iref_children, /*full=*/true);
++
++  std::vector<uint8_t> meta_payload;
++  append(meta_payload, hdlr);
++  append(meta_payload, pitm);
++  append(meta_payload, iinf);
++  append(meta_payload, iprp);
++  append(meta_payload, iloc);
++  append(meta_payload, iref);
++  append(meta_payload, idat);
++  auto meta = make_box("meta", meta_payload, /*full=*/true);
++
++  std::vector<uint8_t> file;
++  append(file, ftyp);
++  append(file, meta);
++  return file;
++}
++
++// Build the exponential amplification gadget: a chain of `depth` overlays where
++// each overlay composites the next one twice, through two distinct 'iden' items
++// (a direct double reference would be rejected by Box_iref). Without the fix,
++// decoding the primary overlay decodes the base 2^depth times.
++//
++// Item layout: id 1 = base ('mski'); then per level k = 0..depth-1:
++//   iovl_k  = 2 + 3*k
++//   iden_ak = 3 + 3*k, iden_bk = 4 + 3*k   (both reference the next level)
++std::vector<uint8_t> build_exponential_overlays(int depth) {
++  std::vector<Item> items;
++  items.push_back({1, "mski", {}, std::vector<uint8_t>(64, 0x7F)});
++
++  for (int k = 0; k < depth; k++) {
++    uint16_t iovl = static_cast<uint16_t>(2 + 3 * k);
++    uint16_t iden_a = static_cast<uint16_t>(3 + 3 * k);
++    uint16_t iden_b = static_cast<uint16_t>(4 + 3 * k);
++    uint16_t next = (k + 1 < depth) ? static_cast<uint16_t>(2 + 3 * (k + 1)) : 1;
++
++    items.push_back({iovl, "iovl", {iden_a, iden_b}, make_overlay_spec(8, 8, 2)});
++    items.push_back({iden_a, "iden", {next}, {}});
++    items.push_back({iden_b, "iden", {next}, {}});
++  }
++
++  return build_file(items, /*primary=*/2);
++}
++
++heif_error decode_primary(const std::vector<uint8_t>& data, bool& read_ok) {
++  heif_context* ctx = heif_context_alloc();
++  REQUIRE(ctx != nullptr);
++
++  heif_error err = heif_context_read_from_memory_without_copy(
++      ctx, data.data(), data.size(), nullptr);
++  read_ok = (err.code == heif_error_Ok);
++  if (!read_ok) {
++    heif_context_free(ctx);
++    return err;
++  }
++
++  heif_image_handle* handle = nullptr;
++  err = heif_context_get_primary_image_handle(ctx, &handle);
++  if (err.code != heif_error_Ok) {
++    heif_context_free(ctx);
++    return err;
++  }
++
++  heif_image* img = nullptr;
++  err = heif_decode_image(handle, &img, heif_colorspace_undefined, heif_chroma_undefined, nullptr);
++
++  if (img) { heif_image_release(img); }
++  heif_image_handle_release(handle);
++  heif_context_free(ctx);
++  return err;
++}
++
++} // namespace
++
++
++// The core DoS: without the fix this decodes the base 2^30 times and never
++// returns. With the fix the overlay-nesting guard rejects it after a few levels,
++// so decoding completes essentially instantly. The test therefore also proves
++// (by completing at all) that the amplification is bounded.
++TEST_CASE("overlay amplification: deeply nested overlays are rejected, not decoded") {
++  auto data = build_exponential_overlays(/*depth=*/30);
++
++  bool read_ok = false;
++  heif_error err = decode_primary(data, read_ok);
++
++  REQUIRE(read_ok);            // the file parses; the blow-up is only at decode
++  REQUIRE(err.code != heif_error_Ok);
++  REQUIRE(err.subcode == heif_suberror_Security_limit_exceeded);
++}
++
++// The per-overlay fan-out limit (MAX_OVERLAY_IMAGES): an overlay compositing
++// more than the allowed number of input images is rejected while reading the
++// overlay spec, so the item becomes undecodable.
++TEST_CASE("overlay amplification: overlay with too many input images is rejected") {
++  std::vector<Item> items;
++  items.push_back({1, "mski", {}, std::vector<uint8_t>(64, 0x7F)});
++
++  // 6 iden items (> MAX_OVERLAY_IMAGES == 5), all pointing at the base.
++  std::vector<uint16_t> refs;
++  for (uint16_t k = 0; k < 6; k++) {
++    uint16_t iden = static_cast<uint16_t>(3 + k);
++    items.push_back({iden, "iden", {1}, {}});
++    refs.push_back(iden);
++  }
++  items.push_back({2, "iovl", refs, make_overlay_spec(8, 8, refs.size())});
++
++  auto data = build_file(items, /*primary=*/2);
++
++  bool read_ok = false;
++  heif_error err = decode_primary(data, read_ok);
++
++  REQUIRE(err.code != heif_error_Ok);
++  REQUIRE(err.subcode == heif_suberror_Security_limit_exceeded);
++}
++
++// Control: a legitimate two-level overlay (well within all limits) still decodes
++// normally, proving the guards do not reject ordinary derived images.
++TEST_CASE("overlay amplification: a shallow legitimate overlay still decodes") {
++  std::vector<Item> items;
++  items.push_back({1, "mski", {}, std::vector<uint8_t>(64, 0x7F)});
++  // iovl_2 (primary) -> iovl_3 -> base. Overlay nesting depth 2 (<= 3), fan-out 1.
++  items.push_back({2, "iovl", {3}, make_overlay_spec(8, 8, 1)});
++  items.push_back({3, "iovl", {1}, make_overlay_spec(8, 8, 1)});
++
++  auto data = build_file(items, /*primary=*/2);
++
++  bool read_ok = false;
++  heif_error err = decode_primary(data, read_ok);
++
++  REQUIRE(read_ok);
++  REQUIRE(err.code == heif_error_Ok);
++}
+Description: CVE-2026-84444 - validate tile images against the unci encoder configuration
+ Out-of-bounds write in the uncompressed (unci) codec. heif_context_add_image_tile()
+ passed independently constructed tile images straight to the uncompressed tile encoder
+ (encode_image_tile()), which sizes its output buffer from the configuration frozen from
+ the prototype image given to heif_context_add_unci_image() while copying from each tile's
+ actual component planes. A tile whose colorspace, chroma subsampling, channel set, bit
+ depths, tile size or plane sizes did not match that configuration wrote past the end of
+ the encoder's output buffer (heap out-of-bounds write, CWE-787). A prior fix
+ (CVE-2026-62291) validated component sizes only on the single-image encode() path, never
+ on the tile-by-tile add path.
+ .
+ This is a hybrid backport of upstream commit
+ e65071f59a1ac08aa1eb0d07a831deaf6bb4d03b (libheif v1.23.2, GHSA-j264-xvrp-5v7q).
+ The upstream fix targets the stateful unc_encoder class introduced by a v1.22.0 refactor
+ that does not exist in 1.19.8, so the guard is re-implemented against the older stateless
+ tile path: ImageItem_uncompressed now freezes the prototype image configuration
+ (colorspace, chroma, tile size, per-channel bit depths) in add_unci_item() and
+ add_image_tile() validates every tile against that frozen configuration and its own plane
+ sizes before encoding. An in-tree regression test adapted to the older test API is added.
+Origin: upstream, https://github.com/strukturag/libheif/commit/e65071f59a1ac08aa1eb0d07a831deaf6bb4d03b
+Bug: https://github.com/strukturag/libheif/security/advisories/GHSA-j264-xvrp-5v7q
+Author: Security Patch Automation <security@example.com>
+Last-Update: 2026-09-23
+---
+--- a/libheif/image-items/unc_image.cc
++++ b/libheif/image-items/unc_image.cc
+@@ -22,6 +22,7 @@
+ #include <cstring>
+ #include <algorithm>
+ #include <map>
++#include <set>
+ #include <iostream>
+ #include <cassert>
+ #include <utility>
+@@ -398,15 +399,142 @@ Result<std::shared_ptr<ImageItem_uncompressed>> ImageItem_uncompressed::add_unci
+   // Set Brands
+   ctx->get_heif_file()->set_brand(heif_compression_uncompressed, unci_image->is_miaf_compatible());
+ 
++  // Freeze the prototype configuration so that every tile added later via add_image_tile() can be
++  // validated against it (GHSA-j264-xvrp-5v7q).
++  unci_image->remember_prototype_configuration(prototype,
++                                               parameters->tile_width,
++                                               parameters->tile_height);
++
+   return {unci_image};
+ }
+ 
+ 
++void ImageItem_uncompressed::remember_prototype_configuration(const std::shared_ptr<const HeifPixelImage>& prototype,
++                                                              uint32_t tile_width, uint32_t tile_height)
++{
++  m_prototype_configuration_known = true;
++  m_prototype_colorspace = prototype->get_colorspace();
++  m_prototype_chroma = prototype->get_chroma_format();
++  m_prototype_tile_width = tile_width;
++  m_prototype_tile_height = tile_height;
++
++  m_prototype_channels.clear();
++  for (heif_channel channel : prototype->get_channel_set()) {
++    prototype_channel pc{};
++    pc.channel = channel;
++    pc.width = prototype->get_width(channel);
++    pc.height = prototype->get_height(channel);
++    pc.bits_per_pixel = prototype->get_bits_per_pixel(channel);
++    m_prototype_channels.push_back(pc);
++  }
++}
++
++
++Error ImageItem_uncompressed::check_component_sizes(const std::shared_ptr<const HeifPixelImage>& image)
++{
++  // The tile encoder (encode_image_tile()) sizes its output buffer from the primary image
++  // dimensions, but copies each component plane using that plane's actual size. If a component
++  // plane is larger than implied by the image dimensions (e.g. an alpha plane that does not match
++  // the color planes), this writes out of bounds. Reject any image whose component planes are
++  // inconsistent with its own dimensions. Chroma (Cb/Cr) planes are legitimately subsampled, so
++  // they are checked against the subsampled size.
++
++  uint32_t image_width = image->get_width();
++  uint32_t image_height = image->get_height();
++  heif_chroma chroma = image->get_chroma_format();
++
++  for (heif_channel channel : image->get_channel_set()) {
++    uint32_t expected_width = image_width;
++    uint32_t expected_height = image_height;
++
++    if (channel == heif_channel_Cb || channel == heif_channel_Cr) {
++      if (chroma == heif_chroma_420) {
++        expected_width = (image_width + 1) / 2;
++        expected_height = (image_height + 1) / 2;
++      }
++      else if (chroma == heif_chroma_422) {
++        expected_width = (image_width + 1) / 2;
++      }
++    }
++
++    if (image->get_width(channel) != expected_width ||
++        image->get_height(channel) != expected_height) {
++      return {heif_error_Invalid_input,
++              heif_suberror_Unspecified,
++              "Image component plane size does not match the image dimensions"};
++    }
++  }
++
++  return Error::Ok;
++}
++
++
++Error ImageItem_uncompressed::check_tile_image_compatibility(const std::shared_ptr<const HeifPixelImage>& image) const
++{
++  // encode_image_tile() derives the layout of the encoded tile (which planes to copy, their
++  // subsampling and their bytes-per-pixel) from the configuration that was frozen when this item
++  // was created from the prototype image. The tiled writing path hands us independently
++  // constructed images, so every one of them has to be validated against that frozen
++  // configuration. Otherwise the encoder sizes its output buffer according to the prototype while
++  // copying from planes with a different layout, which writes outside the buffer (GHSA-j264-xvrp-5v7q).
++
++  auto incompatible = []() {
++    return Error{heif_error_Invalid_input,
++                 heif_suberror_Unspecified,
++                 "Image does not match the component configuration of the uncompressed image it is added to"};
++  };
++
++  if (!m_prototype_configuration_known) {
++    // The item was not created through add_unci_item() (e.g. loaded from a file). We cannot know
++    // the intended configuration, so fall back to a self-consistency check only.
++    return check_component_sizes(image);
++  }
++
++  // The subsampling factors and the number of bytes per pixel are taken from the prototype image.
++  if (image->get_colorspace() != m_prototype_colorspace ||
++      image->get_chroma_format() != m_prototype_chroma) {
++    return incompatible();
++  }
++
++  // Reject tiles whose size differs from the tile size of the image. The write offset is computed
++  // from the size of the passed image, so a differently sized tile would end up at a wrong offset
++  // and be silently truncated by Box_iloc::replace_data.
++  if (image->get_width() != m_prototype_tile_width ||
++      image->get_height() != m_prototype_tile_height) {
++    return incompatible();
++  }
++
++  // The encoder addresses the component planes by channel and uses the prototype's bit depths to
++  // compute the output size. The tile has to carry exactly the same channels with the same bit
++  // depths and no extra ones that would be silently dropped.
++  std::set<heif_channel> tile_channels = image->get_channel_set();
++
++  if (tile_channels.size() != m_prototype_channels.size()) {
++    return incompatible();
++  }
++
++  for (const prototype_channel& pc : m_prototype_channels) {
++    if (!image->has_channel(pc.channel) ||
++        image->get_bits_per_pixel(pc.channel) != pc.bits_per_pixel) {
++      return incompatible();
++    }
++  }
++
++  // Finally make sure the tile's planes are consistent with its own dimensions.
++  return check_component_sizes(image);
++}
++
++
+ Error ImageItem_uncompressed::add_image_tile(uint32_t tile_x, uint32_t tile_y, const std::shared_ptr<const HeifPixelImage>& image)
+ {
+   std::shared_ptr<Box_uncC> uncC = get_property<Box_uncC>();
+   assert(uncC);
+ 
++  // Validate the tile against the frozen encoder configuration before touching any buffer.
++  if (Error err = check_tile_image_compatibility(image)) {
++    return err;
++  }
++
+   uint32_t tile_width = image->get_width();
+   uint32_t tile_height = image->get_height();
+ 
+--- a/libheif/image-items/unc_image.h
++++ b/libheif/image-items/unc_image.h
+@@ -30,6 +30,7 @@
+ #include <string>
+ #include <vector>
+ #include <memory>
++#include <set>
+ 
+ class HeifContext;
+ 
+@@ -81,9 +82,25 @@ public:
+ 
+   Error add_image_tile(uint32_t tile_x, uint32_t tile_y, const std::shared_ptr<const HeifPixelImage>& image);
+ 
++  // Verify that every component plane of 'image' has the size implied by the image dimensions
++  // (chroma planes may be subsampled). The tile encoder assumes this when sizing its output
++  // buffer, so a mismatched plane would otherwise overflow that buffer during encoding.
++  static Error check_component_sizes(const std::shared_ptr<const HeifPixelImage>& image);
++
+ protected:
+   Result<std::shared_ptr<Decoder>> get_decoder() const override;
+ 
++  // Remember the configuration of the prototype image this item was created for (see
++  // add_unci_item()). Every tile later passed to add_image_tile() has to match it, otherwise
++  // encode_image_tile() sizes its output buffer from one layout while copying from another.
++  void remember_prototype_configuration(const std::shared_ptr<const HeifPixelImage>& prototype,
++                                        uint32_t tile_width, uint32_t tile_height);
++
++  // Check that 'image' may be encoded as a tile of this item. It has to match the frozen
++  // prototype configuration (colorspace, chroma subsampling, channel set and bit depths) and be
++  // self-consistent in its plane sizes. This is the gate that makes the tile write path safe.
++  Error check_tile_image_compatibility(const std::shared_ptr<const HeifPixelImage>& image) const;
++
+ private:
+   std::shared_ptr<class Decoder_uncompressed> m_decoder;
+   /*
+@@ -93,6 +110,23 @@ private:
+                                                      */
+ 
+   uint64_t m_next_tile_write_pos = 0;
++
++  // --- frozen configuration of the prototype image, filled in by add_unci_item().
++  //     Used by check_tile_image_compatibility() to validate every tile.
++  struct prototype_channel
++  {
++    heif_channel channel;
++    uint32_t width;
++    uint32_t height;
++    uint8_t bits_per_pixel;
++  };
++
++  bool m_prototype_configuration_known = false;
++  heif_colorspace m_prototype_colorspace = heif_colorspace_undefined;
++  heif_chroma m_prototype_chroma = heif_chroma_undefined;
++  uint32_t m_prototype_tile_width = 0;
++  uint32_t m_prototype_tile_height = 0;
++  std::vector<prototype_channel> m_prototype_channels;
+ };
+ 
+ #endif //LIBHEIF_UNC_IMAGE_H
+--- a/tests/uncompressed_encode.cc
++++ b/tests/uncompressed_encode.cc
+@@ -27,6 +27,7 @@
+ #include "catch_amalgamated.hpp"
+ #include "libheif/api_structs.h"
+ #include "libheif/heif.h"
++#include "libheif/heif_experimental.h"
+ #include <cstdint>
+ #include <string.h>
+ #include "test_utils.h"
+@@ -776,3 +777,156 @@ TEST_CASE("Encode RGBA planar")
+   heif_image *input_image = createImage_RGBA_planar();
+   do_encode(input_image, "encode_rgba_planar.heif", true);
+ }
++
++
++#if HEIF_ENABLE_EXPERIMENTAL_FEATURES
++
++// Regression test for CVE-2026-84444 / GHSA-j264-xvrp-5v7q.
++//
++// heif_context_add_image_tile() used to hand the tile image straight to the uncompressed tile
++// encoder, which sizes its output buffer from the configuration frozen from the prototype image
++// passed to heif_context_add_unci_image() while copying from the tile's actual planes. A tile that
++// did not match that configuration wrote past the end of that buffer (heap out-of-bounds write).
++// The fix validates every tile against the frozen configuration before encoding it.
++
++// Helper: builds a YCbCr image with individually chosen chroma plane sizes.
++static heif_image* createImage_YCbCr_customPlanes(int w, int h, heif_chroma chroma,
++                                                  int cb_w, int cb_h, int cr_w, int cr_h)
++{
++  heif_image *image;
++  heif_error err = heif_image_create(w, h, heif_colorspace_YCbCr, chroma, &image);
++  REQUIRE(err.code == heif_error_Ok);
++
++  err = heif_image_add_plane(image, heif_channel_Y, w, h, 8);
++  REQUIRE(err.code == heif_error_Ok);
++  err = heif_image_add_plane(image, heif_channel_Cb, cb_w, cb_h, 8);
++  REQUIRE(err.code == heif_error_Ok);
++  err = heif_image_add_plane(image, heif_channel_Cr, cr_w, cr_h, 8);
++  REQUIRE(err.code == heif_error_Ok);
++
++  return image;
++}
++
++
++TEST_CASE("Add tile rejects images that do not match the unci configuration")
++{
++  const int TW = 16;
++  const int TH = 16;
++
++  auto add_tile = [](heif_image *prototype, heif_image *tile) -> heif_error {
++    heif_unci_image_parameters params{};
++    params.version = 1;
++    params.image_width = 2 * TW;
++    params.image_height = 2 * TH;
++    params.tile_width = TW;
++    params.tile_height = TH;
++    params.compression = heif_unci_compression_off;
++
++    heif_context *ctx = heif_context_alloc();
++
++    heif_encoder *encoder;
++    heif_error err = heif_context_get_encoder_for_format(ctx, heif_compression_uncompressed, &encoder);
++    REQUIRE(err.code == heif_error_Ok);
++
++    heif_encoding_options *options = heif_encoding_options_alloc();
++    options->macOS_compatibility_workaround_no_nclx_profile = true;
++
++    heif_image_handle *tiled_image;
++    err = heif_context_add_unci_image(ctx, &params, options, prototype, &tiled_image);
++    REQUIRE(err.code == heif_error_Ok);
++
++    heif_error tile_err = heif_context_add_image_tile(ctx, tiled_image, 0, 0, tile, encoder);
++
++    heif_image_handle_release(tiled_image);
++    heif_encoding_options_free(options);
++    heif_encoder_release(encoder);
++    heif_context_free(ctx);
++
++    return tile_err;
++  };
++
++  SECTION("component plane larger than the tile") {
++    heif_image *prototype = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_420, TW / 2, TH / 2, TW / 2, TH / 2);
++    // Declares the correct tile size, but its Cb plane is far larger than the
++    // subsampled size the encoder allocates for.
++    heif_image *tile = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_420, 200, 200, TW / 2, TH / 2);
++
++    REQUIRE(add_tile(prototype, tile).code != heif_error_Ok);
++
++    heif_image_release(tile);
++    heif_image_release(prototype);
++  }
++
++  SECTION("chroma format differs from the prototype") {
++    heif_image *prototype = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_420, TW / 2, TH / 2, TW / 2, TH / 2);
++    // A well-formed 4:4:4 tile: every plane matches its own image dimensions, so
++    // checking the tile against itself is not enough. The encoder still assumes
++    // the 4:2:0 subsampling of the prototype.
++    heif_image *tile = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_444, TW, TH, TW, TH);
++
++    REQUIRE(add_tile(prototype, tile).code != heif_error_Ok);
++
++    heif_image_release(tile);
++    heif_image_release(prototype);
++  }
++
++  SECTION("tile has fewer components than the prototype") {
++    heif_image *prototype = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_444, TW, TH, TW, TH);
++
++    heif_image *tile;
++    heif_error err = heif_image_create(TW, TH, heif_colorspace_monochrome, heif_chroma_monochrome, &tile);
++    REQUIRE(err.code == heif_error_Ok);
++    err = heif_image_add_plane(tile, heif_channel_Y, TW, TH, 8);
++    REQUIRE(err.code == heif_error_Ok);
++
++    REQUIRE(add_tile(prototype, tile).code != heif_error_Ok);
++
++    heif_image_release(tile);
++    heif_image_release(prototype);
++  }
++
++  SECTION("interleaved plane smaller than the image") {
++    heif_image *prototype;
++    heif_error err = heif_image_create(TW, TH, heif_colorspace_RGB, heif_chroma_interleaved_RGB, &prototype);
++    REQUIRE(err.code == heif_error_Ok);
++    err = heif_image_add_plane(prototype, heif_channel_interleaved, TW, TH, 8);
++    REQUIRE(err.code == heif_error_Ok);
++
++    // The interleaved plane is copied using its stored width. A tile with a smaller
++    // interleaved plane makes the encoder read/write out of the buffer sized for the tile.
++    heif_image *tile;
++    err = heif_image_create(TW, TH, heif_colorspace_RGB, heif_chroma_interleaved_RGB, &tile);
++    REQUIRE(err.code == heif_error_Ok);
++    err = heif_image_add_plane(tile, heif_channel_interleaved, 2, 2, 8);
++    REQUIRE(err.code == heif_error_Ok);
++
++    REQUIRE(add_tile(prototype, tile).code != heif_error_Ok);
++
++    heif_image_release(tile);
++    heif_image_release(prototype);
++  }
++
++  SECTION("tile size differs from the tile size of the image") {
++    heif_image *prototype = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_420, TW / 2, TH / 2, TW / 2, TH / 2);
++    // Consistent in itself and matching the prototype configuration, but not the
++    // tile size of the image. It would be written to a wrong offset.
++    heif_image *tile = createImage_YCbCr_customPlanes(TW / 2, TH / 2, heif_chroma_420, TW / 4, TH / 4, TW / 4, TH / 4);
++
++    REQUIRE(add_tile(prototype, tile).code != heif_error_Ok);
++
++    heif_image_release(tile);
++    heif_image_release(prototype);
++  }
++
++  SECTION("a matching tile is still accepted") {
++    heif_image *prototype = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_420, TW / 2, TH / 2, TW / 2, TH / 2);
++    heif_image *tile = createImage_YCbCr_customPlanes(TW, TH, heif_chroma_420, TW / 2, TH / 2, TW / 2, TH / 2);
++
++    REQUIRE(add_tile(prototype, tile).code == heif_error_Ok);
++
++    heif_image_release(tile);
++    heif_image_release(prototype);
++  }
++}
++
++#endif // HEIF_ENABLE_EXPERIMENTAL_FEATURES
+Description: CVE-2026-84384 - bound brotli/zlib decompression output by security limits
+ libheif's decompression routines for 'mime' metadata and 'unci' compressed
+ image data (using brotli and zlib) failed to enforce effective output-size
+ limits, creating a decompression-bomb / data-amplification vulnerability
+ (CWE-409, GHSA-24wx-9w62-c96w). The brotli path had no size check at all, and
+ the zlib path's intended 256MB cap only checked the small intermediate scratch
+ buffer rather than the accumulated output, so it never tripped. Neither path
+ integrated with libheif's memory-management safeguards (heif_security_limits),
+ so configured limits were ineffective and a small crafted HEIF file (as small
+ as 784 bytes) could trigger unbounded memory allocation and an unrecoverable
+ crash.
+ .
+ This is a backport of upstream commit 21893e8f to the pre-refactor 1.19.8
+ codebase. The target lacks the upstream MemoryHandle abstraction and the
+ max_total_memory security limit, so the decompression output is instead bounded
+ against the existing per-block limit (max_memory_block_size): decompress_zlib,
+ decompress_deflate and decompress_brotli gain a heif_security_limits* parameter
+ and reject output that grows past the configured block size, and the unci icef
+ path bounds the total accumulated output across all (possibly overlapping)
+ units. All call sites in file.cc and codecs/uncompressed/decoder_abstract.cc
+ thread the context's limits through. A regression test
+ (tests/decompression_bomb.cc), adapted from the upstream test to the older test
+ harness and the max_memory_block_size limit, is added.
+Origin: upstream, https://github.com/strukturag/libheif/commit/21893e8f66c8b79363ca2809391b07d35e1a95ec
+Bug: https://github.com/strukturag/libheif/security/advisories/GHSA-24wx-9w62-c96w
+Author: Dirk Farin <dirk.farin@gmail.com>
+Last-Update: 2026-09-22
+---
+--- a/libheif/codecs/uncompressed/decoder_abstract.cc
++++ b/libheif/codecs/uncompressed/decoder_abstract.cc
+@@ -182,6 +182,10 @@ const Error AbstractDecoder::get_compressed_image_data_uncompressed(const HeifCo
+   std::shared_ptr<const Box_cmpC> cmpC_box = image->get_property<const Box_cmpC>();
+   std::shared_ptr<const Box_icef> icef_box = image->get_property<const Box_icef>();
+ 
++  // Security limits used to bound the (potentially highly amplified) decompressed
++  // output (GHSA-24wx-9w62-c96w).
++  const heif_security_limits* limits = context->get_security_limits();
++
+   if (!cmpC_box) {
+     // assume no generic compression
+     return context->get_heif_file()->append_data_from_iloc(ID, *data, range_start_offset, range_size);
+@@ -205,7 +209,7 @@ const Error AbstractDecoder::get_compressed_image_data_uncompressed(const HeifCo
+     }
+ 
+     // decompress only the unit
+-    err = do_decompress_data(cmpC_box, compressed_bytes, data);
++    err = do_decompress_data(cmpC_box, compressed_bytes, data, limits);
+     if (err) {
+       return err;
+     }
+@@ -218,6 +222,14 @@ const Error AbstractDecoder::get_compressed_image_data_uncompressed(const HeifCo
+       return err;
+     }
+ 
++    // Bound the total decompressed output accumulated across all units. The units
++    // may overlap (nothing forces them to be disjoint), so N units can point at the
++    // same compressed slice and be decompressed N times into `data`. Without this
++    // accounting, that amplifies a tiny icef box into an unbounded allocation
++    // (GHSA-24wx-9w62-c96w).
++    const uint64_t max_accumulated_size =
++        (limits && limits->max_memory_block_size != 0) ? limits->max_memory_block_size : 0;
++
+     for (Box_icef::CompressedUnitInfo unit_info : icef_box->get_units()) {
+       if (unit_info.unit_offset > compressed_bytes.size() ||
+           unit_info.unit_size > compressed_bytes.size() - unit_info.unit_offset) {
+@@ -230,10 +242,17 @@ const Error AbstractDecoder::get_compressed_image_data_uncompressed(const HeifCo
+       auto unit_end = unit_start + unit_info.unit_size;
+       std::vector<uint8_t> compressed_unit_data = std::vector<uint8_t>(unit_start, unit_end);
+       std::vector<uint8_t> uncompressed_unit_data;
+-      err = do_decompress_data(cmpC_box, std::move(compressed_unit_data), &uncompressed_unit_data);
++      err = do_decompress_data(cmpC_box, std::move(compressed_unit_data), &uncompressed_unit_data, limits);
+       if (err) {
+         return err;
+       }
++
++      if (max_accumulated_size != 0 &&
++          static_cast<uint64_t>(data->size()) + uncompressed_unit_data.size() > max_accumulated_size) {
++        return Error(heif_error_Memory_allocation_error, heif_suberror_Security_limit_exceeded,
++                     "unci icef decompressed units exceed the maximum memory block size");
++      }
++
+       data->insert(data->end(), uncompressed_unit_data.data(), uncompressed_unit_data.data() + uncompressed_unit_data.size());
+     }
+ 
+@@ -255,7 +274,7 @@ const Error AbstractDecoder::get_compressed_image_data_uncompressed(const HeifCo
+     }
+ 
+     // Decode as a single blob
+-    err = do_decompress_data(cmpC_box, compressed_bytes, data);
++    err = do_decompress_data(cmpC_box, compressed_bytes, data, limits);
+     if (err) {
+       return err;
+     }
+@@ -275,11 +294,12 @@ const Error AbstractDecoder::get_compressed_image_data_uncompressed(const HeifCo
+ 
+ const Error AbstractDecoder::do_decompress_data(std::shared_ptr<const Box_cmpC>& cmpC_box,
+                                                 std::vector<uint8_t> compressed_data,
+-                                                std::vector<uint8_t>* data) const
++                                                std::vector<uint8_t>* data,
++                                                const heif_security_limits* limits) const
+ {
+   if (cmpC_box->get_compression_type() == fourcc("brot")) {
+ #if HAVE_BROTLI
+-    return decompress_brotli(compressed_data, data);
++    return decompress_brotli(compressed_data, data, limits);
+ #else
+     std::stringstream sstr;
+   sstr << "cannot decode unci item with brotli compression - not enabled" << std::endl;
+@@ -290,7 +310,7 @@ const Error AbstractDecoder::do_decompress_data(std::shared_ptr<const Box_cmpC>&
+   }
+   else if (cmpC_box->get_compression_type() == fourcc("zlib")) {
+ #if HAVE_ZLIB
+-    return decompress_zlib(compressed_data, data);
++    return decompress_zlib(compressed_data, data, limits);
+ #else
+     std::stringstream sstr;
+     sstr << "cannot decode unci item with zlib compression - not enabled" << std::endl;
+@@ -301,7 +321,7 @@ const Error AbstractDecoder::do_decompress_data(std::shared_ptr<const Box_cmpC>&
+   }
+   else if (cmpC_box->get_compression_type() == fourcc("defl")) {
+ #if HAVE_ZLIB
+-    return decompress_deflate(compressed_data, data);
++    return decompress_deflate(compressed_data, data, limits);
+ #else
+     std::stringstream sstr;
+     sstr << "cannot decode unci item with deflate compression - not enabled" << std::endl;
+--- a/libheif/codecs/uncompressed/decoder_abstract.h
++++ b/libheif/codecs/uncompressed/decoder_abstract.h
+@@ -199,7 +199,8 @@ protected:
+ 
+   const Error do_decompress_data(std::shared_ptr<const Box_cmpC>& cmpC_box,
+                                  std::vector<uint8_t> compressed_data,
+-                                 std::vector<uint8_t>* data) const;
++                                 std::vector<uint8_t>* data,
++                                 const heif_security_limits* limits) const;
+ 
+ protected:
+   void memcpy_to_native_endian(uint8_t* dst, uint32_t value, uint32_t bytes_per_sample);
+--- a/libheif/compression.h
++++ b/libheif/compression.h
+@@ -26,6 +26,8 @@
+ 
+ #include <error.h>
+ 
++struct heif_security_limits;
++
+ #if HAVE_ZLIB
+ /**
+  * Compress data using zlib method.
+@@ -61,7 +63,8 @@ std::vector<uint8_t> compress_deflate(const uint8_t* input, size_t size);
+  * @sa decompress_deflate
+  * @sa compress_zlib
+  */
+-Error decompress_zlib(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t>* output);
++Error decompress_zlib(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t>* output,
++                      const heif_security_limits* limits);
+ 
+ /**
+  * Decompress "deflate" compressed data.
+@@ -75,7 +78,8 @@ Error decompress_zlib(const std::vector<uint8_t>& compressed_input, std::vector<
+  * @sa decompress_zlib
+  * @sa compress_deflate
+  */
+-Error decompress_deflate(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t>* output);
++Error decompress_deflate(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t>* output,
++                         const heif_security_limits* limits);
+ 
+ #endif
+ 
+@@ -89,7 +93,8 @@ Error decompress_deflate(const std::vector<uint8_t>& compressed_input, std::vect
+  * @param output pointer to the resulting vector of decompressed data
+  * @return success (Ok) or an error on failure (usually corrupt data)
+  */
+-Error decompress_brotli(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t>* output);
++Error decompress_brotli(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t>* output,
++                        const heif_security_limits* limits);
+ 
+ std::vector<uint8_t> compress_brotli(const uint8_t* input, size_t size);
+ #endif
+--- a/libheif/compression_brotli.cc
++++ b/libheif/compression_brotli.cc
+@@ -31,9 +31,11 @@ const size_t BUF_SIZE = (1 << 18);
+ #include <vector>
+ 
+ #include "error.h"
++#include "security_limits.h"
+ 
+ 
+-Error decompress_brotli(const std::vector<uint8_t> &compressed_input, std::vector<uint8_t> *output)
++Error decompress_brotli(const std::vector<uint8_t> &compressed_input, std::vector<uint8_t> *output,
++                        const heif_security_limits* limits)
+ {
+     BrotliDecoderResult result = BROTLI_DECODER_RESULT_ERROR;
+     std::vector<uint8_t> buffer(BUF_SIZE, 0);
+@@ -42,6 +44,12 @@ Error decompress_brotli(const std::vector<uint8_t> &compressed_input, std::vecto
+     size_t available_out = buffer.size();
+     std::uint8_t *next_output = buffer.data();
+ 
++    // Bound the growth of `output` against the security limits. Without this, a
++    // high-ratio "decompression bomb" would expand a few KB of input into GBs of
++    // output, bypassing max_memory_block_size (GHSA-24wx-9w62-c96w).
++    const uint64_t max_output_size =
++        (limits && limits->max_memory_block_size != 0) ? limits->max_memory_block_size : 0;
++
+     std::unique_ptr<BrotliDecoderState, void(*)(BrotliDecoderState*)> state(BrotliDecoderCreateInstance(0, 0, 0), BrotliDecoderDestroyInstance);
+ 
+     while (true)
+@@ -50,13 +58,25 @@ Error decompress_brotli(const std::vector<uint8_t> &compressed_input, std::vecto
+ 
+         if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_OUTPUT)
+         {
+-            output->insert(output->end(), buffer.data(), buffer.data() + std::distance(buffer.data(), next_output));
++            size_t n_new_bytes = static_cast<size_t>(std::distance(buffer.data(), next_output));
++            if (max_output_size != 0 &&
++                static_cast<uint64_t>(output->size()) + n_new_bytes > max_output_size) {
++                return Error(heif_error_Memory_allocation_error, heif_suberror_Security_limit_exceeded,
++                             "brotli decompression output exceeds the maximum memory block size");
++            }
++            output->insert(output->end(), buffer.data(), buffer.data() + n_new_bytes);
+             available_out = buffer.size();
+             next_output = buffer.data();
+         }
+         else if (result == BROTLI_DECODER_RESULT_SUCCESS)
+         {
+-            output->insert(output->end(), buffer.data(), buffer.data() + std::distance(buffer.data(), next_output));
++            size_t n_new_bytes = static_cast<size_t>(std::distance(buffer.data(), next_output));
++            if (max_output_size != 0 &&
++                static_cast<uint64_t>(output->size()) + n_new_bytes > max_output_size) {
++                return Error(heif_error_Memory_allocation_error, heif_suberror_Security_limit_exceeded,
++                             "brotli decompression output exceeds the maximum memory block size");
++            }
++            output->insert(output->end(), buffer.data(), buffer.data() + n_new_bytes);
+             break;
+         }
+         else if (result == BROTLI_DECODER_RESULT_NEEDS_MORE_INPUT)
+--- a/libheif/compression_zlib.cc
++++ b/libheif/compression_zlib.cc
+@@ -20,6 +20,7 @@
+ 
+ 
+ #include "compression.h"
++#include "security_limits.h"
+ 
+ 
+ #if HAVE_ZLIB
+@@ -80,8 +81,14 @@ std::vector<uint8_t> compress(const uint8_t* input, size_t size, int windowSize)
+ }
+ 
+ 
+-Error do_inflate(const std::vector<uint8_t>& compressed_input, int windowSize, std::vector<uint8_t> *output)
++Error do_inflate(const std::vector<uint8_t>& compressed_input, int windowSize, std::vector<uint8_t> *output,
++                 const heif_security_limits* limits)
+ {
++  // Bound the growth of `output` against the security limits. Without this, a
++  // high-ratio "decompression bomb" would expand a few KB of input into GBs of
++  // output, bypassing max_memory_block_size (GHSA-24wx-9w62-c96w).
++  const uint64_t max_output_size =
++      (limits && limits->max_memory_block_size != 0) ? limits->max_memory_block_size : 0;
+ 
+   // decompress data with zlib
+ 
+@@ -126,8 +133,17 @@ Error do_inflate(const std::vector<uint8_t>& compressed_input, int windowSize, s
+       return Error(heif_error_Invalid_input, heif_suberror_Decompression_invalid_data, sstr.str());
+     }
+ 
+-    // append decoded data to output
+-    output->insert(output->end(), dst, dst + outBufferSize - strm.avail_out);
++    // account for and append decoded data to output
++
++    size_t n_new_bytes = outBufferSize - strm.avail_out;
++    if (max_output_size != 0 &&
++        static_cast<uint64_t>(output->size()) + n_new_bytes > max_output_size) {
++      inflateEnd(&strm);
++      return Error(heif_error_Memory_allocation_error, heif_suberror_Security_limit_exceeded,
++                   "zlib/deflate decompression output exceeds the maximum memory block size");
++    }
++
++    output->insert(output->end(), dst, dst + n_new_bytes);
+   } while (err != Z_STREAM_END);
+ 
+ 
+@@ -147,13 +163,15 @@ std::vector<uint8_t> compress_deflate(const uint8_t* input, size_t size)
+ }
+ 
+ 
+-Error decompress_zlib(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t> *output)
++Error decompress_zlib(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t> *output,
++                      const heif_security_limits* limits)
+ {
+-  return do_inflate(compressed_input, 15, output);
++  return do_inflate(compressed_input, 15, output, limits);
+ }
+ 
+-Error decompress_deflate(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t> *output)
++Error decompress_deflate(const std::vector<uint8_t>& compressed_input, std::vector<uint8_t> *output,
++                         const heif_security_limits* limits)
+ {
+-  return do_inflate(compressed_input, -15, output);
++  return do_inflate(compressed_input, -15, output, limits);
+ }
+ #endif
+--- a/libheif/file.cc
++++ b/libheif/file.cc
+@@ -602,7 +602,7 @@ Error HeifFile::get_uncompressed_item_data(heif_item_id ID, std::vector<uint8_t>
+       if (error) {
+         return error;
+       }
+-      error = decompress_zlib(compressed_data, data);
++      error = decompress_zlib(compressed_data, data, m_limits);
+       if (error) {
+         return error;
+       }
+@@ -620,7 +620,7 @@ Error HeifFile::get_uncompressed_item_data(heif_item_id ID, std::vector<uint8_t>
+       if (error) {
+         return error;
+       }
+-      error = decompress_deflate(compressed_data, data);
++      error = decompress_deflate(compressed_data, data, m_limits);
+       if (error) {
+         return error;
+       }
+@@ -638,7 +638,7 @@ Error HeifFile::get_uncompressed_item_data(heif_item_id ID, std::vector<uint8_t>
+       if (error) {
+         return error;
+       }
+-      error = decompress_brotli(compressed_data, data);
++      error = decompress_brotli(compressed_data, data, m_limits);
+       if (error) {
+         return error;
+       }
+@@ -757,13 +757,13 @@ Error HeifFile::get_item_data(heif_item_id ID, std::vector<uint8_t>* out_data, h
+   switch (compression) {
+ #if HAVE_ZLIB
+     case heif_metadata_compression_zlib:
+-      return decompress_zlib(compressed_data, out_data);
++      return decompress_zlib(compressed_data, out_data, m_limits);
+     case heif_metadata_compression_deflate:
+-      return decompress_deflate(compressed_data, out_data);
++      return decompress_deflate(compressed_data, out_data, m_limits);
+ #endif
+ #if HAVE_BROTLI
+     case heif_metadata_compression_brotli:
+-      return decompress_brotli(compressed_data, out_data);
++      return decompress_brotli(compressed_data, out_data, m_limits);
+ #endif
+     default:
+       return {heif_error_Unsupported_filetype, heif_suberror_Unsupported_header_compression_method};
+--- a/tests/CMakeLists.txt
++++ b/tests/CMakeLists.txt
+@@ -59,6 +59,12 @@ add_libheif_test(encode)
+ add_libheif_test(extended_type)
+ add_libheif_test(region)
+ 
++if (Brotli_FOUND)
++    add_libheif_test(decompression_bomb)
++else()
++    message(INFO " Disabling the decompression bomb test because Brotli was not found")
++endif ()
++
+ if (WITH_OPENJPH_ENCODER AND SUPPORTS_J2K_HT_ENCODING)
+     add_libheif_test(encode_htj2k)
+ else()
+--- /dev/null
++++ b/tests/decompression_bomb.cc
+@@ -0,0 +1,279 @@
++/*
++  libheif unit tests
++
++  MIT License
++
++  Copyright (c) 2026 Dirk Farin <dirk.farin@gmail.com>
++
++  Permission is hereby granted, free of charge, to any person obtaining a copy
++  of this software and associated documentation files (the "Software"), to deal
++  in the Software without restriction, including without limitation the rights
++  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
++  copies of the Software, and to permit persons to whom the Software is
++  furnished to do so, subject to the following conditions:
++
++  The above copyright notice and this permission notice shall be included in all
++  copies or substantial portions of the Software.
++
++  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
++  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
++  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
++  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
++  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
++  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
++  SOFTWARE.
++*/
++
++// Regression test for GHSA-24wx-9w62-c96w / CVE-2026-84384: a compressed
++// ('mime', content_encoding "br") metadata item is a decompression bomb.
++// Opening the file decompresses the item in
++// HeifContext::interpret_heif_file() via HeifFile::get_uncompressed_item_data(),
++// which used to grow an output vector with no size accounting at all, bypassing
++// the configured security limits and allowing OOM from a few hundred bytes of
++// input.
++//
++// The test builds a tiny HEIF whose 'mime' item is a real brotli payload that
++// expands to tens of MB, then opens it once with a tight per-block memory limit
++// (expecting a security-limit error) and once with the default limits (expecting
++// success, proving the file itself is valid and it is the limit that is
++// enforced).
++//
++// This is a backport-adapted version of the upstream test
++// (tests/decompression_bomb.cc, commit 21893e8f). The 1.19.8 target has no
++// max_total_memory field / MemoryHandle abstraction, so the decompressed output
++// is bounded against max_memory_block_size instead.
++
++#include "catch_amalgamated.hpp"
++#include "libheif/heif.h"
++#include "compression.h"
++
++#include <cstdint>
++#include <string>
++#include <vector>
++
++namespace {
++
++void put_u32_be(std::vector<uint8_t>& out, uint32_t v) {
++  out.push_back(static_cast<uint8_t>(v >> 24));
++  out.push_back(static_cast<uint8_t>(v >> 16));
++  out.push_back(static_cast<uint8_t>(v >> 8));
++  out.push_back(static_cast<uint8_t>(v));
++}
++
++void put_u16_be(std::vector<uint8_t>& out, uint16_t v) {
++  out.push_back(static_cast<uint8_t>(v >> 8));
++  out.push_back(static_cast<uint8_t>(v));
++}
++
++void append_fourcc(std::vector<uint8_t>& out, const char fourcc[4]) {
++  out.insert(out.end(), fourcc, fourcc + 4);
++}
++
++// Append a null-terminated string (as read by Box_infe via read_string()).
++void append_cstr(std::vector<uint8_t>& out, const char* s) {
++  while (*s) { out.push_back(static_cast<uint8_t>(*s)); ++s; }
++  out.push_back(0);
++}
++
++void append(std::vector<uint8_t>& out, const std::vector<uint8_t>& v) {
++  out.insert(out.end(), v.begin(), v.end());
++}
++
++std::vector<uint8_t> make_box(const char fourcc[4],
++                              const std::vector<uint8_t>& payload,
++                              bool is_full_box = false,
++                              uint8_t version = 0,
++                              uint32_t flags = 0) {
++  std::vector<uint8_t> body;
++  if (is_full_box) {
++    body.push_back(version);
++    body.push_back(static_cast<uint8_t>(flags >> 16));
++    body.push_back(static_cast<uint8_t>(flags >> 8));
++    body.push_back(static_cast<uint8_t>(flags));
++  }
++  body.insert(body.end(), payload.begin(), payload.end());
++
++  std::vector<uint8_t> box;
++  put_u32_be(box, static_cast<uint32_t>(8 + body.size()));
++  append_fourcc(box, fourcc);
++  box.insert(box.end(), body.begin(), body.end());
++  return box;
++}
++
++// Build a minimal HEIF file with two items:
++//   item 1 ('mski', 8x8, 8bpp): the primary image. The mask codec needs no
++//           bitstream (its "compressed" data is just the raw pixel bytes), so no
++//           codec plugin is required and the file opens without decoding.
++//   item 2 ('mime', content_encoding "br"): a brotli-compressed metadata item,
++//           'cdsc'-referencing item 1, carrying the supplied bomb payload.
++std::vector<uint8_t> build_heif_with_brotli_mime(const std::vector<uint8_t>& brotli_payload) {
++  std::vector<uint8_t> ftyp_payload;
++  append_fourcc(ftyp_payload, "heic");
++  put_u32_be(ftyp_payload, 0);
++  append_fourcc(ftyp_payload, "mif1");
++  append_fourcc(ftyp_payload, "heic");
++  auto ftyp = make_box("ftyp", ftyp_payload);
++
++  std::vector<uint8_t> hdlr_payload;
++  put_u32_be(hdlr_payload, 0);
++  append_fourcc(hdlr_payload, "pict");
++  put_u32_be(hdlr_payload, 0);
++  put_u32_be(hdlr_payload, 0);
++  put_u32_be(hdlr_payload, 0);
++  hdlr_payload.push_back(0);
++  auto hdlr = make_box("hdlr", hdlr_payload, /*full=*/true);
++
++  // pitm: primary item = item 1 (the 'mski' image).
++  std::vector<uint8_t> pitm_payload;
++  put_u16_be(pitm_payload, 1);
++  auto pitm = make_box("pitm", pitm_payload, /*full=*/true);
++
++  // iinf: item 1 = 'mski', item 2 = 'mime'.
++  std::vector<uint8_t> infe1_payload;
++  put_u16_be(infe1_payload, 1);
++  put_u16_be(infe1_payload, 0);
++  append_fourcc(infe1_payload, "mski");
++  infe1_payload.push_back(0); // item_name (empty)
++  auto infe1 = make_box("infe", infe1_payload, /*full=*/true, /*version=*/2);
++
++  std::vector<uint8_t> infe2_payload;
++  put_u16_be(infe2_payload, 2);
++  put_u16_be(infe2_payload, 0);
++  append_fourcc(infe2_payload, "mime");
++  append_cstr(infe2_payload, "");                          // item_name
++  append_cstr(infe2_payload, "application/octet-stream");  // content_type
++  append_cstr(infe2_payload, "br");                        // content_encoding
++  auto infe2 = make_box("infe", infe2_payload, /*full=*/true, /*version=*/2);
++
++  std::vector<uint8_t> iinf_payload;
++  put_u16_be(iinf_payload, 2);
++  append(iinf_payload, infe1);
++  append(iinf_payload, infe2);
++  auto iinf = make_box("iinf", iinf_payload, /*full=*/true);
++
++  // iprp / ipco: prop 1 = ispe(8,8), prop 2 = mskC(8bpp), both for item 1.
++  std::vector<uint8_t> ispe_payload;
++  put_u32_be(ispe_payload, 8);
++  put_u32_be(ispe_payload, 8);
++  auto ispe = make_box("ispe", ispe_payload, /*full=*/true);
++
++  std::vector<uint8_t> mskC_payload;
++  mskC_payload.push_back(8); // bits_per_pixel
++  auto mskC = make_box("mskC", mskC_payload, /*full=*/true);
++
++  std::vector<uint8_t> ipco_payload;
++  append(ipco_payload, ispe);
++  append(ipco_payload, mskC);
++  auto ipco = make_box("ipco", ipco_payload);
++
++  std::vector<uint8_t> ipma_payload;
++  put_u32_be(ipma_payload, 1); // entry_count
++  put_u16_be(ipma_payload, 1); // item_ID 1
++  ipma_payload.push_back(2);   // association_count
++  ipma_payload.push_back(0x80 | 1); // essential, ispe
++  ipma_payload.push_back(0x80 | 2); // essential, mskC
++  auto ipma = make_box("ipma", ipma_payload, /*full=*/true);
++
++  std::vector<uint8_t> iprp_payload;
++  append(iprp_payload, ipco);
++  append(iprp_payload, ipma);
++  auto iprp = make_box("iprp", iprp_payload);
++
++  // idat: 64 bytes of raw 8x8 8bpp mask data, followed by the brotli bomb payload.
++  std::vector<uint8_t> idat_payload(64, 0x7F);
++  const uint32_t bomb_offset = static_cast<uint32_t>(idat_payload.size());
++  const uint32_t bomb_length = static_cast<uint32_t>(brotli_payload.size());
++  idat_payload.insert(idat_payload.end(), brotli_payload.begin(), brotli_payload.end());
++  auto idat = make_box("idat", idat_payload);
++
++  // iloc (version 1): both items store their data in idat (construction_method=1).
++  std::vector<uint8_t> iloc_payload;
++  put_u16_be(iloc_payload, (4 << 12) | (4 << 8) | (0 << 4) | 0); // offset_size=4, length_size=4
++  put_u16_be(iloc_payload, 2);          // item_count
++  // item 1: mask pixels
++  put_u16_be(iloc_payload, 1);          // item_ID
++  put_u16_be(iloc_payload, 0x0001);     // reserved(12) + construction_method=1 (idat)
++  put_u16_be(iloc_payload, 0);          // data_reference_index
++  put_u16_be(iloc_payload, 1);          // extent_count
++  put_u32_be(iloc_payload, 0);          // extent_offset (within idat)
++  put_u32_be(iloc_payload, 64);         // extent_length
++  // item 2: brotli bomb
++  put_u16_be(iloc_payload, 2);          // item_ID
++  put_u16_be(iloc_payload, 0x0001);     // reserved(12) + construction_method=1 (idat)
++  put_u16_be(iloc_payload, 0);          // data_reference_index
++  put_u16_be(iloc_payload, 1);          // extent_count
++  put_u32_be(iloc_payload, bomb_offset);// extent_offset (within idat)
++  put_u32_be(iloc_payload, bomb_length);// extent_length
++  auto iloc = make_box("iloc", iloc_payload, /*full=*/true, /*version=*/1);
++
++  // iref: item 2 ('mime') 'cdsc'-references item 1 (metadata describes the image).
++  std::vector<uint8_t> cdsc_payload;
++  put_u16_be(cdsc_payload, 2);          // from_item_ID
++  put_u16_be(cdsc_payload, 1);          // reference_count
++  put_u16_be(cdsc_payload, 1);          // to_item_ID
++  auto cdsc = make_box("cdsc", cdsc_payload);
++  auto iref = make_box("iref", cdsc, /*full=*/true);
++
++  std::vector<uint8_t> meta_payload;
++  append(meta_payload, hdlr);
++  append(meta_payload, pitm);
++  append(meta_payload, iinf);
++  append(meta_payload, iprp);
++  append(meta_payload, iloc);
++  append(meta_payload, iref);
++  append(meta_payload, idat);
++  auto meta = make_box("meta", meta_payload, /*full=*/true);
++
++  std::vector<uint8_t> file;
++  append(file, ftyp);
++  append(file, meta);
++  return file;
++}
++
++} // namespace
++
++
++TEST_CASE("brotli mime metadata decompression bomb is bounded by security limits") {
++#if HAVE_BROTLI
++  // A brotli payload that expands to ~40 MB but is only a few hundred bytes on disk.
++  const size_t decompressed_size = 40u * 1024 * 1024;
++  std::vector<uint8_t> zeros(decompressed_size, 0);
++  std::vector<uint8_t> bomb = compress_brotli(zeros.data(), zeros.size());
++  REQUIRE(!bomb.empty());
++  REQUIRE(bomb.size() < decompressed_size); // it really is highly compressible
++
++  std::vector<uint8_t> file = build_heif_with_brotli_mime(bomb);
++
++  // --- with a tight per-block memory limit, opening must fail rather than
++  //     allocate the whole decompressed payload (previously it ignored the
++  //     limit entirely).
++  {
++    heif_context* ctx = heif_context_alloc();
++    REQUIRE(ctx != nullptr);
++
++    heif_security_limits* limits = heif_context_get_security_limits(ctx);
++    REQUIRE(limits != nullptr);
++    limits->max_memory_block_size = 8u * 1024 * 1024; // 8 MB << 40 MB bomb
++
++    heif_error err = heif_context_read_from_memory_without_copy(ctx, file.data(), file.size(), nullptr);
++    REQUIRE(err.code != heif_error_Ok);
++    REQUIRE(err.subcode == heif_suberror_Security_limit_exceeded);
++
++    heif_context_free(ctx);
++  }
++
++  // --- with the default (generous) limits, the very same file opens successfully,
++  //     proving it is structurally valid and that the limit is what is enforced.
++  {
++    heif_context* ctx = heif_context_alloc();
++    REQUIRE(ctx != nullptr);
++
++    heif_error err = heif_context_read_from_memory_without_copy(ctx, file.data(), file.size(), nullptr);
++    REQUIRE(err.code == heif_error_Ok);
++
++    heif_context_free(ctx);
++  }
++#else
++  SUCCEED("brotli support not compiled in - skipping decompression bomb test");
++#endif
++}

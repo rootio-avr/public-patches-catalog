@@ -1,10 +1,13 @@
-# libheif : 1.19.8-1+deb13u1.aikido.9
+# libheif : 1.19.8-1+deb13u1.aikido.10
 
-This patch is based on libheif version 1.19.8-1+deb13u1.aikido.9, which is available at:
+This patch is based on libheif version 1.19.8-1+deb13u1.aikido.10, which is available at:
 https://sources.debian.org/src/libheif/1.19.8-1+deb13u1/
 
 ## Affected CVEs:
 - CVE-2026-84446
+- CVE-2026-84444
+- CVE-2026-84447
+- CVE-2026-84384
 
 ## How to Apply:
 1. Obtain the source package: `apt source libheif`
