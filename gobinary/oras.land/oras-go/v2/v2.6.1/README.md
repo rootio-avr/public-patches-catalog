@@ -4,6 +4,7 @@ This patch is based on oras.land/oras-go/v2 version v2.6.1, which is available a
 unknown
 
 ## Affected CVEs:
+- CVE-2026-85731
 - CVE-2026-50163
 
 ## How to Apply:
