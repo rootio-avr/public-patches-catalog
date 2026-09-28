@@ -1,3 +1,145 @@
+--- a/lib/resolver-compat.js
++++ b/lib/resolver-compat.js
+@@ -161,8 +161,50 @@
+ 	return vm.readonly(copy);
+ }
+ 
+-const BUILTIN_MODULES = (nmod.builtinModules || Object.getOwnPropertyNames(process.binding('natives'))).filter(s=>!s.startsWith('internal/'));
++// SECURITY (GHSA-m5w8-4gq2-6f8x): process-wide builtins whose state belongs to
++// the host process, not the sandbox. `os` and `dns` expose host-process state
++// the `vm.readonly()` proxy cannot localise and, worse, carry *write* APIs that
++// mutate global host state from one line of sandbox code:
++//
++//   - os  : `os.userInfo()` leaks the host process owner (uid/gid/username/
++//           homedir/shell); `os.networkInterfaces()` leaks the full host
++//           network topology (IPs, MACs); `os.hostname()`/`os.loadavg()`/
++//           `os.uptime()`/`os.freemem()` are host-wide telemetry.
++//           `os.setPriority([pid,] prio)` is a *write* -- setpriority(2) on the
++//           host process (pid 0 = host).
++//   - dns : `dns.setServers(['attacker:53'])` replaces the host's process-wide
++//           DNS resolver list, hijacking every subsequent lookup the host makes
++//           (outbound HTTP, telemetry, registry fetch). `dns.setDefaultResult
++//           Order()` is a second process-wide write knob; `dns.getServers()`/
++//           `dns.lookup()`/`dns.resolve()` read and act from the host network
++//           identity. The `dns/promises` subpath shares the surface and is
++//           covered by the family-prefix matcher below.
++//
++// Embedders who genuinely need a sandbox-local subset (`os.platform()`,
++// `os.EOL`, `os.constants`) register a controlled wrapper via `mock`/`override`,
++// which is checked before this denylist in genBuiltinsFromOptions/addDefaultBuiltin.
++const DANGEROUS_BUILTINS = new Set([
++	'os',
++	'dns'
++]);
+ 
++// Family-prefix denylist check. Strips the optional `node:` URL-style prefix so
++// `node:os`/`node:dns` cannot bypass via spelling, and matches any `<family>/...`
++// subpath (e.g. `dns/promises`) against the dangerous family set.
++function isDangerousBuiltin(key) {
++	if (typeof key !== 'string') return false;
++	if (key.startsWith('node:')) key = key.slice(5);
++	if (DANGEROUS_BUILTINS.has(key)) return true;
++	const slash = key.indexOf('/');
++	if (slash > 0 && DANGEROUS_BUILTINS.has(key.slice(0, slash))) return true;
++	return false;
++}
++
++// SECURITY (GHSA-m5w8-4gq2-6f8x): filter dangerous builtins out of the wildcard
++// source so `builtin: ['*']` (and `['*', '-fs']`) never auto-allow `os`/`dns`.
++const BUILTIN_MODULES = (nmod.builtinModules || Object.getOwnPropertyNames(process.binding('natives')))
++	.filter(s=>!s.startsWith('internal/') && !isDangerousBuiltin(s));
++
+ let EventEmitterReferencingAsyncResourceClass = null;
+ if (EventEmitter.EventEmitterAsyncResource) {
+ 	// eslint-disable-next-line global-require
+@@ -210,6 +252,12 @@
+ };
+ 
+ function addDefaultBuiltin(builtins, key, vm) {
++	// SECURITY (GHSA-m5w8-4gq2-6f8x): reject the explicit-allowlist path
++	// (`builtin: ['os']`, `builtin: ['dns/promises']`) and the object-map form.
++	// `mock`/`override` entries are applied before this in genBuiltinsFromOptions
++	// and hit the `builtins[key]` early-return below, so the escape hatch stays
++	// functional for embedders who register a sandbox-local wrapper.
++	if (isDangerousBuiltin(key)) return;
+ 	if (builtins[key]) return;
+ 	const special = SPECIAL_MODULES[key];
+ 	builtins[key] = special ? special(vm) : defaultBuiltinLoader;
+--- /dev/null
++++ b/test/ghsa-m5w8-4gq2-6f8x.js
+@@ -0,0 +1,71 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++// Regression test for GHSA-m5w8-4gq2-6f8x -- NodeVM `os` and `dns` builtins
++// leak host-process state and expose host-process *write* APIs
++// (`os.setPriority`, `dns.setServers`, `dns.setDefaultResultOrder`). Replacement
++// for the upstream test/ghsa/GHSA-m5w8-4gq2-6f8x/repro.js, which is not shipped
++// in the 3.9.7 target tree. The pre-3.11 backport enforces the denylist in
++// lib/resolver-compat.js (wildcard BUILTIN_MODULES filter + addDefaultBuiltin).
++
++const assert = require('assert');
++const {NodeVM} = require('..');
++
++describe('GHSA-m5w8-4gq2-6f8x: os/dns denied as NodeVM builtins', () => {
++	it('builtin: ["*"] does not expose os', () => {
++		const vm = new NodeVM({require: {builtin: ['*']}});
++		assert.throws(() => vm.run('module.exports = require("os");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++	});
++
++	it('builtin: ["*"] does not expose dns', () => {
++		const vm = new NodeVM({require: {builtin: ['*']}});
++		assert.throws(() => vm.run('module.exports = require("dns");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++	});
++
++	it('explicit allowlist builtin: ["os"] is rejected', () => {
++		const vm = new NodeVM({require: {builtin: ['os']}});
++		assert.throws(() => vm.run('module.exports = require("os");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++	});
++
++	it('explicit allowlist builtin: ["dns"] is rejected', () => {
++		const vm = new NodeVM({require: {builtin: ['dns']}});
++		assert.throws(() => vm.run('module.exports = require("dns");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++	});
++
++	it('object-map form builtin: {os: true} is rejected', () => {
++		const vm = new NodeVM({require: {builtin: {os: true}}});
++		assert.throws(() => vm.run('module.exports = require("os");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++	});
++
++	it('node: URL prefix does not bypass (node:os / node:dns)', () => {
++		const vm = new NodeVM({require: {builtin: ['*']}});
++		assert.throws(() => vm.run('module.exports = require("node:os");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++		assert.throws(() => vm.run('module.exports = require("node:dns");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++	});
++
++	it('family-prefix subpath dns/promises is rejected', () => {
++		const vm = new NodeVM({require: {builtin: ['*']}});
++		assert.throws(() => vm.run('module.exports = require("dns/promises");', 'poc.js'),
++			/is not whitelisted|Access denied|Cannot find module/);
++	});
++
++	it('safe builtins still load under builtin: ["*"]', () => {
++		const vm = new NodeVM({require: {builtin: ['*']}});
++		assert.doesNotThrow(() => vm.run('module.exports = require("fs");', 'ok.js'));
++		assert.doesNotThrow(() => vm.run('module.exports = require("path");', 'ok.js'));
++	});
++
++	it('mock escape hatch still exposes a sandbox-local os subset', () => {
++		const vm = new NodeVM({require: {builtin: ['*'], mock: {os: {EOL: '\n'}}}});
++		assert.strictEqual(vm.run('module.exports = require("os").EOL;', 'ok.js'), '\n');
++	});
++});
+
 --- a/lib/setup-sandbox.js
 +++ b/lib/setup-sandbox.js
 @@ -25,7 +25,8 @@
