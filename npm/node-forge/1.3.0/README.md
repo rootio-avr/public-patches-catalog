@@ -4,6 +4,7 @@ This patch is based on node-forge version 1.3.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-33896
 - CVE-2025-12816
 
 ## How to Apply:
