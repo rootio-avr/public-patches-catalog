@@ -1,0 +1,179 @@
+Disable mysql_clear_password plugin by default (GHSA-3f6p-5ww8-9rcr)
+
+The mysql_clear_password authentication plugin sends passwords in plaintext,
+which is a security risk when the connection is not encrypted. A malicious
+server (e.g. via DNS poisoning) could request cleartext auth via an
+AuthSwitchRequest and capture credentials.
+
+This backport gates the built-in mysql_clear_password plugin behind an explicit
+opt-in (the new `enableCleartextPlugin` option, or a user-supplied custom
+`mysql_clear_password` entry in `authPlugins`). When the server requests
+mysql_clear_password and it is not enabled, the connection fails with a
+`MYSQL_CLEAR_PASSWORD_NOT_ENABLED` error. The client_handshake error handler is
+also updated to preserve an existing `err.code` instead of unconditionally
+overwriting it with `AUTH_SWITCH_PLUGIN_ERROR`.
+
+Upstream fix: 884bec56288d827939d0dd3f1f4ae476fbc8dbeb
+
+--- a/lib/commands/auth_switch.js
++++ b/lib/commands/auth_switch.js
+@@ -54,6 +54,27 @@
+     });
+     return;
+   }
++  if (pluginName === 'mysql_clear_password') {
++    const hasCustomPlugin =
++      connection.config.authPlugins &&
++      Object.prototype.hasOwnProperty.call(
++        connection.config.authPlugins,
++        'mysql_clear_password'
++      );
++    if (!hasCustomPlugin && !connection.config.enableCleartextPlugin) {
++      const err = new Error(
++        'Server requested authentication using mysql_clear_password, ' +
++          'which sends the password in plaintext over the network and is ' +
++          'disabled by default. To enable it, set the `enableCleartextPlugin` ' +
++          'option to `true` in your connection configuration, or provide a ' +
++          'custom `mysql_clear_password` auth plugin via the `authPlugins` ' +
++          'option. Only use this over a secure connection (TLS/SSL).'
++      );
++      err.code = 'MYSQL_CLEAR_PASSWORD_NOT_ENABLED';
++      err.fatal = true;
++      throw err;
++    }
++  }
+   if (!authPlugin) {
+     authPlugin = standardAuthPlugins[pluginName];
+   }
+--- a/lib/commands/client_handshake.js
++++ b/lib/commands/client_handshake.js
+@@ -196,7 +196,9 @@
+         return ClientHandshake.prototype.handshakeResult;
+       } catch (err) {
+         // Authentication errors are fatal
+-        err.code = 'AUTH_SWITCH_PLUGIN_ERROR';
++        if (!err.code) {
++          err.code = 'AUTH_SWITCH_PLUGIN_ERROR';
++        }
+         err.fatal = true;
+
+         if (this.onResult) {
+--- a/lib/connection_config.js
++++ b/lib/connection_config.js
+@@ -60,6 +60,7 @@
+   uri: 1,
+   user: 1,
+   disableEval: 1,
++  enableCleartextPlugin: 1,
+   // These options are used for Pool
+   connectionLimit: 1,
+   maxIdle: 1,
+@@ -152,6 +153,7 @@
+       options.nestTables === undefined ? undefined : options.nestTables;
+     this.typeCast = options.typeCast === undefined ? true : options.typeCast;
+     this.disableEval = Boolean(options.disableEval);
++    this.enableCleartextPlugin = Boolean(options.enableCleartextPlugin);
+     if (this.timezone[0] === ' ') {
+       // "+" is a url encoded char for space so it
+       // gets translated to space when giving a
+--- a/typings/mysql/lib/Connection.d.ts
++++ b/typings/mysql/lib/Connection.d.ts
+@@ -325,6 +325,18 @@
+
+   disableEval?: boolean;
+
++  /**
++   * Enable the `mysql_clear_password` authentication plugin, which sends the
++   * password in plaintext. Disabled by default for security — only enable
++   * over secure connections (TLS/SSL).
++   *
++   * Providing a custom `mysql_clear_password` function via `authPlugins`
++   * implicitly enables cleartext authentication without this flag.
++   *
++   * (Default: false)
++   */
++  enableCleartextPlugin?: boolean;
++
+   authPlugins?: {
+     [key: string]: AuthPlugin;
+   };
+--- /dev/null
++++ b/test/integration/test-cleartext-plugin-gate.test.cjs
+@@ -0,0 +1,77 @@
++'use strict';
++
++// Regression test for GHSA-3f6p-5ww8-9rcr: the built-in mysql_clear_password
++// plugin must be disabled by default. A malicious server that requests
++// cleartext auth via an AuthSwitchRequest must not be able to make the client
++// leak the password in plaintext; the connection should instead fail with a
++// MYSQL_CLEAR_PASSWORD_NOT_ENABLED error.
++
++const mysql = require('../../index.js');
++const Command = require('../../lib/commands/command.js');
++const Packets = require('../../lib/packets/index.js');
++const { Buffer } = require('node:buffer');
++const assert = require('node:assert');
++const process = require('node:process');
++
++// The process is not terminated in Deno
++if (typeof Deno !== 'undefined') process.exit(0);
++
++class CleartextAuthSwitch extends Command {
++  start(_, connection) {
++    const serverHelloPacket = new Packets.Handshake({
++      protocolVersion: 10,
++      serverVersion: 'node.js rocks',
++      connectionId: 1234,
++      statusFlags: 2,
++      characterSet: 8,
++      capabilityFlags: 0xffffff,
++    });
++    serverHelloPacket.setScrambleData(() => {
++      connection.writePacket(serverHelloPacket.toPacket(0));
++    });
++    return CleartextAuthSwitch.prototype.sendAuthSwitchRequest;
++  }
++
++  sendAuthSwitchRequest(_, connection) {
++    const asr = new Packets.AuthSwitchRequest({
++      pluginName: 'mysql_clear_password',
++      pluginData: Buffer.allocUnsafe(0),
++    });
++    connection.writePacket(asr.toPacket());
++    return CleartextAuthSwitch.prototype.finish;
++  }
++
++  finish(_, connection) {
++    connection.end();
++    return CleartextAuthSwitch.prototype.finish;
++  }
++}
++
++const server = mysql.createServer((conn) => {
++  conn.on('error', () => {});
++  conn.addCommand(new CleartextAuthSwitch());
++});
++
++let error;
++
++const portfinder = require('portfinder');
++portfinder.getPort((_, port) => {
++  server.listen(port);
++  const conn = mysql.createConnection({
++    port: port,
++    user: 'test_user',
++    password: 'test_password',
++  });
++
++  conn.on('error', (err) => {
++    error = err;
++    conn.destroy();
++    server.close();
++  });
++});
++
++process.on('exit', () => {
++  assert.ok(error, 'connection should emit an error');
++  assert.equal(error.code, 'MYSQL_CLEAR_PASSWORD_NOT_ENABLED');
++  assert.ok(error.message.includes('enableCleartextPlugin'));
++});
