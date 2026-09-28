@@ -4,6 +4,7 @@ This patch is based on github.com/prometheus/prometheus version v0.302.0, which 
 unknown
 
 ## Affected CVEs:
+- CVE-2026-42151
 - CVE-2026-42154
 
 ## How to Apply:
