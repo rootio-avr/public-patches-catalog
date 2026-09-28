@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2025-64718
 - CVE-2026-59869
+- CVE-2026-84375
 - GHSA-5p4m-2wfm-xmqj
 
 ## How to Apply:
