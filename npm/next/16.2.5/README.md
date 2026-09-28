@@ -8,6 +8,7 @@ unknown
 - CVE-2026-64641
 - CVE-2026-64645
 - CVE-2026-64649
+- CVE-2026-64647
 
 ## How to Apply:
 1. Clone or download the source code for next
