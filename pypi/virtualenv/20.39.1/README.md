@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-674766
+- AIKIDO-2026-785880
 
 ## How to Apply:
 1. Clone or download the source code for virtualenv
