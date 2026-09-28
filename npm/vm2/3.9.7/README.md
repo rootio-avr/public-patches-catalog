@@ -4,6 +4,15 @@ This patch is based on vm2 version 3.9.7, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2023-29199
+- CVE-2026-44005
+- CVE-2026-47137
+- CVE-2026-47210
+- CVE-2026-24118
+- CVE-2026-47139
+- CVE-2026-47683
+- CVE-2026-44001
+- CVE-2026-44004
 - CVE-2026-47209
 - GHSA-v836-6xw4-9cx3
 - CVE-2026-47135

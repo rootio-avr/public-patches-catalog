@@ -1,3 +1,1612 @@
+--- a/lib/transformer.js
++++ b/lib/transformer.js
+@@ -60,7 +60,7 @@
+ 						__proto__: null,
+ 						pos: cBody.body[0].start,
+ 						order: RIGHT,
+-						code: `${name}=${INTERNAL_STATE_NAME}.handleException(${name});`
++						coder: () => `${name}=${INTERNAL_STATE_NAME}.handleException(${name});`
+ 					});
+ 				}
+ 			}
+@@ -69,13 +69,13 @@
+ 				__proto__: null,
+ 				pos: node.object.start,
+ 				order: RIGHT,
+-				code: INTERNAL_STATE_NAME + '.wrapWith('
++				coder: () => INTERNAL_STATE_NAME + '.wrapWith('
+ 			});
+ 			insertions.push({
+ 				__proto__: null,
+ 				pos: node.object.end,
+ 				order: LEFT,
+-				code: ')'
++				coder: () => ')'
+ 			});
+ 		} else if (type === 'Identifier') {
+ 			if (node.name === INTERNAL_STATE_NAME) {
+@@ -86,7 +86,7 @@
+ 				__proto__: null,
+ 				pos: node.start,
+ 				order: LEFT,
+-				code: INTERNAL_STATE_NAME + '.'
++				coder: () => INTERNAL_STATE_NAME + '.'
+ 			});
+ 		} else if (type === 'Function') {
+ 			if (node.async) hasAsync = true;
+@@ -101,7 +101,7 @@
+ 	let curr = 0;
+ 	for (let i = 0; i < insertions.length; i++) {
+ 		const change = insertions[i];
+-		ncode += code.substring(curr, change.pos) + change.code;
++		ncode += code.substring(curr, change.pos) + change.coder();
+ 		curr = change.pos;
+ 	}
+ 	ncode += code.substring(curr);
+--- /dev/null
++++ b/test/cve-2023-29199.test.js
+@@ -0,0 +1,59 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++const assert = require('assert');
++const {VM} = require('..');
++
++// Regression test for CVE-2023-29199 (vm2 sandbox escape).
++//
++// The source transformer instruments sandboxed code with handleException()
++// calls so that host exceptions leaked into a catch clause are sanitized
++// before sandboxed code can read them. The upstream fix (3.9.16) removes the
++// insecure string post-processing in transformer.js that let an attacker
++// bypass handleException() and reach the host Function constructor
++// (see the public PoC: https://gist.github.com/leesh3288/f05730165799bf56d70391f3d9ea187c).
++//
++// These tests assert the sanitized behavior the fix guarantees: a host
++// exception caught inside the sandbox cannot be used to obtain the host
++// `process` object, while ordinary in-sandbox catch semantics keep working.
++describe('CVE-2023-29199', () => {
++	it('sanitizes host exceptions caught in a catch clause (no sandbox escape)', () => {
++		const vm = new VM();
++		// Provoke a genuine host exception (stack overflow) and attempt the
++		// escape primitive used by the public PoC: reach the Function
++		// constructor through the caught value and evaluate `return process`.
++		const code = `
++			function stack() { new Error().stack; stack(); }
++			let leaked = null;
++			try {
++				stack();
++			} catch (e) {
++				leaked = e;
++			}
++			(function() {
++				try {
++					return leaked.constructor.constructor('return process')().pid;
++				} catch (err) {
++					return 'blocked';
++				}
++			})();
++		`;
++		assert.strictEqual(vm.run(code), 'blocked', 'caught host exception must be sanitized and must not expose host process');
++	});
++
++	it('still allows normal catch behavior for in-sandbox errors', () => {
++		const vm = new VM();
++		const result = vm.run(`
++			let msg = null;
++			try {
++				throw new Error('boom');
++			} catch (e) {
++				msg = e.message;
++			}
++			msg;
++		`);
++		assert.strictEqual(result, 'boom', 'ordinary catch semantics must be preserved');
++	});
++});
+
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -90,7 +90,10 @@ const ThisProxy = Proxy;
+ const ThisWeakMap = WeakMap;
+ const {
+ 	get: thisWeakMapGet,
+-	set: thisWeakMapSet
++	set: thisWeakMapSet,
++	// SECURITY (GHSA-vwrp-x96c-mhwq): cached so the protected-host-object
++	// check cannot be subverted by attacker mutation of WeakMap.prototype.has.
++	has: thisWeakMapHas
+ } = ThisWeakMap.prototype;
+ const ThisMap = Map;
+ const thisMapGet = ThisMap.prototype.get;
+@@ -306,6 +309,49 @@ function createBridge(otherInit, registerProxy) {
+ 		weakMapSet: otherWeakMapSet
+ 	} = otherInit;
+ 
++	// SECURITY (GHSA-vwrp-x96c-mhwq): Identity set of every host-realm object
++	// that the sandbox must never be able to mutate. Populated at bridge init
++	// with every cached intrinsic prototype + corresponding constructor.
++	//
++	// Sandbox code that walks `__proto__` via a Buffer.apply chain (or any
++	// similar primitive) can surface one of these host intrinsics as the
++	// wrapped object of a bridge proxy. The BaseHandler write traps would
++	// otherwise forward the mutation into the real host object via
++	// otherReflectSet / otherReflectDefineProperty / otherReflectDeleteProperty /
++	// otherReflectPreventExtensions, bleeding attacker-controlled state into
++	// every host-realm object of that class -- full prototype pollution plus
++	// host DoS via preventExtensions.
++	//
++	// Enforced only on the sandbox->host direction (`!isHost`).
++	const protectedHostObjects = new ThisWeakMap();
++	function addProtectedHostObject(value) {
++		if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return;
++		try {
++			thisReflectApply(thisWeakMapSet, protectedHostObjects, [value, true]);
++		} catch (e) { /* best effort */ }
++	}
++	try {
++		const protoKeys = thisReflectOwnKeys(otherGlobalPrototypes);
++		for (let i = 0; i < protoKeys.length; i++) {
++			const p = otherGlobalPrototypes[protoKeys[i]];
++			addProtectedHostObject(p);
++			try {
++				const desc = otherSafeGetOwnPropertyDescriptor(p, 'constructor');
++				if (desc && !desc.get && !desc.set) addProtectedHostObject(desc.value);
++			} catch (e) { /* best effort */ }
++		}
++	} catch (e) { /* best effort */ }
++
++	function isProtectedHostObject(object) {
++		if (isHost) return false;
++		if (object === null || (typeof object !== 'object' && typeof object !== 'function')) return false;
++		try {
++			return thisReflectApply(thisWeakMapHas, protectedHostObjects, [object]) === true;
++		} catch (e) {
++			return false;
++		}
++	}
++
+ 	function thisOtherHasOwnProperty(object, key) {
+ 		// Note: object@other(safe) key@prim throws@this(unsafe)
+ 		try {
+@@ -446,6 +492,11 @@ function createBridge(otherInit, registerProxy) {
+ 		set(target, key, value, receiver) {
+ 			// Note: target@this(unsafe) key@prim value@this(unsafe) receiver@this(unsafe) throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
++			// SECURITY (GHSA-vwrp-x96c-mhwq): refuse sandbox-originated writes
++			// targeting any host-realm intrinsic prototype or constructor.
++			// Covers C1 (plain assignment), C2 (Reflect.set), and C5
++			// (Object.assign) because all of them funnel through this trap.
++			if (isProtectedHostObject(object)) throw new VMError(OPNA);
+ 			if (key === '__proto__' && !thisOtherHasOwnProperty(object, key)) {
+ 				return this.setPrototypeOf(target, value);
+ 			}
+@@ -550,6 +601,10 @@ function createBridge(otherInit, registerProxy) {
+ 		defineProperty(target, prop, desc) {
+ 			// Note: target@this(unsafe) prop@prim desc@this(unsafe) throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
++			// SECURITY (GHSA-vwrp-x96c-mhwq): refuse sandbox-originated
++			// defineProperty calls targeting any host-realm intrinsic
++			// prototype or constructor. Covers C3 (Object.defineProperty).
++			if (isProtectedHostObject(object)) throw new VMError(OPNA);
+ 			if (!thisReflectSetPrototypeOf(desc, null)) throw thisUnexpected();
+ 
+ 			desc = this.definePropertyDesc(target, prop, desc);
+@@ -603,6 +658,12 @@ function createBridge(otherInit, registerProxy) {
+ 		deleteProperty(target, prop) {
+ 			// Note: target@this(unsafe) prop@prim throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
++			// SECURITY (GHSA-vwrp-x96c-mhwq): refuse sandbox-originated
++			// property deletion targeting any host-realm intrinsic prototype
++			// or constructor. Covers C4 (delete hostProto.prop), which could
++			// otherwise remove `hasOwnProperty`, `toString`, etc. from every
++			// host object of that class.
++			if (isProtectedHostObject(object)) throw new VMError(OPNA);
+ 			try {
+ 				return otherReflectDeleteProperty(object, prop) === true;
+ 			} catch (e) { // @other(unsafe)
+@@ -649,6 +710,12 @@ function createBridge(otherInit, registerProxy) {
+ 		preventExtensions(target) {
+ 			// Note: target@this(unsafe) throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
++			// SECURITY (GHSA-vwrp-x96c-mhwq): refuse sandbox-originated
++			// preventExtensions on any host-realm intrinsic prototype or
++			// constructor. Without this the sandbox could permanently freeze
++			// host prototypes, breaking every subsequent host-side attempt
++			// to install or adjust properties on them -- a durable host DoS.
++			if (isProtectedHostObject(object)) throw new VMError(OPNA);
+ 			try {
+ 				if (!otherReflectPreventExtensions(object)) return false;
+ 			} catch (e) { // @other(unsafe)
+
+--- a/lib/nodevm.js
++++ b/lib/nodevm.js
+@@ -40,6 +40,9 @@ const {
+ const {
+ 	resolverFromOptions
+ } = require('./resolver-compat');
++const {
++	Resolver
++} = require('./resolver');
+ 
+ const objectDefineProperty = Object.defineProperty;
+ const objectDefineProperties = Object.defineProperties;
+@@ -213,6 +216,55 @@ class NodeVM extends VM {
+ 			sandbox
+ 		} = options;
+ 
++		// SECURITY (GHSA-m4wx-m65x-ghrr, supersedes GHSA-8hg8-63c5-gwmx):
++		// A truthy `nesting` injects a NESTING_OVERRIDE builtin that exposes
++		// `vm2` to the sandbox. When `requireOpts` is not a real require-config
++		// object, `resolverFromOptions` produces a resolver whose ONLY builtin
++		// is `vm2` — a pure escape primitive (sandbox does `require('vm2')`,
++		// builds an inner NodeVM with attacker-chosen `require` config, reaches
++		// `child_process` for host RCE).
++		//
++		// The guard mirrors the actual reachability of that insecure resolver
++		// on two axes:
++		//
++		// 1. `nesting` truthiness, not strict `=== true`. The override is gated
++		//    below by `nesting && NESTING_OVERRIDE`, which fires for ANY truthy
++		//    value (`1`, `'yes'`, `{}`, `[]`, etc.). The check must cover every
++		//    truthy `nesting` value the override gate accepts.
++		//
++		// 2. `requireOpts` must be an actual require-config object (or a
++		//    `Resolver` instance), not just "truthy". `resolverFromOptions`
++		//    destructures every primitive/function value to all-`undefined` and
++		//    falls into the same NESTING_OVERRIDE-only `if (!options)` branch as
++		//    falsy values do. The shapes that collapse to the insecure resolver:
++		//      - `require: false` / `undefined` / `null` / `0` / `''`
++		//          → falsy → `if (!options)` branch
++		//      - `require: true` / `1` / `'yes'` / `Symbol()` / `function(){}`
++		//          → truthy non-object → destructured to all-undefined →
++		//             same NESTING_OVERRIDE-only resolver
++		//    The documented escape hatch (a truthy `nesting` + an explicit
++		//    `require` config object, even `{}`) continues to work — a non-null
++		//    object counts as the developer's deliberate acknowledgment of the
++		//    tradeoff. A custom `Resolver` instance is also accepted.
++		const hasRealRequireConfig =
++			requireOpts instanceof Resolver
++			|| (typeof requireOpts === 'object' && requireOpts !== null);
++		if (nesting && !hasRealRequireConfig) {
++			throw new VMError(
++				'NodeVM `nesting` requires an explicit `require` config object. '
++				+ '`nesting` is an escape hatch that exposes `vm2` to the '
++				+ 'sandbox (sandbox code can `require(\'vm2\')` and construct nested '
++				+ 'VMs unconstrained by the outer config). With `require` set to '
++				+ 'anything other than a config object (`false`, omitted, `true`, '
++				+ 'a number, a string, a function), the resolver exposes ONLY '
++				+ '`vm2` — a pure escape primitive. To deny all requires, remove '
++				+ '`nesting`. To allow nested VMs, pass an explicit `require` '
++				+ 'config (e.g. `require: { builtin: [] }`) so the tradeoff is '
++				+ 'visible. See README "`nesting: true` is an escape hatch". '
++				+ 'Context: GHSA-m4wx-m65x-ghrr (supersedes GHSA-8hg8-63c5-gwmx).'
++			);
++		}
++
+ 		// Throw this early
+ 		if (sandbox && 'object' !== typeof sandbox) {
+ 			throw new VMError('Sandbox must be an object.');
+
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -436,6 +436,45 @@
+ 		// Contextify.connect(host.Promise.prototype.catch, Promise.prototype.catch);
+ 	}
+ 
++} else if (localPromise) {
++
++	// SECURITY (CVE-2026-47210): when async is allowed the sandbox keeps live Promises.
++	// Promise.prototype.then/catch/finally build their result promise via
++	// SpeciesConstructor(promise, %Promise%), which reads the receiver's attacker
++	// controllable `constructor` / `Symbol.species`. A sandbox Promise subclass can
++	// hijack that lookup so host internals invoke an attacker constructor with the
++	// promise resolving functions, escaping the sandbox. Force every species lookup
++	// back to the genuine host Promise before delegating to the native method.
++
++	const PromisePrototype = localPromise.prototype;
++
++	function resetPromiseSpecies(thiz) {
++		if (thiz === null || (typeof thiz !== 'object' && typeof thiz !== 'function')) return;
++		localReflectDefineProperty(thiz, 'constructor', {
++			__proto__: null,
++			value: localPromise,
++			writable: true,
++			enumerable: false,
++			configurable: true
++		});
++	}
++
++	const SpeciesSafeHandler = {
++		__proto__: null,
++		apply(target, thiz, args) {
++			resetPromiseSpecies(thiz);
++			return localReflectApply(target, thiz, args);
++		}
++	};
++
++	overrideWithProxy(PromisePrototype, 'then', PromisePrototype.then, SpeciesSafeHandler);
++	if (PromisePrototype.finally) {
++		overrideWithProxy(PromisePrototype, 'finally', PromisePrototype.finally, SpeciesSafeHandler);
++	}
++	if (PromisePrototype.catch) {
++		overrideWithProxy(PromisePrototype, 'catch', PromisePrototype.catch, SpeciesSafeHandler);
++	}
++
+ }
+ 
+ function readonly(other, mock) {
+--- /dev/null
++++ b/test/cve-2026-47210.test.js
+@@ -0,0 +1,44 @@
++'use strict';
++
++/*
++ * Regression test for CVE-2026-47210 (vm2 Promise species-constructor sandbox escape).
++ *
++ * When async is allowed, vm2 leaves sandbox Promises live. Promise.prototype
++ * .then/.catch/.finally build their result promise via
++ * SpeciesConstructor(promise, %Promise%), reading the receiver's attacker
++ * controllable `constructor` / `Symbol.species`. A malicious Promise subclass
++ * inside the sandbox could hijack that lookup so host internals invoke an
++ * attacker supplied constructor with the promise resolving functions, leaking
++ * host capabilities and escaping the sandbox. The fix forces the species lookup
++ * back to the genuine host Promise before delegating to the native method.
++ */
++
++const assert = require('assert');
++const {VM} = require('..');
++
++describe('CVE-2026-47210 Promise species-constructor escape', () => {
++	it('does not invoke an attacker-controlled species constructor from .then', () => {
++		const vm = new VM({allowAsync: true});
++		const escaped = vm.run(`
++			let leaked = false;
++			class Evil extends Promise {
++				static get [Symbol.species]() {
++					return function (executor) {
++						leaked = true;
++						return new Promise(executor);
++					};
++				}
++			}
++			const p = Evil.resolve(1);
++			try { p.then(() => {}); } catch (e) {}
++			leaked;
++		`);
++		assert.strictEqual(escaped, false, 'sandbox must not reach a hijacked Promise species constructor');
++	});
++
++	it('still allows normal promise chaining under allowAsync', async () => {
++		const vm = new VM({allowAsync: true});
++		const result = await vm.run('Promise.resolve(41).then(v => v + 1)');
++		assert.strictEqual(result, 42);
++	});
++});
+
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -98,6 +98,13 @@
+ const thisFunction = Function;
+ const thisFunctionBind = thisFunction.prototype.bind;
+ const thisArrayIsArray = Array.isArray;
++// SECURITY (CVE-2026-24118 / GHSA-grj5-jjm8-h35p): Cache the this-realm Array
++// constructor at module load time, BEFORE any sandbox code runs. Used as the safe
++// species-neutralized return value from the proxy get 'constructor' trap on host
++// arrays. Cached directly from `Array` so that prototype pollution attacks
++// (e.g. `Array.prototype.constructor = attackerFn` via cross-realm proto injection)
++// cannot redirect our defense to an attacker-controlled value.
++const thisArrayCtor = Array;
+ const thisErrorCaptureStackTrace = Error.captureStackTrace;
+ 
+ const thisSymbolToString = Symbol.prototype.toString;
+@@ -343,6 +350,148 @@
+ 		return true;
+ 	}
+ 
++	// SECURITY (CVE-2026-24118 / GHSA-grj5-jjm8-h35p): Array species self-return escape defense.
++	//
++	// V8's ArraySpeciesCreate (used by Array#map/filter/slice/concat/splice and the
++	// TypedArray equivalents) reads `this.constructor[Symbol.species]` DIRECTLY on the
++	// raw host object, completely bypassing our proxy traps. If an attacker installs a
++	// sandbox function `x` with `x[Symbol.species] = x` as a host array's `constructor`
++	// and then calls e.g. `r.map(f)` through the bridge, V8 calls `new x(len)` (which
++	// returns `r` itself) and stores mapped raw host values directly into `r` via
++	// CreateDataPropertyOrThrow -- bypassing the bridge entirely. The attacker then
++	// reads the raw host values back out of `r`, escaping the sandbox.
++	//
++	// Two-layer defense:
++	//   1. The get() trap short-circuits `constructor` on host arrays to the cached
++	//      this-realm Array constructor (thisArrayCtor), so reads through the proxy
++	//      cannot surface an attacker-controlled constructor.
++	//   2. The apply/construct traps neutralize the species channel on every host-realm
++	//      array reachable as `context` or as an argument by installing
++	//      `constructor = undefined` as an own data property before the host call, and
++	//      restoring the original state in a `finally`. Arrays whose species state
++	//      cannot be safely neutralized (non-configurable attacker constructor, or a
++	//      non-extensible array with no own constructor slot) are rejected with VMError.
++
++	// SECURITY: Sentinel tagging our saved-state records so we never confuse
++	// attacker-installed state with our own.
++	const SPECIES_NEUTRALIZED = {__proto__: null};
++
++	// SECURITY: Neutralize the ArraySpeciesCreate channel on a single host array.
++	// Returns an opaque saved-state record to pass to restoreArraySpeciesOn, or null
++	// if `arr` did not need neutralization. Throws VMError if the array's species
++	// state cannot be safely neutralized.
++	function neutralizeArraySpeciesOn(arr) {
++		// Only host-realm raw arrays need neutralization.
++		if (arr === null || typeof arr !== 'object') return null;
++		let isHostArray;
++		try {
++			// Array.isArray works cross-realm.
++			isHostArray = thisArrayIsArray(arr);
++		} catch (e) {
++			return null;
++		}
++		if (!isHostArray) return null;
++
++		// Capture original own descriptor (if any) before mutating.
++		let originalDesc;
++		try {
++			originalDesc = otherSafeGetOwnPropertyDescriptor(arr, 'constructor');
++		} catch (e) { // @other(unsafe)
++			throw thisFromOther(e);
++		}
++
++		// A non-configurable `constructor` cannot be safely shadowed/removed for the
++		// duration of the call. Reject unless it is the already-neutralized shape.
++		if (originalDesc && originalDesc.configurable === false) {
++			if (!(originalDesc.value === undefined && originalDesc.writable === false)) {
++				throw new VMError('Unsafe array constructor cannot be neutralized');
++			}
++			return null;
++		}
++
++		// A non-extensible array with no own `constructor` slot cannot receive our
++		// shadow; an attacker may have poisoned the inherited constructor. Reject.
++		let isExt;
++		try {
++			isExt = otherReflectIsExtensible(arr);
++		} catch (e) { // @other(unsafe)
++			throw thisFromOther(e);
++		}
++		if (!isExt && !originalDesc) {
++			throw new VMError('Unsafe non-extensible array passed across bridge');
++		}
++
++		// Install `constructor = undefined` as a data own property. ArraySpeciesCreate
++		// treats undefined as "use the default %Array%", producing a fresh plain array.
++		let defined;
++		try {
++			defined = otherReflectDefineProperty(arr, 'constructor', {
++				__proto__: null,
++				value: undefined,
++				writable: true,
++				enumerable: false,
++				configurable: true
++			});
++		} catch (e) { // @other(unsafe)
++			throw thisFromOther(e);
++		}
++		if (!defined) {
++			throw new VMError('Unsafe array state; cannot neutralize species');
++		}
++
++		return {
++			__proto__: null,
++			arr: arr,
++			originalDesc: originalDesc,
++			marker: SPECIES_NEUTRALIZED
++		};
++	}
++
++	// SECURITY: Restore the original `constructor` state on a host array after the
++	// guarded host call. Called from a `finally`; must not throw.
++	function restoreArraySpeciesOn(saved) {
++		if (!saved || saved.marker !== SPECIES_NEUTRALIZED) return;
++		const arr = saved.arr;
++		const originalDesc = saved.originalDesc;
++		try {
++			if (originalDesc) {
++				otherReflectDefineProperty(arr, 'constructor', originalDesc);
++			} else {
++				otherReflectDeleteProperty(arr, 'constructor');
++			}
++		} catch (e) {
++			// Swallow restore errors -- an inert (undefined constructor) array is
++			// strictly safer than leaving it unrestored, and this must not mask the
++			// primary error propagating out of the guarded call.
++		}
++	}
++
++	// SECURITY: Walk `context` and every element of `args`, neutralize species on each
++	// host array found, and return a flat list of saved-state records. The returned
++	// list must be passed to restoreArraySpeciesBatch in a `finally` block.
++	function neutralizeArraySpeciesBatch(context, args) {
++		const saved = [];
++		const c = neutralizeArraySpeciesOn(context);
++		if (c) saved[saved.length] = c;
++		if (args) {
++			const len = args.length | 0;
++			for (let i = 0; i < len; i++) {
++				const s = neutralizeArraySpeciesOn(args[i]);
++				if (s) saved[saved.length] = s;
++			}
++		}
++		return saved;
++	}
++
++	// SECURITY: Restore every host array in a saved list. Must not throw.
++	function restoreArraySpeciesBatch(savedList) {
++		if (!savedList) return;
++		const len = savedList.length | 0;
++		for (let i = 0; i < len; i++) {
++			restoreArraySpeciesOn(savedList[i]);
++		}
++	}
++
+ 	class BaseHandler extends SafeBase {
+ 
+ 		constructor(object) {
+@@ -411,6 +560,21 @@
+ 			const object = this.object; // @other(unsafe)
+ 			switch (key) {
+ 				case 'constructor': {
++					// SECURITY (CVE-2026-24118 / GHSA-grj5-jjm8-h35p): if the underlying
++					// object is a host-realm array, ALWAYS return the cached this-realm
++					// Array constructor. This neutralizes the species channel that V8's
++					// ArraySpeciesCreate reads via `this.constructor` during
++					// Array.prototype.{map,filter,slice,concat,splice,...}. Attackers who
++					// install a malicious `constructor` (directly, via defineProperty, via
++					// Object.assign, or via prototype injection) cannot leak it back into
++					// V8's species resolution, because this trap short-circuits to the
++					// safe cached Array. Reading thisArrayCtor (captured at module load)
++					// rather than proto.constructor also makes this prototype-pollution-proof.
++					let isArr = false;
++					try {
++						isArr = thisArrayIsArray(target);
++					} catch (e) {}
++					if (isArr) return thisArrayCtor;
+ 					const desc = otherSafeGetOwnPropertyDescriptor(object, key);
+ 					if (desc) return thisDefaultGet(this, object, key, desc);
+ 					const proto = thisReflectGetPrototypeOf(target);
+@@ -471,12 +635,22 @@
+ 			// Note: target@this(unsafe) context@this(unsafe) args@this(safe-array) throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
+ 			let ret; // @other(unsafe)
++			let savedSpecies = null; // SECURITY: CVE-2026-24118 / GHSA-grj5-jjm8-h35p
+ 			try {
+ 				context = otherFromThis(context);
+ 				args = otherFromThisArguments(args);
++				// SECURITY (CVE-2026-24118 / GHSA-grj5-jjm8-h35p): before invoking the
++				// host function, neutralize any attacker-installed constructor/Symbol.species
++				// channel on every host-realm array reachable as `context` or as a
++				// top-level argument. Restored in `finally`.
++				savedSpecies = neutralizeArraySpeciesBatch(context, args);
+ 				ret = otherReflectApply(object, context, args);
+ 			} catch (e) { // @other(unsafe)
+ 				throw thisFromOther(e);
++			} finally {
++				// SECURITY: restore the pre-call species state even if the host call
++				// threw. restoreArraySpeciesBatch is guaranteed not to throw.
++				restoreArraySpeciesBatch(savedSpecies);
+ 			}
+ 			return thisFromOther(ret);
+ 		}
+@@ -485,11 +659,19 @@
+ 			// Note: target@this(unsafe) args@this(safe-array) newTarget@this(unsafe) throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
+ 			let ret; // @other(unsafe)
++			let savedSpecies = null; // SECURITY: CVE-2026-24118 / GHSA-grj5-jjm8-h35p
+ 			try {
+ 				args = otherFromThisArguments(args);
++				// SECURITY (CVE-2026-24118 / GHSA-grj5-jjm8-h35p): constructors can
++				// internally invoke ArraySpeciesCreate on argument arrays (e.g.
++				// Array(arr) copies, typed array constructors, Promise.all on an
++				// iterable), so neutralize argument arrays before the call as well.
++				savedSpecies = neutralizeArraySpeciesBatch(null, args);
+ 				ret = otherReflectConstruct(object, args);
+ 			} catch (e) { // @other(unsafe)
+ 				throw thisFromOther(e);
++			} finally {
++				restoreArraySpeciesBatch(savedSpecies);
+ 			}
+ 			return thisFromOtherWithFactory(this.getFactory(), ret, thisFromOther(object));
+ 		}
+--- /dev/null
++++ b/test/cve-2026-24118.test.js
+@@ -0,0 +1,152 @@
++/**
++ * CVE-2026-24118 / GHSA-grj5-jjm8-h35p — Array species self-return sandbox escape.
++ *
++ * V8's ArraySpeciesCreate (invoked internally by Array.prototype.{map,filter,
++ * slice,concat,splice,...}) reads `this.constructor[Symbol.species]` directly on
++ * raw host objects, bypassing the bridge proxy traps. An attacker obtains a
++ * host-realm array `r`, installs a sandbox `constructor` whose [Symbol.species]
++ * returns `r` itself, then calls `r.map(f)` — causing V8 to write raw host values
++ * directly into a sandbox-visible array, escaping the bridge.
++ *
++ * Fix (lib/bridge.js): (1) the get trap returns a cached this-realm Array
++ * constructor for host arrays; (2) the apply/construct traps shadow
++ * `constructor = undefined` on every reachable host array before the host call and
++ * restore it in a finally; non-configurable/non-extensible attacker state is
++ * rejected with VMError.
++ *
++ * Replacement regression test authored for target 3.9.7 (upstream test/ghsa/... is
++ * not shipped in this version's target_tree). Grounded on the upstream repro.js.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const { VM } = require('../lib/main.js');
++
++// Common prelude: walk the prototype chain via ({}).__lookupGetter__ + Buffer.apply
++// to obtain the HOST Object constructor, then ho.entries({}) yields a host-realm
++// array — the primitive surface for the species attack.
++const PRELUDE = `
++	const g = ({}).__lookupGetter__;
++	const a = Buffer.apply;
++	const p = a.apply(g, [Buffer, ['__proto__']]);
++	const op = p.call(p.call(p.call(p.call(Buffer.of()))));
++	const ho = op.constructor; // host Object
++`;
++
++function assertBlocked(label, code) {
++	const vm = new VM();
++	let result;
++	let thrown = null;
++	try {
++		result = vm.run(PRELUDE + code);
++	} catch (e) {
++		thrown = e;
++	}
++	// 'BLOCKED'   -> attack threw inside the sandbox (caught by test code)
++	// 'NO_ESCAPE' -> attack completed but did NOT escape (fix worked silently)
++	// A bridge-level throw also counts as blocked.
++	if (thrown) return;
++	assert.ok(
++		result === 'BLOCKED' || result === 'NO_ESCAPE',
++		`[${label}] expected BLOCKED or NO_ESCAPE, got: ${JSON.stringify(result)}`
++	);
++}
++
++describe('CVE-2026-24118 (array species self-return escape)', function () {
++	it('blocks the raw species primitive (r.constructor = x + r.map writes into r)', function () {
++		assertBlocked('species-primitive', `
++			try {
++				const r = ho.entries({});
++				r.push(1, 2);
++				function x() { return r; }
++				x[Symbol.species] = x;
++				r.constructor = x;
++				const mapped = r.map(function (v) { return 'm' + v; });
++				if (mapped === r) 'ESCAPE-species-returned-self';
++				else if (r[0] !== 1) 'ESCAPE-r-was-mutated';
++				else 'NO_ESCAPE';
++			} catch (e) { 'BLOCKED' }
++		`);
++	});
++
++	it('blocks the Object.assign backdoor for installing constructor', function () {
++		assertBlocked('object-assign', `
++			try {
++				const r = ho.entries({});
++				r.push(1);
++				function x() { return r; }
++				x[Symbol.species] = x;
++				ho.assign(r, { constructor: x });
++				const mapped = r.map(function (v) { return 'm' + v; });
++				if (mapped === r) 'ESCAPE-assign-species-returned-self';
++				else 'NO_ESCAPE';
++			} catch (e) { 'BLOCKED' }
++		`);
++	});
++
++	it('rejects non-configurable attacker-installed constructor', function () {
++		assertBlocked('non-configurable', `
++			try {
++				const r = ho.entries({});
++				r.push(1);
++				function x() { return r; }
++				x[Symbol.species] = x;
++				ho.defineProperty(r, 'constructor', {
++					value: x, writable: false, enumerable: false, configurable: false
++				});
++				const mapped = r.map(function (v) { return 'm' + v; });
++				if (mapped === r) 'ESCAPE-nonconfig-species';
++				else 'NO_ESCAPE';
++			} catch (e) { 'BLOCKED' }
++		`);
++	});
++
++	it('blocks prototype-level constructor injection (intermediate proto)', function () {
++		assertBlocked('proto-level', `
++			try {
++				const r = ho.entries({});
++				r.push(1);
++				function x() { return r; }
++				x[Symbol.species] = x;
++				const fake = ho.create(Array.prototype);
++				fake.constructor = x;
++				ho.setPrototypeOf(r, fake);
++				const mapped = r.map(function (v) { return 'm' + v; });
++				if (mapped === r) 'ESCAPE-proto-species';
++				else 'NO_ESCAPE';
++			} catch (e) { 'BLOCKED' }
++		`);
++	});
++
++	it('blocks species attacks through filter and slice', function () {
++		assertBlocked('filter-slice', `
++			try {
++				const r = ho.entries({});
++				r.push(1, 2);
++				function x() { return r; }
++				x[Symbol.species] = x;
++				r.constructor = x;
++				const filtered = r.filter(function () { return true; });
++				const sliced = r.slice(0);
++				if (filtered === r || sliced === r) 'ESCAPE-filter-slice-species';
++				else 'NO_ESCAPE';
++			} catch (e) { 'BLOCKED' }
++		`);
++	});
++
++	it('blocks species attack on concat result', function () {
++		assertBlocked('concat', `
++			try {
++				const r = ho.entries({});
++				r.push(1);
++				function x() { return r; }
++				x[Symbol.species] = x;
++				r.constructor = x;
++				const concated = r.concat([2]);
++				if (concated === r) 'ESCAPE-concat-species';
++				else 'NO_ESCAPE';
++			} catch (e) { 'BLOCKED' }
++		`);
++	});
++});
+
+--- a/lib/resolver-compat.js
++++ b/lib/resolver-compat.js
+@@ -237,6 +237,19 @@
+ 		if (def) {
+ 			for (let i = 0; i < BUILTIN_MODULES.length; i++) {
+ 				const name = BUILTIN_MODULES[i];
++				// SECURITY (CVE-2026-47139 / GHSA-r9pm-gxmw-wv6p): Underscored
++				// builtins (_http_client, _http_server, _http_agent, _http_common,
++				// _http_incoming, _http_outgoing, _tls_common, _tls_wrap,
++				// _stream_*) are Node's private implementation modules backing
++				// http/https/tls/streams. They are listed by module.builtinModules
++				// but expose network primitives directly (_http_client.ClientRequest,
++				// _http_server.Server) and must NOT be reachable through the '*'
++				// wildcard, otherwise the documented
++				// `['*', '-http', '-https', '-net', '-tls']` "allow all except
++				// network" pattern silently leaks them (SSRF-class). Explicit
++				// opt-in (`builtin: ['_http_client']`) and mock/override still
++				// work via the branches below -- the wildcard alone is tightened.
++				if (name.charAt(0) === '_') continue;
+ 				if (builtinOpt.indexOf(`-${name}`) === -1) {
+ 					addDefaultBuiltin(builtins, name, vm);
+ 				}
+--- /dev/null
++++ b/test/cve-2026-47139.test.js
+@@ -0,0 +1,94 @@
++'use strict';
++
++/*
++ * Regression test for CVE-2026-47139 (GHSA-r9pm-gxmw-wv6p).
++ *
++ * Node exposes a parallel family of underscored builtins (_http_client,
++ * _http_server, _http_agent, _http_common, _http_incoming, _http_outgoing,
++ * _tls_common, _tls_wrap, _stream_*). They are the private implementation
++ * modules backing http/https/tls/streams -- undocumented, but present in
++ * require('module').builtinModules -- and they expose the network primitives
++ * directly (_http_client.ClientRequest, _http_server.Server).
++ *
++ * Pre-fix, `builtin: ['*', '-http', '-https', '-net', '-tls', ...]` (the
++ * documented "allow all except network" pattern) silently allowed every
++ * _http_* / _tls_* sibling, fully bypassing the embedder's network
++ * restriction (SSRF-class). The fix filters underscored builtins out of the
++ * '*' wildcard expansion in lib/resolver-compat.js while preserving explicit
++ * opt-in and mock/override registrations.
++ */
++
++const assert = require('assert');
++const {NodeVM} = require('../lib/main.js');
++
++const UNDERSCORED_NETWORK = [
++	'_http_agent',
++	'_http_client',
++	'_http_common',
++	'_http_incoming',
++	'_http_outgoing',
++	'_http_server',
++	'_tls_common',
++	'_tls_wrap'
++];
++
++function tryRequire(vm, name) {
++	return vm.run(`
++		try {
++			const m = require(${JSON.stringify(name)});
++			module.exports = {ok: true};
++		} catch (e) {
++			module.exports = {ok: false, message: e && e.message};
++		}
++	`, 'vm.js');
++}
++
++describe('CVE-2026-47139 -- underscored network builtins bypass via wildcard', () => {
++
++	it("`builtin: ['*']` does NOT expose _http_client", () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.strictEqual(tryRequire(vm, '_http_client').ok, false);
++	});
++
++	it("`builtin: ['*']` does NOT expose _http_server", () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.strictEqual(tryRequire(vm, '_http_server').ok, false);
++	});
++
++	it("`['*', '-http', '-https', '-net', '-tls']` leaks no _http_*/_tls_* sibling (canonical PoC)", () => {
++		const vm = new NodeVM({
++			require: {
++				builtin: ['*', '-http', '-https', '-net', '-dgram', '-tls', '-dns', '-http2'],
++				external: false
++			}
++		});
++		for (const name of UNDERSCORED_NETWORK) {
++			assert.strictEqual(tryRequire(vm, name).ok, false, `${name} must NOT load under network-excluded wildcard`);
++		}
++	});
++
++	it('underscored stream internals are also excluded from the wildcard', () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		for (const name of ['_stream_readable', '_stream_writable', '_stream_duplex', '_stream_transform']) {
++			assert.strictEqual(tryRequire(vm, name).ok, false, `${name} must NOT load under wildcard`);
++		}
++	});
++
++	it('non-underscored builtins still load under the wildcard', () => {
++		const vm = new NodeVM({require: {builtin: ['*'], external: false}});
++		assert.strictEqual(vm.run("module.exports = typeof require('fs').readFileSync", 'vm.js'), 'function');
++		assert.strictEqual(vm.run("module.exports = typeof require('path').join", 'vm.js'), 'function');
++	});
++
++	it('mock/override escape hatch is preserved for underscored names', () => {
++		const vm = new NodeVM({
++			require: {
++				builtin: ['*'],
++				external: false,
++				mock: {_http_client: {safe: 7}}
++			}
++		});
++		assert.strictEqual(vm.run("module.exports = require('_http_client').safe", 'vm.js'), 7);
++	});
++
++});
+
+--- a/lib/nodevm.js
++++ b/lib/nodevm.js
+@@ -210,7 +210,8 @@ class NodeVM extends VM {
+ 			argv,
+ 			env,
+ 			strict = false,
+-			sandbox
++			sandbox,
++			bufferAllocLimit
+ 		} = options;
+ 
+ 		// Throw this early
+@@ -218,7 +219,10 @@ class NodeVM extends VM {
+ 			throw new VMError('Sandbox must be an object.');
+ 		}
+ 
+-		super({__proto__: null, compiler: compiler, eval: allowEval, wasm});
++		// SECURITY (GHSA-6785-pvv7-mvg7 / GHSA-gmc2-2x9w-cgh9): forward
++		// bufferAllocLimit so embedders can cap single-shot host Buffer
++		// allocations from sandboxed NodeVM code.
++		super({__proto__: null, compiler: compiler, eval: allowEval, wasm, bufferAllocLimit});
+ 
+ 		// This is only here for backwards compatibility.
+ 		objectDefineProperty(this, 'options', {__proto__: null, value: {
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -48,9 +48,29 @@ const {
+ 	allowAsync,
+ 	GeneratorFunction,
+ 	AsyncFunction,
+-	AsyncGeneratorFunction
++	AsyncGeneratorFunction,
++	bufferAllocLimit
+ } = data;
+ 
++// SECURITY (GHSA-6785-pvv7-mvg7 / GHSA-gmc2-2x9w-cgh9): Buffer.alloc /
++// allocUnsafe / allocUnsafeSlow (and the deprecated Buffer(N) / new Buffer(N)
++// forms), plus Buffer.concat / Buffer.from(arrayLike) / Buffer.copyBytesFrom,
++// execute as a single synchronous host C++ allocation. V8's `timeout` cannot
++// interrupt them, so an attacker controlling the size argument can amplify a
++// small payload into hundreds of megabytes of host RSS, crashing the host
++// process in memory-constrained environments (Docker/K8s/Lambda). Cap every
++// allocation size before it reaches the host implementation. Cached in a const
++// so a sandbox-side prototype-pollution attempt cannot mutate it post-init.
++const localBufferAllocLimit = bufferAllocLimit;
++function checkBufferAllocLimit(size) {
++	// Match host Buffer.alloc semantics: it expects a number. Non-numeric
++	// values are passed through to host validation (it throws TypeError).
++	// Only enforce the cap on numbers actually large enough to trip it.
++	if (typeof size === 'number' && size > localBufferAllocLimit) {
++		throw new RangeError('Buffer allocation size ' + size + ' exceeds bufferAllocLimit ' + localBufferAllocLimit);
++	}
++}
++
+ const localWeakMapGet = LocalWeakMap.prototype.get;
+ 
+ function localUnexpected() {
+@@ -81,6 +101,8 @@ class BufferHandler extends ReadOnlyHandler {
+ 
+ 	apply(target, thiz, args) {
+ 		if (args.length > 0 && typeof args[0] === 'number') {
++			// SECURITY (GHSA-6785-pvv7-mvg7): deprecated Buffer(N) form. Cap before delegating to host.
++			checkBufferAllocLimit(args[0]);
+ 			return LocalBuffer.alloc(args[0]);
+ 		}
+ 		return localReflectApply(LocalBuffer.from, LocalBuffer, args);
+@@ -88,6 +110,8 @@ class BufferHandler extends ReadOnlyHandler {
+ 
+ 	construct(target, args, newTarget) {
+ 		if (args.length > 0 && typeof args[0] === 'number') {
++			// SECURITY (GHSA-6785-pvv7-mvg7): deprecated new Buffer(N) form. Cap before delegating.
++			checkBufferAllocLimit(args[0]);
+ 			return LocalBuffer.alloc(args[0]);
+ 		}
+ 		return localReflectApply(LocalBuffer.from, LocalBuffer, args);
+@@ -109,6 +133,19 @@ if (!localReflectDefineProperty(global, 'Buffer', {
+ 
+ addProtoMapping(LocalBuffer.prototype, host.Buffer.prototype, 'Uint8Array');
+ 
++// SECURITY (GHSA-6785-pvv7-mvg7): cap Buffer.alloc before delegating to host.
++// The captured `localBufferAllocOriginal` is the bridge proxy of host.Buffer.alloc;
++// `connect()` then registers our wrapper as the canonical sandbox-side alloc, so
++// future sandbox lookups of `Buffer.alloc` route through the cap.
++const localBufferAllocOriginal = LocalBuffer.alloc;
++function alloc(size, fill, encoding) {
++	checkBufferAllocLimit(size);
++	// Use raw Reflect.apply here — LocalBuffer is a frozen bridge proxy.
++	return localReflectApply(localBufferAllocOriginal, LocalBuffer, arguments);
++}
++
++connect(alloc, host.Buffer.alloc);
++
+ /**
+  *
+  * @param {*} size Size of new buffer
+@@ -116,6 +153,10 @@ addProtoMapping(LocalBuffer.prototype, host.Buffer.prototype, 'Uint8Array');
+  * @return {LocalBuffer}
+  */
+ function allocUnsafe(size) {
++	// SECURITY (GHSA-6785-pvv7-mvg7): cap before delegating. LocalBuffer.alloc
++	// is already capped via connect() above, but we check here too so a future
++	// refactor cannot silently re-open this path.
++	checkBufferAllocLimit(size);
+ 	return LocalBuffer.alloc(size);
+ }
+ 
+@@ -128,11 +169,155 @@ connect(allocUnsafe, host.Buffer.allocUnsafe);
+  * @return {LocalBuffer}
+  */
+ function allocUnsafeSlow(size) {
++	// SECURITY (GHSA-6785-pvv7-mvg7): cap before delegating (see allocUnsafe).
++	checkBufferAllocLimit(size);
+ 	return LocalBuffer.alloc(size);
+ }
+ 
+ connect(allocUnsafeSlow, host.Buffer.allocUnsafeSlow);
+ 
++// SECURITY (GHSA-gmc2-2x9w-cgh9): bufferAllocLimit bypass via Buffer.concat,
++// Buffer.from(arrayLike) and Buffer.copyBytesFrom.
++//
++// The cap above enforced the limit only at the alloc trio and the deprecated
++// Buffer(N) forms. `Buffer.concat(list, totalLength)`, `Buffer.from(arrayLike)`
++// and `Buffer.copyBytesFrom(view, offset, length)` reach the same synchronous
++// host C++ allocator without traversing the sandbox-side allocUnsafe wrapper,
++// so a single call allocates arbitrary host external memory that the embedder's
++// configured cap was supposed to prevent. Install capped sandbox-side wrappers,
++// connect()'d to their host equivalents, so every size-bearing host Buffer
++// factory consults checkBufferAllocLimit before the native allocation.
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): Buffer.concat(list, totalLength).
++// Node internally calls `Buffer.allocUnsafe(totalLength)` before iterating the
++// list. Cap either the supplied totalLength (if numeric) or the summed list
++// lengths (if omitted) before calling host.
++const localBufferConcatOriginal = LocalBuffer.concat;
++function concat(list, totalLength) {
++	if (arguments.length >= 2 && typeof totalLength === 'number') {
++		// Explicit totalLength path — host allocates exactly `totalLength`
++		// bytes regardless of the list contents. Cap before delegating.
++		checkBufferAllocLimit(totalLength);
++	} else if (list != null && typeof list === 'object' && typeof list.length === 'number') {
++		// Implicit totalLength path — host sums `list[i].length` and allocates
++		// the sum. Replicate that sum here so we cap the same value host would
++		// have used. Any non-numeric length skips the cap (host rejects with
++		// TypeError).
++		let sum = 0;
++		const n = list.length;
++		for (let i = 0; i < n; i++) {
++			const item = list[i];
++			if (item == null) continue;
++			const len = item.length;
++			if (typeof len === 'number' && len > 0) sum += len;
++		}
++		checkBufferAllocLimit(sum);
++	}
++	return localReflectApply(localBufferConcatOriginal, LocalBuffer, arguments);
++}
++
++connect(concat, host.Buffer.concat);
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): Buffer.from(arg, ...).
++// `Buffer.from({length: N})` triggers host's `fromArrayLike`, which calls
++// `Buffer.allocUnsafe(N)` before iterating indices 0..N — so a fake array-like
++// with a numeric `.length` materializes N host bytes from a tiny sandbox
++// payload. `Buffer.from(arrayBuffer, byteOffset, length)` allocates up to
++// `length` bytes. Cap both before delegating. Strings and primitives are exempt
++// because their byte length is bounded by the sandbox-side value itself.
++const localBufferFromOriginal = LocalBuffer.from;
++function bufferFrom(value, encodingOrOffset, length) {
++	if (typeof length === 'number') {
++		checkBufferAllocLimit(length);
++	}
++	if (value != null && typeof value === 'object' && typeof value.length === 'number') {
++		// `.length` may be a getter; reading it here mirrors what host's
++		// `fromArrayLike` does internally and surfaces any thrown error to the
++		// caller exactly as host would.
++		checkBufferAllocLimit(value.length);
++	}
++	return localReflectApply(localBufferFromOriginal, LocalBuffer, arguments);
++}
++
++connect(bufferFrom, host.Buffer.from);
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): Buffer.copyBytesFrom (Node 22+). It takes
++// (view, offset, length) and allocates `length` bytes (or view.length - offset
++// if length omitted). Sandbox controls `length`. Without a wrapper this is a
++// direct bypass parallel to Buffer.concat/totalLength.
++if (typeof host.Buffer.copyBytesFrom === 'function') {
++	const localBufferCopyBytesFromOriginal = host.Buffer.copyBytesFrom;
++	// eslint-disable-next-line no-inner-declarations
++	function copyBytesFrom(view, offset, length) {
++		if (typeof length === 'number') {
++			checkBufferAllocLimit(length);
++		} else if (view != null && typeof view === 'object' && typeof view.byteLength === 'number') {
++			const off = typeof offset === 'number' && offset > 0 ? offset : 0;
++			const derived = view.byteLength - off;
++			if (derived > 0) checkBufferAllocLimit(derived);
++		}
++		return localReflectApply(localBufferCopyBytesFromOriginal, LocalBuffer, arguments);
++	}
++	connect(copyBytesFrom, host.Buffer.copyBytesFrom);
++}
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): fail-closed enumeration of host.Buffer's own
++// keys. Every function-valued key that is NOT on the classified allowlist below
++// gets a sandbox-side throwing stub installed via connect(). A future host
++// method that allocates by sandbox-controlled size therefore cannot reach the
++// host allocator from sandbox code unless a maintainer explicitly classifies it
++// as SAFE (leave alone) or CAPPED (add a wrapper above).
++const BUFFER_STATIC_CLASSIFIED = {
++	__proto__: null,
++	// CAPPED — wrapped via connect() above.
++	alloc: true,
++	allocUnsafe: true,
++	allocUnsafeSlow: true,
++	concat: true,
++	from: true,
++	copyBytesFrom: true,
++	// SAFE — non-allocating inspectors/helpers, bounded by an already-allocated
++	// sandbox-side input, or metadata.
++	byteLength: true,
++	compare: true,
++	isBuffer: true,
++	isEncoding: true,
++	of: true,
++	length: true,
++	name: true,
++	poolSize: true,
++	prototype: true
++};
++
++{
++	const bufferOwnKeys = localObject.getOwnPropertyNames(host.Buffer);
++	for (let i = 0; i < bufferOwnKeys.length; i++) {
++		const key = bufferOwnKeys[i];
++		if (BUFFER_STATIC_CLASSIFIED[key]) continue;
++		let value;
++		try {
++			value = host.Buffer[key];
++		} catch (e) {
++			// Hostile getter (very unlikely on host.Buffer) — skip.
++			continue;
++		}
++		if (typeof value === 'function') {
++			// eslint-disable-next-line no-loop-func
++			(function (name) {
++				function bufferStaticUnknownNamed() {
++					throw new VMError(
++						'Buffer.' + name +
++						' has not been classified for bufferAllocLimit safety in this vm2 version (GHSA-gmc2-2x9w-cgh9). ' +
++						'See lib/setup-sandbox.js to classify it as SAFE or CAPPED.'
++					);
++				}
++				localObjectFreeze(bufferStaticUnknownNamed);
++				connect(bufferStaticUnknownNamed, value);
++			})(key);
++		}
++	}
++}
++
+ /**
+  * Replacement for Buffer inspect
+  *
+--- a/lib/vm.js
++++ b/lib/vm.js
+@@ -226,12 +226,20 @@ class VM extends EventEmitter {
+ 			timeout,
+ 			sandbox,
+ 			compiler = 'javascript',
+-			allowAsync: optAllowAsync = true
++			allowAsync: optAllowAsync = true,
++			bufferAllocLimit = Infinity
+ 		} = options;
+ 		const allowEval = options.eval !== false;
+ 		const allowWasm = options.wasm !== false;
+ 		const allowAsync = optAllowAsync && !options.fixAsync;
+ 
++		// SECURITY (GHSA-6785-pvv7-mvg7 / GHSA-gmc2-2x9w-cgh9): validate
++		// bufferAllocLimit. Reject negatives/NaN. Allow Infinity for callers
++		// who explicitly opt out of the cap.
++		if (typeof bufferAllocLimit !== 'number' || bufferAllocLimit < 0 || Number.isNaN(bufferAllocLimit)) {
++			throw new VMError('bufferAllocLimit must be a non-negative number.');
++		}
++
+ 		// Early error if sandbox is not an object.
+ 		if (sandbox && 'object' !== typeof sandbox) {
+ 			throw new VMError('Sandbox must be object.');
+@@ -262,7 +270,8 @@ class VM extends EventEmitter {
+ 
+ 		const data = {
+ 			__proto__: null,
+-			allowAsync
++			allowAsync,
++			bufferAllocLimit
+ 		};
+ 
+ 		if (getGeneratorFunctionScript) {
+new file mode 100644
+--- /dev/null
++++ b/test/cve-2026-47683.test.js
+@@ -0,0 +1,167 @@
++/* eslint-env mocha */
++'use strict';
++
++/**
++ * CVE-2026-47683 / GHSA-gmc2-2x9w-cgh9 — bufferAllocLimit bypass via
++ * Buffer.concat, Buffer.from(arrayLike) and Buffer.copyBytesFrom.
++ *
++ * The bufferAllocLimit cap wraps Buffer.alloc / allocUnsafe / allocUnsafeSlow
++ * and the deprecated Buffer(N) forms. Buffer.concat(list, totalLength),
++ * Buffer.from(arrayLike) and Buffer.copyBytesFrom reach the same synchronous
++ * host C++ allocator without traversing those wrappers, so a single call
++ * allocates arbitrary host memory that V8's timeout cannot interrupt. The fix
++ * routes every size-bearing host Buffer factory through checkBufferAllocLimit.
++ *
++ * Grounded on upstream test/ghsa/GHSA-gmc2-2x9w-cgh9/repro.js (commit
++ * 3ffb315512e634cf85c447375e85d6c83d00a4bd).
++ */
++
++const assert = require('assert');
++const {VM, NodeVM} = require('..');
++
++describe('CVE-2026-47683 (bufferAllocLimit bypass: concat + from arrayLike)', function () {
++	const CAP = 32 * 1024 * 1024;
++
++	describe('Buffer.concat(list, totalLength)', function () {
++		it('configured cap rejects Buffer.concat([], 100 MB)', function () {
++			const vm = new VM({bufferAllocLimit: CAP});
++			assert.throws(function () {
++				vm.run('Buffer.concat([Buffer.from("a")], 100 * 1024 * 1024)');
++			}, /Buffer allocation size \d+ exceeds bufferAllocLimit/);
++		});
++
++		it('small cap rejects 50 MB totalLength', function () {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run('Buffer.concat([Buffer.from("a")], 50 * 1024 * 1024).length');
++			}, /Buffer allocation size 52428800 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('NodeVM enforces bufferAllocLimit on Buffer.concat', function () {
++			const vm = new NodeVM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run('module.exports = Buffer.concat([Buffer.from("a")], 50 * 1024 * 1024).length');
++			}, /Buffer allocation size 52428800 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('cap rejects oversized sum even without explicit totalLength', function () {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run(`
++					const a = Buffer.alloc(512);
++					const b = Buffer.alloc(512);
++					const c = Buffer.alloc(512);
++					Buffer.concat([a, b, c]);
++				`);
++			}, /Buffer allocation size 1536 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('legitimate small Buffer.concat still works', function () {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.concat([Buffer.from("hello"), Buffer.from(" world")]).toString()'
++			);
++			assert.strictEqual(r, 'hello world');
++		});
++
++		it('Buffer.concat with explicit small totalLength works', function () {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.concat([Buffer.from("hello world")], 5).toString()'
++			);
++			assert.strictEqual(r, 'hello');
++		});
++
++		it('default (Infinity) bufferAllocLimit leaves Buffer.concat unrestricted', function () {
++			const r = new VM().run('Buffer.concat([Buffer.from("a"), Buffer.from("b")]).toString()');
++			assert.strictEqual(r, 'ab');
++		});
++	});
++
++	describe('Buffer.from(arrayLike)', function () {
++		it('configured cap rejects Buffer.from({length: 100 MB})', function () {
++			const vm = new VM({bufferAllocLimit: CAP});
++			assert.throws(function () {
++				vm.run('Buffer.from({length: 100 * 1024 * 1024})');
++			}, /Buffer allocation size \d+ exceeds bufferAllocLimit/);
++		});
++
++		it('small cap rejects 8 MB arrayLike length', function () {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run('Buffer.from({length: 8 * 1024 * 1024})');
++			}, /Buffer allocation size 8388608 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('NodeVM enforces bufferAllocLimit on Buffer.from arrayLike', function () {
++			const vm = new NodeVM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run('module.exports = Buffer.from({length: 8 * 1024 * 1024})');
++			}, /Buffer allocation size 8388608 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('cap applies to real arrays too', function () {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run('Buffer.from(new Array(2048))');
++			}, /Buffer allocation size 2048 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('legitimate Buffer.from(string) still works', function () {
++			const r = new VM({bufferAllocLimit: CAP}).run("Buffer.from('hello').length");
++			assert.strictEqual(r, 5);
++		});
++
++		it('legitimate Buffer.from(Buffer) still works (clone)', function () {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.from(Buffer.from("hello")).toString()'
++			);
++			assert.strictEqual(r, 'hello');
++		});
++
++		it('legitimate Buffer.from(Uint8Array) still works', function () {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.from(new Uint8Array([104, 105])).toString()'
++			);
++			assert.strictEqual(r, 'hi');
++		});
++
++		it('legitimate small Buffer.from(arrayLike) works', function () {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.from({length: 4, 0: 1, 1: 2, 2: 3, 3: 4}).length'
++			);
++			assert.strictEqual(r, 4);
++		});
++
++		it('Buffer.from(arrayLike) length=0 is allowed', function () {
++			const r = new VM({bufferAllocLimit: 1024}).run('Buffer.from({length: 0}).length');
++			assert.strictEqual(r, 0);
++		});
++
++		it('default (Infinity) bufferAllocLimit leaves Buffer.from(arrayLike) unrestricted', function () {
++			const r = new VM().run('Buffer.from({length: 4}).length');
++			assert.strictEqual(r, 4);
++		});
++	});
++
++	describe('Original alloc protections are preserved', function () {
++		it('Buffer.alloc still capped', function () {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run('Buffer.alloc(2048)');
++			}, /Buffer allocation size 2048 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('Buffer.allocUnsafe still capped', function () {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function () {
++				vm.run('Buffer.allocUnsafe(2048)');
++			}, /Buffer allocation size 2048 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('rejects invalid bufferAllocLimit option', function () {
++			assert.throws(function () {
++				// eslint-disable-next-line no-new
++				new VM({bufferAllocLimit: -1});
++			}, /bufferAllocLimit must be a non-negative number/);
++		});
++	});
++});
+
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -10,7 +10,6 @@
+ 	Proxy: LocalProxy,
+ 	WeakMap: LocalWeakMap,
+ 	Function: localFunction,
+-	Promise: localPromise,
+ 	eval: localEval
+ } = global;
+ 
+@@ -417,23 +416,122 @@
+  * Promise sanitization
+  */
+ 
+-if (localPromise && !allowAsync) {
++const globalPromise = global.Promise;
+ 
+-	const PromisePrototype = localPromise.prototype;
++if (globalPromise) {
+ 
+-	overrideWithProxy(PromisePrototype, 'then', PromisePrototype.then, AsyncErrorHandler);
+-	// This seems not to work, and will produce
+-	// UnhandledPromiseRejectionWarning: TypeError: Method Promise.prototype.then called on incompatible receiver [object Object].
+-	// This is likely caused since the host.Promise.prototype.then cannot use the VM Proxy object.
+-	// Contextify.connect(host.Promise.prototype.then, Promise.prototype.then);
++	// SECURITY (CVE-2026-44001 / GHSA-hw58-p9xv-2mjh): a sandbox
++	// `new Promise(executor)` whose executor synchronously triggers a
++	// host-realm error (e.g. `e.name = Symbol(); e.stack` — V8's
++	// FormatStackTrace coerces the Symbol-named name and throws a host
++	// TypeError while still *inside* the executor) became an unhandled
++	// rejection that propagated to the host process. On Node 15+ the default
++	// behaviour terminates the process on any unhandled rejection, so a single
++	// ~150-byte sandbox payload could crash the whole host service.
++	// `allowAsync: false` made it worse because `.catch` was blocked,
++	// guaranteeing the rejection stayed unhandled.
++	//
++	// Fix: replace the sandbox Promise with a subclass whose constructor
++	//   1. wraps the user-supplied executor in try/catch and reject()s with a
++	//      sandbox-realm value (routed through ensureThis, the same sanitiser
++	//      exposed as interanState.handleException), so a sandbox `.catch()`
++	//      sees a sandbox-realm value rather than a raw host TypeError; and
++	//   2. attaches a benign swallow tail (`then(undefined, noop)`) to every
++	//      sandbox-constructed promise so, even with no user `.catch()`, the
++	//      rejection is consumed and the host's unhandledRejection event never
++	//      fires. The tail uses the native then() captured before the
++	//      async-blocking override below installs, and a re-entrancy guard
++	//      prevents species-protocol recursion.
+ 
+-	if (PromisePrototype.finally) {
+-		overrideWithProxy(PromisePrototype, 'finally', PromisePrototype.finally, AsyncErrorHandler);
+-		// Contextify.connect(host.Promise.prototype.finally, Promise.prototype.finally);
++	// Cache the native then() before the async-blocking override below can
++	// replace it, so the swallow tail bypasses that override and cannot
++	// recurse through it.
++	const globalPromisePrototypeThen = globalPromise.prototype.then;
++	function localPromiseSwallow() { /* no-op consumer to silence unhandledRejection */ }
++	// Re-entrancy guard: attaching the swallow tail invokes the native then(),
++	// which constructs a downstream promise via the species protocol — that
++	// downstream construction recurses back into this constructor. Only the
++	// outermost user-visible promise needs a tail; internal species
++	// constructions are left bare.
++	let localPromiseInSwallowTail = false;
++
++	class localPromise extends globalPromise {
++		constructor(executor) {
++			// Preserve native semantics: a non-callable executor must cause
++			// the Promise constructor to throw a TypeError synchronously.
++			// Delegating to super(executor) keeps that check native.
++			if (typeof executor !== 'function') {
++				super(executor);
++				return;
++			}
++			super(function wrappedExecutor(resolve, reject) {
++				try {
++					return localReflectApply(executor, this, [resolve, reject]);
++				} catch (e) {
++					// ensureThis routes the thrown value through the sandbox
++					// realm so a sandbox `.catch()` handler sees a
++					// sandbox-realm value rather than a raw host TypeError.
++					reject(ensureThis(e));
++				}
++			});
++			// Even after the rejection is sanitised, if no sandbox code
++			// attaches a `.catch()` the host fires its unhandledRejection hook
++			// and (Node 15+ default) terminates the process. Attach a benign
++			// tail handler that consumes the rejection silently, using the
++			// original native then() (cached above) so it bypasses our own
++			// override and doesn't recurse.
++			if (!localPromiseInSwallowTail) {
++				localPromiseInSwallowTail = true;
++				try {
++					localReflectApply(globalPromisePrototypeThen, this, [undefined, localPromiseSwallow]);
++				} catch (e) {
++					// best effort — never let the swallow itself crash the executor
++				} finally {
++					localPromiseInSwallowTail = false;
++				}
++			}
++		}
+ 	}
+-	if (Promise.prototype.catch) {
+-		overrideWithProxy(PromisePrototype, 'catch', PromisePrototype.catch, AsyncErrorHandler);
+-		// Contextify.connect(host.Promise.prototype.catch, Promise.prototype.catch);
++
++	// V8 creates async-function promises using the realm's intrinsic Promise
++	// (globalPromise), not localPromise. Delegate instanceof to globalPromise
++	// so `x instanceof Promise` keeps working for those.
++	localReflectDefineProperty(localPromise, Symbol.hasInstance, {
++		__proto__: null,
++		value: function(instance) {
++			return instance instanceof globalPromise;
++		}
++	});
++
++	// Install the wrapping constructor as the sandbox's Promise so that
++	// sandbox `new Promise(...)` actually runs through it.
++	if (!localReflectDefineProperty(global, 'Promise', {
++		__proto__: null,
++		value: localPromise,
++		writable: true,
++		enumerable: false,
++		configurable: true
++	})) throw localUnexpected();
++
++	if (!allowAsync) {
++
++		const PromisePrototype = globalPromise.prototype;
++
++		overrideWithProxy(PromisePrototype, 'then', PromisePrototype.then, AsyncErrorHandler);
++		// This seems not to work, and will produce
++		// UnhandledPromiseRejectionWarning: TypeError: Method Promise.prototype.then called on incompatible receiver [object Object].
++		// This is likely caused since the host.Promise.prototype.then cannot use the VM Proxy object.
++		// Contextify.connect(host.Promise.prototype.then, Promise.prototype.then);
++
++		if (PromisePrototype.finally) {
++			overrideWithProxy(PromisePrototype, 'finally', PromisePrototype.finally, AsyncErrorHandler);
++			// Contextify.connect(host.Promise.prototype.finally, Promise.prototype.finally);
++		}
++		if (PromisePrototype.catch) {
++			overrideWithProxy(PromisePrototype, 'catch', PromisePrototype.catch, AsyncErrorHandler);
++			// Contextify.connect(host.Promise.prototype.catch, Promise.prototype.catch);
++		}
++
+ 	}
+ 
+ }
+--- /dev/null
++++ b/test/cve-2026-44001.test.js
+@@ -0,0 +1,98 @@
++'use strict';
++
++/**
++ * CVE-2026-44001 / GHSA-hw58-p9xv-2mjh
++ * Promise executor unhandled rejection escapes to host (DoS).
++ *
++ * Sandbox code creates a `Promise` whose executor synchronously triggers a
++ * host-realm error (e.g. `new Promise((r,j) => { var e = new Error();
++ * e.name = Symbol(); e.stack; })` — V8's FormatStackTrace coerces the
++ * Symbol-named `name` and throws). With no `.catch()` attached, the rejection
++ * propagated to the host process as an unhandled rejection; Node 15+ default
++ * behaviour terminates the process. `allowAsync: false` made it worse because
++ * the sandbox `.catch` was blocked, guaranteeing the rejection went unhandled.
++ *
++ * Fix: the sandbox Promise is replaced with a subclass whose constructor wraps
++ * the user executor in try/catch (rejecting with a sandbox-realm value) and
++ * attaches a benign swallow tail so the host's unhandledRejection never fires.
++ *
++ * Grounded on the upstream regression test
++ * test/ghsa/GHSA-hw58-p9xv-2mjh/repro.js from fix commit 6bbfbb37.
++ */
++
++const assert = require('assert');
++const {VM} = require('../lib/main.js');
++
++describe('CVE-2026-44001 (Promise executor unhandled rejection DoS)', () => {
++	it('Symbol-named Error stack throw inside executor produces no host unhandled rejection', done => {
++		const captured = [];
++		function handler(reason) {
++			captured.push(reason);
++		}
++		process.on('unhandledRejection', handler);
++		new VM({timeout: 5000, allowAsync: false}).run(`
++			new Promise(function(r, j) {
++				var e = new Error();
++				e.name = Symbol();
++				e.stack;
++			});
++		`);
++		setImmediate(() => {
++			process.off('unhandledRejection', handler);
++			assert.strictEqual(
++				captured.length,
++				0,
++				'host should not see unhandled rejection; got: ' + (captured[0] && captured[0].message)
++			);
++			done();
++		});
++	});
++
++	it('plain executor throw is also swallowed', done => {
++		const captured = [];
++		function handler(reason) {
++			captured.push(reason);
++		}
++		process.on('unhandledRejection', handler);
++		new VM({timeout: 5000, allowAsync: false}).run(`new Promise(function(r, j) { throw new Error('boom'); });`);
++		setImmediate(() => {
++			process.off('unhandledRejection', handler);
++			assert.strictEqual(captured.length, 0, 'plain throw must not produce host unhandled rejection');
++			done();
++		});
++	});
++
++	it('sandbox-side .catch still observes the (sanitised) rejection', () => {
++		const r = new VM({timeout: 5000}).run(`
++			new Promise(function(r, j) {
++				throw new Error('boom-observed');
++			}).catch(function(e) {
++				return String(e && e.message || e);
++			});
++		`);
++		return r.then(observed => {
++			assert.ok(
++				typeof observed === 'string' && /boom-observed/.test(observed),
++				'sandbox .catch did not observe the rejection; got: ' + observed
++			);
++		});
++	});
++
++	it('non-callable executor still throws TypeError synchronously (native semantics preserved)', () => {
++		const r = new VM().run(`
++			let threw = null;
++			try { new Promise(undefined); } catch (e) { threw = e && e.constructor && e.constructor.name; }
++			threw;
++		`);
++		assert.strictEqual(r, 'TypeError', 'non-callable executor must still throw TypeError; got: ' + r);
++	});
++
++	it('resolved-path .then(onFulfilled) still works (regression)', () => {
++		const r = new VM().run(`
++			new Promise(function(r) { r(42); }).then(function(v) { return v + 1; });
++		`);
++		return r.then(v => {
++			assert.strictEqual(v, 43);
++		});
++	});
++});
+
 --- a/lib/bridge.js
 +++ b/lib/bridge.js
 @@ -449,6 +449,30 @@
@@ -147,35 +1756,9 @@
 +	});
 +});
 
---- a/lib/nodevm.js
-+++ b/lib/nodevm.js
-@@ -210,7 +210,10 @@ class NodeVM extends VM {
- 			argv,
- 			env,
- 			strict = false,
--			sandbox
-+			sandbox,
-+			timeout,
-+			allowAsync,
-+			bufferAllocLimit
- 		} = options;
- 
- 		// Throw this early
-@@ -218,7 +221,10 @@ class NodeVM extends VM {
- 			throw new VMError('Sandbox must be an object.');
- 		}
- 
--		super({__proto__: null, compiler: compiler, eval: allowEval, wasm});
-+		// SECURITY (GHSA-6785-pvv7-mvg7 / GHSA-v836-6xw4-9cx3): forward bufferAllocLimit
-+		// so embedders using NodeVM can opt into the cap. Also forward timeout / allowAsync
-+		// which were previously silently dropped by the super() call.
-+		super({__proto__: null, compiler: compiler, eval: allowEval, wasm, timeout, allowAsync, bufferAllocLimit});
- 
- 		// This is only here for backwards compatibility.
- 		objectDefineProperty(this, 'options', {__proto__: null, value: {
 --- a/lib/setup-sandbox.js
 +++ b/lib/setup-sandbox.js
-@@ -21,6 +21,7 @@ const {
+@@ -20,6 +20,7 @@
  const {
  	getPrototypeOf: localReflectGetPrototypeOf,
  	apply: localReflectApply,
@@ -183,78 +1766,53 @@
  	deleteProperty: localReflectDeleteProperty,
  	has: localReflectHas,
  	defineProperty: localReflectDefineProperty,
-@@ -48,9 +49,27 @@ const {
- 	allowAsync,
- 	GeneratorFunction,
- 	AsyncFunction,
--	AsyncGeneratorFunction
-+	AsyncGeneratorFunction,
-+	bufferAllocLimit
- } = data;
+@@ -317,6 +318,251 @@
+ 	}
+ }
  
-+// SECURITY (GHSA-6785-pvv7-mvg7): synchronous host allocation primitives
-+// (Buffer.alloc / allocUnsafe / allocUnsafeSlow and, per GHSA-v836-6xw4-9cx3,
-+// the ArrayBuffer / TypedArray / WebAssembly.Memory intrinsics) execute as a
-+// single host C++ allocation that V8's `timeout` cannot interrupt. An attacker
-+// controlling the size argument can amplify a small payload into gigabytes of
-+// host RSS, crashing the host process in memory-constrained environments. Cap
-+// every allocation size before it reaches the host implementation. Cached in a
-+// const so a sandbox-side prototype-pollution attempt cannot mutate it post-init.
-+const localBufferAllocLimit = bufferAllocLimit;
-+function checkBufferAllocLimit(size) {
-+	// Only enforce the cap on numbers actually large enough to trip it. Non-numeric
-+	// values are passed through to host validation (it throws TypeError).
-+	if (typeof size === 'number' && size > localBufferAllocLimit) {
-+		throw new RangeError('Buffer allocation size ' + size + ' exceeds bufferAllocLimit ' + localBufferAllocLimit);
-+	}
-+}
-+
- const localWeakMapGet = LocalWeakMap.prototype.get;
- 
- function localUnexpected() {
-@@ -133,6 +152,281 @@ function allocUnsafeSlow(size) {
- 
- connect(allocUnsafeSlow, host.Buffer.allocUnsafeSlow);
- 
-+// SECURITY (GHSA-v836-6xw4-9cx3): close the bufferAllocLimit bypass class.
++// SECURITY (GHSA-v836-6xw4-9cx3): close the memory-exhaustion DoS class.
 +//
-+// The GHSA-6785 cap above only wraps the `Buffer.*` family, but `ArrayBuffer`,
-+// `SharedArrayBuffer`, and every TypedArray constructor allocate host
-+// backing-store memory through the SAME synchronous, timeout-immune V8 C++ path
-+// (`ArrayBuffer::NewBackingStore` -> `ArrayBufferAllocator::Allocate` ->
-+// `calloc`). `WebAssembly.Memory` is the same primitive in 64 KiB pages. None of
-+// these are intercepted by `checkBufferAllocLimit`, so a single ~200-byte
++// `ArrayBuffer`, `SharedArrayBuffer`, every TypedArray constructor, and
++// `WebAssembly.Memory` allocate host backing-store memory through the SAME
++// synchronous, timeout-immune V8 C++ path (`ArrayBuffer::NewBackingStore` ->
++// `ArrayBufferAllocator::Allocate` -> `calloc`). `timeout` only fires between
++// bytecodes and cannot preempt a single native allocation, so a ~200-byte
 +// sandbox payload (`new ArrayBuffer(1<<30)`) amplifies into gigabytes of host
-+// RSS in one uninterruptible allocation — identical to the Buffer.alloc DoS.
++// RSS in one uninterruptible call and can OOM-kill the host process.
 +//
-+// Fix: when a finite cap is configured, replace each sandbox-realm allocation
-+// constructor with a `construct`-trapping Proxy that runs `checkBufferAllocLimit`
-+// on the requested byte count BEFORE the native allocation, and pin every
-+// `prototype.constructor` back-reference to the wrapper so the original uncapped
-+// intrinsic cannot be recovered via a constructor walk such as
-+// `new Uint8Array(0).buffer.constructor`. The Proxy forwards `prototype`,
-+// `[Symbol.species]`, and `[[Prototype]]` to the original, so `instanceof`,
-+// species-derived construction (slice/map/subarray), and subclassing keep working.
++// Fix: when a finite `bufferAllocLimit` is configured, replace each
++// sandbox-realm allocation constructor with a `construct`-trapping Proxy that
++// runs `checkBufferAllocLimit` on the ToIndex-coerced byte count BEFORE the
++// native allocation, and pin every `prototype.constructor` back-reference to
++// the wrapper so the original uncapped intrinsic cannot be recovered via a
++// constructor walk such as `new Uint8Array(0).buffer.constructor`. The Proxy
++// forwards `prototype`, `[Symbol.species]`, and `[[Prototype]]` to the
++// original, so `instanceof`, species-derived construction, and subclassing
++// keep working.
 +//
 +// Gated on a finite limit: with the default `bufferAllocLimit: Infinity` the
-+// native intrinsics are left completely untouched — zero behavioural or identity
-+// change for embedders who have not opted into the cap (matches GHSA-6785's
-+// non-breaking, opt-in semantics).
-+if (localBufferAllocLimit !== Infinity) {
-+	installAllocationCaps();
++// native intrinsics are left completely untouched — zero behavioural or
++// identity change for embedders who have not opted into the cap.
++if (typeof localBufferAllocLimit === 'number' && localBufferAllocLimit !== Infinity) {
++	installAllocationCaps(localBufferAllocLimit);
 +}
 +
-+function installAllocationCaps() {
-+	// SECURITY (GHSA-v836-6xw4-9cx3): the native constructors size their
-+	// allocation with ToIndex(arg), i.e. ToNumber first — so a length supplied
-+	// as a string ("209715200"), an object with `valueOf` / `Symbol.toPrimitive`,
-+	// etc. is coerced to a large number by V8. A `typeof === 'number'` guard
-+	// would wave all of those through. `coerceAllocMagnitude` mirrors the
-+	// ToNumber step so the cap measures the SAME magnitude V8 will allocate.
-+	// Values that cannot yield a large positive allocation collapse to 0 (the
-+	// native constructor still applies its own validation/throws); Symbols and
-+	// BigInts throw under unary `+` and are caught — for those the native call
-+	// throws before allocating, so 0 is safe.
++function installAllocationCaps(limit) {
++	function checkBufferAllocLimit(bytes) {
++		if (bytes > limit) {
++			throw new RangeError('Buffer allocation limit exceeded.');
++		}
++	}
++
++	// The native constructors size their allocation with ToIndex(arg), i.e.
++	// ToNumber first — so a length supplied as a string ("209715200"), an object
++	// with `valueOf` / `Symbol.toPrimitive`, etc. is coerced to a large number by
++	// V8. A `typeof === 'number'` guard would wave all of those through.
++	// `coerceAllocMagnitude` mirrors the ToNumber step so the cap measures the
++	// SAME magnitude V8 will allocate. Values that cannot yield a large positive
++	// allocation collapse to 0 (the native constructor still applies its own
++	// validation/throws); Symbols and BigInts throw under unary `+` and are
++	// caught — for those the native call throws before allocating, so 0 is safe.
 +	function coerceAllocMagnitude(value) {
 +		let n;
 +		try {
@@ -262,7 +1820,6 @@
 +		} catch (e) {
 +			return 0;
 +		}
-+		// NaN (n !== n) or negative => no large allocation to cap here.
 +		if (n !== n || n < 0) return 0;
 +		return n;
 +	}
@@ -271,39 +1828,31 @@
 +		return value !== null && (typeof value === 'object' || typeof value === 'function');
 +	}
 +
-+	// SECURITY (GHSA-v836-6xw4-9cx3): the magnitude must be read EXACTLY ONCE.
-+	// `checkBufferAllocLimit(computeBytes(args))` followed by
-+	// `Reflect.construct(target, args)` reads any `valueOf` / accessor twice —
-+	// a getter returning small-then-large slips the real (large) value past the
-+	// cap (TOCTOU). The construct traps below therefore canonicalize every
-+	// object-valued size input to the primitive number the cap checked, and hand
-+	// the native constructor THAT primitive, so check-time and alloc-time observe
-+	// identical values. Pure-primitive inputs are immutable (no TOCTOU) and pass
-+	// through untouched, preserving exact native semantics (e.g. BigInt throws).
++	// The magnitude must be read EXACTLY ONCE. `checkBufferAllocLimit(compute(args))`
++	// followed by `construct(target, args)` reads any `valueOf` / accessor twice —
++	// a getter returning small-then-large slips the real (large) value past the cap
++	// (TOCTOU). The construct traps below canonicalize every object-valued size
++	// input to the primitive the cap checked, and hand the native constructor THAT
++	// primitive, so check-time and alloc-time observe identical values.
 +
-+	// Install `value` as the sandbox global `name`, matching the native global
-+	// property attributes { writable, !enumerable, configurable }.
 +	function defineGlobalCtor(name, value) {
 +		localReflectDefineProperty(global, name, {
 +			__proto__: null,
 +			value: value,
 +			writable: true,
 +			enumerable: false,
-+			configurable: true,
++			configurable: true
 +		});
 +	}
 +
-+	// SECURITY (GHSA-v836-6xw4-9cx3): pin the prototype back-reference to the
-+	// capped proxy so the original uncapped intrinsic cannot be recovered via a
-+	// constructor walk (`new Uint8Array(0).buffer.constructor`). Native
-+	// attributes are { writable, !enumerable, configurable }.
 +	function pinConstructor(prototype, capProxy) {
++		if (!prototype) return;
 +		localReflectDefineProperty(prototype, 'constructor', {
 +			__proto__: null,
 +			value: capProxy,
 +			writable: true,
 +			enumerable: false,
-+			configurable: true,
++			configurable: true
 +		});
 +	}
 +
@@ -324,7 +1873,7 @@
 +				let maxMag = 0;
 +				const options = args.length > 1 ? args[1] : undefined;
 +				if (options !== null && typeof options === 'object') {
-+					const rawMax = options.maxByteLength; // read accessor exactly once
++					const rawMax = options.maxByteLength;
 +					if (rawMax !== undefined) {
 +						maxPresent = true;
 +						maxMag = coerceAllocMagnitude(rawMax);
@@ -332,17 +1881,14 @@
 +					}
 +				}
 +				checkBufferAllocLimit(capBytes);
-+				// Rebuild args from the canonical magnitudes when an object-valued
-+				// length or any maxByteLength option was involved (the TOCTOU-capable
-+				// shapes); pure-primitive non-resizable calls pass through untouched.
 +				if (isObjectLike(rawLen) || maxPresent) {
 +					const finalLen = isObjectLike(rawLen) ? lenMag : rawLen;
 +					args = maxPresent
-+						? [finalLen, { __proto__: null, maxByteLength: maxMag }]
++						? [finalLen, {__proto__: null, maxByteLength: maxMag}]
 +						: [finalLen];
 +				}
 +				return localReflectConstruct(target, args, newTarget === capProxy ? OriginalCtor : newTarget);
-+			},
++			}
 +		});
 +		pinConstructor(OriginalCtor.prototype, capProxy);
 +		return capProxy;
@@ -351,18 +1897,14 @@
 +	// TypedArray. Two allocating shapes carry an attacker-controlled size:
 +	//   (1) `new TA(N)` — primitive length, ToIndex(N) * BYTES_PER_ELEMENT bytes.
 +	//   (2) `new TA(arrayLike)` — object with a `length` property; V8 reads
-+	//       LengthOfArrayLike and allocates that many elements in one shot
-+	//       (`new Uint8Array({length: 1<<30})`).
++	//       LengthOfArrayLike and allocates that many elements in one shot.
 +	// The (buffer[, offset[, len]]) view form views an existing buffer and the
 +	// iterable form is bounded by interruptible JS iteration — neither is a
-+	// single-shot amplifier. We do NOT classify the object (a spoofed
-+	// `Symbol.toStringTag` could lie): instead we simply cap `arg0.length`. A real
-+	// ArrayBuffer/SharedArrayBuffer has no `length` own/inherited property
-+	// (coerces to 0 → no false positive); an array-like exposes its element count;
-+	// an existing TypedArray source reports a length already ≤ the cap. The
-+	// primitive path (1) is immutable (no TOCTOU). A hostile `length` *accessor*
-+	// on an array-like remains a documented residual; the common data-property
-+	// amplifier is fully capped.
++	// single-shot amplifier. We cap `arg0.length`: a real ArrayBuffer has no
++	// `length` property (coerces to 0 → no false positive); an array-like exposes
++	// its element count. The primitive path (1) is immutable (no TOCTOU). A
++	// hostile `length` *accessor* on an array-like is a documented residual; the
++	// common data-property amplifier is fully capped.
 +	function capTypedArray(OriginalCtor, bytesPerElement) {
 +		const capProxy = new LocalProxy(OriginalCtor, {
 +			__proto__: null,
@@ -371,13 +1913,15 @@
 +				const sizeSource = isObjectLike(rawLen) ? rawLen.length : rawLen;
 +				checkBufferAllocLimit(coerceAllocMagnitude(sizeSource) * bytesPerElement);
 +				return localReflectConstruct(target, args, newTarget === capProxy ? OriginalCtor : newTarget);
-+			},
++			}
 +		});
 +		pinConstructor(OriginalCtor.prototype, capProxy);
 +		return capProxy;
 +	}
 +
-+	defineGlobalCtor('ArrayBuffer', capArrayBuffer(global.ArrayBuffer));
++	if (typeof global.ArrayBuffer === 'function') {
++		defineGlobalCtor('ArrayBuffer', capArrayBuffer(global.ArrayBuffer));
++	}
 +	if (typeof global.SharedArrayBuffer === 'function') {
 +		defineGlobalCtor('SharedArrayBuffer', capArrayBuffer(global.SharedArrayBuffer));
 +	}
@@ -386,7 +1930,7 @@
 +		'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
 +		'Int16Array', 'Uint16Array', 'Float16Array',
 +		'Int32Array', 'Uint32Array', 'Float32Array',
-+		'Float64Array', 'BigInt64Array', 'BigUint64Array',
++		'Float64Array', 'BigInt64Array', 'BigUint64Array'
 +	];
 +	for (let i = 0; i < typedArrayNames.length; i++) {
 +		const name = typedArrayNames[i];
@@ -397,18 +1941,17 @@
 +		defineGlobalCtor(name, capTypedArray(Ctor, Ctor.BYTES_PER_ELEMENT));
 +	}
 +
-+	// SECURITY (GHSA-v836-6xw4-9cx3, defense-in-depth): WebAssembly.Memory commits
-+	// host pages (64 KiB each) through the same backing-store path; `initial` is
-+	// attacker-controlled and `grow()` extends the commitment incrementally. Cap
-+	// the initial reservation at construction and bound cumulative growth in
-+	// `grow()`. `maximum` only reserves virtual address space (not RSS), so it is
-+	// not capped here. WebAssembly.Memory exists regardless of the `wasm` option.
++	// WebAssembly.Memory commits host pages (64 KiB each) through the same
++	// backing-store path; `initial` is attacker-controlled and `grow()` extends
++	// the commitment incrementally. Cap the initial reservation at construction
++	// and bound cumulative growth in `grow()`. `maximum` only reserves virtual
++	// address space (not RSS), so it is not capped here.
 +	if (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Memory === 'function') {
 +		const WASM_PAGE_BYTES = 65536;
 +		const OriginalMemory = WebAssembly.Memory;
 +		const memoryProto = OriginalMemory.prototype;
-+		const originalGrow = memoryProto.grow;
-+		const memoryBufferDescriptor = localReflectGetOwnPropertyDescriptor(memoryProto, 'buffer');
++		const originalGrow = memoryProto ? memoryProto.grow : undefined;
++		const memoryBufferDescriptor = memoryProto ? localReflectGetOwnPropertyDescriptor(memoryProto, 'buffer') : undefined;
 +
 +		const memoryCapProxy = new LocalProxy(OriginalMemory, {
 +			__proto__: null,
@@ -417,30 +1960,18 @@
 +				let pages = 0;
 +				let initialPresent = false;
 +				if (descriptor !== null && typeof descriptor === 'object') {
-+					const rawInitial = descriptor.initial; // read accessor exactly once
++					const rawInitial = descriptor.initial;
 +					if (rawInitial !== undefined) {
 +						initialPresent = true;
 +						pages = coerceAllocMagnitude(rawInitial);
 +					}
 +				}
-+				// SECURITY (GHSA-v836-6xw4-9cx3): cap the initial committed bytes.
-+				// `initial` is coerced via ToNumber by V8 (string / valueOf / accessor),
-+				// so measure the coerced magnitude, then hand V8 a descriptor whose
-+				// `initial` is that exact primitive — a toggling `initial` accessor
-+				// cannot read small here and large inside V8 (TOCTOU). `maximum`
-+				// only reserves virtual address space (not RSS) and incremental
-+				// commitment via `grow()` is separately bounded below, so it is
-+				// preserved verbatim.
 +				checkBufferAllocLimit(pages * WASM_PAGE_BYTES);
 +				if (initialPresent) {
-+					const rebuilt = { __proto__: null, initial: pages };
-+					// COMPAT: forward `maximum` / `shared` only when the caller
-+					// actually supplied them. Node 8's V8 does not treat an explicit
-+					// `maximum: undefined` as an absent key -- it coerces it to 0 and
-+					// then rejects the descriptor for having `maximum` below
-+					// `initial`, which would break every capped Memory construction
-+					// on that runtime. Each is still read exactly once, so the
-+					// TOCTOU canonicalization above is preserved.
++					const rebuilt = {__proto__: null, initial: pages};
++					// COMPAT: forward `maximum` / `shared` only when supplied; Node 8
++					// coerces an explicit `maximum: undefined` to 0 and rejects the
++					// descriptor. Each is read exactly once, preserving TOCTOU safety.
 +					const rawMaximum = descriptor.maximum;
 +					if (rawMaximum !== undefined) rebuilt.maximum = rawMaximum;
 +					const rawShared = descriptor.shared;
@@ -448,17 +1979,16 @@
 +					args = [rebuilt];
 +				}
 +				return localReflectConstruct(target, args, newTarget === memoryCapProxy ? OriginalMemory : newTarget);
-+			},
++			}
 +		});
 +
 +		if (typeof originalGrow === 'function' && memoryBufferDescriptor && typeof memoryBufferDescriptor.get === 'function') {
 +			const memoryBufferGetter = memoryBufferDescriptor.get;
 +			const cappedGrow = function grow(delta) {
-+				// SECURITY (GHSA-v836-6xw4-9cx3): bound the post-grow total. Read
-+				// current size off the live backing buffer; a non-Memory `this`
-+				// makes the getter throw, preserving native semantics. `delta` is
-+				// coerced once and the canonical primitive is forwarded to the native
-+				// grow so a `valueOf`/accessor cannot read small here and large in V8.
++				// Bound the post-grow total. Read current size off the live backing
++				// buffer; a non-Memory `this` makes the getter throw, preserving
++				// native semantics. `delta` is coerced once and the canonical
++				// primitive forwarded to the native grow (TOCTOU-safe).
 +				const currentBuffer = localReflectApply(memoryBufferGetter, this, []);
 +				const currentBytes = currentBuffer ? currentBuffer.byteLength : 0;
 +				const addedPages = coerceAllocMagnitude(delta);
@@ -470,23 +2000,17 @@
 +				value: cappedGrow,
 +				writable: true,
 +				enumerable: false,
-+				configurable: true,
++				configurable: true
 +			});
 +		}
 +
-+		localReflectDefineProperty(memoryProto, 'constructor', {
-+			__proto__: null,
-+			value: memoryCapProxy,
-+			writable: true,
-+			enumerable: false,
-+			configurable: true,
-+		});
++		pinConstructor(memoryProto, memoryCapProxy);
 +		localReflectDefineProperty(WebAssembly, 'Memory', {
 +			__proto__: null,
 +			value: memoryCapProxy,
 +			writable: true,
 +			enumerable: false,
-+			configurable: true,
++			configurable: true
 +		});
 +	}
 +}
@@ -494,146 +2018,116 @@
  /**
   * Replacement for Buffer inspect
   *
---- a/lib/vm.js
-+++ b/lib/vm.js
-@@ -226,12 +226,19 @@ class VM extends EventEmitter {
- 			timeout,
- 			sandbox,
- 			compiler = 'javascript',
--			allowAsync: optAllowAsync = true
-+			allowAsync: optAllowAsync = true,
-+			bufferAllocLimit = Infinity
- 		} = options;
- 		const allowEval = options.eval !== false;
- 		const allowWasm = options.wasm !== false;
- 		const allowAsync = optAllowAsync && !options.fixAsync;
- 
-+		// SECURITY (GHSA-6785-pvv7-mvg7 / GHSA-v836-6xw4-9cx3): validate bufferAllocLimit.
-+		// Reject negatives/NaN. Allow Infinity for callers who explicitly opt out of the cap.
-+		if (typeof bufferAllocLimit !== 'number' || bufferAllocLimit < 0 || Number.isNaN(bufferAllocLimit)) {
-+			throw new VMError('bufferAllocLimit must be a non-negative number.');
-+		}
-+
- 		// Early error if sandbox is not an object.
- 		if (sandbox && 'object' !== typeof sandbox) {
- 			throw new VMError('Sandbox must be object.');
-@@ -262,7 +269,8 @@ class VM extends EventEmitter {
- 
- 		const data = {
- 			__proto__: null,
--			allowAsync
-+			allowAsync,
-+			bufferAllocLimit
- 		};
- 
- 		if (getGeneratorFunctionScript) {
 --- /dev/null
-+++ b/test/ghsa-v836-6xw4-9cx3.test.js
-@@ -0,0 +1,100 @@
++++ b/test/ghsa-v836-6xw4-9cx3.js
+@@ -0,0 +1,103 @@
 +/* eslint-env mocha */
++/* eslint-disable max-len */
++
 +'use strict';
 +
-+/**
-+ * GHSA-v836-6xw4-9cx3 — bufferAllocLimit bypass via ArrayBuffer / SharedArrayBuffer /
-+ * TypedArray / WebAssembly.Memory constructors (host memory-exhaustion DoS).
-+ *
-+ * Regression test grounded in the upstream repro
-+ * (test/ghsa/GHSA-v836-6xw4-9cx3/repro.js), reduced to the behaviour this
-+ * backport must guarantee:
-+ *   - a finite `bufferAllocLimit` caps oversized ArrayBuffer / TypedArray /
-+ *     WebAssembly.Memory allocations in the sandbox realm;
-+ *   - the uncapped intrinsic cannot be recovered via a constructor walk;
-+ *   - the object-`length` array-like amplifier is capped;
-+ *   - the default `Infinity` cap leaves the intrinsics untouched.
-+ */
++// Regression test for GHSA-v836-6xw4-9cx3 (CWE-770): memory-exhaustion DoS via
++// bufferAllocLimit bypass. In vm2 3.9.17 the ArrayBuffer / SharedArrayBuffer /
++// TypedArray / WebAssembly.Memory constructors allocate host backing-store
++// memory through the same synchronous, timeout-immune V8 path as Buffer.alloc,
++// but were subject to no allocation cap. The novel patch adds an opt-in
++// `bufferAllocLimit` VM option that caps those intrinsics.
++//
++// These assertions are grounded in vuln_analysis.json: (a) the previously
++// unbounded allocations are now rejected once a finite cap is configured,
++// including the coercion / TOCTOU / constructor-walk variants, and (b) normal
++// (sub-limit) allocations and the non-configured default still work.
 +
 +const assert = require('assert');
 +const {VM} = require('..');
 +
-+const CAP_RE = /Buffer allocation size \d+ exceeds bufferAllocLimit/;
++const LIMIT = 1024 * 1024; // 1 MiB
++const BIG = 64 * 1024 * 1024; // 64 MiB — well over the cap
 +
-+describe('GHSA-v836-6xw4-9cx3 (ArrayBuffer/TypedArray bufferAllocLimit bypass)', function () {
-+	const CAP = 32 * 1024 * 1024;
-+	const BIG = 1024 * 1024 * 100; // 100 MB worth of elements
-+	const HAS_SHARED_AB = typeof SharedArrayBuffer === 'function';
-+	const HAS_WASM_MEMORY = typeof WebAssembly !== 'undefined' && typeof WebAssembly.Memory === 'function';
++function capped(code) {
++	return () => new VM({bufferAllocLimit: LIMIT}).run(code);
++}
 +
-+	it('rejects new ArrayBuffer over the cap', function () {
-+		const vm = new VM({bufferAllocLimit: CAP});
-+		assert.throws(function () {
-+			vm.run('new ArrayBuffer(' + BIG + ').byteLength');
-+		}, CAP_RE);
++describe('GHSA-v836-6xw4-9cx3: bufferAllocLimit caps native allocators', () => {
++	it('caps ArrayBuffer over the limit', () => {
++		assert.throws(capped(`new ArrayBuffer(${BIG})`), /allocation limit/i);
 +	});
 +
-+	it('rejects new Uint8Array over the cap', function () {
-+		const vm = new VM({bufferAllocLimit: CAP});
-+		assert.throws(function () {
-+			vm.run('new Uint8Array(' + BIG + ').length');
-+		}, CAP_RE);
++	it('caps TypedArray numeric length over the limit', () => {
++		assert.throws(capped(`new Uint8Array(${BIG})`), /allocation limit/i);
++		assert.throws(capped(`new Float64Array(${BIG})`), /allocation limit/i);
 +	});
 +
-+	it('counts bytes not elements (Float64Array x8)', function () {
-+		const vm = new VM({bufferAllocLimit: CAP});
-+		assert.throws(function () {
-+			// 5 M elements x 8 bytes = 40 MB > 32 MB cap.
-+			vm.run('new Float64Array(5 * 1024 * 1024).length');
-+		}, CAP_RE);
++	it('caps TypedArray array-like {length: N} amplifier', () => {
++		assert.throws(capped(`new Uint8Array({length: ${BIG}})`), /allocation limit/i);
 +	});
 +
-+	it('caps the {length: N} array-like amplifier', function () {
-+		const vm = new VM({bufferAllocLimit: CAP});
-+		assert.throws(function () {
-+			vm.run('new Uint8Array({length: ' + BIG + '}).length');
-+		}, CAP_RE);
++	it('caps string / valueOf coercion of the length (ToIndex parity)', () => {
++		assert.throws(capped(`new ArrayBuffer("${BIG}")`), /allocation limit/i);
++		assert.throws(capped(`new ArrayBuffer({valueOf(){return ${BIG};}})`), /allocation limit/i);
 +	});
 +
-+	it('blocks constructor-walk recovery of the uncapped ArrayBuffer', function () {
-+		const vm = new VM({bufferAllocLimit: CAP});
-+		assert.throws(function () {
-+			vm.run('var AB = new Uint8Array(0).buffer.constructor; new AB(' + BIG + ').byteLength');
-+		}, CAP_RE);
++	it('is TOCTOU-safe: a toggling valueOf cannot slip a large value past the cap', () => {
++		assert.throws(capped(`
++			let t = 0;
++			new ArrayBuffer({valueOf(){ return t++ ? ${BIG} : 8; }});
++		`), /allocation limit/i);
 +	});
 +
-+	if (HAS_SHARED_AB) {
-+		it('rejects new SharedArrayBuffer over the cap', function () {
-+			const vm = new VM({bufferAllocLimit: CAP});
-+			assert.throws(function () {
-+				vm.run('new SharedArrayBuffer(' + BIG + ').byteLength');
-+			}, CAP_RE);
-+		});
-+	}
-+
-+	if (HAS_WASM_MEMORY) {
-+		it('rejects new WebAssembly.Memory with oversized initial', function () {
-+			const vm = new VM({bufferAllocLimit: CAP});
-+			assert.throws(function () {
-+				// 1000 pages x 64 KiB = ~64 MB > 32 MB cap.
-+				vm.run('new WebAssembly.Memory({initial: 1000}).buffer.byteLength');
-+			}, CAP_RE);
-+		});
-+	}
-+
-+	it('allows a small allocation under the cap', function () {
-+		const vm = new VM({bufferAllocLimit: CAP});
-+		assert.strictEqual(vm.run('new Uint8Array(16).length'), 16);
++	it('caps resizable ArrayBuffer via maxByteLength', () => {
++		assert.throws(capped(`new ArrayBuffer(8, {maxByteLength: ${BIG}})`), /allocation limit/i);
 +	});
 +
-+	it('leaves intrinsics untouched with the default Infinity cap', function () {
-+		const vm = new VM();
-+		assert.strictEqual(vm.run('new ArrayBuffer(1024).byteLength'), 1024);
-+		assert.strictEqual(vm.run('new Uint8Array(0).buffer.constructor === ArrayBuffer'), true);
++	it('cannot recover the uncapped intrinsic via a constructor walk', () => {
++		assert.throws(capped(`
++			const AB = new Uint8Array(8).buffer.constructor;
++			new AB(${BIG});
++		`), /allocation limit/i);
 +	});
 +
-+	it('rejects a negative bufferAllocLimit at construction', function () {
-+		assert.throws(function () {
-+			return new VM({bufferAllocLimit: -1});
-+		}, /bufferAllocLimit must be a non-negative number/);
++	it('caps SharedArrayBuffer when available', () => {
++		if (typeof SharedArrayBuffer !== 'function') return;
++		assert.throws(capped(`new SharedArrayBuffer(${BIG})`), /allocation limit/i);
++	});
++
++	it('caps WebAssembly.Memory initial pages when available', () => {
++		if (typeof WebAssembly === 'undefined' || typeof WebAssembly.Memory !== 'function') return;
++		// 64 MiB / 64 KiB per page = 1024 pages, over the 1 MiB cap.
++		assert.throws(capped(`new WebAssembly.Memory({initial: 1024})`), /allocation limit/i);
++	});
++
++	it('allows allocations at or under the limit', () => {
++		const out = new VM({bufferAllocLimit: LIMIT}).run(`
++			const a = new ArrayBuffer(1024);
++			const b = new Uint8Array(1024);
++			a.byteLength + b.length;
++		`);
++		assert.strictEqual(out, 2048);
++	});
++
++	it('preserves instanceof / prototype semantics under the cap', () => {
++		const ok = new VM({bufferAllocLimit: LIMIT}).run(`
++			const a = new ArrayBuffer(8);
++			const u = new Uint8Array(8);
++			(a instanceof ArrayBuffer) && (u instanceof Uint8Array);
++		`);
++		assert.strictEqual(ok, true);
++	});
++
++	it('is opt-in: default (no limit) leaves large allocations working', () => {
++		const n = new VM().run(`new ArrayBuffer(${BIG}).byteLength`);
++		assert.strictEqual(n, BIG);
++	});
++
++	it('rejects an invalid bufferAllocLimit option', () => {
++		assert.throws(() => new VM({bufferAllocLimit: -1}), /bufferAllocLimit/);
++		assert.throws(() => new VM({bufferAllocLimit: 'nope'}), /bufferAllocLimit/);
 +	});
 +});
 
 --- a/lib/bridge.js
 +++ b/lib/bridge.js
-@@ -103,6 +103,34 @@ const thisErrorCaptureStackTrace = Error.captureStackTrace;
+@@ -113,6 +113,35 @@
  const thisSymbolToString = Symbol.prototype.toString;
  const thisSymbolToStringTag = Symbol.toStringTag;
  
@@ -665,13 +2159,14 @@
 +	return false;
 +}
 +
++
  /**
   * VMError.
   *
-@@ -446,6 +474,14 @@ function createBridge(otherInit, registerProxy) {
- 		set(target, key, value, receiver) {
- 			// Note: target@this(unsafe) key@prim value@this(unsafe) receiver@this(unsafe) throws@this(unsafe)
- 			const object = this.object; // @other(unsafe)
+@@ -661,6 +690,14 @@
+ 			// Covers C1 (plain assignment), C2 (Reflect.set), and C5
+ 			// (Object.assign) because all of them funnel through this trap.
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
 +			// SECURITY (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135): refuse sandbox-originated
 +			// writes whose key is a known dangerous Node.js cross-realm symbol. Even if
 +			// the sandbox-side `Symbol.for` override should prevent the sandbox from ever
@@ -683,20 +2178,20 @@
  			if (key === '__proto__' && !thisOtherHasOwnProperty(object, key)) {
  				return this.setPrototypeOf(target, value);
  			}
-@@ -550,6 +586,9 @@ function createBridge(otherInit, registerProxy) {
- 		defineProperty(target, prop, desc) {
- 			// Note: target@this(unsafe) prop@prim desc@this(unsafe) throws@this(unsafe)
- 			const object = this.object; // @other(unsafe)
+@@ -811,6 +848,9 @@
+ 			// defineProperty calls targeting any host-realm intrinsic
+ 			// prototype or constructor. Covers C3 (Object.defineProperty).
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
 +			// SECURITY (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135): mirror the set trap —
 +			// refuse dangerous-symbol-keyed property installation on any host object.
 +			if (!isHost && isDangerousCrossRealmSymbol(prop)) throw new VMError(OPNA);
  			if (!thisReflectSetPrototypeOf(desc, null)) throw thisUnexpected();
  
  			desc = this.definePropertyDesc(target, prop, desc);
-@@ -603,6 +642,12 @@ function createBridge(otherInit, registerProxy) {
- 		deleteProperty(target, prop) {
- 			// Note: target@this(unsafe) prop@prim throws@this(unsafe)
- 			const object = this.object; // @other(unsafe)
+@@ -870,6 +910,12 @@
+ 			// otherwise remove `hasOwnProperty`, `toString`, etc. from every
+ 			// host object of that class.
+ 			if (isProtectedHostObject(object)) throw new VMError(OPNA);
 +			// SECURITY (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135): refuse sandbox-originated
 +			// deletes whose key is a dangerous cross-realm symbol. Without this, sandbox
 +			// code could strip a host-set hook (e.g. delete a Node-installed
@@ -708,11 +2203,10 @@
  			} catch (e) { // @other(unsafe)
 --- a/lib/setup-sandbox.js
 +++ b/lib/setup-sandbox.js
-@@ -160,6 +160,51 @@ connect(localObject.prototype.__defineSetter__, host.Object.prototype.__defineSe
- connect(localObject.prototype.__lookupGetter__, host.Object.prototype.__lookupGetter__);
+@@ -591,6 +591,52 @@
  connect(localObject.prototype.__lookupSetter__, host.Object.prototype.__lookupSetter__);
  
-+/*
+ /*
 + * Symbol.for sanitization (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135)
 + *
 + * Node.js exposes internal cross-realm hooks keyed by symbols registered under
@@ -757,9 +2251,11 @@
 +	return localReflectApply(originalSymbolFor, localSymbol, [keyStr]);
 +};
 +
- /*
++
++/*
   * PrepareStackTrace sanitization
   */
+ 
 --- /dev/null
 +++ b/test/cve-2026-47135.test.js
 @@ -0,0 +1,164 @@
