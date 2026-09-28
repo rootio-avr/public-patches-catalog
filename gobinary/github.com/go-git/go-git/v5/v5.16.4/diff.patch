@@ -1,0 +1,756 @@
+--- a/plumbing/transport/ssh/common.go
++++ b/plumbing/transport/ssh/common.go
+@@ -252,7 +252,39 @@ func (c *command) setAuthFromEndpoint() error {
+ }
+
+ func endpointToCommand(cmd string, ep *transport.Endpoint) string {
+-	return fmt.Sprintf("%s '%s'", cmd, ep.Path)
++	var b strings.Builder
++	b.WriteString(cmd)
++	b.WriteByte(' ')
++	writeShellQuote(&b, ep.Path)
++	return b.String()
++}
++
++// writeShellQuote writes s to b, wrapped in single quotes with
++// embedded single quotes and exclamation marks escaped using the
++// POSIX close-escape-reopen idiom:
++//
++//	' becomes '\''
++//	! becomes '\!'
++//
++// It is a direct port of canonical Git's sq_quote_buf (quote.c).
++// The bang escape keeps the result safe when re-evaluated under
++// csh-derived shells that perform history expansion. The output is
++// safe to pass as a single argument through any POSIX shell and
++// round-trips through git-shell's sq_dequote_to_argv.
++func writeShellQuote(b *strings.Builder, s string) {
++	b.Grow(len(s) + 2)
++	b.WriteByte('\'')
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if c == '\'' || c == '!' {
++			b.WriteString(`'\`)
++			b.WriteByte(c)
++			b.WriteByte('\'')
++			continue
++		}
++		b.WriteByte(c)
++	}
++	b.WriteByte('\'')
+ }
+
+ func overrideConfig(overrides *ssh.ClientConfig, c *ssh.ClientConfig) {
+--- a/plumbing/transport/ssh/common_test.go
++++ b/plumbing/transport/ssh/common_test.go
+@@ -7,6 +7,7 @@ import (
+
+ 	"github.com/gliderlabs/ssh"
+ 	"github.com/kevinburke/ssh_config"
++	"github.com/stretchr/testify/assert"
+ 	stdssh "golang.org/x/crypto/ssh"
+ 	"golang.org/x/crypto/ssh/testdata"
+ 	. "gopkg.in/check.v1"
+@@ -252,3 +253,51 @@ func (s *SuiteCommon) TestCommandWithInvalidAuthMethod(c *C) {
+ 	c.Assert(err, NotNil)
+ 	c.Assert(err, ErrorMatches, "invalid auth method")
+ }
++
++func TestEndpointToCommand(t *testing.T) {
++	t.Parallel()
++
++	for _, tc := range []struct {
++		name string
++		cmd  string
++		path string
++		want string
++	}{
++		{
++			name: "plain path",
++			cmd:  "git-upload-pack",
++			path: "/repo.git",
++			want: "git-upload-pack '/repo.git'",
++		},
++		{
++			name: "path with single-quote injection payload",
++			cmd:  "git-upload-pack",
++			path: "/repo.git'; touch /tmp/x ; #",
++			want: `git-upload-pack '/repo.git'\''; touch /tmp/x ; #'`,
++		},
++		{
++			name: "bang is escaped for csh history expansion",
++			cmd:  "git-upload-pack",
++			path: "/repo!.git",
++			want: `git-upload-pack '/repo'\!'.git'`,
++		},
++		{
++			name: "mixed quote and bang",
++			cmd:  "git-upload-pack",
++			path: "/a'b!c",
++			want: `git-upload-pack '/a'\''b'\!'c'`,
++		},
++		{
++			name: "inert shell metacharacters pass through",
++			cmd:  "git-upload-pack",
++			path: "/a\\b\"c$d`e",
++			want: "git-upload-pack '/a\\b\"c$d`e'",
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			ep := &transport.Endpoint{Path: tc.path}
++			assert.Equal(t, tc.want, endpointToCommand(tc.cmd, ep))
++		})
++	}
++}
+
+--- a/plumbing/object/commit.go
++++ b/plumbing/object/commit.go
+@@ -6,6 +6,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"slices"
+ 	"strings"
+ 
+ 	"github.com/ProtonMail/go-crypto/openpgp"
+@@ -20,6 +21,7 @@ const (
+ 	beginpgp       string = "-----BEGIN PGP SIGNATURE-----"
+ 	endpgp         string = "-----END PGP SIGNATURE-----"
+ 	headerpgp      string = "gpgsig"
++	headerpgp256   string = "gpgsig-sha256"
+ 	headerencoding string = "encoding"
+ 
+ 	// https://github.com/git/git/blob/bcb6cae2966cc407ca1afc77413b3ef11103c175/Documentation/gitformat-signature.txt#L153
+@@ -66,6 +68,9 @@ type Commit struct {
+ 	ExtraHeaders []ExtraHeader
+ 
+ 	s storer.EncodedObjectStorer
++	// src holds the encoded object this Commit was decoded from, used by
++	// EncodeWithoutSignature to recover the canonical signed bytes.
++	src plumbing.EncodedObject
+ }
+ 
+ // ExtraHeader holds any non-standard header
+@@ -235,6 +240,7 @@ func (c *Commit) Decode(o plumbing.EncodedObject) (err error) {
+ 
+ 	c.Hash = o.Hash()
+ 	c.Encoding = defaultUtf8CommitMessageEncoding
++	c.src = o
+ 
+ 	reader, err := o.Reader()
+ 	if err != nil {
+@@ -344,11 +350,64 @@ func (c *Commit) Encode(o plumbing.EncodedObject) error {
+ 	return c.encode(o, true)
+ }
+ 
+-// EncodeWithoutSignature export a Commit into a plumbing.EncodedObject without the signature (correspond to the payload of the PGP signature).
++// EncodeWithoutSignature exports a Commit into a plumbing.EncodedObject
++// without any signature headers, producing the payload that PGP/GPG
++// signatures are computed over.
++//
++// Behaviour depends on how the Commit was created:
++//
++//   - For Commits populated by Decode whose exported fields still match the
++//     source object, the payload is streamed from the raw source bytes with
++//     gpgsig and gpgsig-sha256 headers (and their continuation lines)
++//     stripped verbatim. This preserves the exact bytes the signature was
++//     computed over, regardless of any normalization performed by Decode.
++//
++//   - For Commits constructed in memory, or for decoded Commits whose
++//     exported fields have been mutated, the payload is derived from the
++//     current struct fields. Mutation is detected by re-decoding the source
++//     object and comparing exported fields; if any differ, the in-memory
++//     representation prevails.
+ func (c *Commit) EncodeWithoutSignature(o plumbing.EncodedObject) error {
++	if c.matchesSource() {
++		return stripObjectSignatures(o, c.src, plumbing.CommitObject)
++	}
+ 	return c.encode(o, false)
+ }
+ 
++// matchesSource reports whether c.src is set and re-decoding it produces a
++// Commit whose payload-affecting exported fields are identical to those of
++// c. It is the auto-detection used by EncodeWithoutSignature to decide
++// between the raw bytes and the struct-encoded payload.
++//
++// PGPSignature is intentionally excluded from the comparison: neither path
++// emits it, so mutating it must not trigger a switch to struct-encode (which
++// would change the byte layout the caller is trying to verify against).
++func (c *Commit) matchesSource() bool {
++	if c.src == nil {
++		return false
++	}
++	fresh := &Commit{}
++	if err := fresh.Decode(c.src); err != nil {
++		return false
++	}
++	return c.Hash == fresh.Hash &&
++		signatureEqual(c.Author, fresh.Author) &&
++		signatureEqual(c.Committer, fresh.Committer) &&
++		c.MergeTag == fresh.MergeTag &&
++		c.Message == fresh.Message &&
++		c.TreeHash == fresh.TreeHash &&
++		c.Encoding == fresh.Encoding &&
++		slices.Equal(c.ParentHashes, fresh.ParentHashes) &&
++		slices.Equal(c.ExtraHeaders, fresh.ExtraHeaders)
++}
++
++func signatureEqual(a, b Signature) bool {
++	return a.Name == b.Name &&
++		a.Email == b.Email &&
++		a.When.Unix() == b.When.Unix() &&
++		a.When.Format("-0700") == b.When.Format("-0700")
++}
++
+ func (c *Commit) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 	o.SetType(plumbing.CommitObject)
+ 	w, err := o.Writer()
+@@ -478,9 +537,21 @@ func (c *Commit) String() string {
+ 	)
+ }
+ 
++// ErrMultipleSignatures is returned by Verify when the commit carries more
++// than one armored signature block. Mirrors upstream's parse_gpg_output
++// rejection of GOODSIG/BADSIG status lines after the first
++// (gpg-interface.c:257-269): multi-signature commits are intentionally
++// unsupported because their provenance cannot be reduced to a single
++// authoritative signer.
++var ErrMultipleSignatures = errors.New("commit has multiple signatures")
++
+ // Verify performs PGP verification of the commit with a provided armored
+ // keyring and returns openpgp.Entity associated with verifying key on success.
+ func (c *Commit) Verify(armoredKeyRing string) (*openpgp.Entity, error) {
++	if countSignatureBlocks([]byte(c.PGPSignature)) > 1 {
++		return nil, ErrMultipleSignatures
++	}
++
+ 	keyRingReader := strings.NewReader(armoredKeyRing)
+ 	keyring, err := openpgp.ReadArmoredKeyRing(keyRingReader)
+ 	if err != nil {
+--- /dev/null
++++ b/plumbing/object/cve_2026_45022_test.go
+@@ -0,0 +1,109 @@
++package object
++
++import (
++	"io"
++	"strings"
++	"testing"
++
++	"github.com/go-git/go-git/v5/plumbing"
++)
++
++// TestCVE202645022CommitVerifyUsesRawBytes is a regression test for
++// CVE-2026-45022 (CWE-345: Insufficient Verification of Data Authenticity).
++//
++// go-git used to compute the PGP verification payload by re-encoding a commit
++// from its parsed struct fields. Because Decode normalizes malformed objects
++// (e.g. a duplicated "author" header collapses to a single field), the
++// reconstructed payload could differ from the exact bytes that were signed,
++// letting a tampered object verify against a signature made over a different,
++// canonical object. The fix streams the payload from the original source bytes
++// with only the signature headers stripped, so the verification payload always
++// matches what was actually signed.
++//
++// Grounded on the upstream tests/objectverify "duplicate-author" case.
++func TestCVE202645022CommitVerifyUsesRawBytes(t *testing.T) {
++	// Commit with a duplicated author header and a gpgsig signature header.
++	raw := "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n" +
++		"parent 1111111111111111111111111111111111111111\n" +
++		"author Test Author <author@example.local> 1700000000 +0000\n" +
++		"author Override Author <override@example.local> 1700000001 +0000\n" +
++		"committer Test Committer <committer@example.local> 1700000000 +0000\n" +
++		"gpgsig -----BEGIN PGP SIGNATURE-----\n" +
++		" \n" +
++		" iHUEABYKAB0WIQTMqU0ycQ3f6g3PMoWMmmmF4LuV8QUCYGebVwAKCRCMmmmF4LuV\n" +
++		" -----END PGP SIGNATURE-----\n" +
++		"\n" +
++		"signed commit message\n"
++
++	o := &plumbing.MemoryObject{}
++	o.SetType(plumbing.CommitObject)
++	if _, err := o.Write([]byte(raw)); err != nil {
++		t.Fatalf("write object: %v", err)
++	}
++
++	commit := &Commit{}
++	if err := commit.Decode(o); err != nil {
++		t.Fatalf("decode commit: %v", err)
++	}
++
++	encoded := &plumbing.MemoryObject{}
++	if err := commit.EncodeWithoutSignature(encoded); err != nil {
++		t.Fatalf("encode without signature: %v", err)
++	}
++	er, err := encoded.Reader()
++	if err != nil {
++		t.Fatalf("reader: %v", err)
++	}
++	payload, err := io.ReadAll(er)
++	if err != nil {
++		t.Fatalf("read payload: %v", err)
++	}
++
++	got := string(payload)
++
++	// The signature headers must be stripped from the payload.
++	if strings.Contains(got, "gpgsig") || strings.Contains(got, "BEGIN PGP SIGNATURE") {
++		t.Fatalf("verification payload still contains signature headers:\n%s", got)
++	}
++
++	// The payload must preserve the ORIGINAL bytes (including the duplicated
++	// author header), not a normalized re-encoding. Before the fix the
++	// duplicated header was silently dropped, which is the bypass.
++	if strings.Count(got, "author ") != 2 {
++		t.Fatalf("verification payload dropped the duplicated author header; "+
++			"payload is a normalized re-encoding, not the signed bytes:\n%s", got)
++	}
++
++	want := "tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n" +
++		"parent 1111111111111111111111111111111111111111\n" +
++		"author Test Author <author@example.local> 1700000000 +0000\n" +
++		"author Override Author <override@example.local> 1700000001 +0000\n" +
++		"committer Test Committer <committer@example.local> 1700000000 +0000\n" +
++		"\n" +
++		"signed commit message\n"
++	if got != want {
++		t.Fatalf("verification payload does not match signed bytes.\n got:\n%s\nwant:\n%s", got, want)
++	}
++}
++
++// TestCVE202645022RejectsMultipleSignatures verifies that a commit carrying
++// more than one armored signature block is rejected, mirroring upstream's
++// tests/objectverify "double-signature" case. Multi-signature payloads cannot
++// be reduced to a single authoritative signer and must not verify.
++func TestCVE202645022RejectsMultipleSignatures(t *testing.T) {
++	sigBlock := "-----BEGIN PGP SIGNATURE-----\n" +
++		"\n" +
++		"iHUEABYKAB0WIQTMqU0ycQ3f6g3PMoWMmmmF4LuV8QUCYGebVwAKCRCMmmmF4LuV\n" +
++		"-----END PGP SIGNATURE-----\n"
++
++	commit := &Commit{
++		PGPSignature: sigBlock + sigBlock,
++	}
++
++	// The keyring argument is irrelevant: the multi-signature check happens
++	// before any keyring parsing.
++	_, err := commit.Verify("")
++	if err != ErrMultipleSignatures {
++		t.Fatalf("expected ErrMultipleSignatures, got %v", err)
++	}
++}
+--- a/plumbing/object/signature.go
++++ b/plumbing/object/signature.go
+@@ -1,6 +1,13 @@
+ package object
+ 
+-import "bytes"
++import (
++	"bytes"
++	"io"
++
++	"github.com/go-git/go-git/v5/plumbing"
++	"github.com/go-git/go-git/v5/utils/ioutil"
++	"github.com/go-git/go-git/v5/utils/sync"
++)
+ 
+ const (
+ 	signatureTypeUnknown signatureType = iota
+@@ -100,3 +107,116 @@ func parseSignedBytes(b []byte) (int, signatureType) {
+ 	}
+ 	return match, t
+ }
++
++// countSignatureBlocks reports how many distinct armored signature blocks
++// start at a line boundary in b. Used by verification paths to reject
++// multi-signature payloads, matching upstream's check in gpg-interface.c
++// where parse_gpg_output bails out the first time it sees a second
++// exclusive status line (a second GOODSIG/BADSIG/etc.).
++func countSignatureBlocks(b []byte) int {
++	n, count := 0, 0
++	for n < len(b) {
++		i := b[n:]
++		if typeForSignature(i) != signatureTypeUnknown {
++			count++
++		}
++		if eol := bytes.IndexByte(i, '\n'); eol >= 0 {
++			n += eol + 1
++			continue
++		}
++		break
++	}
++	return count
++}
++
++// isSignatureHeader reports whether line is a canonical "gpgsig "/
++// "gpgsig-sha256 " header line. Other "gpgsig"-prefixed extra headers
++// are intentionally not matched.
++func isSignatureHeader(line []byte) bool {
++	return bytes.HasPrefix(line, []byte(headerpgp+" ")) ||
++		bytes.HasPrefix(line, []byte(headerpgp256+" "))
++}
++
++// stripObjectSignatures streams src into dst, producing the byte sequence
++// over which a PGP/GPG signature is computed:
++//
++//   - Canonical "gpgsig" and "gpgsig-sha256" headers (and their
++//     continuation lines) are dropped, mirroring upstream's
++//     remove_signature in commit.c.
++//   - For tag objects, the inline trailing PGP signature is additionally
++//     truncated, mirroring upstream's parse_signature in gpg-interface.c
++//     used by gpg_verify_tag.
++//
++// The returned object's type is set to objType. Used by both
++// Commit.EncodeWithoutSignature and Tag.EncodeWithoutSignature to
++// reproduce the exact bytes the signature was computed over.
++func stripObjectSignatures(dst, src plumbing.EncodedObject, objType plumbing.ObjectType) (err error) {
++	dst.SetType(objType)
++
++	r, err := src.Reader()
++	if err != nil {
++		return err
++	}
++	defer ioutil.CheckClose(r, &err)
++
++	var input io.Reader = r
++	if objType == plumbing.TagObject {
++		raw, err := io.ReadAll(r)
++		if err != nil {
++			return err
++		}
++		if sm, _ := parseSignedBytes(raw); sm >= 0 {
++			raw = raw[:sm]
++		}
++		input = bytes.NewReader(raw)
++	}
++
++	w, err := dst.Writer()
++	if err != nil {
++		return err
++	}
++	defer ioutil.CheckClose(w, &err)
++
++	return stripHeaderSignatures(w, input)
++}
++
++// stripHeaderSignatures copies r to w, dropping canonical signature header
++// lines (gpgsig and gpgsig-sha256) and their continuation lines. Lines
++// past the blank line that closes the header block are copied verbatim.
++func stripHeaderSignatures(w io.Writer, r io.Reader) error {
++	br := sync.GetBufioReader(r)
++	defer sync.PutBufioReader(br)
++
++	var inBody, skipping bool
++	for {
++		line, rerr := br.ReadBytes('\n')
++		if rerr != nil && rerr != io.EOF {
++			return rerr
++		}
++
++		write := true
++		if !inBody {
++			switch {
++			case skipping && len(line) > 0 && line[0] == ' ':
++				write = false
++			case isSignatureHeader(line):
++				skipping = true
++				write = false
++			case len(line) == 1 && line[0] == '\n':
++				skipping = false
++				inBody = true
++			default:
++				skipping = false
++			}
++		}
++
++		if write && len(line) > 0 {
++			if _, werr := w.Write(line); werr != nil {
++				return werr
++			}
++		}
++		if rerr == io.EOF {
++			return nil
++		}
++	}
++}
+--- a/plumbing/object/tag.go
++++ b/plumbing/object/tag.go
+@@ -39,6 +39,9 @@ type Tag struct {
+ 	Target plumbing.Hash
+ 
+ 	s storer.EncodedObjectStorer
++	// src holds the encoded object this Tag was decoded from, used by
++	// EncodeWithoutSignature to recover the canonical signed bytes.
++	src plumbing.EncodedObject
+ }
+ 
+ // GetTag gets a tag from an object storer and decodes it.
+@@ -84,6 +87,7 @@ func (t *Tag) Decode(o plumbing.EncodedObject) (err error) {
+ 	}
+ 
+ 	t.Hash = o.Hash()
++	t.src = o
+ 
+ 	reader, err := o.Reader()
+ 	if err != nil {
+@@ -144,11 +148,54 @@ func (t *Tag) Encode(o plumbing.EncodedObject) error {
+ 	return t.encode(o, true)
+ }
+ 
+-// EncodeWithoutSignature export a Tag into a plumbing.EncodedObject without the signature (correspond to the payload of the PGP signature).
++// EncodeWithoutSignature exports a Tag into a plumbing.EncodedObject without
++// any signature data, producing the payload that PGP/GPG signatures are
++// computed over.
++//
++// Behaviour mirrors Commit.EncodeWithoutSignature:
++//
++//   - For Tags populated by Decode whose exported fields still match the
++//     source object, the payload is streamed from the raw source bytes with
++//     the inline trailing signature truncated and gpgsig/gpgsig-sha256
++//     headers (and their continuation lines) stripped verbatim. This
++//     preserves the exact bytes the signature was computed over, regardless
++//     of any normalization performed by Decode.
++//
++//   - For Tags constructed in memory, or for decoded Tags whose exported
++//     fields have been mutated, the payload is derived from the current
++//     struct fields. Mutation is detected by re-decoding the source object
++//     and comparing exported fields; if any differ, the in-memory
++//     representation prevails.
+ func (t *Tag) EncodeWithoutSignature(o plumbing.EncodedObject) error {
++	if t.matchesSource() {
++		return stripObjectSignatures(o, t.src, plumbing.TagObject)
++	}
+ 	return t.encode(o, false)
+ }
+ 
++// matchesSource reports whether t.src is set and re-decoding it produces a
++// Tag whose payload-affecting exported fields are identical to those of t.
++//
++// PGPSignature is intentionally excluded from the comparison: neither path
++// emits it as part of the verification payload, so mutating it must not
++// trigger a switch to struct-encode (which would change the byte layout the
++// caller is trying to verify against).
++func (t *Tag) matchesSource() bool {
++	if t.src == nil {
++		return false
++	}
++	fresh := &Tag{}
++	if err := fresh.Decode(t.src); err != nil {
++		return false
++	}
++	return t.Hash == fresh.Hash &&
++		t.Name == fresh.Name &&
++		signatureEqual(t.Tagger, fresh.Tagger) &&
++		t.Message == fresh.Message &&
++		t.TargetType == fresh.TargetType &&
++		t.Target == fresh.Target
++}
++
+ func (t *Tag) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 	o.SetType(plumbing.TagObject)
+ 	w, err := o.Writer()
+
+--- a/worktree.go
++++ b/worktree.go
+@@ -683,6 +683,10 @@
+ 			return err
+ 		}
+ 
++		if err := w.clearBlockingSymlinks(name); err != nil {
++			return err
++		}
++
+ 		if err := w.Filesystem.MkdirAll(name, mode); err != nil {
+ 			return err
+ 		}
+@@ -726,7 +730,70 @@
+ 	return nil
+ }
+ 
++// clearBlockingSymlinks removes a symlink that is in the way of
++// materialising name, so the checkout writes a real entry in its place
++// instead of following the link out of the worktree. Two cases:
++//
++//   - a leading directory component that is a symlink (e.g. "s" while
++//     writing "s/config", where "s" links to ".git"): OpenFile/MkdirAll
++//     would traverse it, so the write would land under the link's target.
++//   - the final component itself being a symlink (e.g. writing "s" while
++//     "s" links to ".git/config"): OpenFile with O_TRUNC, or Symlink,
++//     would follow/replace through it and clobber the target.
++//
++// A symlink can never be a legitimate parent of, or the destination for,
++// a tracked entry, so removing it is always correct. This mirrors upstream
++// Git's forced checkout, which unlinks a blocking symlink in the leading
++// path (create_directories) and unlinks an existing entry before
++// write_entry.
++// https://github.com/git/git/blob/v2.54.0/entry.c#L50
++func (w *Worktree) clearBlockingSymlinks(name string) error {
++	var dirs []string
++	for dir := filepath.Dir(name); dir != "." && dir != "" && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
++		dirs = append(dirs, dir)
++	}
++	// Leading components, shallowest-first: removing the shallowest symlink
++	// invalidates every component beneath it, so a single removal is enough.
++	for i := len(dirs) - 1; i >= 0; i-- {
++		fi, err := w.Filesystem.Lstat(dirs[i])
++		if err != nil {
++			// A missing component is created as a real directory by the
++			// checkout. Any other error means we cannot tell whether it is
++			// a symlink, so surface it instead of leaving a blocking link in
++			// place and failing later in a harder-to-diagnose way.
++			if os.IsNotExist(err) {
++				continue
++			}
++			return err
++		}
++		if fi.Mode()&os.ModeSymlink != 0 {
++			return w.Filesystem.Remove(dirs[i])
++		}
++	}
++	// Final component: an existing symlink here would be followed by the
++	// subsequent OpenFile/Symlink/MkdirAll, so replace it.
++	fi, err := w.Filesystem.Lstat(name)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil
++		}
++		return err
++	}
++	if fi.Mode()&os.ModeSymlink != 0 {
++		return w.Filesystem.Remove(name)
++	}
++	return nil
++}
++
+ func (w *Worktree) checkoutFile(f *object.File) (err error) {
++	// checkoutFile is the materialisation boundary for tracked entries.
++	// Remove any blocking symlink first so the subsequent OpenFile or
++	// Symlink call writes the entry itself instead of following a planted
++	// final-component link in the underlying filesystem.
++	if err := w.clearBlockingSymlinks(f.Name); err != nil {
++		return err
++	}
++
+ 	mode, err := f.Mode.ToOSFileMode()
+ 	if err != nil {
+ 		return
+--- /dev/null
++++ b/cve-2026-71556_test.go
+@@ -0,0 +1,116 @@
++package git
++
++import (
++	"os"
++	"testing"
++
++	"github.com/go-git/go-billy/v5"
++	"github.com/go-git/go-billy/v5/memfs"
++	"github.com/go-git/go-billy/v5/osfs"
++	"github.com/go-git/go-billy/v5/util"
++	"github.com/go-git/go-git/v5/plumbing"
++	"github.com/go-git/go-git/v5/plumbing/filemode"
++	"github.com/go-git/go-git/v5/plumbing/object"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++)
++
++// TestCVE_2026_71556_CheckoutReplacesBlockingFinalSymlink pins the
++// final-component case at the checkout materialisation boundary: writing a
++// tracked regular file at a path that already exists as a symlink must
++// replace the symlink, not follow it and overwrite the link's target.
++// Grounded on upstream worktree_fs_test.go's
++// TestCheckoutReplacesBlockingFinalSymlink for fix commit 008a78f2.
++func TestCVE_2026_71556_CheckoutReplacesBlockingFinalSymlink(t *testing.T) {
++	run := func(t *testing.T, base billy.Filesystem) {
++		t.Helper()
++
++		w := &Worktree{Filesystem: base}
++
++		require.NoError(t, util.WriteFile(base, "target.txt", []byte("keep"), 0o644))
++		if err := base.Symlink("target.txt", "tracked.txt"); err != nil {
++			if isSymlinkWindowsNonAdmin(err) {
++				t.Skipf("symlink creation requires elevated privileges: %v", err)
++			}
++			require.NoError(t, err)
++		}
++
++		blobObj := &plumbing.MemoryObject{}
++		blobObj.SetType(plumbing.BlobObject)
++		_, err := blobObj.Write([]byte("replacement"))
++		require.NoError(t, err)
++		blob, err := object.DecodeBlob(blobObj)
++		require.NoError(t, err)
++
++		require.NoError(t, w.checkoutFile(object.NewFile("tracked.txt", filemode.Regular, blob)))
++
++		got, err := util.ReadFile(base, "tracked.txt")
++		require.NoError(t, err)
++		assert.Equal(t, "replacement", string(got))
++
++		// The symlink target must be untouched.
++		target, err := util.ReadFile(base, "target.txt")
++		require.NoError(t, err)
++		assert.Equal(t, "keep", string(target))
++
++		fi, err := base.Lstat("tracked.txt")
++		require.NoError(t, err)
++		assert.Zero(t, fi.Mode()&os.ModeSymlink, "tracked.txt must be a regular file, not a symlink")
++	}
++
++	t.Run("memfs", func(t *testing.T) { run(t, memfs.New()) })
++	t.Run("osfs", func(t *testing.T) { run(t, osfs.New(t.TempDir())) })
++}
++
++// TestCVE_2026_71556_CheckoutReplacesLeadingSymlink covers the symlink-mask
++// bypass (CVE-2021-21300 class): a leading directory component that already
++// exists as a symlink must be removed before the file is materialised, so
++// the write cannot escape the worktree by traversing the planted link.
++// Grounded on upstream TestForceCheckoutReplacesLeadingSymlink.
++func TestCVE_2026_71556_CheckoutReplacesLeadingSymlink(t *testing.T) {
++	run := func(t *testing.T, base billy.Filesystem) {
++		t.Helper()
++
++		w := &Worktree{Filesystem: base}
++
++		// A directory outside the intended write path, standing in for a
++		// sensitive location (e.g. .git) an attacker wants to redirect into.
++		require.NoError(t, base.MkdirAll("secret", 0o755))
++		require.NoError(t, util.WriteFile(base, "secret/keep.txt", []byte("keep"), 0o644))
++
++		// Plant the masking symlink: "s" -> "secret". A tracked entry at
++		// "s/planted.txt" would land in "secret" if the link were followed.
++		if err := base.Symlink("secret", "s"); err != nil {
++			if isSymlinkWindowsNonAdmin(err) {
++				t.Skipf("symlink creation requires elevated privileges: %v", err)
++			}
++			require.NoError(t, err)
++		}
++
++		blobObj := &plumbing.MemoryObject{}
++		blobObj.SetType(plumbing.BlobObject)
++		_, err := blobObj.Write([]byte("payload"))
++		require.NoError(t, err)
++		blob, err := object.DecodeBlob(blobObj)
++		require.NoError(t, err)
++
++		require.NoError(t, w.checkoutFile(object.NewFile("s/planted.txt", filemode.Regular, blob)))
++
++		// The leading symlink must have been replaced by a real directory.
++		fi, err := base.Lstat("s")
++		require.NoError(t, err)
++		assert.Zero(t, fi.Mode()&os.ModeSymlink, "leading symlink %q must be replaced by a real directory", "s")
++
++		// The file lands safely inside the worktree, not under the target.
++		got, err := util.ReadFile(base, "s/planted.txt")
++		require.NoError(t, err)
++		assert.Equal(t, "payload", string(got))
++
++		// The masked directory's contents must be untouched.
++		_, statErr := base.Lstat("secret/planted.txt")
++		assert.Error(t, statErr, "checkout must not write through the symlink into %q", "secret")
++	}
++
++	t.Run("memfs", func(t *testing.T) { run(t, memfs.New()) })
++	t.Run("osfs", func(t *testing.T) { run(t, osfs.New(t.TempDir())) })
++}
