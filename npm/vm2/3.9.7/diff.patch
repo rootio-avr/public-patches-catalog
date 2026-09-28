@@ -1,3 +1,152 @@
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -449,6 +449,30 @@
+ 			if (key === '__proto__' && !thisOtherHasOwnProperty(object, key)) {
+ 				return this.setPrototypeOf(target, value);
+ 			}
++			// SECURITY (GHSA-c4cf-2hgv-2qv6): honour ECMA-262 9.5.9 [[Set]]
++			// receiver semantics. When sandbox writes via an object that
++			// *inherits* from this proxy (e.g. `Object.create(proxy).x = v`)
++			// or supplies a forged receiver (`Reflect.set(proxy, k, v, child)`),
++			// V8 invokes this trap with `receiver` set to the child — not the
++			// proxy itself. The pre-fix trap ignored `receiver` and wrote
++			// through to the host object, letting attacker-controlled writes
++			// silently land on host-side properties the sandbox should never
++			// reach. Mirror ReadOnlyHandler.set's install-on-receiver shape,
++			// gated on receiver !== canonical proxy so the legitimate direct
++			// `proxy.x = v` write path (embedder contract) remains unchanged.
++			// `mappingOtherToThis` already stores the canonical sandbox-facing
++			// proxy per host object (populated in thisProxyOther for both the
++			// !isHost inner-proxy and isHost outer-proxy2 branches).
++			const canonicalProxy = thisReflectApply(thisWeakMapGet, mappingOtherToThis, [object]);
++			if (receiver !== canonicalProxy) {
++				return thisReflectDefineProperty(receiver, key, {
++					__proto__: null,
++					value: value,
++					writable: true,
++					enumerable: true,
++					configurable: true,
++				}) === true;
++			}
+ 			try {
+ 				value = otherFromThis(value);
+ 				return otherReflectSet(object, key, value) === true;
+--- /dev/null
++++ b/test/cve-2026-47209.test.js
+@@ -0,0 +1,112 @@
++/**
++ * CVE-2026-47209 / GHSA-c4cf-2hgv-2qv6 — Bridge `set` trap ignores `receiver`,
++ * leaking prototype-inheriting writes through to the wrapped host object.
++ *
++ * Grounded on the upstream reproduction test
++ * (test/ghsa/GHSA-c4cf-2hgv-2qv6/repro.js). The BaseHandler.set trap historically
++ * ignored the ECMA-262 9.5.9 [[Set]] `receiver` argument and wrote through to the
++ * host object. A sandbox-side child built via `Object.create(hostObj)` — or a
++ * forged `Reflect.set(hostObj, k, v, customReceiver)` — therefore became a write
++ * channel onto the host object. The fix installs the property on `receiver`
++ * instead when `receiver` is not the canonical bridge proxy for the host object.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const util = require('util');
++const { VM } = require('../lib/main.js');
++
++describe('CVE-2026-47209 (set trap receiver ignored — write-through via Object.create child)', function () {
++	it('blocks PoC: Object.create(hostFn) + child[Symbol.for(...)]=fn must NOT install on host', function () {
++		const hostFn = function api(cb) {
++			cb(null, 'ok');
++		};
++		const vm = new VM();
++		vm.sandbox.hostFn = hostFn;
++
++		try {
++			vm.run(`
++				const kCustom = Symbol.for('nodejs.util.promisify.custom');
++				const child = Object.create(hostFn);
++				child[kCustom] = function () {
++					return Promise.resolve('HIJACKED-VIA-RECEIVER-BUG');
++				};
++			`);
++		} catch (_) {
++			/* either trap threw or symbol stripped — both acceptable */
++		}
++
++		const ownSyms = Object.getOwnPropertySymbols(hostFn);
++		for (const s of ownSyms) {
++			assert.notStrictEqual(
++				String(s),
++				'Symbol(nodejs.util.promisify.custom)',
++				'host fn must not carry a sandbox-installed nodejs.util.promisify.custom symbol',
++			);
++		}
++
++		const promisified = util.promisify(hostFn);
++		return promisified().then(v => {
++			assert.strictEqual(v, 'ok', 'promisify must not be hijacked');
++		});
++	});
++
++	it('blocks variant: plain string-key write on Object.create child must NOT leak to host', function () {
++		const hostObj = { tag: 'host-original' };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		try {
++			vm.run(`
++				const child = Object.create(hostObj);
++				child.injectedString = 'sandbox-value';
++				child.tag = 'overwritten-by-sandbox';
++			`);
++		} catch (_) {
++			/* trap-refusal is also acceptable */
++		}
++
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, 'injectedString'),
++			false,
++			'host object must not gain an injected own property via Object.create-child write',
++		);
++		assert.strictEqual(hostObj.tag, 'host-original', 'host object existing property must be unchanged');
++	});
++
++	it('blocks variant: Reflect.set(hostObj, k, v, customReceiver) must NOT leak to host', function () {
++		const hostObj = function () {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		try {
++			vm.run(`
++				const customReceiver = { __proto__: null };
++				Reflect.set(hostObj, 'reflectInjected', 'sandbox-value', customReceiver);
++			`);
++		} catch (_) {
++			/* trap-refusal acceptable */
++		}
++
++		assert.strictEqual(
++			Object.prototype.hasOwnProperty.call(hostObj, 'reflectInjected'),
++			false,
++			'Reflect.set with explicit receiver must not leak to host',
++		);
++	});
++
++	it('negative-control: direct write proxy.x = v still mutates host object', function () {
++		const hostObj = { existing: 1 };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++
++		vm.run(`hostObj.newField = 42;`);
++
++		assert.strictEqual(
++			hostObj.newField,
++			42,
++			'direct sandbox-side writes to the proxy must still mutate the host object',
++		);
++	});
++});
+
 --- a/lib/nodevm.js
 +++ b/lib/nodevm.js
 @@ -210,7 +210,10 @@ class NodeVM extends VM {
