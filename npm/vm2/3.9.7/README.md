@@ -4,6 +4,7 @@ This patch is based on vm2 version 3.9.7, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-45411
 - CVE-2022-36067
 
 ## How to Apply:
