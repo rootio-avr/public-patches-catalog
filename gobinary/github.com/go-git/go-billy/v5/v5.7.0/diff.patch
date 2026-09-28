@@ -1,0 +1,867 @@
+--- a/helper/chroot/chroot.go
++++ b/helper/chroot/chroot.go
+@@ -3,19 +3,25 @@ package chroot
+ import (
+ 	"errors"
+ 	"os"
++	"path"
+ 	"path/filepath"
+ 	"strings"
++	"syscall"
+ 
+ 	"github.com/go-git/go-billy/v5"
+ 	"github.com/go-git/go-billy/v5/helper/polyfill"
+ )
+ 
+ // ChrootHelper is a helper to implement billy.Chroot.
++// It is not a security boundary, callers that need containment should use a
++// filesystem implementation that enforces paths at the OS boundary instead.
+ type ChrootHelper struct {
+ 	underlying billy.Filesystem
+ 	base       string
+ }
+ 
++const maxFollowedSymlinks = 8 // Aligns with POSIX_SYMLOOP_MAX
++
+ // New creates a new filesystem wrapping up the given 'fs'.
+ // The created filesystem has its base in the given ChrootHelperectory of the
+ // underlying filesystem.
+@@ -34,15 +40,184 @@ func (fs *ChrootHelper) underlyingPath(filename string) (string, error) {
+ 	return fs.Join(fs.Root(), filename), nil
+ }
+ 
+-func isCrossBoundaries(path string) bool {
+-	path = filepath.ToSlash(path)
+-	path = filepath.Clean(path)
++func (fs *ChrootHelper) followedPath(filename string, followFinal bool, op string) (string, error) {
++	fullpath, err := fs.underlyingPath(filename)
++	if err != nil {
++		return "", err
++	}
++
++	sl, ok := fs.underlying.(billy.Symlink)
++	if !ok {
++		return fullpath, nil
++	}
++
++	rel, err := fs.relativeToRoot(fullpath)
++	if err != nil {
++		return "", err
++	}
++
++	fullpath, err = fs.resolveFollowedPath(rel, followFinal, op, sl)
++	if errors.Is(err, billy.ErrNotSupported) {
++		return fs.underlyingPath(filename)
++	}
++
++	return fullpath, err
++}
++
++func (fs *ChrootHelper) resolveFollowedPath(rel string, followFinal bool, op string, sl billy.Symlink) (string, error) {
++	if rel == "" {
++		return fs.resolveFollowedRoot(followFinal, op, sl)
++	}
++
++	parts := splitRelativePath(rel)
++	resolved := ""
++	followed := 0
++
++	for len(parts) > 0 {
++		part := parts[0]
++		parts = parts[1:]
++
++		currentRel := joinRelativePath(resolved, part)
++		currentPath := fs.Join(fs.Root(), currentRel)
++		if len(parts) == 0 && !followFinal {
++			return currentPath, nil
++		}
++
++		fi, err := sl.Lstat(currentPath)
++		if err != nil {
++			if os.IsNotExist(err) {
++				return fs.Join(fs.Root(), joinRelativePath(append([]string{currentRel}, parts...)...)), nil
++			}
++			return "", err
++		}
++
++		if fi.Mode()&os.ModeSymlink == 0 {
++			resolved = currentRel
++			continue
++		}
++
++		followed++
++		if followed > maxFollowedSymlinks {
++			return "", symlinkLoopError(op, currentPath)
++		}
++
++		target, err := sl.Readlink(currentPath)
++		if err != nil {
++			return "", err
++		}
++
++		targetRel, err := fs.linkTargetRel(currentPath, target)
++		if err != nil {
++			return "", err
++		}
++		if targetRel == currentRel {
++			return "", symlinkLoopError(op, currentPath)
++		}
++
++		parts = append(splitRelativePath(targetRel), parts...)
++		resolved = ""
++	}
++
++	return fs.Join(fs.Root(), resolved), nil
++}
++
++func symlinkLoopError(op, path string) error {
++	return &os.PathError{Op: op, Path: path, Err: syscall.ELOOP}
++}
++
++func (fs *ChrootHelper) resolveFollowedRoot(followFinal bool, op string, sl billy.Symlink) (string, error) {
++	root := fs.Join(fs.Root(), "")
++	if !followFinal {
++		return root, nil
++	}
++
++	fi, err := sl.Lstat(root)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return root, nil
++		}
++		return "", err
++	}
++
++	if fi.Mode()&os.ModeSymlink == 0 {
++		return root, nil
++	}
++
++	target, err := sl.Readlink(root)
++	if err != nil {
++		return "", err
++	}
++
++	targetRel, err := fs.linkTargetRel(root, target)
++	if err != nil {
++		return root, err
++	}
++	if targetRel == "" {
++		return "", symlinkLoopError(op, root)
++	}
+ 
+-	return strings.HasPrefix(path, ".."+string(filepath.Separator))
++	return fs.resolveFollowedPath(targetRel, followFinal, op, sl)
++}
++
++func (fs *ChrootHelper) relativeToRoot(filename string) (string, error) {
++	rel, err := filepath.Rel(filepath.Clean(fs.Root()), filepath.Clean(filename))
++	if err != nil || isCrossBoundaries(rel) {
++		return "", billy.ErrCrossedBoundary
++	}
++
++	if rel == "." {
++		return "", nil
++	}
++	return rel, nil
++}
++
++func (fs *ChrootHelper) linkTargetRel(linkPath, target string) (string, error) {
++	target = filepath.FromSlash(target)
++	if filepath.IsAbs(target) || strings.HasPrefix(target, string(filepath.Separator)) {
++		return fs.relativeToRoot(target)
++	}
++
++	return fs.relativeToRoot(fs.Join(filepath.Dir(linkPath), target))
++}
++
++func splitRelativePath(filename string) []string {
++	filename = filepath.Clean(filename)
++	if filename == "" || filename == "." {
++		return nil
++	}
++
++	return strings.Split(filepath.ToSlash(filename), "/")
++}
++
++func joinRelativePath(elem ...string) string {
++	parts := make([]string, 0, len(elem))
++	for _, part := range elem {
++		if part == "" || part == "." {
++			continue
++		}
++		parts = append(parts, part)
++	}
++
++	if len(parts) == 0 {
++		return ""
++	}
++	return filepath.Join(parts...)
++}
++
++func isCreateExclusive(flag int) bool {
++	return flag&os.O_CREATE != 0 && flag&os.O_EXCL != 0
++}
++
++func isCrossBoundaries(name string) bool {
++	name = filepath.ToSlash(name)
++	name = strings.TrimLeft(name, "/")
++	name = path.Clean(name)
++
++	return name == ".." || strings.HasPrefix(name, "../")
+ }
+ 
+ func (fs *ChrootHelper) Create(filename string) (billy.File, error) {
+-	fullpath, err := fs.underlyingPath(filename)
++	fullpath, err := fs.followedPath(filename, true, "create")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -56,7 +231,7 @@ func (fs *ChrootHelper) Create(filename string) (billy.File, error) {
+ }
+ 
+ func (fs *ChrootHelper) Open(filename string) (billy.File, error) {
+-	fullpath, err := fs.underlyingPath(filename)
++	fullpath, err := fs.followedPath(filename, true, "open")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -70,7 +245,7 @@ func (fs *ChrootHelper) Open(filename string) (billy.File, error) {
+ }
+ 
+ func (fs *ChrootHelper) OpenFile(filename string, flag int, mode os.FileMode) (billy.File, error) {
+-	fullpath, err := fs.underlyingPath(filename)
++	fullpath, err := fs.followedPath(filename, !isCreateExclusive(flag), "open")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -84,12 +259,16 @@ func (fs *ChrootHelper) OpenFile(filename string, flag int, mode os.FileMode) (b
+ }
+ 
+ func (fs *ChrootHelper) Stat(filename string) (os.FileInfo, error) {
+-	fullpath, err := fs.underlyingPath(filename)
++	fullpath, err := fs.followedPath(filename, true, "stat")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	return fs.underlying.Stat(fullpath)
++	fi, err := fs.underlying.Stat(fullpath)
++	if err != nil {
++		return nil, err
++	}
++	return fileInfo{FileInfo: fi, name: filepath.Base(filename)}, nil
+ }
+ 
+ func (fs *ChrootHelper) Rename(from, to string) error {
+@@ -135,7 +314,7 @@ func (fs *ChrootHelper) TempFile(dir, prefix string) (billy.File, error) {
+ }
+ 
+ func (fs *ChrootHelper) ReadDir(path string) ([]os.FileInfo, error) {
+-	fullpath, err := fs.underlyingPath(path)
++	fullpath, err := fs.followedPath(path, true, "readdir")
+ 	if err != nil {
+ 		return nil, err
+ 	}
+@@ -241,6 +420,11 @@ type file struct {
+ 	name string
+ }
+ 
++type fileInfo struct {
++	os.FileInfo
++	name string
++}
++
+ func newFile(fs billy.Filesystem, f billy.File, filename string) billy.File {
+ 	filename = fs.Join(fs.Root(), filename)
+ 	filename, _ = filepath.Rel(fs.Root(), filename)
+@@ -254,3 +438,7 @@ func newFile(fs billy.Filesystem, f billy.File, filename string) billy.File {
+ func (f *file) Name() string {
+ 	return f.name
+ }
++
++func (fi fileInfo) Name() string {
++	return fi.name
++}
+--- a/helper/chroot/chroot_test.go
++++ b/helper/chroot/chroot_test.go
+@@ -37,6 +37,58 @@ func (s *ChrootSuite) TestCreateErrCrossedBoundary(c *C) {
+ 	c.Assert(err, Equals, billy.ErrCrossedBoundary)
+ }
+ 
++func (s *ChrootSuite) TestCreateErrCrossedBoundaryVariants(c *C) {
++	tests := []string{
++		"..",
++		"foo/../..",
++		"/../foo",
++		"/foo/../..",
++		"/foo/../../bar",
++		"foo" + string(filepath.Separator) + "../..",
++		"/foo" + string(filepath.Separator) + "../..",
++	}
++
++	for _, path := range tests {
++		m := &test.BasicMock{}
++		fs := New(m, "/foo")
++
++		f, err := fs.Create(path)
++		c.Assert(err, Equals, billy.ErrCrossedBoundary, Commentf("path: %q", path))
++		c.Assert(f, IsNil, Commentf("path: %q", path))
++		c.Assert(m.CreateArgs, HasLen, 0, Commentf("path: %q", path))
++	}
++}
++
++func (s *ChrootSuite) TestIsCrossBoundaries(c *C) {
++	tests := []struct {
++		path string
++		want bool
++	}{
++		{path: "", want: false},
++		{path: ".", want: false},
++		{path: "foo", want: false},
++		{path: "..foo", want: false},
++		{path: "foo/..bar", want: false},
++		{path: "foo/..", want: false},
++		{path: "foo/../bar", want: false},
++		{path: "/foo/..", want: false},
++		{path: "/foo/../bar", want: false},
++		{path: "..", want: true},
++		{path: "../foo", want: true},
++		{path: "foo/../..", want: true},
++		{path: "/..", want: true},
++		{path: "/../foo", want: true},
++		{path: "/foo/../..", want: true},
++		{path: "/foo/../../bar", want: true},
++		{path: "foo" + string(filepath.Separator) + "../..", want: true},
++		{path: "/foo" + string(filepath.Separator) + "../..", want: true},
++	}
++
++	for _, tt := range tests {
++		c.Check(isCrossBoundaries(tt.path), Equals, tt.want, Commentf("path: %q", tt.path))
++	}
++}
++
+ func (s *ChrootSuite) TestLeadingPeriodsPathNotCrossedBoundary(c *C) {
+ 	m := &test.BasicMock{}
+ 
+--- a/helper/mount/mount.go
++++ b/helper/mount/mount.go
+@@ -1,13 +1,12 @@
+ package mount
+ 
+ import (
++	"fmt"
+ 	"io"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
+ 
+-	"fmt"
+-
+ 	"github.com/go-git/go-billy/v5"
+ 	"github.com/go-git/go-billy/v5/helper/polyfill"
+ )
+@@ -15,7 +14,7 @@ import (
+ var separator = string(filepath.Separator)
+ 
+ // Mount is a helper that allows to emulate the behavior of mount in memory.
+-// Very usufull to create a temporal dir, on filesystem where is a performance
++// Very useful to create a temporal dir, on filesystem where is a performance
+ // penalty in doing so.
+ type Mount struct {
+ 	underlying billy.Filesystem
+@@ -211,7 +210,7 @@ func (fs *Mount) mustRelToMountpoint(path string) string {
+ 
+ func (fs *Mount) isMountpoint(path string) bool {
+ 	path = cleanPath(path)
+-	return strings.HasPrefix(path, fs.mountpoint)
++	return path == fs.mountpoint || strings.HasPrefix(path, fs.mountpoint+separator)
+ }
+ 
+ func cleanPath(path string) string {
+--- a/helper/mount/mount_test.go
++++ b/helper/mount/mount_test.go
+@@ -92,6 +92,16 @@ func (s *MountSuite) TestOpenInMount(c *C) {
+ 	c.Assert(s.Source.OpenArgs[0], Equals, filepath.Join("bar", "qux"))
+ }
+ 
++func (s *MountSuite) TestOpenMountPointPrefix(c *C) {
++	f, err := s.Helper.Open("foobar/qux")
++	c.Assert(err, IsNil)
++	c.Assert(f.Name(), Equals, filepath.Join("foobar", "qux"))
++
++	c.Assert(s.Underlying.OpenArgs, HasLen, 1)
++	c.Assert(s.Underlying.OpenArgs[0], Equals, filepath.Join("foobar", "qux"))
++	c.Assert(s.Source.OpenArgs, HasLen, 0)
++}
++
+ func (s *MountSuite) TestOpenFile(c *C) {
+ 	f, err := s.Helper.OpenFile("bar/qux", 42, 0777)
+ 	c.Assert(err, IsNil)
+@@ -322,6 +332,25 @@ func (s *MountSuite) TestReadlinkInMount(c *C) {
+ 	c.Assert(s.Source.ReadlinkArgs[0], Equals, filepath.Join("bar", "qux"))
+ }
+ 
++func (s *MountSuite) TestIsMountpoint(c *C) {
++	tests := []struct {
++		path string
++		want bool
++	}{
++		{path: "foo", want: true},
++		{path: "/foo", want: true},
++		{path: "foo/bar", want: true},
++		{path: "/foo/bar", want: true},
++		{path: "foobar", want: false},
++		{path: "/foobar/qux", want: false},
++		{path: "bar/foo", want: false},
++	}
++
++	for _, tt := range tests {
++		c.Assert(s.Helper.isMountpoint(tt.path), Equals, tt.want, Commentf("path: %q", tt.path))
++	}
++}
++
+ func (s *MountSuite) TestUnderlyingNotSupported(c *C) {
+ 	h := New(&test.BasicMock{}, "/foo", &test.BasicMock{})
+ 	_, err := h.ReadDir("qux")
+--- a/memfs/memory_test.go
++++ b/memfs/memory_test.go
+@@ -1,16 +1,20 @@
+ package memfs
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"path/filepath"
+ 	"runtime"
++	"syscall"
+ 	"testing"
+ 
+ 	"github.com/go-git/go-billy/v5"
+ 	"github.com/go-git/go-billy/v5/test"
+ 	"github.com/go-git/go-billy/v5/util"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 
+ 	. "gopkg.in/check.v1"
+ )
+@@ -283,6 +287,178 @@ func TestSymlink(t *testing.T) {
+ 	}
+ }
+ 
++func TestChrootSymlinkResolution(t *testing.T) {
++	fs := New()
++	require.NoError(t, util.WriteFile(fs, "file", []byte("outer"), 0o644))
++	require.NoError(t, util.WriteFile(fs, "dir/file", []byte("outer-dir"), 0o644))
++
++	chroot, err := fs.Chroot("base")
++	require.NoError(t, err)
++	require.NoError(t, chroot.MkdirAll("nested", 0o755))
++	require.NoError(t, chroot.Symlink("../../file", "nested/file-link"))
++	require.NoError(t, chroot.Symlink("../../dir", "nested/dir-link"))
++
++	fi, err := chroot.Lstat("nested/file-link")
++	require.NoError(t, err)
++	assert.True(t, fi.Mode()&os.ModeSymlink != 0)
++
++	target, err := chroot.Readlink("nested/file-link")
++	require.NoError(t, err)
++	assert.Equal(t, filepath.FromSlash("../../file"), target)
++
++	tests := []struct {
++		name string
++		run  func() error
++	}{
++		{
++			name: "create",
++			run: func() error {
++				f, err := chroot.Create("nested/file-link")
++				if err == nil {
++					_ = f.Close()
++				}
++				return err
++			},
++		},
++		{
++			name: "open file",
++			run: func() error {
++				f, err := chroot.OpenFile("nested/file-link", os.O_RDONLY, 0)
++				if err == nil {
++					_ = f.Close()
++				}
++				return err
++			},
++		},
++		{
++			name: "open",
++			run: func() error {
++				f, err := chroot.Open("nested/file-link")
++				if err == nil {
++					_ = f.Close()
++				}
++				return err
++			},
++		},
++		{
++			name: "stat",
++			run: func() error {
++				_, err := chroot.Stat("nested/file-link")
++				return err
++			},
++		},
++		{
++			name: "read dir",
++			run: func() error {
++				_, err := chroot.ReadDir("nested/dir-link")
++				return err
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			require.ErrorIs(t, tt.run(), billy.ErrCrossedBoundary)
++		})
++	}
++
++	require.NoError(t, fs.Symlink("file", "root-link"))
++	rootChroot, err := fs.Chroot("root-link")
++	require.NoError(t, err)
++
++	_, err = rootChroot.Open("/")
++	require.ErrorIs(t, err, billy.ErrCrossedBoundary)
++
++	_, err = rootChroot.Stat("/")
++	require.ErrorIs(t, err, billy.ErrCrossedBoundary)
++
++	data, err := util.ReadFile(fs, "file")
++	require.NoError(t, err)
++	assert.Equal(t, []byte("outer"), data)
++}
++
++func (s *MemorySuite) TestChrootSymlinkResolutionLoop(c *C) {
++	tests := []struct {
++		name  string
++		setup func(c *C, fs billy.Filesystem)
++	}{
++		{
++			name: "mutual",
++			setup: func(c *C, fs billy.Filesystem) {
++				c.Assert(fs.Symlink("b", "a"), IsNil)
++				c.Assert(fs.Symlink("a", "b"), IsNil)
++			},
++		},
++		{
++			name: "self",
++			setup: func(c *C, fs billy.Filesystem) {
++				c.Assert(fs.Symlink("a", "a"), IsNil)
++			},
++		},
++		{
++			name: "self dot relative",
++			setup: func(c *C, fs billy.Filesystem) {
++				c.Assert(fs.Symlink("./a", "a"), IsNil)
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		fs := New()
++		tt.setup(c, fs)
++
++		f, err := fs.Open("a")
++		c.Assert(f, IsNil, Commentf("case: %s", tt.name))
++		requireSymlinkLoop(c, err, "open")
++
++		f, err = fs.Create("a")
++		c.Assert(f, IsNil, Commentf("case: %s", tt.name))
++		requireSymlinkLoop(c, err, "create")
++
++		fi, err := fs.Stat("a")
++		c.Assert(fi, IsNil, Commentf("case: %s", tt.name))
++		requireSymlinkLoop(c, err, "stat")
++	}
++}
++
++func (s *MemorySuite) TestChrootRootSymlinkResolutionLoop(c *C) {
++	tests := []struct {
++		name   string
++		target string
++	}{
++		{name: "self", target: "root"},
++		{name: "self dot relative", target: "./root"},
++	}
++
++	for _, tt := range tests {
++		fs := New()
++		c.Assert(fs.Symlink(tt.target, "root"), IsNil, Commentf("case: %s", tt.name))
++
++		chroot, err := fs.Chroot("root")
++		c.Assert(err, IsNil, Commentf("case: %s", tt.name))
++
++		f, err := chroot.Open("/")
++		c.Assert(f, IsNil, Commentf("case: %s", tt.name))
++		requireSymlinkLoop(c, err, "open")
++
++		fi, err := chroot.Stat("/")
++		c.Assert(fi, IsNil, Commentf("case: %s", tt.name))
++		requireSymlinkLoop(c, err, "stat")
++
++		entries, err := chroot.ReadDir("/")
++		c.Assert(entries, IsNil, Commentf("case: %s", tt.name))
++		requireSymlinkLoop(c, err, "readdir")
++	}
++}
++
++func requireSymlinkLoop(c *C, err error, op string) {
++	c.Assert(errors.Is(err, syscall.ELOOP), Equals, true)
++
++	var pathErr *os.PathError
++	c.Assert(errors.As(err, &pathErr), Equals, true)
++	c.Assert(pathErr.Op, Equals, op)
++}
++
+ func TestJoin(t *testing.T) {
+ 	tests := []struct {
+ 		name string
+@@ -325,10 +501,10 @@ func (s *MemorySuite) TestSymlink(c *C) {
+ 	c.Assert(err, IsNil)
+ 
+ 	f, err := s.FS.Open("test")
+-	c.Assert(err, IsNil)
+-	c.Assert(f, NotNil)
++	c.Assert(f, IsNil)
++	requireSymlinkLoop(c, err, "open")
+ 
+ 	fi, err := s.FS.ReadDir("test")
+-	c.Assert(err, IsNil)
+ 	c.Assert(fi, IsNil)
++	requireSymlinkLoop(c, err, "readdir")
+ }
+--- a/osfs/os_chroot.go
++++ b/osfs/os_chroot.go
+@@ -14,6 +14,8 @@ import (
+ // ChrootOS is a legacy filesystem based on a "soft chroot" of the os filesystem.
+ // Although this is still the default os filesystem, consider using BoundOS instead.
+ //
++// Deprecated: use New with WithBoundOS instead.
++//
+ // Behaviours of note:
+ //  1. A "soft chroot" translates the base dir to "/" for the purposes of the
+ //     fs abstraction.
+@@ -24,6 +26,10 @@ import (
+ type ChrootOS struct{}
+ 
+ func newChrootOS(baseDir string) billy.Filesystem {
++	if resolved, err := filepath.EvalSymlinks(baseDir); err == nil {
++		baseDir = resolved
++	}
++
+ 	return chroot.New(&ChrootOS{}, baseDir)
+ }
+ 
+--- a/osfs/os_chroot_test.go
++++ b/osfs/os_chroot_test.go
+@@ -51,6 +51,27 @@ func (s *ChrootOSSuite) TestOpenDoesNotCreateDir(c *C) {
+ 	c.Assert(os.IsNotExist(err), Equals, true)
+ }
+ 
++func (s *ChrootOSSuite) TestSymlinkedRoot(c *C) {
++	root := c.MkDir()
++	realRoot := filepath.Join(root, "real")
++	linkRoot := filepath.Join(root, "link")
++
++	c.Assert(os.Mkdir(realRoot, 0755), IsNil)
++	if err := os.Symlink(realRoot, linkRoot); err != nil {
++		c.Skip("symlink creation is not supported")
++	}
++
++	fs := newChrootOS(linkRoot)
++
++	fi, err := fs.Stat("/")
++	c.Assert(err, IsNil)
++	c.Assert(fi.IsDir(), Equals, true)
++
++	_, err = fs.Stat(".git")
++	c.Assert(os.IsNotExist(err), Equals, true)
++	c.Assert(err, Not(Equals), billy.ErrCrossedBoundary)
++}
++
+ func (s *ChrootOSSuite) TestCapabilities(c *C) {
+ 	_, ok := s.FS.(billy.Capable)
+ 	c.Assert(ok, Equals, true)
+--- a/test/chroot.go
++++ b/test/chroot.go
+@@ -2,10 +2,11 @@ package test
+ 
+ import (
+ 	"os"
++	"path/filepath"
+ 
+-	. "gopkg.in/check.v1"
+ 	. "github.com/go-git/go-billy/v5"
+ 	"github.com/go-git/go-billy/v5/util"
++	. "gopkg.in/check.v1"
+ )
+ 
+ // ChrootSuite is a convenient test suite to validate any implementation of
+@@ -30,6 +31,25 @@ func (s *ChrootSuite) TestCreateWithChroot(c *C) {
+ 	c.Assert(f.Close(), IsNil)
+ }
+ 
++func (s *ChrootSuite) TestCreateOutOffBoundaryVariants(c *C) {
++	tests := []string{
++		"..",
++		"foo/../..",
++		"/../foo",
++		"/foo/../..",
++		"/foo/../../bar",
++		"foo" + string(filepath.Separator) + "../..",
++		"/foo" + string(filepath.Separator) + "../..",
++	}
++
++	fs, _ := s.FS.Chroot("foo")
++	for _, path := range tests {
++		f, err := fs.Create(path)
++		c.Assert(err, Equals, ErrCrossedBoundary, Commentf("path: %q", path))
++		c.Assert(f, IsNil, Commentf("path: %q", path))
++	}
++}
++
+ func (s *ChrootSuite) TestOpenWithChroot(c *C) {
+ 	fs, _ := s.FS.Chroot("foo")
+ 	f, err := fs.Create("bar")
+--- a/test/fs.go
++++ b/test/fs.go
+@@ -4,9 +4,9 @@ import (
+ 	"os"
+ 	"runtime"
+ 
+-	. "gopkg.in/check.v1"
+ 	. "github.com/go-git/go-billy/v5"
+ 	"github.com/go-git/go-billy/v5/util"
++	. "gopkg.in/check.v1"
+ )
+ 
+ // FilesystemSuite is a convenient test suite to validate any implementation of
+@@ -122,9 +122,13 @@ func (s *FilesystemSuite) TestSymlinkWithChrootCrossBounders(c *C) {
+ 	err := qux.Symlink("../../file", "qux/link")
+ 	c.Assert(err, Equals, nil)
+ 
+-	fi, err := qux.Stat("qux/link")
++	fi, err := qux.Lstat("qux/link")
+ 	c.Assert(fi, NotNil)
+ 	c.Assert(err, Equals, nil)
++
++	fi, err = qux.Stat("qux/link")
++	c.Assert(fi, IsNil)
++	c.Assert(err, Equals, ErrCrossedBoundary)
+ }
+ 
+ func (s *FilesystemSuite) TestReadDirWithLink(c *C) {
+--- a/util/util.go
++++ b/util/util.go
+@@ -16,8 +16,6 @@ import (
+ // can but returns the first error it encounters. If the path does not exist,
+ // RemoveAll returns nil (no error).
+ func RemoveAll(fs billy.Basic, path string) error {
+-	fs, path = getUnderlyingAndPath(fs, path)
+-
+ 	if r, ok := fs.(removerAll); ok {
+ 		return r.RemoveAll(path)
+ 	}
+@@ -39,7 +37,7 @@ func removeAll(fs billy.Basic, path string) error {
+ 	}
+ 
+ 	// Otherwise, is this a directory we need to recurse into?
+-	dir, serr := fs.Stat(path)
++	dir, serr := lstat(fs, path)
+ 	if serr != nil {
+ 		if errors.Is(serr, os.ErrNotExist) {
+ 			return nil
+@@ -48,8 +46,8 @@ func removeAll(fs billy.Basic, path string) error {
+ 		return serr
+ 	}
+ 
+-	if !dir.IsDir() {
+-		// Not a directory; return the error from Remove.
++	if dir.Mode()&os.ModeSymlink != 0 || !dir.IsDir() {
++		// Not a directory we should recurse into; return the error from Remove.
+ 		return err
+ 	}
+ 
+@@ -62,7 +60,7 @@ func removeAll(fs billy.Basic, path string) error {
+ 	fis, err := dirfs.ReadDir(path)
+ 	if err != nil {
+ 		if errors.Is(err, os.ErrNotExist) {
+-			// Race. It was deleted between the Lstat and Open.
++			// Race. It was deleted between the Lstat and ReadDir.
+ 			// Return nil per RemoveAll's docs.
+ 			return nil
+ 		}
+@@ -91,7 +89,18 @@ func removeAll(fs billy.Basic, path string) error {
+ 	}
+ 
+ 	return err
++}
+ 
++func lstat(filesystem billy.Basic, path string) (os.FileInfo, error) {
++	if sl, ok := filesystem.(billy.Symlink); ok {
++		// Avoid following a symlink substituted after the initial Remove fails.
++		fi, err := sl.Lstat(path)
++		if err == nil || !errors.Is(err, billy.ErrNotSupported) {
++			return fi, err
++		}
++	}
++
++	return filesystem.Stat(path)
+ }
+ 
+ // WriteFile writes data to a file named by filename in the given filesystem.
+@@ -123,8 +132,10 @@ func WriteFile(fs billy.Basic, filename string, data []byte, perm os.FileMode) (
+ // We generate random temporary file names so that there's a good
+ // chance the file doesn't exist yet - keeps the number of tries in
+ // TempFile to a minimum.
+-var rand uint32
+-var randmu sync.Mutex
++var (
++	rand   uint32
++	randmu sync.Mutex
++)
+ 
+ func reseed() uint32 {
+ 	return uint32(time.Now().UnixNano() + int64(os.Getpid()))
+@@ -220,22 +231,6 @@ func getTempDir(fs billy.Basic) string {
+ 	return ".tmp"
+ }
+ 
+-type underlying interface {
+-	Underlying() billy.Basic
+-}
+-
+-func getUnderlyingAndPath(fs billy.Basic, path string) (billy.Basic, string) {
+-	u, ok := fs.(underlying)
+-	if !ok {
+-		return fs, path
+-	}
+-	if ch, ok := fs.(billy.Chroot); ok {
+-		path = fs.Join(ch.Root(), path)
+-	}
+-
+-	return u.Underlying(), path
+-}
+-
+ // ReadFile reads the named file and returns the contents from the given filesystem.
+ // A successful call returns err == nil, not err == EOF.
+ // Because ReadFile reads the whole file, it does not treat an EOF from Read
+--- a/util/util_test.go
++++ b/util/util_test.go
+@@ -60,7 +60,6 @@ func TestReadFile(t *testing.T) {
+ 	if string(data) != "foo" || err != nil {
+ 		t.Errorf("ReadFile(%q, %q) = %v, %v", fs, f.Name(), data, err)
+ 	}
+-
+ }
+ 
+ func TestTempDir(t *testing.T) {
