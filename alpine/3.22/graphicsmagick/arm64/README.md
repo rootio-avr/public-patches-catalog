@@ -1,11 +1,12 @@
-# graphicsmagick : 1.3.45-r00072
+# graphicsmagick : 1.3.45-r00073
 
-This patch is based on graphicsmagick version 1.3.45-r00072, which is available at:
+This patch is based on graphicsmagick version 1.3.45-r00073, which is available at:
 unknown
 
 ## Affected CVEs:
 - CVE-2025-32460
 - CVE-2025-27795
+- CVE-2025-27796
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source graphicsmagick`
