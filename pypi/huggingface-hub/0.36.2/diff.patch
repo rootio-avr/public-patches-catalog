@@ -1,0 +1,619 @@
+--- a/src/huggingface_hub/serialization/_torch.py
++++ b/src/huggingface_hub/serialization/_torch.py
+@@ -30,6 +30,12 @@ from ._base import MAX_SHARD_SIZE, StateDictSplit, split_state_dict_into_shards_
+ 
+ logger = logging.get_logger(__file__)
+ 
++SAFETENSORS_EXTENSION = ".safetensors"
++
++# A checkpoint index is plain metadata (a tensor name -> shard file mapping). 10 MB is already far beyond
++# anything a real checkpoint produces, so anything bigger is not worth parsing into memory.
++MAX_INDEX_FILE_SIZE = 10 * 1024 * 1024
++
+ if TYPE_CHECKING:
+     import torch
+ 
+@@ -366,7 +372,7 @@ def load_torch_model(
+     *,
+     strict: bool = False,
+     safe: bool = True,
+-    weights_only: bool = False,
++    weights_only: bool = True,
+     map_location: Optional[Union[str, "torch.device"]] = None,
+     mmap: bool = False,
+     filename_pattern: Optional[str] = None,
+@@ -381,13 +387,17 @@ def load_torch_model(
+             Path to either the checkpoint file or directory containing the checkpoint(s).
+         strict (`bool`, *optional*, defaults to `False`):
+             Whether to strictly enforce that the keys in the model state dict match the keys in the checkpoint.
++            As with [`torch.nn.Module.load_state_dict`], the check happens once the checkpoint has been loaded, so
++            the model may have been partially updated when the error is raised.
+         safe (`bool`, *optional*, defaults to `True`):
+             If `safe` is True, the safetensors files will be loaded. If `safe` is False, the function
+             will first attempt to load safetensors files if they are available, otherwise it will fall back to loading
+-            pickle files. `filename_pattern` parameter takes precedence over `safe` parameter.
+-        weights_only (`bool`, *optional*, defaults to `False`):
+-            If True, only loads the model weights without optimizer states and other metadata.
+-            Only supported in PyTorch >= 1.13.
++            pickle files. A `filename_pattern` that does not describe safetensors files is rejected when `safe=True`.
++        weights_only (`bool`, *optional*, defaults to `True`):
++            If True, only loads the model weights without optimizer states and other metadata, using torch's
++            restricted unpickler. Set to False to allow arbitrary Python objects in a pickle checkpoint (this
++            executes arbitrary code at load time). Has no effect on PyTorch < 1.13, which has no restricted
++            unpickler and always unpickles without restriction.
+         map_location (`str` or `torch.device`, *optional*):
+             A `torch.device` object, string or a dict specifying how to remap storage locations. It
+             indicates the location where all tensors should be loaded.
+@@ -428,6 +438,8 @@ def load_torch_model(
+             checkpoint_file=checkpoint_path,
+             map_location=map_location,
+             weights_only=weights_only,
++            mmap=mmap,
++            safe=safe,
+         )
+         return model.load_state_dict(state_dict, strict=strict)
+ 
+@@ -438,6 +450,13 @@ def load_torch_model(
+         # Only fallback to pickle format if safetensors index is not found and safe is False.
+         if not index_path.is_file() and not safe:
+             filename_pattern = constants.PYTORCH_WEIGHTS_FILE_PATTERN
++    elif safe and not _is_safetensors(filename_pattern.format(suffix="")):
++        # A pickle `filename_pattern` combined with `safe=True` is a conflict: loading those shards would execute
++        # arbitrary code at load time. Refuse it instead of silently letting the pattern win over `safe`.
++        raise ValueError(
++            f"`filename_pattern={filename_pattern!r}` does not describe safetensors files but `safe=True`. "
++            "Pass `safe=False` to explicitly allow loading pickled weights (this executes arbitrary code at load time)."
++        )
+ 
+     index_path = checkpoint_path / (filename_pattern.format(suffix="") + ".index.json")
+ 
+@@ -447,17 +466,26 @@ def load_torch_model(
+             save_directory=checkpoint_path,
+             strict=strict,
+             weights_only=weights_only,
++            safe=safe,
+             filename_pattern=filename_pattern,
+         )
+ 
+-    # Look for single model file
+-    model_files = list(checkpoint_path.glob("*.safetensors" if safe else "*.bin"))
++    # Look for single model file.
++    # Safetensors is tried first even when `safe=False`: the docstring promises a *fallback* to pickle files for
++    # that case, not a pickle-first preference. A directory holding only `model.safetensors` used to raise
++    # `ValueError` under `safe=False`.
++    model_files = list(checkpoint_path.glob("*" + SAFETENSORS_EXTENSION))
++    if len(model_files) != 1 and not safe:
++        # Fallback only helps if it yields exactly one file, so it must also run when several safetensors files
++        # were found (e.g. `model.safetensors` next to `model.fp16.safetensors` and a single `pytorch_model.bin`).
++        model_files = list(checkpoint_path.glob("*.bin"))
+     if len(model_files) == 1:
+         state_dict = load_state_dict_from_file(
+             checkpoint_file=model_files[0],
+             map_location=map_location,
+             weights_only=weights_only,
+             mmap=mmap,
++            safe=safe,
+         )
+         return model.load_state_dict(state_dict, strict=strict)
+ 
+@@ -472,7 +500,8 @@ def _load_sharded_checkpoint(
+     save_directory: os.PathLike,
+     *,
+     strict: bool = False,
+-    weights_only: bool = False,
++    weights_only: bool = True,
++    safe: bool = True,
+     filename_pattern: str = constants.SAFETENSORS_WEIGHTS_FILE_PATTERN,
+ ) -> NamedTuple:
+     """
+@@ -487,9 +516,16 @@ def _load_sharded_checkpoint(
+             A path to a folder containing the sharded checkpoint.
+         strict (`bool`, *optional*, defaults to `False`):
+             Whether to strictly enforce that the keys in the model state dict match the keys in the sharded checkpoint.
+-        weights_only (`bool`, *optional*, defaults to `False`):
+-            If True, only loads the model weights without optimizer states and other metadata.
+-            Only supported in PyTorch >= 1.13.
++            As with [`torch.nn.Module.load_state_dict`], the check happens once every shard has been loaded, so the
++            model may have been partially updated when the error is raised.
++        weights_only (`bool`, *optional*, defaults to `True`):
++            If True, only loads the model weights without optimizer states and other metadata, using torch's
++            restricted unpickler. Set to False to allow arbitrary Python objects in a pickle checkpoint (this
++            executes arbitrary code at load time). Has no effect on PyTorch < 1.13, which has no restricted
++            unpickler and always unpickles without restriction.
++        safe (`bool`, *optional*, defaults to `True`):
++            If True, every shard is loaded with the safetensors loader. If False, shards are loaded as safetensors
++            when their name says so and with `torch.load` otherwise.
+         filename_pattern (`str`, *optional*, defaults to `"model{suffix}.safetensors"`):
+             The pattern to look for the index file. Pattern must be a string that
+             can be formatted with `filename_pattern.format(suffix=...)` and must contain the keyword `suffix`
+@@ -505,17 +541,25 @@ def _load_sharded_checkpoint(
+     # The index file contains mapping of parameter names to shard files
+     index_path = filename_pattern.format(suffix="") + ".index.json"
+     index_file = os.path.join(save_directory, index_path)
++    # Refuse oversized index files before parsing them: the index is metadata, never a multi-GB payload.
++    if os.path.getsize(index_file) > MAX_INDEX_FILE_SIZE:
++        raise ValueError(
++            f"Invalid index file '{index_file}': larger than {MAX_INDEX_FILE_SIZE} bytes, which is not a valid "
++            "checkpoint index."
++        )
+     with open(index_file, "r", encoding="utf-8") as f:
+         index = json.load(f)
+-
+-    # 2. Validate keys if in strict mode
+-    # This is done before loading any shards to fail fast
+-    if strict:
+-        _validate_keys_for_strict_loading(model, index["weight_map"].keys())
+-
+-    # 3. Load each shard using `load_state_dict`
++    # Validate the structure before touching it: a malformed index would otherwise surface as a raw `KeyError` /
++    # `AttributeError` / `TypeError` traceback from attacker-controlled input.
++    if not isinstance(index, dict) or not isinstance(index.get("weight_map"), dict):
++        raise ValueError(f"Invalid index file '{index_file}': expected a JSON object with a 'weight_map' object.")
++    if not all(isinstance(shard_file, str) for shard_file in index["weight_map"].values()):
++        raise ValueError(f"Invalid index file '{index_file}': all 'weight_map' values must be strings.")
++
++    # 2. Load each shard using `load_state_dict`
+     # Get unique shard files (multiple parameters can be in same shard)
+     shard_files = list(set(index["weight_map"].values()))
++    loaded_keys: Set[str] = set()
+     for shard_file in shard_files:
+         # Load shard into memory
+         shard_path = os.path.join(save_directory, shard_file)
+@@ -523,14 +567,24 @@ def _load_sharded_checkpoint(
+             shard_path,
+             map_location="cpu",
+             weights_only=weights_only,
++            safe=safe,
+         )
+-        # Update model with parameters from this shard
+-        model.load_state_dict(state_dict, strict=strict)
++        loaded_keys.update(state_dict.keys())
++        # Update model with parameters from this shard. `strict=False` here: a single shard never holds all the
++        # model's keys, so per-shard strict loading would always raise. Strictness is enforced against the real
++        # loaded keys below.
++        model.load_state_dict(state_dict, strict=False)
+         # Explicitly remove the state dict from memory
+         del state_dict
+ 
+-    # 4. Return compatibility info
+-    loaded_keys = set(index["weight_map"].keys())
++    # 3. Validate keys and return compatibility info.
++    # Both are computed from what the shards actually contained, never from the index file: the index is
++    # attacker-controlled metadata and must not be able to lie about what was loaded into the model — neither by
++    # hiding a tensor it did declare, nor by failing `strict=True` over a tensor no shard ever held.
++    if unexpected := loaded_keys - set(index["weight_map"]):
++        logger.warning(f"Shard files contain tensors absent from the index: {sorted(unexpected)}")
++    if strict:
++        _validate_keys_for_strict_loading(model, loaded_keys)
+     model_keys = set(model.state_dict().keys())
+     return _IncompatibleKeys(
+         missing_keys=list(model_keys - loaded_keys), unexpected_keys=list(loaded_keys - model_keys)
+@@ -540,8 +594,10 @@ def _load_sharded_checkpoint(
+ def load_state_dict_from_file(
+     checkpoint_file: Union[str, os.PathLike],
+     map_location: Optional[Union[str, "torch.device"]] = None,
+-    weights_only: bool = False,
++    weights_only: bool = True,
+     mmap: bool = False,
++    *,
++    safe: bool = True,
+ ) -> Union[Dict[str, "torch.Tensor"], Any]:
+     """
+     Loads a checkpoint file, handling both safetensors and pickle checkpoint formats.
+@@ -552,14 +608,21 @@ def load_state_dict_from_file(
+         map_location (`str` or `torch.device`, *optional*):
+             A `torch.device` object, string or a dict specifying how to remap storage locations. It
+             indicates the location where all tensors should be loaded.
+-        weights_only (`bool`, *optional*, defaults to `False`):
+-            If True, only loads the model weights without optimizer states and other metadata.
+-            Only supported for pickle (`.bin`) checkpoints with PyTorch >= 1.13. Has no effect when
+-            loading safetensors files.
++        weights_only (`bool`, *optional*, defaults to `True`):
++            If True, only loads the model weights without optimizer states and other metadata, using torch's
++            restricted unpickler. Set to False to allow arbitrary Python objects in a pickle checkpoint (this
++            executes arbitrary code at load time). Has no effect when loading safetensors files, nor on
++            PyTorch < 1.13 which has no restricted unpickler — those versions always unpickle without restriction
++            and a warning is logged.
+         mmap (`bool`, *optional*, defaults to `False`):
+             Whether to use memory-mapped file loading. Memory mapping can improve loading performance
+             for large models in PyTorch >= 2.1.0 with zipfile-based checkpoints. Has no effect when
+             loading safetensors files, as the `safetensors` library uses memory mapping by default.
++        safe (`bool`, *optional*, defaults to `True`):
++            If True, the checkpoint is always loaded as safetensors, whatever its name. Any other format
++            (e.g. a pickle `.bin` file) raises a `ValueError` instead of being deserialized: pickle checkpoints can
++            execute arbitrary code at load time. If False, the file is loaded as safetensors when its name says so,
++            and with `torch.load` otherwise.
+ 
+     Returns:
+         `Union[Dict[str, "torch.Tensor"], Any]`: The loaded checkpoint.
+@@ -575,18 +638,19 @@ def load_state_dict_from_file(
+         [`OSError`](https://docs.python.org/3/library/exceptions.html#OSError)
+             If the checkpoint file format is invalid or if git-lfs files are not properly downloaded.
+         [`ValueError`](https://docs.python.org/3/library/exceptions.html#ValueError)
+-            If the checkpoint file path is empty or invalid.
++            If the checkpoint file path is empty or invalid, or if it cannot be deserialized as safetensors while
++            `safe=True` (pass `safe=False` to allow pickle checkpoints).
+ 
+     Example:
+     ```python
+     >>> from huggingface_hub import load_state_dict_from_file
+ 
+-    # Load a PyTorch checkpoint
+-    >>> state_dict = load_state_dict_from_file("path/to/model.bin", map_location="cpu")
++    # Load a safetensors checkpoint (safe by default)
++    >>> state_dict = load_state_dict_from_file("path/to/model.safetensors", safe=True)
+     >>> model.load_state_dict(state_dict)
+ 
+-    # Load a safetensors checkpoint
+-    >>> state_dict = load_state_dict_from_file("path/to/model.safetensors")
++    # Load a pickle checkpoint. `safe=False` is required: pickle files can execute arbitrary code.
++    >>> state_dict = load_state_dict_from_file("path/to/model.bin", safe=False, map_location="cpu")
+     >>> model.load_state_dict(state_dict)
+     ```
+     """
+@@ -600,31 +664,25 @@ def load_state_dict_from_file(
+         )
+ 
+     # Load safetensors checkpoint
+-    if checkpoint_path.suffix == ".safetensors":
++    if safe or _is_safetensors(checkpoint_path):
++        # `safe=True` is a hard guarantee: the safetensors loader is used whatever the file is called. A pickle file
++        # pretending to be safetensors — or any other name the extension check failed to recognize — fails to
++        # deserialize instead of being executed. The filename is only a hint, used in the already-unsafe `safe=False`
++        # branch below.
+         try:
+-            from safetensors import safe_open
+-            from safetensors.torch import load_file
+-        except ImportError as e:
+-            raise ImportError(
+-                "Please install `safetensors` to load safetensors checkpoint. "
+-                "You can install it with `pip install safetensors`."
+-            ) from e
++            return _load_safetensors_file(checkpoint_path, map_location=map_location)
++        except ImportError:
++            raise
++        except OSError:
++            raise  # invalid safetensors metadata: the error message is already actionable
++        except Exception as e:
++            if safe:
++                raise ValueError(
++                    f"Cannot load '{checkpoint_path}' as safetensors. If this is a pickle checkpoint, pass "
++                    "`safe=False` to allow it (this executes arbitrary code at load time)."
++                ) from e
++            raise
+ 
+-        # Check format of the archive
+-        with safe_open(checkpoint_file, framework="pt") as f:  # type: ignore[attr-defined]
+-            metadata = f.metadata()
+-        # see comment: https://github.com/huggingface/transformers/blob/3d213b57fe74302e5902d68ed9478c3ad1aaa713/src/transformers/modeling_utils.py#L3966
+-        if metadata is not None and metadata.get("format") not in ["pt", "mlx"]:
+-            raise OSError(
+-                f"The safetensors archive passed at {checkpoint_file} does not contain the valid metadata. Make sure "
+-                "you save your model with the `save_torch_model` method."
+-            )
+-        device = str(map_location.type) if map_location is not None and hasattr(map_location, "type") else map_location
+-        # meta device is not supported with safetensors, falling back to CPU
+-        if device == "meta":
+-            logger.warning("Meta device is not supported with safetensors. Falling back to CPU device.")
+-            device = "cpu"
+-        return load_file(checkpoint_file, device=device)  # type: ignore[arg-type]
+     # Otherwise, load from pickle
+     try:
+         import torch
+@@ -633,6 +691,7 @@ def load_state_dict_from_file(
+         raise ImportError(
+             "Please install `torch` to load torch tensors. You can install it with `pip install torch`."
+         ) from e
++
+     # Add additional kwargs, mmap is only supported in torch >= 2.1.0
+     additional_kwargs = {}
+     if version.parse(torch.__version__) >= version.parse("2.1.0"):
+@@ -642,6 +701,16 @@ def load_state_dict_from_file(
+     if version.parse(torch.__version__) >= version.parse("1.13.0"):
+         additional_kwargs["weights_only"] = weights_only
+ 
++    if not additional_kwargs.get("weights_only", False):
++        # Warn only when the unrestricted unpickler is what actually runs: either the caller asked for it, or torch
++        # is too old to have a restricted one and `weights_only=True` could not be honored. With the restricted
++        # unpickler in play the warning would be both untrue and noisy (it is emitted once per shard).
++        logger.warning(
++            f"Loading '{checkpoint_path}' with `torch.load` and no restricted unpickler (`weights_only=False`, or "
++            "torch < 1.13 which does not support it). Pickle checkpoints can execute arbitrary code at load time; "
++            "only load files from sources you trust."
++        )
++
+     return load(
+         checkpoint_file,
+         map_location=map_location,
+@@ -649,9 +718,50 @@ def load_state_dict_from_file(
+     )
+ 
+ 
++def _load_safetensors_file(
++    checkpoint_file: Union[str, os.PathLike],
++    map_location: Optional[Union[str, "torch.device"]] = None,
++) -> Dict[str, "torch.Tensor"]:
++    """Load a safetensors checkpoint. Raises `safetensors.SafetensorError` if the file is not a valid safetensors."""
++    try:
++        from safetensors import safe_open
++        from safetensors.torch import load_file
++    except ImportError as e:
++        raise ImportError(
++            "Please install `safetensors` to load safetensors checkpoint. "
++            "You can install it with `pip install safetensors`."
++        ) from e
++
++    # Check format of the archive
++    with safe_open(checkpoint_file, framework="pt") as f:  # type: ignore[attr-defined]
++        metadata = f.metadata()
++    # see comment: https://github.com/huggingface/transformers/blob/3d213b57fe74302e5902d68ed9478c3ad1aaa713/src/transformers/modeling_utils.py#L3966
++    if metadata is not None and metadata.get("format") not in ["pt", "mlx"]:
++        raise OSError(
++            f"The safetensors archive passed at {checkpoint_file} does not contain the valid metadata. Make sure "
++            "you save your model with the `save_torch_model` method."
++        )
++    device = str(map_location.type) if map_location is not None and hasattr(map_location, "type") else map_location
++    # meta device is not supported with safetensors, falling back to CPU
++    if device == "meta":
++        logger.warning("Meta device is not supported with safetensors. Falling back to CPU device.")
++        device = "cpu"
++    return load_file(checkpoint_file, device=device)  # type: ignore[arg-type]
++
++
+ # HELPERS
+ 
+ 
++def _is_safetensors(filename: Union[str, os.PathLike]) -> bool:
++    """Whether `filename` must be loaded with the safetensors loader.
++
++    The comparison is case-insensitive on purpose: Windows and macOS resolve filenames case-insensitively, so a file
++    named `model.SAFETENSORS` can be picked up by a case-insensitive glob. This is only a *hint* used when `safe=False`;
++    it is never the security boundary (see `load_state_dict_from_file`).
++    """
++    return str(filename).lower().endswith(SAFETENSORS_EXTENSION)
++
++
+ def _validate_keys_for_strict_loading(
+     model: "torch.nn.Module",
+     loaded_keys: Iterable[str],
+--- a/tests/test_serialization.py
++++ b/tests/test_serialization.py
+@@ -1,4 +1,5 @@
+ import json
++import pickle
+ import struct
+ from pathlib import Path
+ from typing import TYPE_CHECKING, Dict, List
+@@ -627,12 +628,16 @@ def test_load_state_dict_from_file(tmp_path: Path, torch_state_dict: Dict[str, "
+ 
+     # Test PyTorch pickle format
+     save_torch_state_dict(torch_state_dict, tmp_path, safe_serialization=False)
+-    loaded_dict = load_state_dict_from_file(tmp_path / "pytorch_model.bin")
++    loaded_dict = load_state_dict_from_file(tmp_path / "pytorch_model.bin", safe=False)
+     assert isinstance(loaded_dict, dict)
+     assert set(loaded_dict.keys()) == set(torch_state_dict.keys())
+     for key in torch_state_dict:
+         assert torch.equal(loaded_dict[key], torch_state_dict[key])
+ 
++    # A pickle checkpoint is rejected by default (`safe=True`)
++    with pytest.raises(ValueError, match="Cannot load .* as safetensors"):
++        load_state_dict_from_file(tmp_path / "pytorch_model.bin")
++
+ 
+ @requires("torch")
+ def test_load_sharded_state_dict(
+@@ -795,19 +800,12 @@ def test_load_torch_model_with_filename_pattern(tmp_path, torch_state_dict, dumm
+             ["model.variant.safetensors.index.json", "pytorch_model.bin.index.json"],
+             "model.variant{suffix}.safetensors",
+         ),  # both exist and safe=False -> load safetensors
+-        # `filename_pattern` takes precedence over `safe` parameter
+         (
+             "model.variant{suffix}.bin",
+             False,
+             ["model.variant.safetensors.index.json", "model.variant.bin.index.json"],
+             "model.variant{suffix}.bin",
+         ),  # custom filename pattern and safe=False -> load custom file index
+-        (
+-            "model.variant{suffix}.bin",
+-            True,
+-            ["model.variant.safetensors.index.json", "model.variant.bin.index.json"],
+-            "model.variant{suffix}.bin",
+-        ),  # custom filename pattern and safe=False -> load custom file index
+     ],
+ )
+ @requires("torch")
+@@ -837,3 +835,194 @@ def test_load_torch_model_index_selection(
+     load_torch_model(model, tmp_path, safe=safe, filename_pattern=filename_pattern)
+     mock_load.assert_called_once()
+     assert mock_load.call_args.kwargs["filename_pattern"] == expected_filename_pattern
++
++
++@requires("torch")
++def test_load_torch_model_pickle_pattern_with_safe_true(tmp_path):
++    """A pickle `filename_pattern` combined with `safe=True` is rejected instead of silently loading pickles."""
++    import torch
++
++    class SimpleModel(torch.nn.Module):
++        def __init__(self):
++            super().__init__()
++            self.layer_1 = torch.nn.Parameter(torch.tensor([0.0]))
++
++    (tmp_path / "model.variant.bin.index.json").touch()
++
++    with pytest.raises(ValueError, match="does not describe safetensors files but `safe=True`"):
++        load_torch_model(SimpleModel(), tmp_path, safe=True, filename_pattern="model.variant{suffix}.bin")
++
++
++@requires("torch")
++def test_load_torch_model_forwards_mmap_for_single_file(tmp_path, torch_state_dict, dummy_model, mocker):
++    """`mmap` used to be a silent no-op in the single-file branch."""
++    save_torch_state_dict(torch_state_dict, tmp_path)
++    mock_load = mocker.patch("huggingface_hub.serialization._torch.load_state_dict_from_file", return_value={})
++
++    load_torch_model(dummy_model, tmp_path / "model.safetensors", mmap=True)
++
++    assert mock_load.call_args.kwargs["mmap"] is True
++
++
++@requires("torch")
++def test_load_torch_model_safe_false_falls_back_to_pickle_with_several_safetensors(
++    tmp_path, torch_state_dict, dummy_model
++):
++    """The `.bin` fallback must also run when the safetensors glob found several files, not just zero."""
++    import torch
++
++    save_torch_state_dict(torch_state_dict, tmp_path)
++    (tmp_path / "model.fp16.safetensors").write_bytes((tmp_path / "model.safetensors").read_bytes())
++    torch.save(torch_state_dict, tmp_path / "pytorch_model.bin")
++
++    result = load_torch_model(dummy_model, tmp_path, safe=False)
++
++    assert not result.missing_keys
++
++
++class _MarkerPayload:
++    """Pickle payload that touches `marker` when unpickled.
++
++    Used to prove a checkpoint is never deserialized as pickle when it must not be: asserting that loading raised is
++    not enough, since the payload runs *before* any format error is raised.
++    """
++
++    def __init__(self, marker: Path) -> None:
++        self.marker = marker
++
++    def __reduce__(self):
++        return (Path.touch, (self.marker,))
++
++
++def _write_pickle(path: Path, marker: Path) -> None:
++    path.write_bytes(pickle.dumps(_MarkerPayload(marker)))
++
++
++class TestCheckpointLoadingSecurity:
++    """Regression tests for deserialization safety in checkpoint loading.
++
++    See https://github.com/huggingface/hackerone/issues/141 for more details.
++
++    Ensures that crafted checkpoints and index files cannot trick the loader into deserializing
++    unsafe pickle payloads or accessing files outside the checkpoint directory.
++    """
++
++    @requires("torch")
++    def test_pickle_payload_is_live(self, tmp_path):
++        """Control: the payload below does execute when pickle loading is explicitly requested.
++
++        `torch.load` only notices the file is not a real checkpoint *after* unpickling it, so the marker exists even
++        though the call raises.
++        """
++        marker = tmp_path / "PWNED"
++        checkpoint = tmp_path / "model.bin"
++        _write_pickle(checkpoint, marker)
++
++        with pytest.raises(Exception):
++            load_state_dict_from_file(checkpoint, safe=False, weights_only=False)
++
++        assert marker.exists()
++
++    @requires("torch")
++    @pytest.mark.parametrize("filename", ["model.safetensors", "model.SAFETENSORS", "model.SafeTensors"])
++    def test_pickle_named_safetensors_is_not_executed(self, tmp_path, filename):
++        """A pickle file named like safetensors goes to the safetensors loader, it is never deserialized."""
++        marker = tmp_path / "PWNED"
++        _write_pickle(tmp_path / filename, marker)
++
++        with pytest.raises(ValueError, match="Cannot load .* as safetensors"):
++            load_state_dict_from_file(tmp_path / filename)
++
++        assert not marker.exists()
++
++    @requires("torch")
++    def test_weights_only_default_rejects_pickle_globals(self, tmp_path):
++        """Without `weights_only=False`, torch's restricted unpickler refuses objects that are not tensors."""
++        from packaging import version
++
++        import torch
++
++        if version.parse(torch.__version__) < version.parse("1.13.0"):
++            pytest.skip("torch < 1.13 has no restricted unpickler")
++
++        marker = tmp_path / "PWNED"
++        checkpoint = tmp_path / "model.bin"
++        _write_pickle(checkpoint, marker)
++
++        with pytest.raises(Exception):
++            load_state_dict_from_file(checkpoint, safe=False)
++
++        assert not marker.exists()
++
++    @requires("torch")
++    def test_load_torch_model_does_not_execute_pickle(self, tmp_path, dummy_model):
++        """Neither an explicit pickle path nor a directory picks up a pickle under `safe=True`."""
++        marker = tmp_path / "PWNED"
++        checkpoint = tmp_path / "pytorch_model.bin"
++        _write_pickle(checkpoint, marker)
++
++        with pytest.raises(ValueError, match="Cannot load .* as safetensors"):
++            load_torch_model(dummy_model, checkpoint, safe=True)
++
++        # In a directory, a `.bin` is simply not picked up when `safe=True`; the uppercase spelling is only matched
++        # on a case-insensitive filesystem, where it goes to the safetensors loader and is rejected.
++        checkpoint.rename(tmp_path / "model.SAFETENSORS")
++        with pytest.raises(ValueError):
++            load_torch_model(dummy_model, tmp_path, safe=True)
++
++        assert not marker.exists()
++
++    @requires("torch")
++    def test_load_sharded_model_strict_succeeds(self, tmp_path, torch_state_dict, dummy_model):
++        """`strict=True` works on a legitimate multi-shard checkpoint."""
++        save_torch_state_dict(torch_state_dict, tmp_path, max_shard_size=30)
++        assert (tmp_path / "model.safetensors.index.json").is_file()  # actually sharded
++
++        result = load_torch_model(dummy_model, tmp_path, strict=True)
++
++        assert not result.missing_keys
++        assert not result.unexpected_keys
++
++    @requires("torch")
++    def test_index_cannot_misreport_the_loaded_keys(self, tmp_path, torch_state_dict, dummy_model):
++        """Keys are reported from the shard contents, not from the index declaring them."""
++        save_torch_state_dict(torch_state_dict, tmp_path, max_shard_size=30)
++        index_file = tmp_path / "model.safetensors.index.json"
++        index = json.loads(index_file.read_text())
++        weight_map = index["weight_map"]
++
++        # Drop an entry whose shard holds other tensors: that shard is still listed, so the tensor is still loaded.
++        shards = list(weight_map.values())
++        dropped_key = next(key for key, shard in weight_map.items() if shards.count(shard) > 1)
++        del weight_map[dropped_key]
++        # And declare a tensor that no shard contains.
++        weight_map["ghost"] = shards[0]
++        index_file.write_text(json.dumps(index))
++
++        result = load_torch_model(dummy_model, tmp_path)
++
++        assert dropped_key not in result.missing_keys  # it was loaded from the shard all along
++        assert "ghost" not in result.unexpected_keys  # and was never loaded
++
++        # And the index cannot fail `strict=True` over a tensor no shard ever held either.
++        result = load_torch_model(dummy_model, tmp_path, strict=True)
++        assert not result.missing_keys
++        assert not result.unexpected_keys
++
++    @requires("torch")
++    def test_load_torch_model_safe_false_loads_safetensors(self, tmp_path, torch_state_dict, dummy_model):
++        """`safe=False` means "fall back to pickle", not "pickle first"."""
++        save_torch_state_dict(torch_state_dict, tmp_path)
++        assert (tmp_path / "model.safetensors").is_file()
++
++        result = load_torch_model(dummy_model, tmp_path, safe=False)
++
++        assert not result.missing_keys
++
++    @pytest.mark.parametrize("index", [None, [1, 2], {"foo": "bar"}, {"weight_map": [1, 2]}, {"weight_map": {"a": 1}}])
++    def test_malformed_index_is_rejected(self, tmp_path, index):
++        """A malformed index raises a clear `ValueError` instead of a raw traceback."""
++        (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
++
++        with pytest.raises(ValueError, match="Invalid index file"):
++            load_torch_model(Mock(), tmp_path)
