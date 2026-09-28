@@ -1,3 +1,300 @@
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -103,6 +103,34 @@ const thisErrorCaptureStackTrace = Error.captureStackTrace;
+ const thisSymbolToString = Symbol.prototype.toString;
+ const thisSymbolToStringTag = Symbol.toStringTag;
+ 
++// SECURITY (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135): the set of Node.js internal
++// cross-realm symbols that must never be installed on, or deleted from, a host
++// object by sandbox code. Captured at module load (before any sandbox override
++// of `Symbol.for` runs) so identity comparison uses the real registry symbols.
++// `nodejs.util.inspect.custom` / `nodejs.rejection` are the historically-known
++// hooks; the promisify hook, the four stream brand symbols and the two
++// webstream symbols were the newly-verified live exploit surface. Keep this in
++// sync with the sandbox-side `nodejs.`-prefix denial in setup-sandbox.js.
++const dangerousCrossRealmSymbols = [
++	Symbol.for('nodejs.util.inspect.custom'),
++	Symbol.for('nodejs.rejection'),
++	Symbol.for('nodejs.util.promisify.custom'),
++	Symbol.for('nodejs.stream.readable'),
++	Symbol.for('nodejs.stream.writable'),
++	Symbol.for('nodejs.stream.duplex'),
++	Symbol.for('nodejs.stream.transform'),
++	Symbol.for('nodejs.webstream.isClosedPromise'),
++	Symbol.for('nodejs.webstream.controllerErrorFunction')
++];
++
++function isDangerousCrossRealmSymbol(key) {
++	if (typeof key !== 'symbol') return false;
++	for (let i = 0; i < dangerousCrossRealmSymbols.length; i++) {
++		if (key === dangerousCrossRealmSymbols[i]) return true;
++	}
++	return false;
++}
++
+ /**
+  * VMError.
+  *
+@@ -446,6 +474,14 @@ function createBridge(otherInit, registerProxy) {
+ 		set(target, key, value, receiver) {
+ 			// Note: target@this(unsafe) key@prim value@this(unsafe) receiver@this(unsafe) throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
++			// SECURITY (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135): refuse sandbox-originated
++			// writes whose key is a known dangerous Node.js cross-realm symbol. Even if
++			// the sandbox-side `Symbol.for` override should prevent the sandbox from ever
++			// surfacing such a symbol primitive, this trap is the structural last line of
++			// defense: without it, a future extraction-path bypass would let the sandbox
++			// install host-side hooks (util.promisify, stream brand, webstream controller)
++			// on any non-protected host object exposed to it.
++			if (!isHost && isDangerousCrossRealmSymbol(key)) throw new VMError(OPNA);
+ 			if (key === '__proto__' && !thisOtherHasOwnProperty(object, key)) {
+ 				return this.setPrototypeOf(target, value);
+ 			}
+@@ -550,6 +586,9 @@ function createBridge(otherInit, registerProxy) {
+ 		defineProperty(target, prop, desc) {
+ 			// Note: target@this(unsafe) prop@prim desc@this(unsafe) throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
++			// SECURITY (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135): mirror the set trap —
++			// refuse dangerous-symbol-keyed property installation on any host object.
++			if (!isHost && isDangerousCrossRealmSymbol(prop)) throw new VMError(OPNA);
+ 			if (!thisReflectSetPrototypeOf(desc, null)) throw thisUnexpected();
+ 
+ 			desc = this.definePropertyDesc(target, prop, desc);
+@@ -603,6 +642,12 @@ function createBridge(otherInit, registerProxy) {
+ 		deleteProperty(target, prop) {
+ 			// Note: target@this(unsafe) prop@prim throws@this(unsafe)
+ 			const object = this.object; // @other(unsafe)
++			// SECURITY (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135): refuse sandbox-originated
++			// deletes whose key is a dangerous cross-realm symbol. Without this, sandbox
++			// code could strip a host-set hook (e.g. delete a Node-installed
++			// `nodejs.util.inspect.custom` from a host object) and substitute its own
++			// behavior or break host code that relies on the host-set property.
++			if (!isHost && isDangerousCrossRealmSymbol(prop)) throw new VMError(OPNA);
+ 			try {
+ 				return otherReflectDeleteProperty(object, prop) === true;
+ 			} catch (e) { // @other(unsafe)
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -160,6 +160,51 @@ connect(localObject.prototype.__defineSetter__, host.Object.prototype.__defineSe
+ connect(localObject.prototype.__lookupGetter__, host.Object.prototype.__lookupGetter__);
+ connect(localObject.prototype.__lookupSetter__, host.Object.prototype.__lookupSetter__);
+ 
++/*
++ * Symbol.for sanitization (GHSA-m5q2-4fm3-vfqp / CVE-2026-47135)
++ *
++ * Node.js exposes internal cross-realm hooks keyed by symbols registered under
++ * the `nodejs.` namespace of the process-global symbol registry (shared across
++ * all realms/contexts). Examples: `nodejs.util.inspect.custom`,
++ * `nodejs.rejection`, `nodejs.util.promisify.custom`, the four stream brand
++ * symbols and the two webstream symbols. Because `Symbol.for` reads the
++ * process-global registry, unmodified sandbox code could obtain the real
++ * cross-realm symbol and install a sandbox-controlled hook on a host object,
++ * steering host-side control flow.
++ *
++ * Fix: override `Symbol.for` inside the sandbox so that any key in the
++ * `nodejs.` namespace is mapped to a stable sandbox-local symbol instead of the
++ * real cross-realm one. A per-key cache preserves `Symbol.for(k) === Symbol.for(k)`
++ * identity inside the sandbox while never crossing the realm boundary. All other
++ * keys keep normal cross-realm behavior (no over-denial). The primitives used
++ * here are captured before any sandbox code runs so they cannot be subverted by
++ * a later monkey-patch of `String.prototype.startsWith` / `Symbol.for`.
++ */
++
++const localSymbol = global.Symbol;
++const originalSymbolFor = localSymbol.for;
++const localStringStartsWith = global.String.prototype.startsWith;
++const blockedNodejsSymbolCache = {__proto__: null};
++
++localSymbol.for = function for_(key) {
++	// Convert to string once to prevent toString/toPrimitive bypass and TOCTOU attacks.
++	const keyStr = '' + key;
++	if (localReflectApply(localStringStartsWith, keyStr, ['nodejs.'])) {
++		const cached = blockedNodejsSymbolCache[keyStr];
++		if (typeof cached === 'symbol') return cached;
++		const fresh = localSymbol(keyStr);
++		if (!localReflectDefineProperty(blockedNodejsSymbolCache, keyStr, {
++			__proto__: null,
++			value: fresh,
++			writable: true,
++			enumerable: false,
++			configurable: false
++		})) throw localUnexpected();
++		return fresh;
++	}
++	return localReflectApply(originalSymbolFor, localSymbol, [keyStr]);
++};
++
+ /*
+  * PrepareStackTrace sanitization
+  */
+--- /dev/null
++++ b/test/cve-2026-47135.test.js
+@@ -0,0 +1,164 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++/**
++ * CVE-2026-47135 / GHSA-m5q2-4fm3-vfqp
++ *
++ * Sandbox escape via unblocked cross-realm `Symbol.for` keys plus missing
++ * dangerous-symbol guards on the bridge's write traps.
++ *
++ * Two-layer fix (backported to 3.9.7):
++ *   1. lib/setup-sandbox.js — `Symbol.for(key)` returns a sandbox-local symbol
++ *      whenever `key` is in the `nodejs.` namespace, so sandbox code can never
++ *      obtain a real cross-realm Node.js internal symbol.
++ *   2. lib/bridge.js — the `set`, `defineProperty` and `deleteProperty` write
++ *      traps reject any sandbox-originated operation whose key is a known
++ *      dangerous cross-realm symbol, so even a host-provided dangerous symbol
++ *      cannot be installed on / deleted from a host object from the sandbox.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const util = require('util');
++const {VM} = require('..');
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++const HAS_STREAM_BRAND_SYMBOLS = NODE_MAJOR >= 16;
++
++function safeRun(code) {
++	const vm = new VM();
++	try {
++		return vm.run('(function () { try { ' + code + ' } catch (_) { return undefined; } })()');
++	} catch (_) {
++		return undefined;
++	}
++}
++
++describe('CVE-2026-47135 (cross-realm Symbol.for + bridge write-trap leak)', () => {
++
++	// ---- Symbol.for source-side denial -------------------------------------
++
++	it('Symbol.for("nodejs.util.promisify.custom") returns a sandbox-local symbol', () => {
++		const isSandboxLocal = safeRun(`return Symbol.keyFor(Symbol.for('nodejs.util.promisify.custom')) === undefined;`);
++		assert.strictEqual(isSandboxLocal, true, 'Symbol.for returned a real cross-realm symbol');
++	});
++
++	it('Symbol.for keeps identity for the same nodejs.* key inside the sandbox', () => {
++		const sameIdentity = safeRun(`return Symbol.for('nodejs.util.promisify.custom') === Symbol.for('nodejs.util.promisify.custom');`);
++		assert.strictEqual(sameIdentity, true, 'Symbol.for identity not preserved for nodejs.* key');
++	});
++
++	it('Symbol.for denies any forward-compat nodejs.* key', () => {
++		const allSandboxLocal = safeRun(`
++			const probes = ['nodejs.future.feature1', 'nodejs.unknown', 'nodejs.zalgo'];
++			for (let i = 0; i < probes.length; i++) {
++				if (Symbol.keyFor(Symbol.for(probes[i])) !== undefined) return false;
++			}
++			return true;
++		`);
++		assert.strictEqual(allSandboxLocal, true, 'a forward-compat nodejs.* key leaked');
++	});
++
++	it('Symbol.for keeps non-"nodejs." keys cross-realm (no over-denial)', () => {
++		const stillCrossRealm = safeRun(`return Symbol.keyFor(Symbol.for('user.app.event')) === 'user.app.event';`);
++		assert.strictEqual(stillCrossRealm, true, 'legitimate Symbol.for over-denied');
++	});
++
++	// ---- Primary PoC: util.promisify hijack --------------------------------
++
++	it('blocks PoC: sandbox cannot hijack util.promisify on a host function', () => {
++		const hostFn = function readFile(path, cb) { cb(null, 'real data'); };
++		const vm = new VM();
++		vm.sandbox.hostFn = hostFn;
++		try {
++			vm.run(`
++				const kPromisify = Symbol.for('nodejs.util.promisify.custom');
++				hostFn[kPromisify] = function (path) { return Promise.resolve('HIJACKED by sandbox'); };
++			`);
++		} catch (_) { /* either Symbol.for returned a safe symbol or the write trap threw */ }
++
++		const asyncRead = util.promisify(hostFn);
++		return asyncRead('/etc/passwd').then((result) => {
++			assert.notStrictEqual(result, 'HIJACKED by sandbox', 'sandbox hijacked util.promisify');
++			assert.strictEqual(result, 'real data', 'host function executed normally');
++		});
++	});
++
++	// ---- Bridge write-trap denial ------------------------------------------
++	// Pass the host's real dangerous symbol into the sandbox and verify the
++	// write traps reject install/delete regardless of the Symbol.for override.
++
++	it('set trap: dangerous symbol key cannot be assigned on a host object', () => {
++		const realSym = Symbol.for('nodejs.util.promisify.custom');
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`hostObj[realSym] = function () { return 'pwned'; };`); } catch (_) { /* expected */ }
++		assert.strictEqual(Object.prototype.hasOwnProperty.call(hostObj, realSym), false, 'set trap installed dangerous symbol key on host object');
++	});
++
++	it('defineProperty trap: dangerous symbol key cannot be installed on a host object', () => {
++		const realSym = Symbol.for('nodejs.util.promisify.custom');
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`Object.defineProperty(hostObj, realSym, { value: 'pwned' });`); } catch (_) { /* expected */ }
++		assert.strictEqual(Object.prototype.hasOwnProperty.call(hostObj, realSym), false, 'defineProperty trap installed dangerous symbol key on host object');
++	});
++
++	it('deleteProperty trap: dangerous symbol key on a host object cannot be deleted', () => {
++		const realSym = Symbol.for('nodejs.util.promisify.custom');
++		const hostObj = {};
++		hostObj[realSym] = function () { return 'host-set'; };
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`delete hostObj[realSym];`); } catch (_) { /* expected */ }
++		assert.strictEqual(Object.prototype.hasOwnProperty.call(hostObj, realSym), true, 'deleteProperty trap removed dangerous symbol from host object');
++	});
++
++	it('write traps: nodejs.rejection symbol denied across set/defineProperty/delete', () => {
++		const realSym = Symbol.for('nodejs.rejection');
++		const hostObj = {[realSym]: 'host-set'};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`hostObj[realSym] = 'set';`); } catch (_) {}
++		try { vm.run(`Object.defineProperty(hostObj, realSym, { value: 'def' });`); } catch (_) {}
++		try { vm.run(`delete hostObj[realSym];`); } catch (_) {}
++		assert.strictEqual(hostObj[realSym], 'host-set', 'nodejs.rejection write/delete leaked through bridge');
++	});
++
++	it('write traps: nodejs.util.inspect.custom symbol denied', () => {
++		const realSym = Symbol.for('nodejs.util.inspect.custom');
++		const hostObj = {[realSym]: 'host-set'};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`hostObj[realSym] = 'set';`); } catch (_) {}
++		try { vm.run(`Object.defineProperty(hostObj, realSym, { value: 'def' });`); } catch (_) {}
++		try { vm.run(`delete hostObj[realSym];`); } catch (_) {}
++		assert.strictEqual(hostObj[realSym], 'host-set', 'nodejs.util.inspect.custom write/delete leaked');
++	});
++
++	(HAS_STREAM_BRAND_SYMBOLS ? it : it.skip)('write traps: stream brand symbol assignment denied', () => {
++		const realSym = Symbol.for('nodejs.stream.readable');
++		const hostObj = {};
++		const vm = new VM();
++		vm.sandbox.hostObj = hostObj;
++		vm.sandbox.realSym = realSym;
++		try { vm.run(`hostObj[realSym] = true;`); } catch (_) {}
++		assert.strictEqual(Object.prototype.hasOwnProperty.call(hostObj, realSym), false, 'sandbox installed stream brand on host object');
++	});
++
++	it('normal (non-dangerous) symbol writes on a host object still work', () => {
++		const vm = new VM();
++		const hostObj = {};
++		vm.sandbox.hostObj = hostObj;
++		vm.run(`hostObj.plain = 'ok'; hostObj[Symbol.iterator] = function () {};`);
++		assert.strictEqual(hostObj.plain, 'ok', 'plain host writes broke');
++	});
++});
+
 --- a/lib/resolver-compat.js
 +++ b/lib/resolver-compat.js
 @@ -161,8 +161,50 @@
