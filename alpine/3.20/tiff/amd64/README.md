@@ -1,6 +1,6 @@
-# tiff : 4.6.0t-r00071
+# tiff : 4.6.0t-r00072
 
-This patch is based on tiff version 4.6.0t-r00071, which is available at:
+This patch is based on tiff version 4.6.0t-r00072, which is available at:
 unknown
 
 ## Affected CVEs:
