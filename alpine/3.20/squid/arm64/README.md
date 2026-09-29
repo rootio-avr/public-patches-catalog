@@ -1,6 +1,6 @@
-# squid : 6.9-r00074
+# squid : 6.9-r00075
 
-This patch is based on squid version 6.9-r00074, which is available at:
+This patch is based on squid version 6.9-r00075, which is available at:
 unknown
 
 ## Affected CVEs:
