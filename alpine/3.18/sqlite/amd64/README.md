@@ -1,6 +1,6 @@
-# sqlite : 3.41.2-r30077
+# sqlite : 3.41.2-r40078
 
-This patch is based on sqlite version 3.41.2-r30077, which is available at:
+This patch is based on sqlite version 3.41.2-r40078, which is available at:
 unknown
 
 ## Affected CVEs:
