@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-31808
+- CVE-2022-36313
 
 ## How to Apply:
 1. Clone or download the source code for file-type
