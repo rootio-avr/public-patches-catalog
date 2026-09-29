@@ -1,6 +1,6 @@
-# graphviz : 9.0.0-r20074
+# graphviz : 9.0.0-r20075
 
-This patch is based on graphviz version 9.0.0-r20074, which is available at:
+This patch is based on graphviz version 9.0.0-r20075, which is available at:
 unknown
 
 ## Affected CVEs:
