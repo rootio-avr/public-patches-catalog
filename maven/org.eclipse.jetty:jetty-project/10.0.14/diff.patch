@@ -1,0 +1,271 @@
+--- a/jetty-http/src/main/java/org/eclipse/jetty/http/HttpParser.java
++++ b/jetty-http/src/main/java/org/eclipse/jetty/http/HttpParser.java
+@@ -244,6 +244,11 @@
+     private long _contentPosition;
+     private int _chunkLength;
+     private int _chunkPosition;
++    // RFC 9112 chunk-extension quoted-string tracking (CVE-2026-2332): while inside an
++    // open chunk-ext quoted-string value, an embedded CR/LF must NOT terminate the
++    // chunk-size line, otherwise a second request can be smuggled after the quote.
++    private boolean _chunkExtQuoted;
++    private boolean _chunkExtQuotedEscape;
+     private boolean _headResponse;
+     private boolean _cr;
+     private ByteBuffer _contentChunk;
+@@ -1735,6 +1740,9 @@
+                     HttpTokens.Token t = next(buffer);
+                     if (t == null)
+                         break;
++                    // Reset chunk-extension quoted-string tracking at the start of each chunk.
++                    _chunkExtQuoted = false;
++                    _chunkExtQuotedEscape = false;
+                     switch (t.getType())
+                     {
+                         case LF:
+@@ -1794,6 +1802,10 @@
+                             }
+                             else
+                             {
++                                // A DQUOTE opens a chunk-ext quoted-string value (CVE-2026-2332):
++                                // remember it so an embedded CRLF cannot terminate the line.
++                                if (t.getChar() == '"')
++                                    _chunkExtQuoted = true;
+                                 setState(State.CHUNK_PARAMS);
+                             }
+                     }
+@@ -1806,6 +1818,42 @@
+                     if (t == null)
+                         break;
+ 
++                    // RFC 9112 chunk-extension parsing (CVE-2026-2332). Track the state of a
++                    // chunk-ext quoted-string value so that a CRLF appearing inside an
++                    // (unterminated) quoted-string is rejected instead of being treated as the
++                    // end of the chunk-size line. Treating the embedded CRLF as a terminator is
++                    // what allowed a second, attacker-controlled request to be smuggled onto the
++                    // connection.
++                    if (_chunkExtQuoted)
++                    {
++                        if (t.getType() == HttpTokens.Type.LF)
++                        {
++                            // next() has already collapsed a preceding CR into this LF; an LF
++                            // inside an open quoted-string is not a valid line terminator.
++                            throw new BadMessageException(HttpStatus.BAD_REQUEST_400, "Bad chunk-ext quoting");
++                        }
++                        else if (_chunkExtQuotedEscape)
++                        {
++                            // quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )
++                            if (!isChunkExtQuotedPair(t))
++                                throw new IllegalCharacterException(_state, t, buffer);
++                            _chunkExtQuotedEscape = false;
++                        }
++                        else if (t.getChar() == '\\')
++                        {
++                            _chunkExtQuotedEscape = true;
++                        }
++                        else if (t.getChar() == '"')
++                        {
++                            _chunkExtQuoted = false;
++                        }
++                        else if (!isChunkExtQdText(t))
++                        {
++                            throw new IllegalCharacterException(_state, t, buffer);
++                        }
++                        break;
++                    }
++
+                     switch (t.getType())
+                     {
+                         case LF:
+@@ -1819,7 +1867,10 @@
+                                 setState(State.CHUNK);
+                             break;
+                         default:
+-                            break; // TODO review
++                            // Opening DQUOTE of a chunk-ext quoted-string value.
++                            if (t.getChar() == '"')
++                                _chunkExtQuoted = true;
++                            break;
+                     }
+                     break;
+                 }
+@@ -1863,6 +1914,56 @@
+         return false;
+     }
+ 
++    /**
++     * qdtext, as defined in RFC 9110 section 5.6.4, is the set of characters allowed inside a
++     * quoted-string without escaping. Used to validate a chunk-extension quoted-string value
++     * (CVE-2026-2332).
++     * <pre>qdtext = HTAB / SP / "!" / %x23-5B / %x5D-7E / obs-text</pre>
++     *
++     * @param t the token
++     * @return whether the token is valid quoted text
++     */
++    private boolean isChunkExtQdText(HttpTokens.Token t)
++    {
++        switch (t.getType())
++        {
++            case HTAB:
++            case SPACE:
++            case OTEXT:
++                return true;
++            default:
++                char c = t.getChar();
++                return c == 0x21 || (c >= 0x23 && c <= 0x5B) || (c >= 0x5D && c <= 0x7E);
++        }
++    }
++
++    /**
++     * quoted-pair, as defined in RFC 9110 section 5.6.4, is the set of characters allowed
++     * immediately after a backslash inside a quoted-string. Used to validate a chunk-extension
++     * quoted-string value (CVE-2026-2332).
++     * <pre>quoted-pair = "\" ( HTAB / SP / VCHAR / obs-text )</pre>
++     *
++     * @param t the token
++     * @return whether the token is a valid quoted-pair character
++     */
++    private boolean isChunkExtQuotedPair(HttpTokens.Token t)
++    {
++        switch (t.getType())
++        {
++            case HTAB:
++            case SPACE:
++            case COLON:
++            case TCHAR:
++            case VCHAR:
++            case DIGIT:
++            case ALPHA:
++            case OTEXT:
++                return true;
++            default:
++                return false;
++        }
++    }
++
+     public boolean isAtEOF()
+     {
+         return _eof;
+@@ -1908,6 +2009,8 @@
+         _headerBytes = 0;
+         _parsedHost = null;
+         _headerComplete = false;
++        _chunkExtQuoted = false;
++        _chunkExtQuotedEscape = false;
+     }
+ 
+     public void servletUpgrade()
+--- a/jetty-http/src/test/java/org/eclipse/jetty/http/HttpParserTest.java
++++ b/jetty-http/src/test/java/org/eclipse/jetty/http/HttpParserTest.java
+@@ -3218,4 +3218,112 @@
+         assertThat(list, contains(HttpHeaderValue.CLOSE));
+         assertThat(unknowns, empty());
+     }
++
++    /**
++     * Regression test for CVE-2026-2332 (GHSA-355h-qmc2-wpwf).
++     *
++     * A chunk-extension value that opens a quoted-string but embeds a CRLF before closing the
++     * quote must be rejected. Previously Jetty terminated chunk-header parsing at the embedded
++     * CRLF, so the bytes after it were parsed as an independent, smuggled HTTP request.
++     */
++    @Test
++    public void testChunkExtQuotedStringSmuggling()
++    {
++        ByteBuffer buffer = BufferUtil.toBuffer(
++            "POST /chunk HTTP/1.1\r\n" +
++                "Host: localhost\r\n" +
++                "Transfer-Encoding: chunked\r\n" +
++                "\r\n" +
++                "1;a=\"\r\n" +
++                "GET /smuggled HTTP/1.1\r\n" +
++                "Host: localhost\r\n" +
++                "\r\n" +
++                "\"\r\n" +
++                "X\r\n" +
++                "0\r\n" +
++                "\r\n");
++        HttpParser.RequestHandler handler = new Handler();
++        HttpParser parser = new HttpParser(handler);
++        parseAll(parser, buffer);
++
++        // The embedded CRLF inside the (unterminated) quoted-string must be treated as a parse
++        // error, NOT as the end of the chunk-size line; the smuggled request must never be parsed.
++        assertThat(_bad, Matchers.notNullValue());
++        assertThat(_uriOrStatus, is("/chunk"));
++    }
++
++    /**
++     * A CRLF appearing inside an open chunk-extension quoted-string is rejected even without a
++     * full smuggled request following it.
++     */
++    @Test
++    public void testChunkExtUnterminatedQuoteRejected()
++    {
++        ByteBuffer buffer = BufferUtil.toBuffer(
++            "POST /chunk HTTP/1.1\r\n" +
++                "Host: localhost\r\n" +
++                "Transfer-Encoding: chunked\r\n" +
++                "\r\n" +
++                "1;a=\"unterminated\r\n" +
++                "0123456789\r\n" +
++                "0\r\n" +
++                "\r\n");
++        HttpParser.RequestHandler handler = new Handler();
++        HttpParser parser = new HttpParser(handler);
++        parseAll(parser, buffer);
++
++        assertThat(_bad, Matchers.notNullValue());
++    }
++
++    /**
++     * A well-formed, properly closed chunk-extension quoted-string value must still be accepted,
++     * so the fix does not break legitimate RFC 9112 chunk extensions.
++     */
++    @Test
++    public void testChunkExtQuotedStringValid()
++    {
++        ByteBuffer buffer = BufferUtil.toBuffer(
++            "POST /chunk HTTP/1.1\r\n" +
++                "Host: localhost\r\n" +
++                "Transfer-Encoding: chunked\r\n" +
++                "\r\n" +
++                "a;name=\"quoted value\"\r\n" +
++                "0123456789\r\n" +
++                "0\r\n" +
++                "\r\n");
++        HttpParser.RequestHandler handler = new Handler();
++        HttpParser parser = new HttpParser(handler);
++        parseAll(parser, buffer);
++
++        assertThat(_bad, Matchers.nullValue());
++        assertEquals("POST", _methodOrVersion);
++        assertEquals("/chunk", _uriOrStatus);
++        assertEquals("0123456789", _content);
++        assertTrue(_messageCompleted);
++    }
++
++    /**
++     * A quoted-pair (backslash escape) that escapes a DQUOTE inside a chunk-extension
++     * quoted-string must not prematurely close the quote.
++     */
++    @Test
++    public void testChunkExtQuotedPairValid()
++    {
++        ByteBuffer buffer = BufferUtil.toBuffer(
++            "POST /chunk HTTP/1.1\r\n" +
++                "Host: localhost\r\n" +
++                "Transfer-Encoding: chunked\r\n" +
++                "\r\n" +
++                "a;name=\"a\\\"b\"\r\n" +
++                "0123456789\r\n" +
++                "0\r\n" +
++                "\r\n");
++        HttpParser.RequestHandler handler = new Handler();
++        HttpParser parser = new HttpParser(handler);
++        parseAll(parser, buffer);
++
++        assertThat(_bad, Matchers.nullValue());
++        assertEquals("0123456789", _content);
++        assertTrue(_messageCompleted);
++    }
+ }
