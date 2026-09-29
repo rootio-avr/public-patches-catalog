@@ -1,6 +1,6 @@
-# libtasn1 : 4.20.0-r00071
+# libtasn1 : 4.20.0-r00072
 
-This patch is based on libtasn1 version 4.20.0-r00071, which is available at:
+This patch is based on libtasn1 version 4.20.0-r00072, which is available at:
 unknown
 
 ## Affected CVEs:
