@@ -1,6 +1,6 @@
-# util-linux : 2.38.1-r80074
+# util-linux : 2.38.1-r80075
 
-This patch is based on util-linux version 2.38.1-r80074, which is available at:
+This patch is based on util-linux version 2.38.1-r80075, which is available at:
 unknown
 
 ## Affected CVEs:
