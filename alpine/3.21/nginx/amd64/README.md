@@ -1,6 +1,6 @@
-# nginx : 1.26.3-r00071
+# nginx : 1.26.3-r30072
 
-This patch is based on nginx version 1.26.3-r00071, which is available at:
+This patch is based on nginx version 1.26.3-r30072, which is available at:
 unknown
 
 ## Affected CVEs:
