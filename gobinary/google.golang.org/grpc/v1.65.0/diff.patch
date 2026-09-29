@@ -116,6 +116,404 @@
  	method := sm[pos+1:]
  
 
+diff --git a/internal/envconfig/envconfig.go b/internal/envconfig/envconfig.go
+index 17c58190..5cb3972c 100644
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -62,6 +62,16 @@ var (
+ 	// A future release will remove this environment variable, enabling strict
+ 	// path checking behavior unconditionally.
+ 	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
++
++	// EnableReceiveBufferCompaction enables the compaction of data buffers
++	// to reduce the memory overhead of buffering many small DATA frames in the
++	// receive buffer.
++	//
++	// This environment variable serves as an escape hatch to disable the
++	// feature if unforeseen issues arise, and it will be removed in a future
++	// release. It can be overridden by setting the environment variable
++	// "GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION" to "false".
++	EnableReceiveBufferCompaction = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION", true)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+diff --git a/internal/transport/transport.go b/internal/transport/transport.go
+index 4b39c0ad..7e81f42c 100644
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -32,10 +32,12 @@ import (
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"unsafe"
+ 
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/keepalive"
+ 	"google.golang.org/grpc/metadata"
+ 	"google.golang.org/grpc/peer"
+@@ -45,7 +47,35 @@ import (
+ 	"google.golang.org/grpc/tap"
+ )
+ 
+-const logLevel = 2
++const (
++	logLevel = 2
++	// recvMsgSize estimates the memory overhead of a recvMsg in the backlog.
++	// It accounts for the recvMsg struct itself and the slice header of the
++	// underlying buffer's data.
++	recvMsgSize = int(unsafe.Sizeof(recvMsg{}) + unsafe.Sizeof([]byte{}))
++
++	// utilizationFactor controls when we consider memory utilization
++	// acceptable. When backlogHeapSize / payloadSize <= utilizationFactor
++	// (meaning at least 50% of the heap memory is actual payload data),
++	// compaction is skipped.
++	utilizationFactor = 2
++
++	// bufferPoolingThreshold is the minimum payload size that would normally be
++	// pooled. Individual DATA frame payloads smaller than this are allocated on
++	// the heap, so accumulating at least this many of them before compacting
++	// coalesces those small heap allocations into a single large buffer while
++	// avoiding frequent copying for small bursts of frames.
++	bufferPoolingThreshold = 1 << 10
++)
++
++var (
++	// compactionThreshold is approx 57KB (on 64-bit systems). It allows
++	// accumulating up to bufferPoolingThreshold 1-byte payloads before
++	// triggering compaction, coalescing many tiny DATA frames into a single
++	// large buffer and bounding the per-stream memory overhead of buffering
++	// small data frames (CVE-2026-84304).
++	compactionThreshold = bufferPoolingThreshold * (recvMsgSize + 1)
++)
+ 
+ type bufferPool struct {
+ 	pool sync.Pool
+@@ -89,20 +119,29 @@ type recvBuffer struct {
+ 	c       chan recvMsg
+ 	mu      sync.Mutex
+ 	backlog []recvMsg
+-	err     error
++	// uncompactedSuffixLen tracks the number of consecutive data messages at
++	// the tail of backlog that have not been compacted.
++	uncompactedSuffixLen int
++	// uncompactedBytes tracks the total payload bytes across the trailing
++	// uncompactedSuffixLen messages.
++	uncompactedBytes int
++	err              error
++	// bufPool is used to allocate the coalesced buffer produced by compaction.
++	bufPool *bufferPool
+ }
+ 
+ func newRecvBuffer() *recvBuffer {
+ 	b := &recvBuffer{
+-		c: make(chan recvMsg, 1),
++		c:       make(chan recvMsg, 1),
++		bufPool: newBufferPool(),
+ 	}
+ 	return b
+ }
+ 
+ func (b *recvBuffer) put(r recvMsg) {
+ 	b.mu.Lock()
++	defer b.mu.Unlock()
+ 	if b.err != nil {
+-		b.mu.Unlock()
+ 		// An error had occurred earlier, don't accept more
+ 		// data or errors.
+ 		return
+@@ -111,13 +150,76 @@ func (b *recvBuffer) put(r recvMsg) {
+ 	if len(b.backlog) == 0 {
+ 		select {
+ 		case b.c <- r:
+-			b.mu.Unlock()
+ 			return
+ 		default:
+ 		}
+ 	}
+ 	b.backlog = append(b.backlog, r)
+-	b.mu.Unlock()
++	b.compactBacklogLocked(r)
++}
++
++// compactBacklogLocked bounds the memory overhead of buffering many small DATA
++// frames. When a long tail of tiny payloads accumulates in the backlog, the
++// per-message struct overhead dominates and can be exploited to drive
++// unbounded memory growth (CWE-400). Once enough small messages have been
++// buffered, their payloads are coalesced into a single buffer so the number of
++// backlog entries — and their heap overhead — stays bounded.
++//
++// b.mu must be held.
++func (b *recvBuffer) compactBacklogLocked(r recvMsg) {
++	if !envconfig.EnableReceiveBufferCompaction {
++		return
++	}
++	if r.buffer == nil {
++		b.uncompactedBytes = 0
++		b.uncompactedSuffixLen = 0
++		return
++	}
++
++	b.uncompactedSuffixLen++
++	b.uncompactedBytes += r.buffer.Len()
++	backlogHeapSize := b.uncompactedSuffixLen*recvMsgSize + b.uncompactedBytes
++
++	// If the memory overhead is less than 50% of the heap usage (e.g., because
++	// a large DATA frame arrived), the average message size in the suffix is
++	// large enough that memory bloat is not a concern. Reset suffix tracking.
++	if backlogHeapSize <= utilizationFactor*b.uncompactedBytes {
++		b.uncompactedBytes = 0
++		b.uncompactedSuffixLen = 0
++		return
++	}
++	// Avoid compacting too frequently for short bursts of small frames.
++	// Wait until we have accumulated at least ~1024 small messages (~57 KB).
++	if backlogHeapSize <= compactionThreshold {
++		// Still can accumulate more payloads.
++		return
++	}
++
++	// Coalesce the uncompacted suffix into a single buffer drawn from the
++	// buffer pool.
++	newBuf := b.bufPool.get()
++	newBuf.Reset()
++	newBuf.Grow(b.uncompactedBytes)
++	startIdx := len(b.backlog) - b.uncompactedSuffixLen
++
++	for i := startIdx; i < len(b.backlog); i++ {
++		m := b.backlog[i]
++		b.backlog[i] = recvMsg{}
++		if m.buffer != nil {
++			newBuf.Write(m.buffer.Bytes())
++			b.bufPool.put(m.buffer)
++		}
++	}
++	b.backlog[startIdx] = recvMsg{
++		buffer: newBuf,
++	}
++	b.backlog = b.backlog[:startIdx+1]
++	// After compaction, the suffix is replaced with a single message containing
++	// the combined payload. The new utilization is close to 1.0 (overhead of
++	// one recvMsg relative to the large compacted payload), which is well
++	// below the utilization factor of 2.
++	b.uncompactedBytes = 0
++	b.uncompactedSuffixLen = 0
+ }
+ 
+ func (b *recvBuffer) load() {
+@@ -125,6 +227,15 @@ func (b *recvBuffer) load() {
+ 	if len(b.backlog) > 0 {
+ 		select {
+ 		case b.c <- b.backlog[0]:
++			// backlog[0] is only part of the tracked uncompacted suffix if the
++			// entire backlog currently consists of the suffix. If an earlier
++			// compaction or reset occurred, backlog[0] is already compacted.
++			if envconfig.EnableReceiveBufferCompaction && b.uncompactedSuffixLen == len(b.backlog) {
++				b.uncompactedSuffixLen--
++				if b.backlog[0].buffer != nil {
++					b.uncompactedBytes -= b.backlog[0].buffer.Len()
++				}
++			}
+ 			b.backlog[0] = recvMsg{}
+ 			b.backlog = b.backlog[1:]
+ 		default:
+diff --git a/internal/transport/transport_test.go b/internal/transport/transport_test.go
+index 64dd4722..1ae2509b 100644
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -42,6 +42,7 @@ import (
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpctest"
+ 	"google.golang.org/grpc/internal/leakcheck"
+ 	"google.golang.org/grpc/internal/testutils"
+@@ -2750,3 +2751,181 @@ func (s) TestClientSendsAGoAwayFrame(t *testing.T) {
+ 		t.Errorf("Context timed out")
+ 	}
+ }
++
++// makeRecvMsg returns a recvMsg wrapping a copy of the given payload, mirroring
++// the way DATA frames are buffered by the HTTP/2 transports.
++func makeRecvMsg(payload []byte) recvMsg {
++	b := new(bytes.Buffer)
++	b.Write(payload)
++	return recvMsg{buffer: b}
++}
++
++// TestRecvBufferCompaction verifies that a long backlog of tiny DATA frames is
++// coalesced into a single buffer, bounding the per-stream memory overhead of
++// buffering small data frames (CVE-2026-84304).
++func (s) TestRecvBufferCompaction(t *testing.T) {
++	b := newRecvBuffer()
++
++	// Compaction triggers once more than bufferPoolingThreshold 1-byte messages
++	// have accumulated in the backlog. The first message put into the
++	// recvBuffer goes directly to the channel b.c, and subsequent messages go
++	// to the backlog. So we need 1 (channel) + (bufferPoolingThreshold + 1)
++	// messages to trigger compaction.
++	numMessages := bufferPoolingThreshold + 2
++	payload := []byte{0x0a}
++
++	for i := 0; i < numMessages-1; i++ {
++		b.put(makeRecvMsg(payload))
++	}
++
++	// Verify no compaction occurred yet.
++	if got, want := len(b.backlog), numMessages-2; got != want {
++		t.Fatalf("Got backlog length %d, want %d", got, want)
++	}
++
++	b.put(makeRecvMsg(payload))
++
++	// The first message is in the channel; the remaining
++	// (bufferPoolingThreshold + 1) messages went to the backlog and should have
++	// been compacted into 1 message.
++	if got, want := len(b.backlog), 1; got != want {
++		t.Fatalf("Got backlog length %d after compaction, want %d", got, want)
++	}
++	if b.uncompactedSuffixLen != 0 {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", b.uncompactedSuffixLen, 0)
++	}
++	if b.uncompactedBytes != 0 {
++		t.Fatalf("Got uncompactedBytes %d, want %d", b.uncompactedBytes, 0)
++	}
++
++	// Verify the contents of the first message (not compacted, in channel).
++	select {
++	case msg1 := <-b.c:
++		if !bytes.Equal(msg1.buffer.Bytes(), payload) {
++			t.Errorf("Unexpected first message: %v", msg1)
++		}
++	default:
++		t.Fatal("Expected first message to be in the channel")
++	}
++
++	b.load()
++
++	// Verify the compacted message.
++	select {
++	case msgCompacted := <-b.c:
++		wantLen := numMessages - 1
++		if msgCompacted.buffer.Len() != wantLen {
++			t.Errorf("Got compacted buffer length %d, want %d", msgCompacted.buffer.Len(), wantLen)
++		}
++		wantPayload := bytes.Repeat(payload, wantLen)
++		if !bytes.Equal(msgCompacted.buffer.Bytes(), wantPayload) {
++			t.Errorf("Compacted payload mismatch")
++		}
++	default:
++		t.Fatal("Expected compacted message to be loaded into the channel")
++	}
++}
++
++// TestRecvBufferErrorResetsCounters verifies that an error message resets the
++// uncompacted suffix tracking counters.
++func (s) TestRecvBufferErrorResetsCounters(t *testing.T) {
++	b := newRecvBuffer()
++
++	payload := []byte{0x0a}
++	// Push 3 messages. First goes to channel, second and third to backlog.
++	b.put(makeRecvMsg(payload))
++	b.put(makeRecvMsg(payload))
++	b.put(makeRecvMsg(payload))
++
++	if got, want := b.uncompactedSuffixLen, 2; got != want {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", got, want)
++	}
++	if got, want := b.uncompactedBytes, 2; got != want {
++		t.Fatalf("Got uncompactedBytes %d, want %d", got, want)
++	}
++
++	// Read one message.
++	select {
++	case msg1 := <-b.c:
++		if !bytes.Equal(msg1.buffer.Bytes(), payload) {
++			t.Errorf("Unexpected first message: %v", msg1)
++		}
++	default:
++		t.Fatal("Expected first message to be in the channel")
++	}
++	b.load()
++	if got, want := b.uncompactedSuffixLen, 1; got != want {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", got, want)
++	}
++	if got, want := b.uncompactedBytes, 1; got != want {
++		t.Fatalf("Got uncompactedBytes %d, want %d", got, want)
++	}
++
++	// Push error; counters must reset to 0.
++	b.put(recvMsg{err: io.EOF})
++
++	if got, want := b.uncompactedSuffixLen, 0; got != want {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", got, want)
++	}
++	if got, want := b.uncompactedBytes, 0; got != want {
++		t.Fatalf("Got uncompactedBytes %d, want %d", got, want)
++	}
++}
++
++// TestRecvBufferCompactionSkippedLargeBuffer verifies that compaction is
++// skipped when a large DATA frame arrives, because memory utilization is
++// already acceptable.
++func (s) TestRecvBufferCompactionSkippedLargeBuffer(t *testing.T) {
++	b := newRecvBuffer()
++
++	// Put bufferPoolingThreshold 1-byte messages into the backlog.
++	// Total = 1 (channel) + bufferPoolingThreshold (backlog).
++	numSmallMessages := bufferPoolingThreshold + 1
++	payload := []byte{0x0a}
++
++	for i := 0; i < numSmallMessages; i++ {
++		b.put(makeRecvMsg(payload))
++	}
++
++	if got, want := len(b.backlog), bufferPoolingThreshold; got != want {
++		t.Fatalf("Got backlog length %d, want %d", got, want)
++	}
++
++	// Send a large buffer that satisfies the utilization factor check, causing
++	// the suffix tracking to reset without compacting.
++	threshold := bufferPoolingThreshold*(recvMsgSize-1) + recvMsgSize
++	largePayload := make([]byte, threshold)
++	b.put(makeRecvMsg(largePayload))
++
++	if got, want := len(b.backlog), bufferPoolingThreshold+1; got != want {
++		t.Fatalf("Got backlog length %d after large buffer (compaction skipped), want %d", got, want)
++	}
++	if b.uncompactedSuffixLen != 0 {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", b.uncompactedSuffixLen, 0)
++	}
++	if b.uncompactedBytes != 0 {
++		t.Fatalf("Got uncompactedBytes %d, want %d", b.uncompactedBytes, 0)
++	}
++}
++
++// TestRecvBufferCompactionDisabled verifies that the escape-hatch env var
++// disables compaction.
++func (s) TestRecvBufferCompactionDisabled(t *testing.T) {
++	orig := envconfig.EnableReceiveBufferCompaction
++	envconfig.EnableReceiveBufferCompaction = false
++	defer func() { envconfig.EnableReceiveBufferCompaction = orig }()
++
++	b := newRecvBuffer()
++
++	numMessages := bufferPoolingThreshold + 2
++	payload := []byte{0x0a}
++
++	for i := 0; i < numMessages; i++ {
++		b.put(makeRecvMsg(payload))
++	}
++
++	// No compaction: first message in channel, the rest in the backlog.
++	if got, want := len(b.backlog), numMessages-1; got != want {
++		t.Fatalf("Got backlog length %d, want %d", got, want)
++	}
++}
+
 --- a/internal/transport/http2_server.go
 +++ b/internal/transport/http2_server.go
 @@ -523,6 +523,18 @@
