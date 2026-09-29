@@ -1,6 +1,6 @@
-# perl : 5.42.2-r00072
+# perl : 5.42.2-r00073
 
-This patch is based on perl version 5.42.2-r00072, which is available at:
+This patch is based on perl version 5.42.2-r00073, which is available at:
 unknown
 
 ## Affected CVEs:
