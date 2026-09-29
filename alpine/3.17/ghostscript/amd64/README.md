@@ -1,6 +1,6 @@
-# ghostscript : 10.01.2-r00074
+# ghostscript : 10.01.2-r00075
 
-This patch is based on ghostscript version 10.01.2-r00074, which is available at:
+This patch is based on ghostscript version 10.01.2-r00075, which is available at:
 unknown
 
 ## Affected CVEs:
