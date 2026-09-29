@@ -1,6 +1,6 @@
-# gnupg : 2.4.4-r00071
+# gnupg : 2.4.4-r00072
 
-This patch is based on gnupg version 2.4.4-r00071, which is available at:
+This patch is based on gnupg version 2.4.4-r00072, which is available at:
 unknown
 
 ## Affected CVEs:
