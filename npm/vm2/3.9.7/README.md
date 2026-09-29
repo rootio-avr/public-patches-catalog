@@ -4,6 +4,24 @@ This patch is based on vm2 version 3.9.7, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-44008
+- CVE-2026-47131
+- CVE-2026-26332
+- CVE-2026-47140
+- CVE-2026-22709
+- CVE-2023-30547
+- CVE-2022-25893
+- CVE-2023-37903
+- CVE-2026-47686
+- CVE-2026-44007
+- CVE-2023-37466
+- CVE-2023-32314
+- CVE-2026-43997
+- CVE-2026-44006
+- CVE-2026-26956
+- CVE-2026-47208
+- CVE-2023-29017
+- CVE-2026-24120
 - CVE-2023-29199
 - CVE-2026-44005
 - CVE-2026-47137
@@ -19,6 +37,8 @@ unknown
 - GHSA-m5w8-4gq2-6f8x
 - CVE-2026-45411
 - CVE-2022-36067
+- CVE-2026-24781
+- CVE-2026-47698
 
 ## How to Apply:
 1. Clone or download the source code for vm2
