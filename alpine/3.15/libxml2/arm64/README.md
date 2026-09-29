@@ -1,6 +1,6 @@
-# libxml2 : 2.9.14-r20071
+# libxml2 : 2.9.14-r20072
 
-This patch is based on libxml2 version 2.9.14-r20071, which is available at:
+This patch is based on libxml2 version 2.9.14-r20072, which is available at:
 unknown
 
 ## Affected CVEs:
