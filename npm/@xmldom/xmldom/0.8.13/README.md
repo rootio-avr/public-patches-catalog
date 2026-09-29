@@ -12,6 +12,10 @@ unknown
 - CVE-2026-83615
 - CVE-2026-83616
 - CVE-2026-83619
+- CVE-2026-41673
+- CVE-2026-41675
+- CVE-2026-41672
+- CVE-2026-41674
 
 ## How to Apply:
 1. Clone or download the source code for @xmldom/xmldom
