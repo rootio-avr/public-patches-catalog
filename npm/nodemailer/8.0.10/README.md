@@ -4,6 +4,7 @@ This patch is based on nodemailer version 8.0.10, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-82659
 - GHSA-2x7j-588g-ccc2
 
 ## How to Apply:
