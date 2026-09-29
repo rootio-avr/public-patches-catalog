@@ -21,6 +21,12 @@ unknown
 - CVE-2026-44008
 - CVE-2026-44009
 - GHSA-2cm2-m3w5-gp2f
+- GHSA-v836-6xw4-9cx3
+- GHSA-m5w8-4gq2-6f8x
+- CVE-2026-47683
+- CVE-2026-47686
+- CVE-2026-47698
+- CVE-2026-45411
 
 ## How to Apply:
 1. Clone or download the source code for vm2

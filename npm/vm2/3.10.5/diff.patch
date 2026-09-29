@@ -1773,3 +1773,2294 @@ index fa94546..c3cce54 100644
  /*
   * Eval sanitization
   */
+
+diff --git a/lib/setup-sandbox.js b/lib/setup-sandbox.js
+index 3a1a4b3..8241665 100644
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -484,6 +484,281 @@ function allocUnsafeSlow(size) {
+ 
+ connect(allocUnsafeSlow, host.Buffer.allocUnsafeSlow);
+ 
++// SECURITY (GHSA-v836-6xw4-9cx3): close the bufferAllocLimit bypass class.
++//
++// The GHSA-6785 cap above only wraps the `Buffer.*` family, but `ArrayBuffer`,
++// `SharedArrayBuffer`, and every TypedArray constructor allocate host
++// backing-store memory through the SAME synchronous, timeout-immune V8 C++ path
++// (`ArrayBuffer::NewBackingStore` -> `ArrayBufferAllocator::Allocate` ->
++// `calloc`). `WebAssembly.Memory` is the same primitive in 64 KiB pages. None of
++// these are intercepted by `checkBufferAllocLimit`, so a single ~200-byte
++// sandbox payload (`new ArrayBuffer(1<<30)`) amplifies into gigabytes of host
++// RSS in one uninterruptible allocation — identical to the Buffer.alloc DoS.
++//
++// Fix: when a finite cap is configured, replace each sandbox-realm allocation
++// constructor with a `construct`-trapping Proxy that runs `checkBufferAllocLimit`
++// on the requested byte count BEFORE the native allocation, and pin every
++// `prototype.constructor` back-reference to the wrapper so the original uncapped
++// intrinsic cannot be recovered via a constructor walk such as
++// `new Uint8Array(0).buffer.constructor`. The Proxy forwards `prototype`,
++// `[Symbol.species]`, and `[[Prototype]]` to the original, so `instanceof`,
++// species-derived construction (slice/map/subarray), and subclassing keep working.
++//
++// Gated on a finite limit: with the default `bufferAllocLimit: Infinity` the
++// native intrinsics are left completely untouched — zero behavioural or identity
++// change for embedders who have not opted into the cap (matches GHSA-6785's
++// non-breaking, opt-in semantics).
++if (localBufferAllocLimit !== Infinity) {
++	installAllocationCaps();
++}
++
++function installAllocationCaps() {
++	// SECURITY (GHSA-v836-6xw4-9cx3): the native constructors size their
++	// allocation with ToIndex(arg), i.e. ToNumber first — so a length supplied
++	// as a string ("209715200"), an object with `valueOf` / `Symbol.toPrimitive`,
++	// etc. is coerced to a large number by V8. A `typeof === 'number'` guard
++	// would wave all of those through. `coerceAllocMagnitude` mirrors the
++	// ToNumber step so the cap measures the SAME magnitude V8 will allocate.
++	// Values that cannot yield a large positive allocation collapse to 0 (the
++	// native constructor still applies its own validation/throws); Symbols and
++	// BigInts throw under unary `+` and are caught — for those the native call
++	// throws before allocating, so 0 is safe.
++	function coerceAllocMagnitude(value) {
++		let n;
++		try {
++			n = +value;
++		} catch (e) {
++			return 0;
++		}
++		// NaN (n !== n) or negative => no large allocation to cap here.
++		if (n !== n || n < 0) return 0;
++		return n;
++	}
++
++	function isObjectLike(value) {
++		return value !== null && (typeof value === 'object' || typeof value === 'function');
++	}
++
++	// SECURITY (GHSA-v836-6xw4-9cx3): the magnitude must be read EXACTLY ONCE.
++	// `checkBufferAllocLimit(computeBytes(args))` followed by
++	// `Reflect.construct(target, args)` reads any `valueOf` / accessor twice —
++	// a getter returning small-then-large slips the real (large) value past the
++	// cap (TOCTOU). The construct traps below therefore canonicalize every
++	// object-valued size input to the primitive number the cap checked, and hand
++	// the native constructor THAT primitive, so check-time and alloc-time observe
++	// identical values. Pure-primitive inputs are immutable (no TOCTOU) and pass
++	// through untouched, preserving exact native semantics (e.g. BigInt throws).
++
++	// Install `value` as the sandbox global `name`, matching the native global
++	// property attributes { writable, !enumerable, configurable }.
++	function defineGlobalCtor(name, value) {
++		localReflectDefineProperty(global, name, {
++			__proto__: null,
++			value: value,
++			writable: true,
++			enumerable: false,
++			configurable: true,
++		});
++	}
++
++	// SECURITY (GHSA-v836-6xw4-9cx3): pin the prototype back-reference to the
++	// capped proxy so the original uncapped intrinsic cannot be recovered via a
++	// constructor walk (`new Uint8Array(0).buffer.constructor`). Native
++	// attributes are { writable, !enumerable, configurable }.
++	function pinConstructor(prototype, capProxy) {
++		localReflectDefineProperty(prototype, 'constructor', {
++			__proto__: null,
++			value: capProxy,
++			writable: true,
++			enumerable: false,
++			configurable: true,
++		});
++	}
++
++	// ArrayBuffer / SharedArrayBuffer. The allocated bytes are the larger of the
++	// committed `length` (arg0) and the reserved `maxByteLength` (resizable /
++	// growable forms reserve max up front). Both are canonicalized to primitives
++	// so a `maxByteLength` accessor cannot read small here and large inside V8 —
++	// which would otherwise leave the buffer resizable past the cap and let a
++	// later `.resize()` / `.grow()` commit the full (uncapped) maximum.
++	function capArrayBuffer(OriginalCtor) {
++		const capProxy = new LocalProxy(OriginalCtor, {
++			__proto__: null,
++			construct(target, args, newTarget) {
++				const rawLen = args.length > 0 ? args[0] : 0;
++				const lenMag = coerceAllocMagnitude(rawLen);
++				let capBytes = lenMag;
++				let maxPresent = false;
++				let maxMag = 0;
++				const options = args.length > 1 ? args[1] : undefined;
++				if (options !== null && typeof options === 'object') {
++					const rawMax = options.maxByteLength; // read accessor exactly once
++					if (rawMax !== undefined) {
++						maxPresent = true;
++						maxMag = coerceAllocMagnitude(rawMax);
++						if (maxMag > capBytes) capBytes = maxMag;
++					}
++				}
++				checkBufferAllocLimit(capBytes);
++				// Rebuild args from the canonical magnitudes when an object-valued
++				// length or any maxByteLength option was involved (the TOCTOU-capable
++				// shapes); pure-primitive non-resizable calls pass through untouched.
++				if (isObjectLike(rawLen) || maxPresent) {
++					const finalLen = isObjectLike(rawLen) ? lenMag : rawLen;
++					args = maxPresent
++						? [finalLen, { __proto__: null, maxByteLength: maxMag }]
++						: [finalLen];
++				}
++				return localReflectConstruct(target, args, newTarget === capProxy ? OriginalCtor : newTarget);
++			},
++		});
++		pinConstructor(OriginalCtor.prototype, capProxy);
++		return capProxy;
++	}
++
++	// TypedArray. Two allocating shapes carry an attacker-controlled size:
++	//   (1) `new TA(N)` — primitive length, ToIndex(N) * BYTES_PER_ELEMENT bytes.
++	//   (2) `new TA(arrayLike)` — object with a `length` property; V8 reads
++	//       LengthOfArrayLike and allocates that many elements in one shot
++	//       (`new Uint8Array({length: 1<<30})`).
++	// The (buffer[, offset[, len]]) view form views an existing buffer and the
++	// iterable form is bounded by interruptible JS iteration — neither is a
++	// single-shot amplifier. We do NOT classify the object (a spoofed
++	// `Symbol.toStringTag` could lie): instead we simply cap `arg0.length`. A real
++	// ArrayBuffer/SharedArrayBuffer has no `length` own/inherited property
++	// (coerces to 0 → no false positive); an array-like exposes its element count;
++	// an existing TypedArray source reports a length already ≤ the cap. The
++	// primitive path (1) is immutable (no TOCTOU). A hostile `length` *accessor*
++	// on an array-like remains a documented residual; the common data-property
++	// amplifier is fully capped.
++	function capTypedArray(OriginalCtor, bytesPerElement) {
++		const capProxy = new LocalProxy(OriginalCtor, {
++			__proto__: null,
++			construct(target, args, newTarget) {
++				const rawLen = args.length > 0 ? args[0] : 0;
++				const sizeSource = isObjectLike(rawLen) ? rawLen.length : rawLen;
++				checkBufferAllocLimit(coerceAllocMagnitude(sizeSource) * bytesPerElement);
++				return localReflectConstruct(target, args, newTarget === capProxy ? OriginalCtor : newTarget);
++			},
++		});
++		pinConstructor(OriginalCtor.prototype, capProxy);
++		return capProxy;
++	}
++
++	defineGlobalCtor('ArrayBuffer', capArrayBuffer(global.ArrayBuffer));
++	if (typeof global.SharedArrayBuffer === 'function') {
++		defineGlobalCtor('SharedArrayBuffer', capArrayBuffer(global.SharedArrayBuffer));
++	}
++
++	const typedArrayNames = [
++		'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
++		'Int16Array', 'Uint16Array', 'Float16Array',
++		'Int32Array', 'Uint32Array', 'Float32Array',
++		'Float64Array', 'BigInt64Array', 'BigUint64Array',
++	];
++	for (let i = 0; i < typedArrayNames.length; i++) {
++		const name = typedArrayNames[i];
++		const Ctor = global[name];
++		// Feature-gated: Float16Array (Node 22+), BigInt64Array/BigUint64Array
++		// (Node 10+) may be absent on older runtimes.
++		if (typeof Ctor !== 'function') continue;
++		defineGlobalCtor(name, capTypedArray(Ctor, Ctor.BYTES_PER_ELEMENT));
++	}
++
++	// SECURITY (GHSA-v836-6xw4-9cx3, defense-in-depth): WebAssembly.Memory commits
++	// host pages (64 KiB each) through the same backing-store path; `initial` is
++	// attacker-controlled and `grow()` extends the commitment incrementally. Cap
++	// the initial reservation at construction and bound cumulative growth in
++	// `grow()`. `maximum` only reserves virtual address space (not RSS), so it is
++	// not capped here. WebAssembly.Memory exists regardless of the `wasm` option.
++	if (typeof WebAssembly !== 'undefined' && typeof WebAssembly.Memory === 'function') {
++		const WASM_PAGE_BYTES = 65536;
++		const OriginalMemory = WebAssembly.Memory;
++		const memoryProto = OriginalMemory.prototype;
++		const originalGrow = memoryProto.grow;
++		const memoryBufferDescriptor = localReflectGetOwnPropertyDescriptor(memoryProto, 'buffer');
++
++		const memoryCapProxy = new LocalProxy(OriginalMemory, {
++			__proto__: null,
++			construct(target, args, newTarget) {
++				const descriptor = args.length > 0 ? args[0] : undefined;
++				let pages = 0;
++				let initialPresent = false;
++				if (descriptor !== null && typeof descriptor === 'object') {
++					const rawInitial = descriptor.initial; // read accessor exactly once
++					if (rawInitial !== undefined) {
++						initialPresent = true;
++						pages = coerceAllocMagnitude(rawInitial);
++					}
++				}
++				// SECURITY (GHSA-v836-6xw4-9cx3): cap the initial committed bytes.
++				// `initial` is coerced via ToNumber by V8 (string / valueOf / accessor),
++				// so measure the coerced magnitude, then hand V8 a descriptor whose
++				// `initial` is that exact primitive — a toggling `initial` accessor
++				// cannot read small here and large inside V8 (TOCTOU). `maximum`
++				// only reserves virtual address space (not RSS) and incremental
++				// commitment via `grow()` is separately bounded below, so it is
++				// preserved verbatim.
++				checkBufferAllocLimit(pages * WASM_PAGE_BYTES);
++				if (initialPresent) {
++					const rebuilt = { __proto__: null, initial: pages };
++					// COMPAT: forward `maximum` / `shared` only when the caller
++					// actually supplied them. Node 8's V8 does not treat an explicit
++					// `maximum: undefined` as an absent key -- it coerces it to 0 and
++					// then rejects the descriptor for having `maximum` below
++					// `initial`, which would break every capped Memory construction
++					// on that runtime. Each is still read exactly once, so the
++					// TOCTOU canonicalization above is preserved.
++					const rawMaximum = descriptor.maximum;
++					if (rawMaximum !== undefined) rebuilt.maximum = rawMaximum;
++					const rawShared = descriptor.shared;
++					if (rawShared !== undefined) rebuilt.shared = rawShared;
++					args = [rebuilt];
++				}
++				return localReflectConstruct(target, args, newTarget === memoryCapProxy ? OriginalMemory : newTarget);
++			},
++		});
++
++		if (typeof originalGrow === 'function' && memoryBufferDescriptor && typeof memoryBufferDescriptor.get === 'function') {
++			const memoryBufferGetter = memoryBufferDescriptor.get;
++			const cappedGrow = function grow(delta) {
++				// SECURITY (GHSA-v836-6xw4-9cx3): bound the post-grow total. Read
++				// current size off the live backing buffer; a non-Memory `this`
++				// makes the getter throw, preserving native semantics. `delta` is
++				// coerced once and the canonical primitive is forwarded to the native
++				// grow so a `valueOf`/accessor cannot read small here and large in V8.
++				const currentBuffer = apply(memoryBufferGetter, this, []);
++				const currentBytes = currentBuffer ? currentBuffer.byteLength : 0;
++				const addedPages = coerceAllocMagnitude(delta);
++				checkBufferAllocLimit(currentBytes + addedPages * WASM_PAGE_BYTES);
++				return apply(originalGrow, this, [addedPages]);
++			};
++			localReflectDefineProperty(memoryProto, 'grow', {
++				__proto__: null,
++				value: cappedGrow,
++				writable: true,
++				enumerable: false,
++				configurable: true,
++			});
++		}
++
++		localReflectDefineProperty(memoryProto, 'constructor', {
++			__proto__: null,
++			value: memoryCapProxy,
++			writable: true,
++			enumerable: false,
++			configurable: true,
++		});
++		localReflectDefineProperty(WebAssembly, 'Memory', {
++			__proto__: null,
++			value: memoryCapProxy,
++			writable: true,
++			enumerable: false,
++			configurable: true,
++		});
++	}
++}
++
+ /**
+  * Replacement for Buffer inspect
+  *
+diff --git a/test/ghsa-v836-6xw4-9cx3.test.js b/test/ghsa-v836-6xw4-9cx3.test.js
+new file mode 100644
+index 0000000..f145ed0
+--- /dev/null
++++ b/test/ghsa-v836-6xw4-9cx3.test.js
+@@ -0,0 +1,120 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++/**
++ * GHSA-v836-6xw4-9cx3 — bufferAllocLimit bypass via ArrayBuffer / SharedArrayBuffer /
++ * TypedArray / WebAssembly.Memory constructors (host memory-exhaustion DoS).
++ *
++ * Regression test authored for the backport onto vm2 3.10.5 (the upstream
++ * test/ghsa/GHSA-v836-6xw4-9cx3/repro.js is not shipped in this target tree).
++ * Grounded on the upstream repro: a finite `bufferAllocLimit` must cap the
++ * backing-store allocation constructors that share the synchronous, timeout-immune
++ * V8 allocation path, while leaving small allocations and the default (Infinity)
++ * behaviour untouched.
++ */
++
++const assert = require('assert');
++const {VM} = require('..');
++
++const HAS_SHARED_AB = typeof SharedArrayBuffer === 'function';
++const HAS_WASM_MEMORY = typeof WebAssembly !== 'undefined' && typeof WebAssembly.Memory === 'function';
++
++if (typeof global.it.cond !== 'function') {
++	global.it.cond = (name, cond, fn) => (cond ? it(name, fn) : it.skip(name, fn));
++}
++
++const CAP_RE = /Buffer allocation size \d+ exceeds bufferAllocLimit/;
++
++describe('GHSA-v836-6xw4-9cx3 (ArrayBuffer/TypedArray bufferAllocLimit bypass)', function () {
++	const CAP = 32 * 1024 * 1024;
++	const BIG = 1024 * 1024 * 100; // 100 MB worth of elements
++
++	it('rejects new ArrayBuffer(100 MB)', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('new ArrayBuffer(' + BIG + ').byteLength');
++		}, CAP_RE);
++	});
++
++	it.cond('rejects new SharedArrayBuffer(100 MB)', HAS_SHARED_AB, function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('new SharedArrayBuffer(' + BIG + ').byteLength');
++		}, CAP_RE);
++	});
++
++	it('rejects new Uint8Array(100 MB)', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('new Uint8Array(' + BIG + ').length');
++		}, CAP_RE);
++	});
++
++	it('rejects new Float64Array (cap counts bytes, not elements)', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			// 5 M elements x 8 bytes = 40 MB > 32 MB cap.
++			vm.run('new Float64Array(5 * 1024 * 1024).length');
++		}, CAP_RE);
++	});
++
++	it('rejects new Uint8Array({length: 100 MB}) (array-like amplifier)', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('new Uint8Array({length: ' + BIG + '}).length');
++		}, CAP_RE);
++	});
++
++	it('blocks constructor-walk recovery (new Uint8Array(0).buffer.constructor)', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('var AB = new Uint8Array(0).buffer.constructor; new AB(' + BIG + ').byteLength');
++		}, CAP_RE);
++	});
++
++	it('blocks species-derived subclass escape', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('class Big extends Uint8Array {}; new Big(' + BIG + ').length');
++		}, CAP_RE);
++	});
++
++	it.cond('rejects new WebAssembly.Memory({initial: 2000 pages})', HAS_WASM_MEMORY, function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			// 2000 x 64 KiB = ~131 MB > 32 MB cap.
++			vm.run('new WebAssembly.Memory({ initial: 2000 }).buffer.byteLength');
++		}, CAP_RE);
++	});
++
++	it.cond('rejects WebAssembly.Memory.grow() past the cap', HAS_WASM_MEMORY, function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('var m = new WebAssembly.Memory({ initial: 1 }); m.grow(2000)');
++		}, CAP_RE);
++	});
++
++	it('still allows a small ArrayBuffer under the cap', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.strictEqual(vm.run('var a = new ArrayBuffer(64); a.byteLength'), 64);
++	});
++
++	it('still allows a small typed array (instanceof holds)', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.strictEqual(vm.run('var a = new Uint8Array(8); a.length === 8 && a instanceof Uint8Array'), true);
++	});
++
++	it('default (Infinity) leaves ArrayBuffer allocation uncapped', function () {
++		const vm = new VM({});
++		assert.strictEqual(vm.run('new ArrayBuffer(' + BIG + ').byteLength'), BIG);
++	});
++
++	it('still caps Buffer.alloc (GHSA-6785 prerequisite)', function () {
++		const vm = new VM({bufferAllocLimit: CAP});
++		assert.throws(function () {
++			vm.run('Buffer.alloc(' + BIG + ').length');
++		}, CAP_RE);
++	});
++});
+
+diff --git a/lib/builtin.js b/lib/builtin.js
+index 624212e..294a53b 100644
+--- a/lib/builtin.js
++++ b/lib/builtin.js
+@@ -68,11 +68,29 @@ const DANGEROUS_BUILTINS = new Set([
+ 	'cluster',
+ 	'vm',
+ 	'repl',
+-	'inspector'
++	'inspector',
++	// SECURITY (GHSA-m5w8-4gq2-6f8x): NodeVM `os`/`dns` builtins leak host-process
++	// state (os.userInfo/networkInterfaces/hostname/...) and carry host-mutating
++	// *write* APIs (os.setPriority, dns.setServers, dns.setDefaultResultOrder) that
++	// escape the sandbox in one line. Deny by default under both layers below.
++	'os',
++	'dns'
+ ]);
+ 
++// SECURITY (GHSA-m5w8-4gq2-6f8x): family-prefix denylist check. Strips the `node:`
++// URL-style prefix so `node:os`/`node:dns` cannot bypass via spelling, and matches
++// subpaths such as `dns/promises` so a dangerous family and its sub-modules share fate.
++function isDangerousBuiltin(key) {
++	if (typeof key !== 'string') return false;
++	if (key.startsWith('node:')) key = key.slice(5);
++	if (DANGEROUS_BUILTINS.has(key)) return true;
++	const slash = key.indexOf('/');
++	if (slash > 0 && DANGEROUS_BUILTINS.has(key.slice(0, slash))) return true;
++	return false;
++}
++
+ const BUILTIN_MODULES = (nmod.builtinModules || Object.getOwnPropertyNames(process.binding('natives')))
+-	.filter(s=>!s.startsWith('internal/') && !DANGEROUS_BUILTINS.has(s));
++	.filter(s=>!s.startsWith('internal/') && !isDangerousBuiltin(s));
+ 
+ let EventEmitterReferencingAsyncResourceClass = null;
+ if (EventEmitter.EventEmitterAsyncResource) {
+@@ -131,7 +149,7 @@ function addDefaultBuiltin(builtins, key, hostRequire) {
+ 	// (`new Worker(src, {eval:true})`), or evaluates host-realm code
+ 	// (`vm.runInThisContext`). The `SPECIAL_MODULES` escape hatch above is
+ 	// still honoured -- a future safe wrapper can be registered there.
+-	if (!special && DANGEROUS_BUILTINS.has(key)) return;
++	if (!special && isDangerousBuiltin(key)) return;
+ 	builtins.set(key, special ? special : vm => vm.readonly(hostRequire(key)));
+ }
+ 
+diff --git a/test/ghsa-m5w8-4gq2-6f8x.js b/test/ghsa-m5w8-4gq2-6f8x.js
+new file mode 100644
+index 0000000..308a413
+--- /dev/null
++++ b/test/ghsa-m5w8-4gq2-6f8x.js
+@@ -0,0 +1,145 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++/**
++ * GHSA-m5w8-4gq2-6f8x -- NodeVM `os` and `dns` builtins leak host state and
++ * hijack the host process.
++ *
++ * `os` and `dns` load through the default `vm.readonly(hostRequire(key))` path,
++ * which cannot localise host-process state. Both also carry write APIs
++ * (`os.setPriority`, `dns.setServers`, `dns.setDefaultResultOrder`) that mutate
++ * global host state from one line of sandbox code. The fix adds them to a
++ * denylist enforced at both the `BUILTIN_MODULES` wildcard source and inside
++ * `addDefaultBuiltin`, with a family-prefix matcher that also covers the
++ * `node:` prefix and the `dns/promises` subpath.
++ *
++ * Grounded on upstream test/ghsa/GHSA-m5w8-4gq2-6f8x/repro.js (commit 768bcfc).
++ */
++
++'use strict';
++
++const assert = require('assert');
++const {NodeVM} = require('..');
++
++function expectBuiltinBlocked(name, requireOpts, sandboxCode) {
++	const vm = new NodeVM({require: Object.assign({external: false}, requireOpts)});
++	let escaped = null;
++	let thrown = null;
++	try {
++		escaped = vm.run(sandboxCode, 'poc.js');
++	} catch (e) {
++		thrown = e;
++	}
++	assert.ok(
++		thrown || escaped === 'BLOCKED',
++		`[${name}] expected denial, got: ${typeof escaped === 'string' ? escaped.slice(0, 200) : escaped}`
++	);
++}
++
++const HOST_STATE_BUILTINS = ['os', 'dns'];
++
++describe('GHSA-m5w8-4gq2-6f8x -- os/dns host-process builtins are denied', () => {
++	for (const name of HOST_STATE_BUILTINS) {
++		describe(name, () => {
++			it("blocked under ['*']", () => {
++				expectBuiltinBlocked(`${name}-wildcard`, {builtin: ['*']}, `
++					try {
++						const m = require('${name}');
++						module.exports = m ? 'ESCAPED' : 'BLOCKED';
++					} catch (e) { module.exports = 'BLOCKED'; }
++				`);
++			});
++
++			it("blocked under ['*', '-fs'] wildcard-with-exclusion", () => {
++				expectBuiltinBlocked(`${name}-wildcard-exclusion`, {builtin: ['*', '-fs']}, `
++					try {
++						require('${name}');
++						module.exports = 'ESCAPED';
++					} catch (e) { module.exports = 'BLOCKED'; }
++				`);
++			});
++
++			it(`blocked under explicit ['${name}']`, () => {
++				expectBuiltinBlocked(`${name}-explicit`, {builtin: [name]}, `
++					try {
++						require('${name}');
++						module.exports = 'ESCAPED';
++					} catch (e) { module.exports = 'BLOCKED'; }
++				`);
++			});
++
++			it('blocked under node: prefix', () => {
++				expectBuiltinBlocked(`${name}-node-prefix`, {builtin: ['*']}, `
++					try {
++						require('node:${name}');
++						module.exports = 'ESCAPED';
++					} catch (e) { module.exports = 'BLOCKED'; }
++				`);
++			});
++
++			it('blocked when builtin is an object map', () => {
++				const opts = {};
++				opts[name] = true;
++				expectBuiltinBlocked(`${name}-object-map`, {builtin: opts}, `
++					try {
++						require('${name}');
++						module.exports = 'ESCAPED';
++					} catch (e) { module.exports = 'BLOCKED'; }
++				`);
++			});
++		});
++	}
++
++	describe('dns/promises subpath is covered by the family-prefix matcher', () => {
++		it("blocked under ['*']", () => {
++			expectBuiltinBlocked('dns/promises-wildcard', {builtin: ['*']}, `
++				try {
++					require('dns/promises');
++					module.exports = 'ESCAPED';
++				} catch (e) { module.exports = 'BLOCKED'; }
++			`);
++		});
++
++		it("blocked under explicit ['dns/promises']", () => {
++			expectBuiltinBlocked('dns/promises-explicit', {builtin: ['dns/promises']}, `
++				try {
++					require('dns/promises');
++					module.exports = 'ESCAPED';
++				} catch (e) { module.exports = 'BLOCKED'; }
++			`);
++		});
++	});
++
++	describe('confirmed exploitation paths from the advisory PoC are unreachable', () => {
++		it('os.userInfo (host identity read) is unreachable', () => {
++			expectBuiltinBlocked('os-userInfo', {builtin: ['*']}, `
++				try {
++					const os = require('os');
++					if (typeof os.userInfo === 'function') module.exports = 'ESCAPED';
++					else module.exports = 'BLOCKED';
++				} catch (e) { module.exports = 'BLOCKED'; }
++			`);
++		});
++
++		it('dns.setServers (host DNS-hijack write) is unreachable', () => {
++			expectBuiltinBlocked('dns-setServers', {builtin: ['*']}, `
++				try {
++					const dns = require('dns');
++					if (typeof dns.setServers === 'function') module.exports = 'ESCAPED';
++					else module.exports = 'BLOCKED';
++				} catch (e) { module.exports = 'BLOCKED'; }
++			`);
++		});
++	});
++
++	it('a safe builtin still loads under the wildcard (no over-blocking)', () => {
++		const vm = new NodeVM({require: {external: false, builtin: ['*']}});
++		const ok = vm.run(`
++			try {
++				const path = require('path');
++				module.exports = typeof path.join === 'function' ? 'OK' : 'FAIL';
++			} catch (e) { module.exports = 'FAIL'; }
++		`, 'safe.js');
++		assert.strictEqual(ok, 'OK');
++	});
++});
+
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -484,6 +484,163 @@
+ 
+ connect(allocUnsafeSlow, host.Buffer.allocUnsafeSlow);
+ 
++// SECURITY (GHSA-gmc2-2x9w-cgh9): bufferAllocLimit bypass via Buffer.concat,
++// Buffer.from(arrayLike) and Buffer.copyBytesFrom.
++//
++// Every host-Buffer factory reachable from sandbox code by a sandbox-controlled
++// size must consult `checkBufferAllocLimit` before the host C++ allocator runs.
++// The alloc trio + deprecated Buffer(N) form are capped above; the reporter
++// found three more allocators (`concat` total-length, `from` array-like length,
++// `copyBytesFrom` length) that reach the same host allocator without traversing
++// the sandbox-side alloc wrapper. Layer A below installs a capped wrapper for
++// each; Layer B (the fail-closed enumeration) connects a throwing stub for any
++// currently-unclassified function-valued own key of host.Buffer, so a future
++// Node release that ships a new Buffer allocator surfaces as an explicit error
++// rather than a silent uncapped bypass.
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): Buffer.concat(list, totalLength).
++// Node internally calls `Buffer.allocUnsafe(totalLength)` before iterating the
++// list. The sandbox `Buffer.concat` is the bridge proxy of the host method, so
++// the host allocator was reached without consulting our alloc wrapper. Cap
++// either the supplied totalLength (if numeric) or the summed list lengths (if
++// omitted) before calling host.
++const localBufferConcatOriginal = LocalBuffer.concat;
++function concat(list, totalLength) {
++	if (arguments.length >= 2 && typeof totalLength === 'number') {
++		// Explicit totalLength path — host allocates exactly `totalLength`
++		// bytes regardless of the list contents. Cap before delegating.
++		checkBufferAllocLimit(totalLength);
++	} else if (list != null && typeof list === 'object' && typeof list.length === 'number') {
++		// Implicit totalLength path — host sums `list[i].length` and allocates
++		// the sum. Replicate that sum here so we cap the same value host would
++		// have used. Any non-numeric length skips the cap (host rejects with
++		// TypeError).
++		let sum = 0;
++		const n = list.length;
++		for (let i = 0; i < n; i++) {
++			const item = list[i];
++			if (item == null) continue;
++			const len = item.length;
++			if (typeof len === 'number' && len > 0) sum += len;
++		}
++		checkBufferAllocLimit(sum);
++	}
++	return apply(localBufferConcatOriginal, LocalBuffer, arguments);
++}
++
++connect(concat, host.Buffer.concat);
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): Buffer.from(arg, ...).
++// `Buffer.from({length: N})` triggers host's `fromArrayLike`, which calls
++// `Buffer.allocUnsafe(N)` before iterating indices 0..N — so a fake array-like
++// with a numeric `.length` materializes N host bytes from a tiny sandbox
++// payload. Also cap the explicit `length` third argument (ArrayBuffer overload).
++// Strings and primitives are exempt: their byte length is bounded by the
++// sandbox-side value itself.
++const localBufferFromOriginal = LocalBuffer.from;
++function bufferFrom(value, encodingOrOffset, length) {
++	if (typeof length === 'number') {
++		checkBufferAllocLimit(length);
++	}
++	if (
++		value != null &&
++		typeof value === 'object' &&
++		typeof value.length === 'number'
++	) {
++		// `.length` may be a getter; reading it here mirrors what host's
++		// `fromArrayLike` does internally and surfaces any thrown error to the
++		// caller exactly as host would.
++		checkBufferAllocLimit(value.length);
++	}
++	return apply(localBufferFromOriginal, LocalBuffer, arguments);
++}
++
++connect(bufferFrom, host.Buffer.from);
++
++// Classification allowlist for the fail-closed gate (Layer B). Keys not present
++// here that are function-valued own keys of host.Buffer get a throwing stub.
++//   CAPPED   — wrapped via connect() above (reaches host through a
++//              checkBufferAllocLimit chokepoint).
++//   SAFE     — non-allocating inspectors / helpers, or bounded by an
++//              already-allocated sandbox-side input.
++//   METADATA — non-function own properties (length, name, prototype, poolSize).
++const BUFFER_STATIC_CLASSIFIED = {
++	__proto__: null,
++	// CAPPED
++	alloc: true,
++	allocUnsafe: true,
++	allocUnsafeSlow: true,
++	concat: true,
++	from: true,
++	// SAFE — non-allocating inspectors and helpers.
++	byteLength: true,
++	compare: true,
++	isBuffer: true,
++	isEncoding: true,
++	of: true,
++	// METADATA
++	length: true,
++	name: true,
++	poolSize: true,
++	prototype: true
++};
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): explicitly classify `copyBytesFrom` (Node 22+)
++// as CAPPED. It takes (view, offset, length) and allocates `length` bytes (or
++// view.byteLength - offset if length omitted). Sandbox controls `length`.
++if (typeof host.Buffer.copyBytesFrom === 'function') {
++	const localBufferCopyBytesFromOriginal = LocalBuffer.copyBytesFrom;
++	// eslint-disable-next-line no-inner-declarations
++	function copyBytesFrom(view, offset, length) {
++		if (typeof length === 'number') {
++			checkBufferAllocLimit(length);
++		} else if (view != null && typeof view === 'object' && typeof view.byteLength === 'number') {
++			const off = typeof offset === 'number' && offset > 0 ? offset : 0;
++			const derived = view.byteLength - off;
++			if (derived > 0) checkBufferAllocLimit(derived);
++		}
++		return apply(localBufferCopyBytesFromOriginal, LocalBuffer, arguments);
++	}
++	connect(copyBytesFrom, host.Buffer.copyBytesFrom);
++	BUFFER_STATIC_CLASSIFIED.copyBytesFrom = true;
++}
++
++// SECURITY (GHSA-gmc2-2x9w-cgh9): fail-closed gate. Iterate host.Buffer's own
++// keys and install a throwing stub for any function-valued key not in the
++// classified allowlist. A future host method that allocates by
++// sandbox-controlled size therefore cannot reach the host allocator from
++// sandbox code unless a maintainer explicitly classifies it as SAFE or CAPPED.
++{
++	const bufferOwnKeys = localObject.getOwnPropertyNames(host.Buffer);
++	for (let i = 0; i < bufferOwnKeys.length; i++) {
++		const key = bufferOwnKeys[i];
++		if (BUFFER_STATIC_CLASSIFIED[key]) continue;
++		let value;
++		try {
++			value = host.Buffer[key];
++		} catch (e) {
++			// Hostile getter (very unlikely on host.Buffer) — skip.
++			continue;
++		}
++		if (typeof value === 'function') {
++			// Install a unique stub per key so the error message names the
++			// method, aiding a maintainer triaging a future Node upgrade. We
++			// fail at the call site (not init) so property access still works.
++			(function(name) {
++				function bufferStaticUnknownNamed() {
++					throw new VMError(
++						'Buffer.' + name +
++						' has not been classified for bufferAllocLimit safety in this vm2 version (GHSA-gmc2-2x9w-cgh9). ' +
++						'See lib/setup-sandbox.js to classify it as SAFE or CAPPED.'
++					);
++				}
++				localObjectFreeze(bufferStaticUnknownNamed);
++				connect(bufferStaticUnknownNamed, value);
++			})(key);
++		}
++	}
++}
++
+ /**
+  * Replacement for Buffer inspect
+  *
+diff --git a/test/cve-2026-47683.test.js b/test/cve-2026-47683.test.js
+new file mode 100644
+--- /dev/null
++++ b/test/cve-2026-47683.test.js
+@@ -0,0 +1,132 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++/**
++ * CVE-2026-47683 / GHSA-gmc2-2x9w-cgh9 — bufferAllocLimit bypass via
++ * Buffer.concat, Buffer.from(arrayLike) and Buffer.copyBytesFrom.
++ *
++ * The bufferAllocLimit cap wrapped Buffer.alloc / allocUnsafe / allocUnsafeSlow
++ * and the deprecated Buffer(N) forms, but Buffer.concat(list, totalLength),
++ * Buffer.from({length: N}) and Buffer.copyBytesFrom(view, offset, length)
++ * reached the same synchronous host C++ allocator without traversing the
++ * sandbox-side alloc wrapper, letting sandbox code amplify a tiny payload into
++ * hundreds of MB of host RSS in a single call.
++ *
++ * Replacement regression test grounded in the upstream repro
++ * (test/ghsa/GHSA-gmc2-2x9w-cgh9/repro.js), trimmed to the target's suite idiom.
++ */
++
++const assert = require('assert');
++const {VM} = require('..');
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++
++describe('CVE-2026-47683 (bufferAllocLimit bypass: concat / from / copyBytesFrom)', function() {
++	const CAP = 32 * 1024 * 1024;
++
++	describe('Buffer.concat(list, totalLength)', function() {
++		it('small cap rejects explicit oversized totalLength', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer.concat([Buffer.from("a")], 50 * 1024 * 1024).length');
++			}, /Buffer allocation size 52428800 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('cap rejects oversized summed length without explicit totalLength', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer.concat([Buffer.alloc(512), Buffer.alloc(512), Buffer.alloc(512)])');
++			}, /Buffer allocation size 1536 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('legitimate small Buffer.concat still works', function() {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.concat([Buffer.from("hello"), Buffer.from(" world")]).toString()'
++			);
++			assert.strictEqual(r, 'hello world');
++		});
++
++		it('default (Infinity) bufferAllocLimit leaves Buffer.concat unrestricted', function() {
++			const r = new VM().run('Buffer.concat([Buffer.from("a"), Buffer.from("b")]).toString()');
++			assert.strictEqual(r, 'ab');
++		});
++	});
++
++	describe('Buffer.from(arrayLike)', function() {
++		it('small cap rejects fake array-like length', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer.from({length: 8 * 1024 * 1024})');
++			}, /Buffer allocation size 8388608 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('cap applies to real arrays too', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer.from(new Array(2048))');
++			}, /Buffer allocation size 2048 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('legitimate Buffer.from(string) still works', function() {
++			const r = new VM({bufferAllocLimit: CAP}).run("Buffer.from('hello').length");
++			assert.strictEqual(r, 5);
++		});
++
++		it('legitimate Buffer.from(Uint8Array) still works', function() {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.from(new Uint8Array([104, 105])).toString()'
++			);
++			assert.strictEqual(r, 'hi');
++		});
++
++		it('small array-like within cap still works', function() {
++			const r = new VM({bufferAllocLimit: CAP}).run(
++				'Buffer.from({length: 4, 0: 1, 1: 2, 2: 3, 3: 4}).length'
++			);
++			assert.strictEqual(r, 4);
++		});
++	});
++
++	describe('Buffer.copyBytesFrom (Node 22+)', function() {
++		it.cond = it.cond || function(name, cond, fn) { return cond ? it(name, fn) : it.skip(name, fn); };
++		(NODE_MAJOR >= 22 ? it : it.skip)('cap rejects oversized copyBytesFrom', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer.copyBytesFrom(new Uint16Array(4 * 1024 * 1024))');
++			}, /Buffer allocation size \d+ exceeds bufferAllocLimit 1024/);
++		});
++	});
++
++	describe('Original Buffer.alloc protections preserved', function() {
++		it('Buffer.alloc still capped', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer.alloc(2048)');
++			}, /Buffer allocation size 2048 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('Buffer.allocUnsafe still capped', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer.allocUnsafe(2048)');
++			}, /Buffer allocation size 2048 exceeds bufferAllocLimit 1024/);
++		});
++
++		it('deprecated Buffer(N) still capped', function() {
++			const vm = new VM({bufferAllocLimit: 1024});
++			assert.throws(function() {
++				vm.run('Buffer(2048)');
++			}, /Buffer allocation size 2048 exceeds bufferAllocLimit 1024/);
++		});
++	});
++
++	it('bufferAllocLimit rejects negative / NaN values', function() {
++		assert.throws(function() {
++			new VM({bufferAllocLimit: -1});
++		}, /bufferAllocLimit must be a non-negative number/);
++		assert.throws(function() {
++			new VM({bufferAllocLimit: NaN});
++		}, /bufferAllocLimit must be a non-negative number/);
++	});
++});
+
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -554,28 +554,356 @@
+  * sanitizes their .error and .suppressed properties via ensureThis.
+  */
+ const localSuppressedErrorProto = (typeof SuppressedError === 'function') ? SuppressedError.prototype : null;
++const localAggregateErrorProto = (typeof AggregateError === 'function') ? AggregateError.prototype : null;
++const LocalSuppressedError = (typeof SuppressedError === 'function') ? SuppressedError : null;
++const LocalAggregateError = (typeof AggregateError === 'function') ? AggregateError : null;
+ 
++// SECURITY (GHSA-m283-3h24-438v): the standard Error subclasses are captured
++// HERE, at module load, before any sandbox code has run. The carrier rebuild
++// in `sanitizeHostOwnProps` runs at exception-handling time, long after guest
++// code has executed; reading the mutable sandbox globals (`RangeError`,
++// `TypeError`, ...) at that point would let `RangeError = fn` from inside the
++// sandbox place attacker code in the middle of the sanitizer and choose the
++// value it returns.
++const LocalTypeError = global.TypeError;
++const LocalRangeError = global.RangeError;
++const LocalReferenceError = global.ReferenceError;
++const LocalSyntaxError = global.SyntaxError;
++const LocalEvalError = global.EvalError;
++const LocalURIError = global.URIError;
++
++// SECURITY (GHSA-m283-3h24-438v): captured at module load so a sandbox that
++// monkey-patches String.prototype.startsWith cannot influence carrier subclass
++// resolution below.
++const localStringStartsWith = global.String.prototype.startsWith;
++
++// SECURITY (GHSA-m283-3h24-438v): resolve a carrier's error subclass from its
++// `name` STRING rather than `instanceof`. A host-wrapped carrier's prototype
++// chain reaches the *host* `RangeError.prototype`, never the sandbox's, so
++// `instanceof` against a sandbox constructor is false for every host error and
++// the subclass would always collapse to plain Error. Matching on the name also
++// avoids running attacker-reachable prototype walks (and any `Symbol.hasInstance`
++// trap) inside the sanitizer. `name` is attacker-controllable, but the only
++// thing it can influence is which of these six benign sandbox-realm
++// constructors is used -- every one of them is captured above.
++function localErrorCtorForName(name) {
++	if (typeof name !== 'string') return LocalError;
++	// Node <= 11 reports its internal errors with the legacy composite name
++	// "RangeError [ERR_INVALID_OPT_VALUE]", so match the leading token rather
++	// than the whole string -- an exact comparison silently degrades every such
++	// error to plain Error on those runtimes.
++	if (apply(localStringStartsWith, name, ['TypeError'])) return LocalTypeError;
++	if (apply(localStringStartsWith, name, ['RangeError'])) return LocalRangeError;
++	if (apply(localStringStartsWith, name, ['ReferenceError'])) return LocalReferenceError;
++	if (apply(localStringStartsWith, name, ['SyntaxError'])) return LocalSyntaxError;
++	if (apply(localStringStartsWith, name, ['EvalError'])) return LocalEvalError;
++	if (apply(localStringStartsWith, name, ['URIError'])) return LocalURIError;
++	return LocalError;
++}
++
++function _isHostWrapped(e) {
++	try { return e.isProxy === true; } catch (_) { return false; }
++}
++
++// SECURITY (GHSA-m283-3h24-438v): Splits the host-wrapped vs sandbox-realm
++// branches for `.cause` sanitization. Returns the (possibly replaced) carrier —
++// the host-wrapped branch may substitute a fresh sandbox-realm Error when
++// `.cause` cannot be overwritten in place (frozen / non-configurable host
++// property), because in that scenario the proxy `get` trap would otherwise
++// re-deliver the host reference on every read.
++function sanitizeErrorCause(e, visited) {
++	if (_isHostWrapped(e)) {
++		// Strip `.cause` with a SEALED descriptor (`writable: false,
++		// configurable: false`). Non-configurable + non-writable forces two
++		// ECMA-262 Proxy invariants: §10.5.6 makes a lying `defineProperty`
++		// trap throw when it does not actually modify a configurable target,
++		// and §10.5.8 forces subsequent `get` traps to return the locked
++		// value. Both a Proxy reporting success without mutating and an
++		// accessor returning benign-now / process-later are defeated. Strip
++		// failure falls through to substituting a fresh sandbox-realm Error.
++		let stripped = false;
++		try {
++			stripped =
++				localReflectDefineProperty(e, 'cause', {
++					__proto__: null,
++					value: undefined,
++					writable: false,
++					enumerable: false,
++					configurable: false,
++				}) === true;
++		} catch (_) {
++			/* engine threw on invariant violation — fall through to substitution. */
++		}
++		if (!stripped) {
++			let safeMsg = '';
++			try {
++				const m = e.message;
++				if (typeof m === 'string') safeMsg = m;
++			} catch (_) {}
++			return new LocalError(safeMsg);
++		}
++	} else {
++		// Sandbox-realm carrier. Read `.cause` once, recurse if non-primitive
++		// so nested host-wrapped sub-errors get their own `.cause` stripped,
++		// then re-install the sanitized value as a data property.
++		let causeVal;
++		try {
++			causeVal = e.cause;
++		} catch (_) {
++			return e;
++		}
++		let sanitized = causeVal;
++		if (causeVal !== undefined && causeVal !== null) {
++			const t = typeof causeVal;
++			if (t === 'object' || t === 'function') {
++				sanitized = handleException(causeVal, visited);
++			}
++		}
++		try {
++			localReflectDefineProperty(e, 'cause', {
++				__proto__: null,
++				value: sanitized,
++				writable: true,
++				enumerable: false,
++				configurable: true,
++			});
++		} catch (_) {
++			try {
++				e.cause = sanitized;
++			} catch (_) {}
++		}
++	}
++	return e;
++}
++
++// SECURITY (GHSA-m283-3h24-438v second follow-up): host-wrapped SuppressedError
++// carriers are snapshot-and-rebuilt. A read-then-recurse-then-assign
++// (`e.error = handleException(e.error)`) no-ops against a getter-only accessor,
++// leaving the live host reference reachable on later reads (TOCTOU). Instead
++// read each sub-error once, sanitize, and construct a fresh sandbox-realm
++// carrier; the original — with any number of attacker-controlled accessors —
++// is dropped.
++function sanitizeSuppressedError(e, visited) {
++	if (!_isHostWrapped(e) || LocalSuppressedError === null) {
++		try { e.error = handleException(e.error, visited); } catch (_) {}
++		try { e.suppressed = handleException(e.suppressed, visited); } catch (_) {}
++		return e;
++	}
++	let errVal, suppVal, msg = '';
++	try { errVal = e.error; } catch (_) {}
++	try { suppVal = e.suppressed; } catch (_) {}
++	try { const m = e.message; if (typeof m === 'string') msg = m; } catch (_) {}
++	const sanitizedErr = handleException(errVal, visited);
++	const sanitizedSupp = handleException(suppVal, visited);
++	try {
++		return new LocalSuppressedError(sanitizedErr, sanitizedSupp, msg);
++	} catch (_) {
++		return new LocalError(msg);
++	}
++}
++
++// SECURITY (GHSA-m283-3h24-438v / GHSA-55hx-c926-fr95): AggregateError.errors[]
++// can carry host-realm rejection values. Sandbox-realm carriers are sanitized
++// in place; host-wrapped carriers are snapshot-and-rebuilt as a fresh
++// sandbox-realm AggregateError.
++function sanitizeAggregateError(e, visited) {
++	if (!_isHostWrapped(e) || LocalAggregateError === null) {
++		let arr;
++		try { arr = e.errors; } catch (_) { return e; }
++		if (localArrayIsArray(arr)) {
++			let len;
++			try { len = arr.length >>> 0; } catch (_) { return e; }
++			for (let i = 0; i < len; i++) {
++				let item;
++				try { item = arr[i]; } catch (_) { continue; }
++				const sanitized = handleException(item, visited);
++				if (sanitized !== item) {
++					try { arr[i] = sanitized; } catch (_) {}
++				}
++			}
++		}
++		return e;
++	}
++	let arrRead, msg = '';
++	try { arrRead = e.errors; } catch (_) {}
++	try { const m = e.message; if (typeof m === 'string') msg = m; } catch (_) {}
++	const sanitizedArr = [];
++	if (localArrayIsArray(arrRead)) {
++		let len = 0;
++		try { len = arrRead.length >>> 0; } catch (_) {}
++		for (let i = 0; i < len; i++) {
++			let item;
++			try { item = arrRead[i]; } catch (_) { continue; }
++			sanitizedArr[sanitizedArr.length] = handleException(item, visited);
++		}
++	}
++	try {
++		return new LocalAggregateError(sanitizedArr, msg);
++	} catch (_) {
++		return new LocalError(msg);
++	}
++}
++
++// SECURITY (GHSA-m283-3h24-438v third/fourth follow-up): close arbitrary own-
++// property and prototype-inherited host-reference channels on host-wrapped
++// error carriers. Enumerate own keys, seal each to a captured primitive (or to
++// undefined when non-primitive) with a non-configurable + non-writable
++// descriptor, then REBUILD the carrier as a fresh sandbox-realm error carrying
++// across only the sealed primitive own properties. This discards the host
++// prototype chain wholesale, so the returned object is structurally incapable
++// of referencing the host realm (`Object.setPrototypeOf(hostErr, { leak:
++// process })` no longer leaks through `e.leak`).
++function sanitizeHostOwnProps(e) {
++	let keys;
++	try {
++		keys = apply(localReflectOwnKeys, localReflect, [e]);
++	} catch (_) {
++		return new LocalError('');
++	}
++	if (!localArrayIsArray(keys)) return new LocalError('');
++	let keysLen;
++	try {
++		keysLen = keys.length >>> 0;
++	} catch (_) {
++		return new LocalError('');
++	}
++	let safeMsg = '';
++	const carryKeys = [];
++	const carryVals = [];
++	for (let i = 0; i < keysLen; i++) {
++		let k;
++		try { k = keys[i]; } catch (_) { return new LocalError(safeMsg); }
++		let v;
++		try { v = e[k]; } catch (_) { v = undefined; }
++		const t = typeof v;
++		const isPrim = v === null || v === undefined || (t !== 'object' && t !== 'function');
++		if (isPrim && k === 'message' && t === 'string') safeMsg = v;
++		let sealed = false;
++		try {
++			sealed = localReflectDefineProperty(e, k, {
++				__proto__: null,
++				value: isPrim ? v : undefined,
++				writable: false,
++				enumerable: false,
++				configurable: false,
++			}) === true;
++		} catch (_) {
++			/* engine invariant violation — substitute carrier below. */
++		}
++		if (!sealed) {
++			return new LocalError(safeMsg);
++		}
++		if (isPrim && k !== 'message' && v !== undefined) {
++			carryKeys[carryKeys.length] = k;
++			carryVals[carryVals.length] = v;
++		}
++	}
++	let safeName = '';
++	try {
++		const n = e.name;
++		if (typeof n === 'string') safeName = n;
++	} catch (_) { /* hostile accessor — fall back to plain Error */ }
++	const Ctor = localErrorCtorForName(safeName);
++	let out;
++	try {
++		out = new Ctor(safeMsg);
++	} catch (_) {
++		out = new LocalError(safeMsg);
++	}
++	for (let i = 0; i < carryKeys.length; i++) {
++		try {
++			localReflectDefineProperty(out, carryKeys[i], {
++				__proto__: null,
++				value: carryVals[i],
++				writable: true,
++				enumerable: false,
++				configurable: true,
++			});
++		} catch (_) { /* best effort: a diagnostic property is not worth failing on */ }
++	}
++	return out;
++}
++
++// SECURITY (GHSA-cfcw-xp6x-25gj / CVE-2026-47698): captured at module load, before any sandbox
++// code runs, so the foreign-realm detector below cannot be subverted by later
++// mutation of `Object.prototype` from inside the sandbox.
++const localObjectPrototype = localObject.prototype;
++// SECURITY (GHSA-cfcw-xp6x-25gj): hard cap on the proto-chain walk. A genuine
++// sandbox object reaches `Object.prototype` in a handful of hops; the cap only
++// bounds pathological / adversarial chains.
++const FOREIGN_PROTO_WALK_LIMIT = 100;
++
++// SECURITY (GHSA-cfcw-xp6x-25gj): mechanism-independent payoff defense for the
++// host-prototype-severance escape family (GHSA-v6mx-mf47-r5wg and its
++// composition follow-up GHSA-cfcw-xp6x-25gj). Second, independent layer to the
++// `thisEnsureThis` proto-walk guard in lib/bridge.js (CVE-2026-47698).
++function isForeignSeveredHostValue(e) {
++	let proto;
++	try {
++		proto = localReflectGetPrototypeOf(e);
++	} catch (ex) {
++		return true;
++	}
++	if (proto === null) return false;
++	for (let i = 0; i < FOREIGN_PROTO_WALK_LIMIT; i++) {
++		if (proto === localObjectPrototype) return false;
++		let next;
++		try {
++			next = localReflectGetPrototypeOf(proto);
++		} catch (ex) {
++			return true;
++		}
++		if (next === null) return true;
++		proto = next;
++	}
++	return true;
++}
++
+ function handleException(e, visited) {
+ 	// SECURITY (GHSA-9vg3-4rfj-wgcm / CVE-2026-44009): use `ensureThis`,
+ 	// NOT `from`. The previous CVE-2026-26332 hardening switched to `from`
+ 	// for "symmetry" with the host-side path, but values reaching this
+ 	// function from sandbox-side callsites — transformer-instrumented JS
+ 	// catch (`catch(e){e=handleException(e);}`), the localPromise executor
+ 	// catch wrapper, and the sandbox-side `Promise.prototype.then|catch`
+ 	// onRejected wrappers — are sandbox-realm by construction (host-side
+ 	// errors are pre-converted at the bridge boundary by
+ 	// `thisFromOtherForThrow`). Wrapping a sandbox-realm null-proto value
+ 	// with `from` builds a bridge proxy whose `set` trap unwraps incoming
+ 	// sandbox proxies of host references (e.g., `Buffer.prototype.inspect`)
+ 	// to their raw host originals and stores them on the underlying
+ 	// sandbox object — readable directly via the sandbox reference and
+ 	// trivially pivoted to host `Function` via `.constructor` → RCE.
+ 	e = ensureThis(e);
+-	if (localSuppressedErrorProto !== null && e !== null && typeof e === 'object') {
+-		if (!visited) visited = new LocalWeakMap();
+-		// Cycle detection: if we've already visited this object, stop recursing
+-		if (apply(localWeakMapGet, visited, [e])) return e;
+-		apply(localWeakMapSet, visited, [e, true]);
++	if (e === null || (typeof e !== 'object' && typeof e !== 'function')) return e;
++	// SECURITY (GHSA-cfcw-xp6x-25gj / CVE-2026-47698): refuse severed host-realm
++	// objects that reached handleException unwrapped. Complements the bridge
++	// proto-walk guard in lib/bridge.js; either layer alone blocks the escape.
++	if (isForeignSeveredHostValue(e)) {
++		return new LocalError('Foreign exception blocked by vm2 sandbox');
++	}
++	// SECURITY (GHSA-m283-3h24-438v): there is deliberately no
++	// `if (localSuppressedErrorProto === null && localAggregateErrorProto === null) return e;`
++	// short-circuit here. Such an early return would skip .cause / own-property
++	// sanitization on any runtime without SuppressedError and AggregateError
++	// (Node < 15), leaving the host-reference leak open on the oldest versions.
++	if (!visited) visited = new LocalWeakMap();
++	// Cycle detection: if we've already visited this object, stop recursing
++	if (apply(localWeakMapGet, visited, [e])) return e;
++	apply(localWeakMapSet, visited, [e, true]);
++	// SECURITY (GHSA-m283-3h24-438v): Error.cause is a free-form ES2022
++	// property that can carry an arbitrary host reference. When an embedder-
++	// exposed host function throws `new Error('msg', { cause: process })`,
++	// the host Error reaches the sandbox catch as a bridge proxy whose `.cause`
++	// wraps a FULLY FUNCTIONAL bridge proxy of the host object. The bridge
++	// wraps for realm isolation, not capability restriction, so re-wrapping is
++	// not enough; `.cause` must be removed from sandbox reach entirely.
++	e = sanitizeErrorCause(e, visited);
++	// SECURITY (GHSA-m283-3h24-438v): skipping the SuppressedError /
++	// AggregateError prototype walk when neither intrinsic exists on this
++	// runtime is a valid optimization, but execution MUST still fall through to
++	// the own-property sanitizer below.
++	if (localSuppressedErrorProto !== null || localAggregateErrorProto !== null) {
+ 		let proto;
+ 		try {
+ 			proto = localReflectGetPrototypeOf(e);
+@@ -569,17 +856,25 @@
+ 			return e;
+ 		}
+ 		while (proto !== null) {
+-			if (proto === localSuppressedErrorProto) {
+-				e.error = handleException(e.error, visited);
+-				e.suppressed = handleException(e.suppressed, visited);
+-				return e;
++			if (localSuppressedErrorProto !== null && proto === localSuppressedErrorProto) {
++				return sanitizeSuppressedError(e, visited);
+ 			}
++			if (localAggregateErrorProto !== null && proto === localAggregateErrorProto) {
++				return sanitizeAggregateError(e, visited);
++			}
+ 			try {
+ 				proto = localReflectGetPrototypeOf(proto);
+ 			} catch (ex) {
+ 				return e;
+ 			}
+ 		}
++	}
++	// SECURITY (GHSA-m283-3h24-438v third/fourth follow-up): close the arbitrary
++	// own-property and prototype-inherited leak classes on host-wrapped error
++	// carriers. SuppressedError / AggregateError do not reach here — their
++	// handlers above return sandbox-realm replacements.
++	if (_isHostWrapped(e)) {
++		return sanitizeHostOwnProps(e);
+ 	}
+ 	return e;
+ }
+--- /dev/null
++++ b/test/cve-2026-47686.test.js
+@@ -0,0 +1,238 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++'use strict';
++
++/*
++ * CVE-2026-47686 / GHSA-m283-3h24-438v
++ *
++ * handleException() in lib/setup-sandbox.js failed to sanitize Error.cause
++ * (alongside SuppressedError/AggregateError and arbitrary own/prototype
++ * properties), allowing sandboxed code to reach host objects (e.g. process)
++ * via a thrown error and achieve RCE:
++ *
++ *     e.cause.mainModule.require('child_process').execSync(...)
++ *
++ * This replacement regression test (the upstream test/ghsa/GHSA-m283-3h24-438v
++ * tree is not shipped in this package version) reproduces the leak channels and
++ * asserts the sandbox can no longer navigate into the host realm through a
++ * caught error.
++ */
++
++const assert = require('assert');
++const {VM} = require('..');
++
++const itCond = (name, cond, fn) => (cond ? it(name, fn) : it.skip(name, fn));
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++const NODE_MINOR = parseInt(process.versions.node.split('.')[1], 10);
++// Error.cause shipped in Node 16.9. Older Nodes silently drop the option.
++const HAS_ERROR_CAUSE = NODE_MAJOR > 16 || (NODE_MAJOR === 16 && NODE_MINOR >= 9);
++const HAS_SUPPRESSED_ERROR = typeof SuppressedError === 'function';
++const HAS_AGGREGATE_ERROR = typeof AggregateError === 'function';
++
++describe('CVE-2026-47686 (host error carriers leak host references -> RCE)', function () {
++	itCond('canonical PoC: Error cause=process cannot reach child_process', HAS_ERROR_CAUSE, function () {
++		const probe = {realm: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: process});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					const cp = e.cause.mainModule.require('child_process');
++					__probe.realm = 'HOST:' + cp.execSync('echo PWNED').toString().trim();
++				} catch (err) {
++					__probe.realm = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.notStrictEqual(probe.realm, 'HOST:PWNED', 'sandbox reached host child_process via Error.cause');
++	});
++
++	itCond('cause is not a usable host reference (cannot reach process.mainModule)', HAS_ERROR_CAUSE, function () {
++		const probe = {mainModuleType: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					throw new Error('fail', {cause: process});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.mainModuleType = e.cause && typeof e.cause.mainModule;
++				} catch (_) {
++					__probe.mainModuleType = 'THREW';
++				}
++			}
++		`);
++		assert.notStrictEqual(probe.mainModuleType, 'object', 'sandbox reached process.mainModule via Error.cause');
++		assert.notStrictEqual(probe.mainModuleType, 'function', 'sandbox reached process.mainModule via Error.cause');
++	});
++
++	itCond('deeply nested cause (cause.cause) is neutralized', HAS_ERROR_CAUSE, function () {
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					const inner = new Error('inner', {cause: process});
++					throw new Error('outer', {cause: inner});
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.result = e.cause.cause.mainModule.require('child_process').execSync('echo PWN').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.ok(
++			probe.result === 'UNSET' || /^BLOCKED:/.test(probe.result) || probe.result === undefined,
++			'nested cause pivot succeeded: ' + probe.result
++		);
++	});
++
++	it('arbitrary own property (e.detail = process) is neutralized', function () {
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					const e = new Error('boom');
++					e.detail = process;
++					throw e;
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.result = e.detail.mainModule.require('child_process').execSync('echo PWN').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.ok(
++			probe.result === 'UNSET' || /^BLOCKED:/.test(probe.result) || probe.result === undefined,
++			'own-property leak reached host: ' + probe.result
++		);
++	});
++
++	it('prototype-inherited host reference (setPrototypeOf) is neutralized', function () {
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					const e = new Error('boom');
++					Object.setPrototypeOf(e, {leak: process});
++					throw e;
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.result = e.leak.mainModule.require('child_process').execSync('echo PWN').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.ok(
++			probe.result === 'UNSET' || /^BLOCKED:/.test(probe.result) || probe.result === undefined,
++			'prototype-inherited leak reached host: ' + probe.result
++		);
++	});
++
++	itCond('SuppressedError carrying a host error with cause=process is neutralized', HAS_ERROR_CAUSE && HAS_SUPPRESSED_ERROR, function () {
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					const hostErr = new Error('host', {cause: process});
++					throw new SuppressedError(hostErr, new Error('supp'), 'suppressed');
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.result = e.error.cause.mainModule.require('child_process').execSync('echo PWN').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.ok(
++			probe.result === 'UNSET' || /^BLOCKED:/.test(probe.result) || probe.result === undefined,
++			'SuppressedError sub-error leaked host: ' + probe.result
++		);
++	});
++
++	itCond('AggregateError carrying a host error with cause=process is neutralized', HAS_ERROR_CAUSE && HAS_AGGREGATE_ERROR, function () {
++		const probe = {result: 'UNSET'};
++		const vm = new VM({
++			sandbox: {
++				hostFn: () => {
++					const hostErr = new Error('host', {cause: process});
++					throw new AggregateError([hostErr], 'aggregate');
++				},
++				__probe: probe
++			}
++		});
++		vm.run(`
++			try {
++				hostFn();
++			} catch (e) {
++				try {
++					__probe.result = e.errors[0].cause.mainModule.require('child_process').execSync('echo PWN').toString();
++				} catch (err) {
++					__probe.result = 'BLOCKED:' + (err && err.message);
++				}
++			}
++		`);
++		assert.ok(
++			probe.result === 'UNSET' || /^BLOCKED:/.test(probe.result) || probe.result === undefined,
++			'AggregateError sub-error leaked host: ' + probe.result
++		);
++	});
++
++	it('a normally-thrown sandbox error still surfaces with its message intact', function () {
++		const vm = new VM({});
++		const msg = vm.run(`
++			try {
++				throw new TypeError('plain sandbox error');
++			} catch (e) {
++				(e instanceof TypeError) + '|' + e.message;
++			}
++		`);
++		assert.strictEqual(msg, 'true|plain sandbox error');
++	});
++});
+
+diff --git a/lib/bridge.js b/lib/bridge.js
+index ba6fbba..04365a7 100644
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -1551,7 +1551,24 @@ function createBridge(otherInit, registerProxy) {
+ 				if (!proto) {
+ 					return other;
+ 				}
++				// SECURITY (GHSA-cfcw-xp6x-25gj): track whether the prototype walk
++				// passes through the sandbox-realm `Object.prototype`. Every genuine
++				// sandbox-realm object (plain `{}`, sandbox Error, class instance,
++				// etc.) has it in its chain, so such values always hit a protoMapping
++				// (sandbox intrinsics are registered) or terminate via it. A value
++				// that walks its whole chain to null WITHOUT a mapping AND without
++				// ever seeing the sandbox Object.prototype is anomalous: it is a
++				// host-realm object whose prototype chain was severed host-side. The
++				// map/bind laundering bypass (apply.bind(call,call) over a genuine
++				// host array's `.map`) sets a Node-internal error prototype's
++				// `[[Prototype]]` to null host-side, so the walk falls off before
++				// reaching the registered host TypeError.prototype mapping. Returning
++				// such an object raw lets `e.constructor.constructor` reach host
++				// `Function`. Mechanism-independent payoff defense — it does not
++				// matter HOW the chain was severed.
++				let sawSandboxObjectProto = false;
+ 				while (proto) {
++					if (proto === thisObjectPrototype) sawSandboxObjectProto = true; // SECURITY (GHSA-cfcw-xp6x-25gj)
+ 					const mapping = thisReflectApply(thisMapGet, protoMappings, [proto]);
+ 					if (mapping) {
+ 						const mapped = thisReflectApply(thisWeakMapGet, mappingOtherToThis, [other]);
+@@ -1560,6 +1577,18 @@ function createBridge(otherInit, registerProxy) {
+ 					}
+ 					proto = thisReflectGetPrototypeOf(proto);
+ 				}
++				// SECURITY (GHSA-cfcw-xp6x-25gj): walked the entire chain to null with
++				// no protoMapping. If the chain never included the sandbox
++				// Object.prototype, the value is a host-realm object with a
++				// severed/foreign chain — refuse to surface it raw. `emptyFrozenObject`
++				// mirrors the dangerous-Function-constructor sentinel used elsewhere;
++				// its `.constructor.constructor` is the harmless sandbox Function. The
++				// immediate-null-proto branch above (GHSA-9vg3-4rfj-wgcm sandbox
++				// `{__proto__:null}`) returns before entering this walk and is
++				// unaffected.
++				if (!isHost && !sawSandboxObjectProto) {
++					return emptyFrozenObject;
++				}
+ 				return other;
+ 			case 'symbol':
+ 				// SECURITY (GHSA-47x8-96vw-5wg6): Strip dangerous cross-realm symbols.
+--- /dev/null
++++ b/test/cve-2026-47698.test.js
+@@ -0,0 +1,187 @@
++/* eslint-env mocha */
++/* eslint-disable max-len */
++
++/**
++ * CVE-2026-47698 / GHSA-cfcw-xp6x-25gj — stacked-indirection & host-side
++ * laundering bypass of the host-prototype-severance defense.
++ *
++ * An attacker severs a host intrinsic's prototype chain (host-side, via
++ * stacked `Function.prototype.call/apply/bind` indirection or `map`/`forEach`
++ * laundering) so the bridge's proto-mapping lookups miss and a RAW host error
++ * surfaces in a sandbox `catch`. The sandbox then pivots
++ * `e.constructor.constructor` to host `Function` -> RCE.
++ *
++ * Fix (backported from upstream a85acb61): two independent chokepoints —
++ * the `thisEnsureThis` proto-walk guard in lib/bridge.js (this patch) and the
++ * `isForeignSeveredHostValue` refusal in `handleException` (CVE-2026-47686).
++ * Either alone refuses a host-realm object whose prototype chain reaches null
++ * without ever passing through the sandbox Object.prototype.
++ *
++ * Grounded on test/ghsa/GHSA-cfcw-xp6x-25gj/repro.js from the upstream fix.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const {VM} = require('..');
++
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++// WebAssembly.compileStreaming exists on Node 14+; the PoC depends on its
++// rejection producing a host Node-internal error.
++const HAS_WASM_STREAMING = NODE_MAJOR >= 14;
++
++if (typeof global.it.cond !== 'function') {
++	global.it.cond = function(name, cond, fn) {
++		return cond ? it(name, fn) : it.skip(name, fn);
++	};
++}
++
++function escapeAttempt(code) {
++	const vm = new VM({timeout: 2000});
++	const pwnKey = '__CVE_2026_47698_pwned_' + Math.random().toString(36).slice(2);
++	global[pwnKey] = false;
++	try {
++		vm.run(code.replace(/__PWN_KEY__/g, JSON.stringify(pwnKey)));
++	} catch (_) {
++		/* bridge-level throws are also blocked */
++	}
++	return new Promise(function(resolve) {
++		setTimeout(function() {
++			const escaped = global[pwnKey] === true;
++			delete global[pwnKey];
++			resolve(escaped);
++		}, 300);
++	});
++}
++
++describe('CVE-2026-47698 (stacked indirection / host-side laundering escape)', function() {
++	it.cond(
++		'blocks the canonical stacked PoC (Buffer.call.call(Buffer.call, setProto, ...))',
++		HAS_WASM_STREAMING,
++		async function() {
++			this.timeout(5000);
++			const escaped = await escapeAttempt(`
++				"use strict";
++				const getProto = Buffer.call.call(Buffer.call, {}.__lookupGetter__, Buffer, "__proto__");
++				const setProto = Buffer.call.call(Buffer.call, {}.__lookupSetter__, Buffer, "__proto__");
++				async function f() {
++					try { await WebAssembly.compileStreaming(); }
++					catch (e) {
++						try {
++							Buffer.call.call(Buffer.call, setProto,
++								Buffer.call.call(Buffer.call, getProto, e), null);
++						} catch (_) {}
++					}
++					try { await WebAssembly.compileStreaming(); }
++					catch (e) {
++						try {
++							const HostFunction = e.constructor.constructor;
++							new HostFunction("globalThis[" + JSON.stringify(__PWN_KEY__) + "] = true")();
++						} catch (_) {}
++					}
++				}
++				f().catch(() => {});
++			`);
++			assert.strictEqual(escaped, false, 'stacked-indirection PoC succeeded');
++		}
++	);
++
++	it.cond(
++		'blocks the map/bind host-side laundering bypass',
++		HAS_WASM_STREAMING,
++		async function() {
++			this.timeout(5000);
++			const escaped = await escapeAttempt(`
++				"use strict";
++				const ca = Buffer.call.call(Buffer.bind, Buffer.apply, Buffer.call, Buffer.call);
++				function caar(a){ const r = Buffer.of().toJSON().data; r[0] = a; return r.map(ca); }
++				async function f() {
++					try { await WebAssembly.compileStreaming(); }
++					catch (e) {
++						try {
++							const g = caar([{}.__lookupGetter__, Buffer, "__proto__"]); g[1] = e;
++							const s = caar([{}.__lookupSetter__, Buffer, "__proto__"]); s[1] = ca(g); s[2] = null;
++							ca(s);
++						} catch (_) {}
++					}
++					try { await WebAssembly.compileStreaming(); }
++					catch (e) {
++						try {
++							e.constructor.constructor("globalThis[" + JSON.stringify(__PWN_KEY__) + "] = true")();
++						} catch (_) {}
++					}
++				}
++				f().catch(() => {});
++			`);
++			assert.strictEqual(escaped, false, 'map/bind host-side laundering PoC succeeded');
++		}
++	);
++
++	it.cond(
++		'blocks reduce/forEach host-side laundering variants',
++		HAS_WASM_STREAMING,
++		async function() {
++			this.timeout(5000);
++			const escaped = await escapeAttempt(`
++				"use strict";
++				const ca = Buffer.call.call(Buffer.bind, Buffer.apply, Buffer.call, Buffer.call);
++				function caar(a){
++					const r = Buffer.of().toJSON().data; r[0] = a;
++					let out;
++					r.forEach(function(x){ out = ca(x); });
++					return [out];
++				}
++				async function f() {
++					try { await WebAssembly.compileStreaming(); }
++					catch (e) {
++						try {
++							const g = caar([{}.__lookupGetter__, Buffer, "__proto__"]); g[1] = e;
++							const s = caar([{}.__lookupSetter__, Buffer, "__proto__"]); s[1] = ca(g); s[2] = null;
++							ca(s);
++						} catch (_) {}
++					}
++					try { await WebAssembly.compileStreaming(); }
++					catch (e) {
++						try {
++							e.constructor.constructor("globalThis[" + JSON.stringify(__PWN_KEY__) + "] = true")();
++						} catch (_) {}
++					}
++				}
++				f().catch(() => {});
++			`);
++			assert.strictEqual(escaped, false, 'forEach host-side laundering PoC succeeded');
++		}
++	);
++
++	it('legitimate sandbox use of Object.setPrototypeOf on sandbox objects is preserved', function() {
++		const vm = new VM();
++		const out = vm.run(`
++			const a = {};
++			const b = { kind: 'parent' };
++			Object.setPrototypeOf(a, b);
++			a.kind;
++		`);
++		assert.strictEqual(out, 'parent', 'legitimate setPrototypeOf broke');
++	});
++
++	it('legitimate sandbox use of Object.defineProperty on sandbox objects is preserved', function() {
++		const vm = new VM();
++		const out = vm.run(`
++			const a = {};
++			Object.defineProperty(a, 'x', { value: 7, configurable: true });
++			a.x;
++		`);
++		assert.strictEqual(out, 7, 'legitimate defineProperty broke');
++	});
++
++	it('a normal sandbox Error thrown and caught is unaffected', function() {
++		const vm = new VM();
++		const out = vm.run(`
++			let msg;
++			try { throw new TypeError('boom'); }
++			catch (e) { msg = e.message; }
++			msg;
++		`);
++		assert.strictEqual(out, 'boom', 'normal sandbox error handling broke');
++	});
++});
+
+--- a/lib/setup-sandbox.js
++++ b/lib/setup-sandbox.js
+@@ -585,3 +585,378 @@ function handleException(e, visited) {
+ }
+ 
++// SECURITY (GHSA-248r-7h7q-cr24): Async generator yield*-return thenable
++// exception capture. When sandbox code calls `i.return(thenable)` on an
++// async generator that delegates via `yield*` to an inner async iterator
++// without a `return` method, V8's PromiseResolveThenableJob captures any
++// synchronous throw from the thenable's `.then` callback and the yield*
++// machinery delivers it to sandbox code as an iterator result
++// (`{ value: thrown, done: false }`). This bypasses (a) the transformer's
++// `catch`-block instrumentation (the catch is implicit in V8 internals)
++// and (b) the `globalPromise.prototype.then` rejection sanitizer above,
++// because internal `Await` uses `PerformPromiseThen` directly and never
++// invokes the user-visible `.then` override. Wrap
++// `%AsyncGeneratorPrototype%.next` / `.return` / `.throw` so every value
++// flowing out of an async generator into sandbox code is routed through
++// `handleException` — restoring the invariant that no host-realm value
++// can reach sandbox code without sanitization.
++let localAsyncGeneratorPrototype = null;
++try {
++	// %AsyncGeneratorPrototype% is two prototype levels up from an instance:
++	//   instance.[[Prototype]]                    → per-function prototype
++	//   per-function-prototype.[[Prototype]]      → %AsyncGeneratorPrototype%
++	// Each async generator function gets its own per-function prototype, so
++	// wrapping that level is ineffective for any other async generator
++	// (like helpers defined inside sandbox code). Walk up one more step to
++	// reach the shared intrinsic prototype that owns next/return/throw.
++	const localAsyncGenInstance = localEval('(async function*(){})()');
++	localAsyncGeneratorPrototype = localReflectGetPrototypeOf(localReflectGetPrototypeOf(localAsyncGenInstance));
++} catch (e) {
++	// AsyncGenerators not available (Node < 10) — nothing to wrap.
++}
++
++if (localAsyncGeneratorPrototype) {
++	const origAsyncGenNext = localAsyncGeneratorPrototype.next;
++	const origAsyncGenReturn = localAsyncGeneratorPrototype.return;
++	const origAsyncGenThrow = localAsyncGeneratorPrototype.throw;
++
++	// SECURITY: chain through the *cached* native then() so this sanitization
++	// step does not itself recurse through the `globalPromise.prototype.then`
++	// override (which would double-handle and could observe attacker-supplied
++	// species manipulation on intermediate promises).
++	function sanitizeAsyncIteratorResultPromise(promise) {
++		return apply(globalPromiseThen, promise, [
++			function sanitizeFulfilledIterResult(result) {
++				if (result === null || (typeof result !== 'object' && typeof result !== 'function')) return result;
++				let value;
++				try {
++					value = result.value;
++				} catch (ex) {
++					return result;
++				}
++				const sanitized = safeSanitize(value);
++				if (sanitized === value) return result;
++				let done;
++				try {
++					done = !!result.done;
++				} catch (ex) {
++					done = false;
++				}
++				// New object — never mutate an attacker-controlled result shape.
++				return { value: sanitized, done };
++			},
++			function sanitizeRejectedIterResult(error) {
++				throw safeSanitize(error);
++			},
++		]);
++	}
++
++	// SECURITY: when sandbox passes a thenable to AsyncGeneratorPrototype.return
++	// (or .next / .throw), V8 awaits the thenable as part of yield* abrupt-
++	// completion processing. PromiseResolveThenableJob calls the thenable's
++	// .then(resolve, reject); a synchronous throw from .then is captured by
++	// V8's host-side try/catch and propagated INTO the inner iterator as the
++	// resumption value — i.e., V8 calls inner.next(captured) on the next loop
++	// turn. The inner iterator (sandbox-defined) can package that value
++	// however it wants — including hiding it inside a closure
++	// (`{value: ()=>v, done: false}`) so the wrapper above sees only the
++	// closure and the iterator-result `value` sanitization is a no-op.
++	//
++	// Three sub-attacks, all closed below:
++	//
++	//   (1) Direct sync throw — wrap user .then in try/catch, convert to
++	//       reject(handleException(e)).
++	//   (2) Nested-thenable resolve — `{ then(r){ r({ then(r){ f(); r(); }}) }}`.
++	//       Outer .then resolves with another thenable; V8 recursively
++	//       unwraps via PromiseResolveThenableJob, the inner .then runs
++	//       unwrapped. Fix: wrap the resolve callback so any thenable
++	//       handed to it is recursively re-sanitised before V8 sees it.
++	//   (3) Getter TOCTOU on .then — a getter returns undefined to our
++	//       pre-read and a real function to V8's read. Fix: never pre-read.
++	//       Always substitute a sandbox-realm wrapper whose .then is a
++	//       fixed function. Inside that function read user.then exactly
++	//       once and use the captured ref. For the non-thenable branch,
++	//       resolve with a fresh shadow object that has no .then own or
++	//       inherited property, so V8 cannot re-detect a thenable when
++	//       PromiseResolve runs again on the resolution value.
++	//
++	// Together these collapse the attack surface to: V8 only ever calls
++	// safeThen, and safeThen routes every value flowing across the boundary
++	// through handleException or another safeThen wrapper.
++	// SECURITY (v5 — review feedback): the previous makeNonThenableShadow
++	// always built a `{__proto__:null}` copy of value's own descriptors.
++	// That preserved the "V8 cannot re-detect a thenable on PromiseResolve"
++	// invariant, but corrupted any value with meaningful prototype-defined
++	// behaviour: passing a function, Map, Set, Date, or any class instance
++	// to `i.return(x)` would surface to sandbox code as an empty object
++	// stripped of its constructor methods (`fn(2,3)`, `m.get('a')`,
++	// `d.toISOString()` all break).
++	//
++	// Use a hybrid strategy: walk value's prototype chain for a `then`
++	// accessor (getter/setter). If none, V8's re-read of `value.then` will
++	// see the same `undefined` we did — safe to pass `value` straight to
++	// resolve, preserving identity and prototype methods. If an accessor
++	// IS present (attacker scenario or `Object.prototype.then` poisoning),
++	// fall back to the stripped shadow — the data corruption is acceptable
++	// because the value is already attacker-crafted in that case.
++
++	// SECURITY (v7 — GHSA-248r-7h7q-cr24): the v6 fix used a descriptor
++	// walk + double-read to decide whether `value` could be passed
++	// directly to `resolve()` (preserving identity for benign non-thenable
++	// inputs). The reviewer demonstrated a structural bypass: a getter on
++	// `.then` that counts reads, returns non-function on each pre-read,
++	// then self-replaces with a data property holding a malicious function
++	// before V8's `[[Get]]` in `PromiseResolveThenableJob` runs. The
++	// descriptor walk afterwards sees the data property (not an accessor)
++	// and concludes "safe to pass value". V8 then reads the malicious
++	// function and schedules another `PromiseResolveThenableJob` that
++	// invokes it OUTSIDE our wrapper, with V8 internal capability
++	// resolvers — defeating every layer above.
++	//
++	// The same flaw applies to Proxies: `getOwnPropertyDescriptor` traps
++	// can lie about descriptors while `get` traps return arbitrary values
++	// across reads. Detection-based heuristics on attacker-controlled
++	// `.then` slots are fundamentally bypassable.
++	//
++	// `thenIsAccessorInChain` is therefore removed in v7. The non-function
++	// branch ALWAYS shadows; see `safeThen` below for rationale.
++	function makeNonThenableShadow(value) {
++		const shadow = { __proto__: null };
++		let keys;
++		try {
++			keys = localReflectOwnKeys(value);
++		} catch (ex) {
++			return shadow;
++		}
++		if (!localArrayIsArray(keys)) return shadow;
++		for (let i = 0; i < keys.length; i++) {
++			const k = keys[i];
++			if (k === 'then') continue;
++			let desc;
++			try {
++				desc = localReflectGetOwnPropertyDescriptor(value, k);
++			} catch (ex) {
++				continue;
++			}
++			if (!desc) continue;
++			try {
++				localReflectDefineProperty(shadow, k, desc);
++			} catch (ex) {
++				// best effort — non-configurable / non-writable conflicts
++			}
++		}
++		return shadow;
++	}
++
++	// SECURITY (v5 — review feedback): handleException(e) itself can throw
++	// (e.g., bridge.from on a hostile prototype, or a getter on .error /
++	// .suppressed that escapes its inner try/catch). If the throw escapes
++	// uncaught from a place where we then re-throw or hand the value to V8,
++	// the original raw value reaches sandbox code via the rejection path —
++	// defeating the entire sanitisation chain. Wrap every call with a
++	// fallback that returns a sandbox-realm VMError.
++	function safeSanitize(e) {
++		let result;
++		try {
++			result = handleException(e);
++		} catch (sanEx) {
++			try {
++				result = new VMError('Exception sanitization failed');
++			} catch (vmEx) {
++				try {
++					result = new LocalError('Exception sanitization failed');
++				} catch (errEx) {
++					result = undefined;
++				}
++			}
++		}
++		return result;
++	}
++
++	function sanitizeThenableArg(value) {
++		if (value === null || (typeof value !== 'object' && typeof value !== 'function')) return value;
++		// ALWAYS wrap. Do not pre-read value.then — a getter could behave
++		// differently on the second call and bypass the wrap (sub-attack 3).
++		return {
++			then: function safeThen(resolve, reject) {
++				// Read user.then exactly once; V8 will not re-read because it
++				// already captured `safeThen` (a fixed function) at PromiseResolve
++				// time and uses that captured ref for the resolver job.
++				let userThen;
++				try {
++					userThen = value.then;
++				} catch (e) {
++					if (typeof reject === 'function') {
++						try {
++							reject(safeSanitize(e));
++						} catch (rejectEx) {
++							/* best effort */
++						}
++						return undefined;
++					}
++					throw safeSanitize(e);
++				}
++				if (typeof userThen !== 'function') {
++					// SECURITY (v7 — GHSA-248r-7h7q-cr24): the v6 fix tried
++					// to preserve identity for benign non-thenable inputs by
++					// passing `value` to `resolve()` after a descriptor walk
++					// confirmed no `.then` accessor in the chain. The
++					// external review demonstrated a counter: a getter
++					// that counts reads, returns non-function on each
++					// pre-read, then self-replaces with a data property
++					// holding a malicious function before V8's `[[Get]]` in
++					// PromiseResolveThenableJob. By the time the descriptor
++					// walk runs, the getter has already mutated to a data
++					// property, so the walk reports "no accessor" and the
++					// code passes `value` to `resolve()`. V8 then reads the
++					// malicious function via [[Get]] and schedules another
++					// PromiseResolveThenableJob that calls it OUTSIDE our
++					// wrapper — proven by the V8-supplied resolver having
++					// `.name === ""` instead of `safeResolveCallback`.
++					//
++					// Doubling, tripling, or N-reading does not help: the
++					// getter (or a Proxy) can count to any N before
++					// switching, and Proxies can lie about descriptors.
++					// Detection-based heuristics on an attacker-controlled
++					// `.then` slot are fundamentally bypassable.
++					//
++					// Structural fix: when `userThen` is non-function on
++					// our read, ALWAYS resolve with a sandbox-realm shadow
++					// that has no `.then` anywhere in its chain. V8 cannot
++					// re-read the user's `value`; it only sees the shadow,
++					// which we fully control. Trade-off: identity is not
++					// preserved for non-thenable values passed to
++					// `i.return(x)` (the resolved iterator value will not
++					// be `===` to the input). Identity preservation in this
++					// codepath is incompatible with safety against TOCTOU
++					// attacks on `.then`; the shadow option is the only
++					// invariant we can hold against an adversarial input.
++					if (typeof resolve === 'function') {
++						let shadow;
++						try {
++							shadow = makeNonThenableShadow(value);
++						} catch (shadowEx) {
++							shadow = { __proto__: null };
++						}
++						try {
++							resolve(shadow);
++						} catch (resolveEx) {
++							/* best effort */
++						}
++					}
++					return undefined;
++				}
++				// Wrap resolve so any nested thenable handed to it is itself
++				// sanitised before V8 schedules the next PromiseResolveThenableJob
++				// (sub-attack 2 — `{ then(r){ r(innerThenable) }}` chains).
++				const safeResolve =
++					typeof resolve === 'function'
++						? function safeResolveCallback(v) {
++								let safe;
++								try {
++									safe = sanitizeThenableArg(v);
++								} catch (wrapEx) {
++									safe = v;
++								}
++								return resolve(safe);
++							}
++						: resolve;
++				const safeReject =
++					typeof reject === 'function'
++						? function safeRejectCallback(r) {
++								return reject(safeSanitize(r));
++							}
++						: reject;
++				try {
++					return apply(userThen, value, [safeResolve, safeReject]);
++				} catch (e) {
++					const sanitized = safeSanitize(e);
++					if (typeof reject === 'function') {
++						try {
++							reject(sanitized);
++						} catch (rejectEx) {
++							/* best effort */
++						}
++						return undefined;
++					}
++					throw sanitized;
++				}
++			},
++		};
++	}
++
++	function wrapAsyncGenMethod(orig) {
++		return function asyncGenSanitizedWrapper() {
++			// SECURITY: sanitize the first argument (the only one V8 awaits in
++			// yield* abrupt-completion paths) BEFORE delegating to the native
++			// method. Build the argsList as a `{ __proto__: null }` array-like
++			// so writes to `args[i]` cannot walk the prototype chain and fire
++			// sandbox-installed setters on `Array.prototype` / `Object.prototype`.
++			// Using `[]` would inherit Array.prototype, and an attacker setter
++			// on `Array.prototype['0']` would intercept the user value before
++			// sanitizeThenableArg ever runs (or could feed a different value
++			// to the native method via a paired getter).
++			const len = arguments.length;
++			const args = { __proto__: null, length: len };
++			for (let i = 0; i < len; i++) {
++				args[i] = arguments[i];
++			}
++			if (len > 0) {
++				args[0] = sanitizeThenableArg(args[0]);
++			}
++			let res;
++			try {
++				res = apply(orig, this, args);
++			} catch (e) {
++				// Synchronous throw from the native method (e.g. wrong receiver) —
++				// sanitize the throw value before it reaches sandbox catch blocks.
++				throw safeSanitize(e);
++			}
++			if (res === null || (typeof res !== 'object' && typeof res !== 'function')) return res;
++			return sanitizeAsyncIteratorResultPromise(res);
++		};
++	}
++
++	// SECURITY: install with writable:false, configurable:false so sandbox
++	// code cannot delete or replace the wrappers (defense-in-depth — even
++	// without a reference to the original native, replacing the wrapper
++	// would let sandbox interpose its own logic on V8's yield* protocol
++	// invocations).
++	if (typeof origAsyncGenNext === 'function') {
++		if (
++			!localReflectDefineProperty(localAsyncGeneratorPrototype, 'next', {
++				__proto__: null,
++				value: wrapAsyncGenMethod(origAsyncGenNext),
++				writable: false,
++				enumerable: false,
++				configurable: false,
++			})
++		)
++			throw localUnexpected();
++	}
++	if (typeof origAsyncGenReturn === 'function') {
++		if (
++			!localReflectDefineProperty(localAsyncGeneratorPrototype, 'return', {
++				__proto__: null,
++				value: wrapAsyncGenMethod(origAsyncGenReturn),
++				writable: false,
++				enumerable: false,
++				configurable: false,
++			})
++		)
++			throw localUnexpected();
++	}
++	if (typeof origAsyncGenThrow === 'function') {
++		if (
++			!localReflectDefineProperty(localAsyncGeneratorPrototype, 'throw', {
++				__proto__: null,
++				value: wrapAsyncGenMethod(origAsyncGenThrow),
++				writable: false,
++				enumerable: false,
++				configurable: false,
++			})
++		)
++			throw localUnexpected();
++	}
++}
++
+ const withProxy = localObjectFreeze({
+--- /dev/null
++++ b/test/cve-2026-45411.test.js
+@@ -0,0 +1,117 @@
++'use strict';
++
++/**
++ * CVE-2026-45411 / GHSA-248r-7h7q-cr24
++ * Async generator yield*-return thenable exception capture.
++ *
++ * When an async generator delegates via `yield*` to an inner async iterator
++ * with no `return` method, calling `i.return(thenable)` causes V8 to await
++ * the thenable as the abrupt-return value. If the thenable's `.then` method
++ * throws (or resolves with a host-realm value), V8's
++ * `PromiseResolveThenableJob` captures the value and the yield* machinery
++ * delivers it to sandbox code as `{ value, done: false }` — bypassing both
++ * the transformer's `catch` instrumentation and the
++ * `globalPromise.prototype.then` rejection sanitizer.
++ *
++ * The fix wraps `%AsyncGeneratorPrototype%.next` / `.return` / `.throw` so
++ * every value flowing out of an async generator into sandbox code is routed
++ * through `handleException`, and every thenable argument is replaced with a
++ * sandbox-realm wrapper. This regression test asserts that no host-realm
++ * value (in particular the host `Function` constructor / `process`) can be
++ * reached through the yield*-return-thenable path.
++ *
++ * Grounded on upstream test/ghsa/GHSA-248r-7h7q-cr24/repro.js from fix commit
++ * 093494c0c3ef2390d2e56909f9d56e290e6f18b0.
++ */
++
++const assert = require('assert');
++const {VM} = require('../lib/main.js');
++
++const HAS_ASYNC_GEN = (() => {
++	try {
++		eval('(async function*(){})');
++		return true;
++	} catch (e) {
++		return false;
++	}
++})();
++
++describe('CVE-2026-45411 (async generator yield*-return thenable exception capture)', function () {
++	(HAS_ASYNC_GEN ? it : it.skip)('thrown value is sanitized to a sandbox-realm Error', async function () {
++		this.timeout(10000);
++		const vm = new VM();
++		const result = await vm.run(`
++			async function* helper() {
++				yield* {
++					[Symbol.asyncIterator]: () => ({
++						next: v => ({value: v, done: false}),
++						throw: v => ({value: v, done: false})
++					})
++				};
++			}
++			async function doCatch(f) {
++				const i = helper();
++				await i.next();
++				const v = await i.return({then(r){ f(); r(); }});
++				return v.value;
++			}
++			(async () => {
++				const probe = {};
++				const e = await doCatch(() => { throw new Error('sandbox-throw'); });
++				probe.ctorIsSandboxError = e && e.constructor === Error;
++				probe.instanceofError = e instanceof Error;
++				probe.message = e && e.message;
++				try {
++					const fn = e.constructor.constructor('return process');
++					probe.gotProcess = !!fn();
++				} catch (ex) {
++					probe.escapeBlocked = true;
++				}
++				return probe;
++			})();
++		`);
++		assert.strictEqual(result.ctorIsSandboxError, true, 'e.constructor must be sandbox Error');
++		assert.strictEqual(result.instanceofError, true, 'e must be instanceof sandbox Error');
++		assert.strictEqual(result.message, 'sandbox-throw');
++		assert.ok(!result.gotProcess, 'must not obtain host process via thrown value: ' + JSON.stringify(result));
++	});
++
++	(HAS_ASYNC_GEN ? it : it.skip)('host-realm error via bridged host call is sanitized through yield* capture', async function () {
++		this.timeout(10000);
++		const vm = new VM();
++		const result = await vm.run(`
++			async function* helper() {
++				yield* {
++					[Symbol.asyncIterator]: () => ({
++						next: v => ({value: v, done: false}),
++						throw: v => ({value: v, done: false})
++					})
++				};
++			}
++			async function doCatch(f) {
++				const i = helper();
++				await i.next();
++				const v = await i.return({then(r){ f(); r(); }});
++				return v.value;
++			}
++			(async () => {
++				const e = await doCatch(() => { Buffer.alloc(-1); });
++				const probe = {
++					ctorIsSandboxRangeError: e && e.constructor === RangeError,
++					instanceofRangeError: e instanceof RangeError,
++					instanceofError: e instanceof Error
++				};
++				try {
++					const fn = e.constructor.constructor('return process');
++					probe.gotProcess = !!fn();
++				} catch (ex) {
++					probe.escapeBlocked = true;
++				}
++				return probe;
++			})();
++		`);
++		assert.strictEqual(result.ctorIsSandboxRangeError, true);
++		assert.strictEqual(result.instanceofRangeError, true);
++		assert.ok(!result.gotProcess, 'host process leaked: ' + JSON.stringify(result));
++	});
++});
