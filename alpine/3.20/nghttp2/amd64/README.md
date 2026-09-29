@@ -1,6 +1,6 @@
-# nghttp2 : 1.62.1-r00071
+# nghttp2 : 1.62.1-r00072
 
-This patch is based on nghttp2 version 1.62.1-r00071, which is available at:
+This patch is based on nghttp2 version 1.62.1-r00072, which is available at:
 unknown
 
 ## Affected CVEs:
