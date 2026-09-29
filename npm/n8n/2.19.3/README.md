@@ -31,6 +31,10 @@ unknown
 - GHSA-hv7x-3x78-gx53
 - GHSA-jwm3-qcfw-c5pp
 - CVE-2026-56348
+- GHSA-gf29-4f56-r2jf
+- CVE-2026-65598
+- CVE-2026-59207
+- GHSA-gv7g-jm28-cr3m
 
 ## How to Apply:
 1. Clone or download the source code for n8n
