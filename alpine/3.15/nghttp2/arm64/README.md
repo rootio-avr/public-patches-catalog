@@ -1,6 +1,6 @@
-# nghttp2 : 1.46.0-r20071
+# nghttp2 : 1.46.0-r20072
 
-This patch is based on nghttp2 version 1.46.0-r20071, which is available at:
+This patch is based on nghttp2 version 1.46.0-r20072, which is available at:
 unknown
 
 ## Affected CVEs:
