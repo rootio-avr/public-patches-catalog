@@ -1,6 +1,6 @@
-# binutils : 2.44-r30072
+# binutils : 2.44-r30073
 
-This patch is based on binutils version 2.44-r30072, which is available at:
+This patch is based on binutils version 2.44-r30073, which is available at:
 unknown
 
 ## Affected CVEs:
