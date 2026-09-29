@@ -1,6 +1,6 @@
-# graphicsmagick : 1.3.45-r00074
+# graphicsmagick : 1.3.45-r00075
 
-This patch is based on graphicsmagick version 1.3.45-r00074, which is available at:
+This patch is based on graphicsmagick version 1.3.45-r00075, which is available at:
 unknown
 
 ## Affected CVEs:
