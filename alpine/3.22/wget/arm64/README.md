@@ -1,6 +1,6 @@
-# wget : 1.25.0-r10071
+# wget : 1.25.0-r10072
 
-This patch is based on wget version 1.25.0-r10071, which is available at:
+This patch is based on wget version 1.25.0-r10072, which is available at:
 unknown
 
 ## Affected CVEs:
