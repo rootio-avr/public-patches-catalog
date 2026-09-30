@@ -4,6 +4,7 @@ This patch is based on org.bouncycastle:bc-java version 1.80.2, which is availab
 unknown
 
 ## Affected CVEs:
+- CVE-2026-8763
 - CVE-2026-13506
 
 ## How to Apply:
