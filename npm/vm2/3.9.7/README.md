@@ -39,6 +39,7 @@ unknown
 - CVE-2022-36067
 - CVE-2026-24781
 - CVE-2026-47698
+- CVE-2026-44009
 
 ## How to Apply:
 1. Clone or download the source code for vm2
