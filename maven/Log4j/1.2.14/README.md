@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2021-4104
 - CVE-2022-23302
+- CVE-2022-23307
 
 ## How to Apply:
 1. Clone or download the source code for Log4j
