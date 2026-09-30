@@ -1,0 +1,198 @@
+--- a/index.js
++++ b/index.js
+@@ -28,19 +28,46 @@
+ 		.then(files => files.reduce((a, b) => [...a, ...b]));
+ };
+ 
++const isInsideOutput = (target, root) => {
++	const rel = path.relative(root, target);
++	// '' is the dir itself; a `..` or an absolute path (different drive on Windows) is outside it
++	return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
++};
++
+ const safeMakeDir = (dir, realOutputPath) => realpath(dir)
+ 	.catch(_ => {
+ 		const parent = path.dirname(dir);
+ 		return safeMakeDir(parent, realOutputPath);
+ 	})
+ 	.then(realParentPath => {
+-		if (realParentPath.indexOf(realOutputPath) !== 0) {
++		if (!isInsideOutput(realParentPath, realOutputPath)) {
+ 			throw new Error('Refusing to create a directory outside the output path.');
+ 		}
+ 
+ 		return makeDir(dir).then(realpath);
+ 	});
+ 
++const ensureLinkTargetInsideOutput = (linkname, linkBase, realOutputPath) => {
++	const target = path.resolve(linkBase, linkname);
++
++	if (!isInsideOutput(target, realOutputPath)) {
++		return Promise.reject(new Error(`Refusing to create a link pointing outside the output directory: ${target}`));
++	}
++
++	// An existing target may itself be a symlink that escapes, so check its real path
++	return realpath(target).then(
++		realTarget => {
++			if (!isInsideOutput(realTarget, realOutputPath)) {
++				throw new Error(`Refusing to create a link pointing outside the output directory: ${realTarget}`);
++			}
++
++			return target;
++		},
++		// Dangling target; the path check above covers it
++		_ => target,
++	);
++};
++
+ const preventWritingThroughSymlink = (destination, realOutputPath) => readlink(destination)
+ 	// Either no file exists, or it's not a symlink. In either case, this is
+ 	// not an escape we need to worry about in this phase.
+@@ -80,7 +107,8 @@
+ 
+ 	return Promise.all(files.map(x => {
+ 		const dest = path.join(output, x.path);
+-		const mode = x.mode & ~process.umask(); // eslint-disable-line no-bitwise
++		// Never honor setuid/setgid/sticky bits from an archive
++		const mode = (x.mode & 0o777) & ~process.umask(); // eslint-disable-line no-bitwise
+ 		const now = new Date();
+ 
+ 		if (x.type === 'directory') {
+@@ -97,29 +125,36 @@
+ 				// Attempt to ensure parent directory exists (failing if it's outside the output dir)
+ 				safeMakeDir(path.dirname(dest), realOutputPath).then(() => realOutputPath),
+ 			)
+-			.then(realOutputPath => x.type === 'file'
+-				? preventWritingThroughSymlink(dest, realOutputPath)
+-				: realOutputPath)
+ 			.then(realOutputPath => realpath(path.dirname(dest))
+ 				.then(realDestinationDir => {
+-					if (realDestinationDir.indexOf(realOutputPath) !== 0) {
++					if (!isInsideOutput(realDestinationDir, realOutputPath)) {
+ 						throw new Error(`Refusing to write outside output directory: ${realDestinationDir}`);
+ 					}
++
++					return realOutputPath;
+ 				}))
+-			.then(() => {
++			.then(realOutputPath => {
+ 				if (x.type === 'link') {
+-					return link(x.linkname, dest);
++					// Hardlink target is relative to the extraction root
++					return ensureLinkTargetInsideOutput(x.linkname, realOutputPath, realOutputPath)
++						.then(target => link(target, dest));
+ 				}
+ 
+ 				if (x.type === 'symlink' && process.platform === 'win32') {
+-					return link(x.linkname, dest);
++					// No symlinks on Windows; emulate with a hardlink relative to the link's dir
++					return ensureLinkTargetInsideOutput(x.linkname, path.dirname(dest), realOutputPath)
++						.then(target => link(target, dest));
+ 				}
+ 
+ 				if (x.type === 'symlink') {
+-					return symlink(x.linkname, dest);
++					// Target is relative to the link's own dir
++					return ensureLinkTargetInsideOutput(x.linkname, path.dirname(dest), realOutputPath)
++						.then(() => symlink(x.linkname, dest));
+ 				}
+ 
+-				return writeFile(dest, x.data, {mode});
++				// Guard the write itself, not just `file`, so flavors like contiguous-file can't bypass it
++				return preventWritingThroughSymlink(dest, realOutputPath)
++					.then(() => writeFile(dest, x.data, {mode}));
+ 			})
+ 			.then(() => x.type === 'file' && utimes(dest, now, x.mtime))
+ 			.then(() => x);
+--- /dev/null
++++ b/test/cve-2026-53486.test.js
+@@ -0,0 +1,89 @@
++import {Buffer} from 'node:buffer';
++import fs from 'node:fs/promises';
++import path from 'node:path';
++import process from 'node:process';
++import {fileURLToPath} from 'node:url';
++import test from 'ava';
++import decompress from '../index.js';
++
++// Regression tests for CVE-2026-53486 (path traversal / link escape / setuid).
++// The upstream fix ships crafted binary fixtures that are not present in this
++// (9.0.1) target tree, so the vulnerable entries are fed through in-process
++// plugins instead. Each plugin returns file/link entries the same way a
++// decompress plugin would, so the writer path exercised is identical.
++
++const __dirname = path.dirname(fileURLToPath(import.meta.url));
++const isWindows = process.platform === 'win32';
++const outputDir = path.join(__dirname, 'cve-2026-53486-out');
++
++const plugin = entries => () => Promise.resolve(entries.map(entry => ({
++	mtime: new Date(),
++	...entry,
++})));
++
++test.afterEach.always('clean up', async () => {
++	await fs.rm(outputDir, {force: true, recursive: true});
++	await fs.rm(path.join(__dirname, 'cve-2026-53486-secret.txt'), {force: true});
++});
++
++test.serial('refuses a hardlink whose target escapes the output directory', async t => {
++	const secret = path.join(__dirname, 'cve-2026-53486-secret.txt');
++	await fs.writeFile(secret, 'SECRET');
++
++	await t.throwsAsync(
++		decompress(Buffer.from(''), outputDir, {
++			plugins: [plugin([{type: 'link', path: 'evil', linkname: '../cve-2026-53486-secret.txt'}])],
++		}),
++		{message: /Refusing/},
++	);
++
++	t.is(await fs.readFile(secret, 'utf8'), 'SECRET');
++});
++
++(isWindows ? test.serial.skip : test.serial)('refuses a symlink whose target escapes the output directory', async t => {
++	const secret = path.join(__dirname, 'cve-2026-53486-secret.txt');
++	await fs.writeFile(secret, 'SECRET');
++
++	await t.throwsAsync(
++		decompress(Buffer.from(''), outputDir, {
++			plugins: [plugin([{type: 'symlink', path: 'evil', linkname: '../cve-2026-53486-secret.txt'}])],
++		}),
++		{message: /Refusing/},
++	);
++
++	t.is(await fs.readFile(secret, 'utf8'), 'SECRET');
++});
++
++(isWindows ? test.serial.skip : test.serial)('refuses writing a file through an in-output symlink (contiguous-file style)', async t => {
++	const secret = path.join(__dirname, 'cve-2026-53486-secret.txt');
++	await fs.writeFile(secret, 'SECRET');
++	await fs.mkdir(outputDir, {recursive: true});
++	await fs.symlink(secret, path.join(outputDir, 'pwned'));
++
++	await t.throwsAsync(
++		decompress(Buffer.from(''), outputDir, {
++			plugins: [plugin([{type: 'file', path: 'pwned', data: Buffer.from('overwritten')}])],
++		}),
++		{message: /Refusing/},
++	);
++
++	t.is(await fs.readFile(secret, 'utf8'), 'SECRET');
++});
++
++(isWindows ? test.serial.skip : test.serial)('strips setuid/setgid/sticky bits from extracted files', async t => {
++	await decompress(Buffer.from(''), outputDir, {
++		plugins: [plugin([{type: 'file', path: 'evil', mode: 0o4755, data: Buffer.from('x')}])],
++	});
++
++	const {mode} = await fs.stat(path.join(outputDir, 'evil'));
++	t.is(mode & 0o7000, 0); // eslint-disable-line no-bitwise
++	t.is(mode & 0o100, 0o100); // eslint-disable-line no-bitwise
++});
++
++test.serial('still extracts a normal file inside the output directory', async t => {
++	await decompress(Buffer.from(''), outputDir, {
++		plugins: [plugin([{type: 'file', path: 'safe.txt', mode: 0o644, data: Buffer.from('hello')}])],
++	});
++
++	t.is(await fs.readFile(path.join(outputDir, 'safe.txt'), 'utf8'), 'hello');
++});
