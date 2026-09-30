@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-32285
+- CVE-2020-35381
 
 ## How to Apply:
 1. Clone or download the source code for github.com/buger/jsonparser
