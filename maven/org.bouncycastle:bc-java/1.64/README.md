@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-3505
+- CVE-2026-5588
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-java
