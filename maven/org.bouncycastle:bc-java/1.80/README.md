@@ -23,6 +23,9 @@ unknown
 - AIKIDO-2026-582928
 - CVE-2026-13506
 - CVE-2026-8763
+- AIKIDO-2026-511225
+- AIKIDO-2026-572912
+- AIKIDO-2026-98906
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-java
