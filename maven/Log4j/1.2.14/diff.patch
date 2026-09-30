@@ -256,6 +256,419 @@ topic lookup through that helper as well, hardening both lookup call sites.
    <!--  destination for generated documentation on Apache web host  -->
    <property name="apache.javadoc_dest" value="/www/logging.apache.org/log4j/docs"/>
 
+--- a/src/java/org/apache/log4j/jdbc/JDBCAppender.java
++++ b/src/java/org/apache/log4j/jdbc/JDBCAppender.java
+@@ -24,6 +24,7 @@ import java.util.Iterator;
+ 
+ import java.sql.DriverManager;
+ import java.sql.Connection;
++import java.sql.PreparedStatement;
+ import java.sql.Statement;
+ import java.sql.SQLException;
+ 
+@@ -114,6 +115,32 @@ public class JDBCAppender extends org.apache.log4j.AppenderSkeleton
+    */
+   protected String sqlStatement = "";
+ 
++  /**
++   * When true (the default), the JDBCAppender converts the configured SQL
++   * conversion pattern into a parameterized {@link PreparedStatement} and binds
++   * the pattern-derived values (such as %m) instead of concatenating them into
++   * the SQL text. This prevents the SQL injection described in
++   * CVE-2022-23305.
++   *
++   * The old (insecure) behavior can be restored by setting the system property
++   * <code>org.apache.log4j.jdbc.JDBCAppender.secure_jdbc_replacement</code> to
++   * <code>false</code>.
++   */
++  private final boolean secureSqlReplacement =
++      Boolean.valueOf(System.getProperty(
++          "org.apache.log4j.jdbc.JDBCAppender.secure_jdbc_replacement", "true")).booleanValue();
++
++  private static final IllegalArgumentException ILLEGAL_PATTERN_FOR_SECURE_EXEC =
++      new IllegalArgumentException(
++          "Only org.apache.log4j.PatternLayout is supported for now due to CVE-2022-23305");
++
++  /**
++   * Helper that converts the conversion pattern into a parameterized SQL
++   * statement so that user-controlled values are bound rather than
++   * concatenated.
++   */
++  private final JdbcPatternParser preparedStatementParser = new JdbcPatternParser();
++
+   /**
+    * size of LoggingEvent buffer before writting to the database.
+    * Default is 1.
+@@ -241,26 +268,88 @@ public class JDBCAppender extends org.apache.log4j.AppenderSkeleton
+    * If a statement fails the LoggingEvent stays in the buffer!
+    */
+   public void flushBuffer() {
++    if (buffer.isEmpty()) {
++      return;
++    }
+     //Do the actual logging
+     removes.ensureCapacity(buffer.size());
++    if (secureSqlReplacement) {
++      flushBufferSecure();
++    } else {
++      flushBufferInsecure();
++    }
++
++    // remove from the buffer any events that were reported
++    buffer.removeAll(removes);
++
++    // clear the buffer of reported events
++    removes.clear();
++  }
++
++  private void flushBufferInsecure() {
+     for (Iterator i = buffer.iterator(); i.hasNext();) {
++      LoggingEvent logEvent = (LoggingEvent)i.next();
+       try {
+-        LoggingEvent logEvent = (LoggingEvent)i.next();
+ 	    String sql = getLogStatement(logEvent);
+ 	    execute(sql);
+-        removes.add(logEvent);
+       }
+       catch (SQLException e) {
+ 	    errorHandler.error("Failed to excute sql", e,
+ 			   ErrorCode.FLUSH_FAILURE);
+       }
++      finally {
++        removes.add(logEvent);
++      }
++    }
++  }
++
++  private void flushBufferSecure() {
++    // Prepare events that we will store to the DB
++    removes.addAll(buffer);
++
++    Layout theLayout = getLayout();
++    if (theLayout == null || theLayout.getClass() != PatternLayout.class) {
++      errorHandler.error("Failed to convert pattern " + theLayout + " to SQL",
++          ILLEGAL_PATTERN_FOR_SECURE_EXEC, ErrorCode.MISSING_LAYOUT);
++      return;
++    }
++    PatternLayout patternLayout = (PatternLayout) theLayout;
++    preparedStatementParser.setPattern(patternLayout.getConversionPattern());
++    Connection con = null;
++    boolean useBatch = removes.size() > 1;
++    try {
++      con = getConnection();
++      PreparedStatement ps = con.prepareStatement(preparedStatementParser.getParameterizedSql());
++      try {
++        for (Iterator i = removes.iterator(); i.hasNext();) {
++          LoggingEvent logEvent = (LoggingEvent) i.next();
++          try {
++            preparedStatementParser.setParameters(ps, logEvent);
++            if (useBatch) {
++              ps.addBatch();
++            }
++          } catch (SQLException e) {
++            errorHandler.error("Failed to append parameters", e, ErrorCode.FLUSH_FAILURE);
++          }
++        }
++        if (useBatch) {
++          ps.executeBatch();
++        } else {
++          ps.execute();
++        }
++      } finally {
++        try {
++          ps.close();
++        } catch (SQLException ignored) {
++        }
++      }
++    } catch (SQLException e) {
++      errorHandler.error("Failed to append messages sql", e, ErrorCode.FLUSH_FAILURE);
++    } finally {
++      if (con != null) {
++        closeConnection(con);
++      }
+     }
+-    
+-    // remove from the buffer any events that were reported
+-    buffer.removeAll(removes);
+-    
+-    // clear the buffer of reported events
+-    removes.clear();
+   }
+ 
+ 
+new file mode 100644
+--- /dev/null
++++ b/src/java/org/apache/log4j/jdbc/JdbcPatternParser.java
+@@ -0,0 +1,109 @@
++/*
++ * Copyright 1999-2005 The Apache Software Foundation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.log4j.jdbc;
++
++import org.apache.log4j.helpers.PatternConverter;
++import org.apache.log4j.helpers.PatternParser;
++import org.apache.log4j.spi.LoggingEvent;
++
++import java.sql.PreparedStatement;
++import java.sql.SQLException;
++import java.util.ArrayList;
++import java.util.List;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * Converts a log4j conversion pattern that is used as an SQL statement into a
++ * parameterized SQL statement, so that the JDBCAppender can bind the values
++ * that originate from user-controlled log messages (such as %m) using
++ * {@link PreparedStatement#setString(int, String)} instead of concatenating
++ * them into the SQL text.
++ *
++ * This is the fix for CVE-2022-23305 (SQL injection through the JDBCAppender),
++ * backported from the reload4j project (commit e845f28).
++ */
++class JdbcPatternParser {
++    private final static Pattern STRING_LITERAL_PATTERN = Pattern.compile("'((?>[^']|'')+)'");
++
++    private String lastPattern;
++    private String parameterizedSql;
++    private final List argPatterns = new ArrayList();
++    private final List args = new ArrayList();
++    private StringBuffer buffer = new StringBuffer();
++
++    public String getParameterizedSql() {
++        return parameterizedSql;
++    }
++
++    public String toString() {
++        return "JdbcPatternParser{sql=" + parameterizedSql + ",args=" + argPatterns + "}";
++    }
++
++    /**
++     * Converts '....' literals into bind variables in JDBC.
++     */
++    void setPattern(String pattern) {
++        if (pattern == null) {
++            throw new IllegalArgumentException("Null pattern");
++        }
++        if (pattern.equals(lastPattern)) {
++            return;
++        }
++        Matcher m = STRING_LITERAL_PATTERN.matcher(pattern);
++        StringBuffer sb = new StringBuffer();
++        args.clear();
++        argPatterns.clear();
++        while (m.find()) {
++            String literal = m.group(1);
++            if (literal.indexOf('%') == -1) {
++                // Just literal, append it as is
++                // It can't contain user-provided parts like %m, etc.
++                m.appendReplacement(sb, "'$1'");
++                continue;
++            }
++
++            // Replace with bind
++            m.appendReplacement(sb, "?");
++            // We will use prepared statements, so we don't need to escape quotes.
++            // And we assume the users had 'That''s a string with quotes' in their configs.
++            literal = literal.replaceAll("''", "'");
++            argPatterns.add(literal);
++            args.add(new PatternParser(literal).parse());
++        }
++        m.appendTail(sb);
++        parameterizedSql = sb.toString();
++        lastPattern = pattern;
++    }
++
++    public void setParameters(PreparedStatement ps, LoggingEvent logEvent) throws SQLException {
++        for (int i = 0; i < args.size(); i++) {
++            buffer.setLength(0);
++            PatternConverter c = (PatternConverter) args.get(i);
++            while (c != null) {
++                c.format(buffer, logEvent);
++                c = c.next;
++            }
++            ps.setString(i + 1, buffer.toString());
++        }
++        // This clears "toString cache"
++        buffer.setLength(0);
++        if (buffer.capacity() > 100000) {
++            // Avoid leaking too much memory if we discover long parameter
++            buffer = new StringBuffer();
++        }
++    }
++}
+new file mode 100644
+--- /dev/null
++++ b/tests/src/java/org/apache/log4j/jdbc/JdbcPatternParserTestCase.java
+@@ -0,0 +1,75 @@
++/*
++ * Copyright 1999-2005 The Apache Software Foundation.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++// Log4j uses the JUnit framework for internal unit testing. JUnit
++// is available from "http://www.junit.org".
++
++package org.apache.log4j.jdbc;
++
++import junit.framework.TestCase;
++
++/**
++ * Regression test for CVE-2022-23305 (SQL injection via JDBCAppender).
++ *
++ * Verifies that {@link JdbcPatternParser} turns quoted conversion-pattern
++ * literals that contain user-controlled conversion words (such as %m) into
++ * JDBC bind placeholders ("?"), while plain string literals are kept inline.
++ * This is the backported behaviour from reload4j commit e845f28, which makes
++ * the appender use a parameterized PreparedStatement instead of concatenating
++ * the log message into the SQL text.
++ */
++public class JdbcPatternParserTestCase extends TestCase {
++
++  public JdbcPatternParserTestCase(String name) {
++    super(name);
++  }
++
++  private void assertParameterizedSql(String expected, String input) {
++    JdbcPatternParser parser = new JdbcPatternParser();
++    parser.setPattern(input);
++    assertEquals("parser.setPattern(...).toString() for " + input,
++        expected, parser.toString());
++  }
++
++  public void testParameterizedSql() {
++    assertParameterizedSql(
++        "JdbcPatternParser{sql=INSERT INTO A1 (TITLE3) VALUES ( ? ),args=[ %d  -  %c %-5p %c %x  -  %m%n ]}",
++        "INSERT INTO A1 (TITLE3) VALUES ( ' %d  -  %c %-5p %c %x  -  %m%n ' )"
++    );
++    assertParameterizedSql(
++        "JdbcPatternParser{sql=INSERT INTO A1 (TITLE3) VALUES ( ?, ?, ?, ?,  ?, ? ),args=[%d, %c, %-5p,  '%c, %x,   -  %m%n ]}",
++        "INSERT INTO A1 (TITLE3) VALUES ( '%d', '%c', '%-5p', ' ''%c',  '%x', '  -  %m%n ' )"
++    );
++    assertParameterizedSql(
++        "JdbcPatternParser{sql=INSERT INTO A1 (TITLE3) VALUES ( ' just string literal', 'another literal with quotes '' asdf', ?),args=[message: %m]}",
++        "INSERT INTO A1 (TITLE3) VALUES ( ' just string literal', 'another literal with quotes '' asdf', 'message: %m')"
++    );
++  }
++
++  /**
++   * A pattern that contains a user-controlled conversion word (%m) inside a
++   * quoted literal must NOT appear verbatim in the generated SQL; it must be
++   * replaced by a bind placeholder so the value is bound, not concatenated.
++   */
++  public void testMessageIsBoundNotConcatenated() {
++    JdbcPatternParser parser = new JdbcPatternParser();
++    parser.setPattern("INSERT INTO logs (msg) VALUES ('%m')");
++    String sql = parser.getParameterizedSql();
++    assertEquals("INSERT INTO logs (msg) VALUES (?)", sql);
++    assertTrue("message conversion word must not be concatenated into SQL",
++        sql.indexOf("%m") == -1);
++  }
++}
+
+--- a/build.xml
++++ b/build.xml
+@@ -71,8 +71,8 @@
+   <!-- Directory for temporary files. -->
+   <property name="dist.tmp" value="${dist.dir}/tmp"/>
+   
+-  <property name="javac.source" value="1.5"/>
+-  <property name="javac.target" value="1.5"/>
++  <property name="javac.source" value="1.6"/>
++  <property name="javac.target" value="1.6"/>
+   
+   <!--  destination for generated documentation on Apache web host  -->
+   <property name="apache.javadoc_dest" value="/www/logging.apache.org/log4j/docs"/>
+@@ -211,8 +211,8 @@
+                     ${stem}/net/JMS*.java,
+                     ${stem}/jmx/*.java,
+                     ${stem}/or/jms/*.java"
+-           target="${javac.target}"
+-           source="${javac.source}"
++           target="1.6"
++           source="1.6"
+            includeAntRuntime="${javac.includeAntRuntime}"
+            includeJavaRuntime="${javac.includeJavaRuntime}"
+            fork="${javac.fork}"
+@@ -234,8 +234,8 @@
+            destdir="${javac.dest}"
+            includes="examples/**/*.java"
+            excludes="misc/*"
+-           target="${javac.target}"
+-           source="${javac.source}"
++           target="1.6"
++           source="1.6"
+            includeAntRuntime="${javac.includeAntRuntime}"
+            includeJavaRuntime="${javac.includeJavaRuntime}"
+            fork="${javac.fork}"
+@@ -261,8 +261,8 @@
+            includes="${stem}/xml/**/*.java"
+            excludes="${stem}/xml/examples/doc-files/**.java,
+                      ${stem}/xml/Transform.java"
+-           target="${javac.target}"
+-           source="${javac.source}"
++           target="1.6"
++           source="1.6"
+            includeAntRuntime="${javac.includeAntRuntime}"
+            includeJavaRuntime="${javac.includeJavaRuntime}"
+            fork="${javac.fork}"
+@@ -278,8 +278,8 @@
+     <javac srcdir="${java.source.dir}"
+            destdir="${javac.dest}"
+            includes="${stem}/net/SMTPAppender.java"
+-           target="${javac.target}"
+-           source="${javac.source}"
++           target="1.6"
++           source="1.6"
+            includeAntRuntime="${javac.includeAntRuntime}"
+            includeJavaRuntime="${javac.includeJavaRuntime}"
+            fork="${javac.fork}"
+@@ -292,8 +292,8 @@
+     <javac srcdir="${java.source.dir}"
+            destdir="${javac.dest}"
+            includes="${stem}/net/JMS*.java, ${stem}/or/jms/*.java"
+-           target="${javac.target}"
+-           source="${javac.source}"
++           target="1.6"
++           source="1.6"
+            includeAntRuntime="${javac.includeAntRuntime}"
+            includeJavaRuntime="${javac.includeJavaRuntime}"
+            fork="${javac.fork}"
+@@ -307,8 +307,8 @@
+            destdir="${javac.dest}"
+            includes="${stem}/jmx/*.java"
+            excludes="${stem}/jmx/T.java"
+-           target="${javac.target}"
+-           source="${javac.source}"
++           target="1.6"
++           source="1.6"
+            includeAntRuntime="${javac.includeAntRuntime}"
+            includeJavaRuntime="${javac.includeJavaRuntime}"
+            fork="${javac.fork}"
+
 --- a/src/java/org/apache/log4j/chainsaw/LoggingReceiver.java
 +++ b/src/java/org/apache/log4j/chainsaw/LoggingReceiver.java
 @@ -17,11 +17,11 @@ package org.apache.log4j.chainsaw;
