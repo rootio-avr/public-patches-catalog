@@ -4,6 +4,7 @@ This patch is based on Log4j version 1.2.14, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2021-4104
 - CVE-2022-23302
 
 ## How to Apply:
