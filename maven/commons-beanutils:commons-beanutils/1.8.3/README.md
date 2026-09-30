@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2019-10086
 - CVE-2025-48734
+- CVE-2014-0114
 
 ## How to Apply:
 1. Clone or download the source code for commons-beanutils:commons-beanutils
