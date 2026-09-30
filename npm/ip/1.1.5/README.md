@@ -4,6 +4,7 @@ This patch is based on ip version 1.1.5, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2023-42282
 - CVE-2024-29415
 
 ## How to Apply:
