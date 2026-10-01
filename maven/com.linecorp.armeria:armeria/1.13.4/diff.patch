@@ -1,0 +1,273 @@
+--- a/core/src/main/java/com/linecorp/armeria/common/Flags.java
++++ b/core/src/main/java/com/linecorp/armeria/common/Flags.java
+@@ -423,6 +423,9 @@
+     private static final boolean
+             DEFAULT_TLS_ALLOW_UNSAFE_CIPHERS = getBoolean("tlsAllowUnsafeCiphers", false);
+ 
++    private static final boolean ALLOW_SEMICOLON_IN_PATH_COMPONENT =
++            getBoolean("allowSemicolonInPathComponent", false);
++
+     private static final Set<TransientServiceOption> TRANSIENT_SERVICE_OPTIONS =
+             Sets.immutableEnumSet(
+                     Streams.stream(CSV_SPLITTER.split(getNormalized(
+@@ -1286,6 +1289,21 @@
+      */
+     public static boolean tlsAllowUnsafeCiphers() {
+         return DEFAULT_TLS_ALLOW_UNSAFE_CIPHERS;
++    }
++
++    /**
++     * Returns whether to allow a semicolon ({@code ;}) in a request path component on the server-side.
++     * If disabled, the substring from the semicolon to before the next slash, commonly referred to as
++     * matrix variables, is removed. For example, {@code /foo;a=b/bar} will be converted to {@code /foo/bar}.
++     * Also, a percent-encoded semicolon ({@code %3B}) is not decoded, and a path that has a semicolon
++     * right after a slash, e.g. {@code /;a=b/foo}, is rejected.
++     * Note that this flag has no effect on the client-side.
++     *
++     * <p>This flag is disabled by default. Specify the
++     * {@code -Dcom.linecorp.armeria.allowSemicolonInPathComponent=true} JVM option to enable it.
++     */
++    public static boolean allowSemicolonInPathComponent() {
++        return ALLOW_SEMICOLON_IN_PATH_COMPONENT;
+     }
+ 
+     /**
+--- a/core/src/main/java/com/linecorp/armeria/internal/common/PathAndQuery.java
++++ b/core/src/main/java/com/linecorp/armeria/internal/common/PathAndQuery.java
+@@ -133,13 +133,29 @@
+      */
+     @Nullable
+     public static PathAndQuery parse(@Nullable String rawPath) {
++        return splitPathAndQuery(rawPath, false);
++    }
++
++    /**
++     * Validates the {@link String} that contains an absolute path and a query, and splits them into
++     * the path part and the query part, just like {@link #parse(String)}, but for a request received by
++     * a server. Unless {@link Flags#allowSemicolonInPathComponent()} is enabled, the matrix variables,
++     * i.e. the substrings from a semicolon to before the next slash, are removed from the path,
++     * a percent-encoded semicolon ({@code %3B}) is not decoded and a semicolon right after a slash is
++     * rejected so that routing and decorators always see the same canonical path.
++     *
++     * @return a {@link PathAndQuery} with the absolute path and query, or {@code null} if the specified
++     *         {@link String} is not an absolute path or invalid.
++     */
++    @Nullable
++    public static PathAndQuery parseForServer(@Nullable String rawPath) {
+         if (CACHE != null && rawPath != null) {
+             final PathAndQuery parsed = CACHE.getIfPresent(rawPath);
+             if (parsed != null) {
+                 return parsed;
+             }
+         }
+-        return splitPathAndQuery(rawPath);
++        return splitPathAndQuery(rawPath, !Flags.allowSemicolonInPathComponent());
+     }
+ 
+     /**
+@@ -202,8 +218,9 @@
+     }
+ 
+     @Nullable
+-    private static PathAndQuery splitPathAndQuery(@Nullable final String pathAndQuery) {
+-        final Bytes path;
++    private static PathAndQuery splitPathAndQuery(@Nullable final String pathAndQuery,
++                                                  boolean removeMatrixVariables) {
++        Bytes path;
+         final Bytes query;
+ 
+         if (pathAndQuery == null) {
+@@ -214,16 +231,16 @@
+         final int queryPos = pathAndQuery.indexOf('?');
+         if (queryPos >= 0) {
+             if ((path = decodePercentsAndEncodeToUtf8(
+-                    pathAndQuery, 0, queryPos, true)) == null) {
++                    pathAndQuery, 0, queryPos, true, removeMatrixVariables)) == null) {
+                 return null;
+             }
+             if ((query = decodePercentsAndEncodeToUtf8(
+-                    pathAndQuery, queryPos + 1, pathAndQuery.length(), false)) == null) {
++                    pathAndQuery, queryPos + 1, pathAndQuery.length(), false, false)) == null) {
+                 return null;
+             }
+         } else {
+             if ((path = decodePercentsAndEncodeToUtf8(
+-                    pathAndQuery, 0, pathAndQuery.length(), true)) == null) {
++                    pathAndQuery, 0, pathAndQuery.length(), true, removeMatrixVariables)) == null) {
+                 return null;
+             }
+             query = null;
+@@ -234,6 +251,14 @@
+             return null;
+         }
+ 
++        if (removeMatrixVariables) {
++            path = removeMatrixVariables(path);
++            if (path == null) {
++                // A semicolon that follows a slash, e.g. '/;a=b/foo'.
++                return null;
++            }
++        }
++
+         // Reject the prohibited patterns.
+         if (pathContainsDoubleDots(path) || queryContainsDoubleDots(query)) {
+             return null;
+@@ -243,7 +268,8 @@
+     }
+ 
+     @Nullable
+-    private static Bytes decodePercentsAndEncodeToUtf8(String value, int start, int end, boolean isPath) {
++    private static Bytes decodePercentsAndEncodeToUtf8(String value, int start, int end, boolean isPath,
++                                                       boolean keepSemicolonEncoded) {
+         final int length = end - start;
+         if (length == 0) {
+             return isPath ? ROOT_PATH : EMPTY_QUERY;
+@@ -279,6 +305,11 @@
+                         buf.ensure(1);
+                         buf.addEncoded((byte) '/');
+                         wasSlash = false;
++                    } else if (decoded == ';' && keepSemicolonEncoded) {
++                        // Do not decode '%3B' so that it is never regarded as the start of matrix variables.
++                        buf.ensure(1);
++                        buf.addEncoded((byte) ';');
++                        wasSlash = false;
+                     } else {
+                         if (appendOneByte(buf, decoded, wasSlash, isPath)) {
+                             wasSlash = false;
+@@ -394,6 +425,54 @@
+         }
+ 
+         return true;
++    }
++
++    /**
++     * Removes the matrix variables, i.e. the substrings from an unencoded semicolon to before the next slash
++     * (or to the end of the path), from the specified path.
++     *
++     * @return the path without the matrix variables, or {@code null} if a semicolon follows a slash.
++     */
++    @Nullable
++    private static Bytes removeMatrixVariables(Bytes path) {
++        final int length = path.length;
++        int firstSemicolon = -1;
++        for (int i = 0; i < length; i++) {
++            if (path.data[i] == ';' && !path.isEncoded(i)) {
++                firstSemicolon = i;
++                break;
++            }
++        }
++        if (firstSemicolon < 0) {
++            return path;
++        }
++
++        final Bytes result = new Bytes(length);
++        boolean inMatrixVariables = false;
++        for (int i = 0; i < length; i++) {
++            final byte b = path.data[i];
++            final boolean encoded = path.isEncoded(i);
++            if (!encoded && b == ';') {
++                if (i == 0 || (path.data[i - 1] == '/' && !path.isEncoded(i - 1))) {
++                    // Invalid matrix variables, e.g. '/;a=b/foo'.
++                    return null;
++                }
++                inMatrixVariables = true;
++                continue;
++            }
++            if (!encoded && b == '/') {
++                inMatrixVariables = false;
++            }
++            if (inMatrixVariables) {
++                continue;
++            }
++            if (encoded) {
++                result.addEncoded(b);
++            } else {
++                result.add(b);
++            }
++        }
++        return result;
+     }
+ 
+     private static boolean pathContainsDoubleDots(Bytes path) {
+--- a/core/src/main/java/com/linecorp/armeria/server/HttpServerHandler.java
++++ b/core/src/main/java/com/linecorp/armeria/server/HttpServerHandler.java
+@@ -340,7 +340,7 @@
+         }
+ 
+         // Validate and split path and query.
+-        final PathAndQuery pathAndQuery = PathAndQuery.parse(originalPath);
++        final PathAndQuery pathAndQuery = PathAndQuery.parseForServer(originalPath);
+         if (pathAndQuery == null) {
+             final ServiceRequestContext reqCtx =
+                     newEarlyRespondingRequestContext(channel, req, hostname, virtualHost,
+--- a/core/src/test/java/com/linecorp/armeria/internal/common/PathAndQueryTest.java
++++ b/core/src/test/java/com/linecorp/armeria/internal/common/PathAndQueryTest.java
+@@ -430,6 +430,46 @@
+         assertThat(res.query()).isEqualTo("%22");
+     }
+ 
++    @Test
++    void matrixVariablesAreRemovedOnServerSide() {
++        assertThat(parseForServer("/foo;a=b/bar").path()).isEqualTo("/foo/bar");
++        assertThat(parseForServer("/foo;a=b").path()).isEqualTo("/foo");
++        assertThat(parseForServer("/foo;a=b/bar;c=d/").path()).isEqualTo("/foo/bar/");
++        assertThat(parseForServer("/foo;a=b;c=d/bar").path()).isEqualTo("/foo/bar");
++        assertThat(parseForServer("/important;a=b/resources").path()).isEqualTo("/important/resources");
++        // Semicolons in the query string must be kept.
++        final PathAndQuery res = parseForServer("/foo;a=b/bar?x=1;y=2");
++        assertThat(res.path()).isEqualTo("/foo/bar");
++        assertThat(res.query()).isEqualTo("x=1;y=2");
++    }
++
++    @Test
++    void semicolonAfterSlashIsProhibitedOnServerSide() {
++        assertThat(parseForServer("/;a=b/foo")).isNull();
++        assertThat(parseForServer("/foo/;a=b/bar")).isNull();
++        assertThat(parseForServer("/foo/;a=b")).isNull();
++        assertThat(parseForServer("/;")).isNull();
++    }
++
++    @Test
++    void encodedSemicolonIsNotDecodedOnServerSide() {
++        assertThat(parseForServer("/foo%3Ba=b/bar").path()).isEqualTo("/foo%3Ba=b/bar");
++        assertThat(parseForServer("/foo%3ba=b/bar").path()).isEqualTo("/foo%3Ba=b/bar");
++        assertThat(parseForServer("/foo%3B/bar").path()).isEqualTo("/foo%3B/bar");
++        // A matrix variable hidden behind a prohibited pattern is still prohibited.
++        assertThat(parseForServer("/foo/..;a=b/bar")).isNull();
++    }
++
++    @Test
++    void semicolonIsKeptOnClientSide() {
++        assertThat(parse("/foo;a=b/bar").path()).isEqualTo("/foo;a=b/bar");
++    }
++
++    @Nullable
++    private static PathAndQuery parseForServer(String rawPath) {
++        return PathAndQuery.parseForServer(rawPath);
++    }
++
+     private static void assertProhibited(String rawPath) {
+         assertThat(parse(rawPath))
+                 .as("Ensure parse(\"%s\") returns null.", rawPath)
+
+--- a/build.gradle
++++ b/build.gradle
+@@ -224,3 +224,18 @@
+         throw new IllegalStateException("You must release using JDK 16.");
+     }
+ }
++
++// Unpublished projects (it/*, examples, benchmarks, ...) still emit jars: :core:trimShadedJar
++// depends on every relocate project's shadedJar, and root assemble builds the rest.
++// The publisher scans build/libs and runs <project>:publishToMavenLocal, which these
++// projects do not define. Keep the jars for ProGuard, just outside build/libs.
++allprojects { p ->
++    afterEvaluate {
++        if (p == rootProject || p.hasFlags('publish')) {
++            return
++        }
++        tasks.withType(Jar).configureEach {
++            destinationDirectory.set(file("${buildDir}/not-published"))
++        }
++    }
++}
