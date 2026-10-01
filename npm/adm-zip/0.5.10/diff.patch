@@ -70,3 +70,208 @@ diff --git a/methods/inflater.js b/methods/inflater.js
                  parts = [],
                  total = 0;
              tmp.on("data", function (data) {
+
+--- a/methods/inflater.js
++++ b/methods/inflater.js
+@@ -1,12 +1,19 @@
+ module.exports = function (/*Buffer*/ inbuf, /*number*/ expectedLength) {
+     var zlib = require("zlib");
++    var Errors = require("../util/errors");
+     var version = 0;
+     try {
+         version = parseInt((process.versions && process.versions.node ? process.versions.node : "").split(".")[0], 10) || 0;
+     } catch (e) {
+         version = 0;
+     }
+-    var option = version >= 15 && expectedLength > 0 ? { maxOutputLength: expectedLength } : {};
++    // Cap decompression output at the entry's declared uncompressed size to bound
++    // decompression bombs (CVE-2026-77301). A declared size of 0 must not disable
++    // the cap: a genuinely empty entry inflates to 0 bytes, so a 1-byte floor
++    // still lets it through while stopping a bomb that lies about its size.
++    // zlib requires maxOutputLength >= 1.
++    var maxOutputLength = expectedLength > 0 ? expectedLength : 1;
++    var option = version >= 15 ? { maxOutputLength: maxOutputLength } : {};
+ 
+     return {
+         inflate: function () {
+@@ -16,12 +23,35 @@
+         inflateAsync: function (/*Function*/ callback) {
+             var tmp = zlib.createInflateRaw(option),
+                 parts = [],
+-                total = 0;
++                total = 0,
++                done = false;
++            var fail = function (err) {
++                if (done) return;
++                done = true;
++                tmp.destroy();
++                callback && callback(Buffer.alloc(0), err);
++            };
++            // Route stream errors (e.g. Z_DATA_ERROR on malformed input) through the
++            // callback. Without an "error" listener zlib re-throws the event as an
++            // uncaught exception on a later tick, crashing the host process instead
++            // of failing the call.
++            tmp.on("error", function (err) {
++                fail(err);
++            });
+             tmp.on("data", function (data) {
+-                parts.push(data);
++                if (done) return;
+                 total += data.length;
++                // The streaming API ignores maxOutputLength, so enforce the cap by
++                // hand; otherwise the async path decompresses without limit while the
++                // sync path is capped (CVE-2026-77301).
++                if (total > maxOutputLength) {
++                    return fail(new Error(Errors.MAX_OUTPUT_EXCEEDED));
++                }
++                parts.push(data);
+             });
+             tmp.on("end", function () {
++                if (done) return;
++                done = true;
+                 var buf = Buffer.alloc(total),
+                     written = 0;
+                 buf.fill(0);
+--- /dev/null
++++ b/test/cve-2026-77301.test.js
+@@ -0,0 +1,103 @@
++"use strict";
++
++const { expect } = require("chai");
++const Zip = require("../adm-zip");
++
++// Regression test for CVE-2026-77301:
++// adm-zip allocated the entry output buffer from the attacker-declared
++// uncompressed size (central-directory / local-header size field) before any
++// validation. A tiny crafted archive could declare a ~3 GB size and force a
++// matching Buffer.alloc, OOM-killing the process. The allocation must be bound
++// by the data actually present in the archive, not by the declared size.
++
++const u16 = (n) => {
++    const b = Buffer.alloc(2);
++    b.writeUInt16LE(n >>> 0);
++    return b;
++};
++const u32 = (n) => {
++    const b = Buffer.alloc(4);
++    b.writeUInt32LE(n >>> 0);
++    return b;
++};
++
++// Build a single-entry zip that declares `declaredSize` uncompressed bytes while
++// only carrying `content` bytes of (crc-invalid) payload.
++function craftBomb(declaredSize, method, content) {
++    const name = Buffer.from("a");
++    const crc = 0; // deliberately wrong: alloc used to happen before the crc check
++    const lfh = Buffer.concat([
++        u32(0x04034b50),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(crc),
++        u32(content.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        name,
++        content
++    ]);
++    const cd = Buffer.concat([
++        u32(0x02014b50),
++        u16(20),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(crc),
++        u32(content.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        u16(0),
++        u16(0),
++        u16(0),
++        u32(0),
++        u32(0),
++        name
++    ]);
++    const eocd = Buffer.concat([u32(0x06054b50), u16(0), u16(0), u16(1), u16(1), u32(cd.length), u32(lfh.length), u16(0)]);
++    return Buffer.concat([lfh, cd, eocd]);
++}
++
++describe("decompression bomb (declared size) - CVE-2026-77301", () => {
++    const DECLARED = 3 * 1024 * 1024 * 1024; // ~3 GB, far above any plausible RSS budget
++
++    it("does not allocate the declared size for a STORED entry", () => {
++        const zip = new Zip(craftBomb(DECLARED, 0 /* STORED */, Buffer.from("A")));
++        const before = process.memoryUsage().rss;
++        // invalid crc -> must throw, but crucially without committing gigabytes
++        expect(() => zip.getEntries()[0].getData()).to.throw(/CRC32/);
++        const grewMB = (process.memoryUsage().rss - before) / (1024 * 1024);
++        expect(grewMB, "RSS growth must stay bounded by real data, not declared size").to.be.below(256);
++    });
++
++    it("does not allocate the declared size for a DEFLATED entry", () => {
++        const zip = new Zip(craftBomb(DECLARED, 8 /* DEFLATED */, Buffer.from([0x00])));
++        const before = process.memoryUsage().rss;
++        // bogus deflate stream / crc -> must throw without a huge eager allocation
++        expect(() => zip.getEntries()[0].getData()).to.throw();
++        const grewMB = (process.memoryUsage().rss - before) / (1024 * 1024);
++        expect(grewMB, "RSS growth must stay bounded by real data, not declared size").to.be.below(256);
++    });
++
++    it("still reads a legitimate STORED entry", () => {
++        const zip = new Zip();
++        zip.addFile("s.bin", Buffer.from([1, 2, 3, 4, 5]));
++        const round = new Zip(zip.toBuffer());
++        expect([...round.readFile("s.bin")]).to.eql([1, 2, 3, 4, 5]);
++    });
++
++    it("still reads a legitimate DEFLATED entry", () => {
++        const zip = new Zip();
++        const payload = Buffer.from("hello world ".repeat(5000));
++        zip.addFile("d.txt", payload);
++        const round = new Zip(zip.toBuffer());
++        expect(round.readFile("d.txt").equals(payload)).to.equal(true);
++    });
++});
+--- a/util/errors.js
++++ b/util/errors.js
+@@ -7,6 +7,7 @@
+     /* ZipEntry error messages*/
+     NO_DATA: "Nothing to decompress",
+     BAD_CRC: "CRC32 checksum failed",
++    MAX_OUTPUT_EXCEEDED: "Decompressed data exceeds the declared uncompressed size",
+     FILE_IN_THE_WAY: "There is a file in the way: %s",
+     UNKNOWN_METHOD: "Invalid/unsupported compression method",
+ 
+--- a/zipEntry.js
++++ b/zipEntry.js
+@@ -92,13 +92,17 @@
+                     }
+                     return data;
+                 } else {
+-                    inflater.inflateAsync(function (result) {
+-                        if (callback) {
+-                            if (!crc32OK(result)) {
+-                                callback(result, Utils.Errors.BAD_CRC); //si added error
+-                            } else {
+-                                callback(result);
+-                            }
++                    inflater.inflateAsync(function (result, err) {
++                        if (!callback) return;
++                        if (err) {
++                            // surface inflater/stream failures (including the
++                            // maxOutputLength cap being exceeded) instead of
++                            // validating an empty placeholder buffer (CVE-2026-77301)
++                            callback(Buffer.alloc(0), err);
++                        } else if (!crc32OK(result)) {
++                            callback(result, Utils.Errors.BAD_CRC); //si added error
++                        } else {
++                            callback(result);
+                         }
+                     });
+                 }
