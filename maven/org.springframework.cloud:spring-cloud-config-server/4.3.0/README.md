@@ -7,6 +7,7 @@ unknown
 - CVE-2026-22739
 - CVE-2026-40981
 - CVE-2026-41002
+- CVE-2026-40982
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework.cloud:spring-cloud-config-server
