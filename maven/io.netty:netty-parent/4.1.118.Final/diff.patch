@@ -5505,6 +5505,157 @@ index 5b6406a..46eee95 100644
              int requestCountDown, int trailersCountDown) throws Exception {
          bootstrapEnv(dataCountDown, settingsAckCount, requestCountDown, trailersCountDown, -1);
 
+--- a/codec-http2/src/main/java/io/netty/handler/codec/http2/DelegatingDecompressorFrameListener.java
++++ b/codec-http2/src/main/java/io/netty/handler/codec/http2/DelegatingDecompressorFrameListener.java
+@@ -29,6 +29,8 @@
+ import io.netty.handler.codec.compression.ZlibWrapper;
+ import io.netty.handler.codec.compression.SnappyFrameDecoder;
+ 
++import java.nio.channels.ClosedChannelException;
++
+ import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_ENCODING;
+ import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_LENGTH;
+ import static io.netty.handler.codec.http.HttpHeaderValues.BR;
+@@ -401,6 +403,15 @@
+                 this.dataDecompressed = false;
+                 this.targetCtx = ctx;
+ 
++                if (!decompressor.isOpen()) {
++                    // Directly throw an exception in this case which we will handle in the catch block below.
++                    // This is required as otherwise it will impossible for us to know if the used EmbeddedChannel
++                    // did throw because it was closed already or because of other reasons. We need this knowledge
++                    // to know if we need to call data.release() ourselves after it was retained or not. This is needed
++                    // as EmbeddedChannel will not release the buffer if it throws because it was not open.
++                    // This mimics what EmbeddedChannel will throw.
++                    throw new ClosedChannelException();
++                }
+                 // call retain here as it will call release after its written to the channel
+                 decompressor.writeInbound(data.retain());
+                 if (endOfStream) {
+--- /dev/null
++++ b/codec-http2/src/test/java/io/netty/handler/codec/http2/DelegatingDecompressorFrameListenerCve202656819Test.java
+@@ -0,0 +1,120 @@
++/*
++ * Copyright 2026 The Netty Project
++ *
++ * The Netty Project licenses this file to you under the Apache License, version 2.0 (the
++ * "License"); you may not use this file except in compliance with the License. You may obtain a
++ * copy of the License at:
++ *
++ * https://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software distributed under the License
++ * is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
++ * or implied. See the License for the specific language governing permissions and limitations under
++ * the License.
++ */
++package io.netty.handler.codec.http2;
++
++import io.netty.buffer.ByteBuf;
++import io.netty.buffer.Unpooled;
++import io.netty.channel.ChannelHandlerContext;
++import io.netty.channel.embedded.EmbeddedChannel;
++import io.netty.handler.codec.compression.ZlibCodecFactory;
++import io.netty.handler.codec.compression.ZlibWrapper;
++import org.junit.jupiter.api.Test;
++
++import static io.netty.handler.codec.http.HttpHeaderNames.CONTENT_ENCODING;
++import static io.netty.handler.codec.http.HttpHeaderValues.GZIP;
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.mockito.Mockito.mock;
++
++/**
++ * Regression test for CVE-2026-56819 (GHSA-93wv-jw9v-4972).
++ *
++ * <p>{@link DelegatingDecompressorFrameListener} retains the inbound {@link ByteBuf} before writing
++ * it to the per-stream decompression {@link EmbeddedChannel}. If that channel is already closed (which
++ * can happen when an {@code END_STREAM} arrives in between and triggers cleanup), the closed
++ * {@link EmbeddedChannel} throws and does <em>not</em> release the retained buffer, so the extra
++ * reference retained by {@code data.retain()} was never released &mdash; leaking direct memory on a
++ * long lived HTTP/2 connection.
++ *
++ * <p>The fix guards {@code writeInbound(...)} with an {@code isOpen()} check that throws
++ * {@link java.nio.channels.ClosedChannelException} <em>before</em> the retain, so the buffer's
++ * reference count is left untouched and the caller's single reference can be released normally.</p>
++ */
++public class DelegatingDecompressorFrameListenerCve202656819Test {
++
++    /**
++     * Feeds a gzip encoded DATA frame into a stream whose decompressor {@link EmbeddedChannel} has
++     * already been closed and asserts that the inbound buffer is not leaked (its reference count
++     * returns to zero once the caller releases its own reference).
++     */
++    @Test
++    public void inboundBufferNotLeakedWhenDecompressorChannelAlreadyClosed() throws Exception {
++        Http2Connection connection = new DefaultHttp2Connection(true);
++        // Install the local flow controller used by the listener when it converts consumed bytes.
++        connection.local().flowController(new DefaultHttp2LocalFlowController(connection));
++
++        final EmbeddedChannel[] captured = new EmbeddedChannel[1];
++        Http2FrameListener delegate = mock(Http2FrameListener.class);
++        DelegatingDecompressorFrameListener listener =
++                new DelegatingDecompressorFrameListener(connection, delegate, true) {
++            @Override
++            protected EmbeddedChannel newContentDecompressor(ChannelHandlerContext ctx, CharSequence contentEncoding)
++                    throws Http2Exception {
++                EmbeddedChannel channel = new EmbeddedChannel(
++                        ZlibCodecFactory.newZlibDecoder(ZlibWrapper.GZIP));
++                captured[0] = channel;
++                return channel;
++            }
++        };
++
++        // Create the stream and initialize the gzip decompressor for it via a headers frame.
++        int streamId = 3;
++        connection.local().createStream(streamId, false);
++        Http2Headers headers = new DefaultHttp2Headers();
++        headers.set(CONTENT_ENCODING, GZIP);
++        ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
++        listener.onHeadersRead(ctx, streamId, headers, 0, false);
++
++        assertNotNull(captured[0], "Expected a decompressor EmbeddedChannel to be created");
++
++        // Simulate the race described in the advisory: the decompressor channel is already closed
++        // (as if cleanup()/finishAndReleaseAll() ran after an END_STREAM in between) by the time the
++        // next DATA frame is processed.
++        captured[0].finishAndReleaseAll();
++
++        // Build a real gzip encoded payload so the DATA frame looks like legitimate compressed data.
++        EmbeddedChannel encoder = new EmbeddedChannel(ZlibCodecFactory.newZlibEncoder(ZlibWrapper.GZIP));
++        encoder.writeOutbound(Unpooled.wrappedBuffer("hello netty".getBytes("UTF-8")));
++        encoder.finish();
++        ByteBuf compressed = Unpooled.buffer();
++        for (;;) {
++            ByteBuf part = encoder.readOutbound();
++            if (part == null) {
++                break;
++            }
++            compressed.writeBytes(part);
++            part.release();
++        }
++
++        assertEquals(1, compressed.refCnt(), "precondition: caller holds a single reference");
++
++        try {
++            listener.onDataRead(ctx, streamId, compressed, 0, false);
++        } catch (Http2Exception expected) {
++            // The closed decompressor surfaces as a stream error; that is the expected control flow.
++        } finally {
++            // Release the caller's single reference, mirroring the DATA read path.
++            if (compressed.refCnt() > 0) {
++                compressed.release();
++            }
++        }
++
++        // Before the fix, data.retain() bumped the refCnt to 2 and the closed EmbeddedChannel threw
++        // without releasing, so after the caller's release the refCnt would still be 1 (leaked).
++        // With the fix, the isOpen() guard throws before the retain, so the buffer is fully released.
++        assertEquals(0, compressed.refCnt(),
++                "inbound buffer must be fully released (no leak) when the decompressor channel is closed");
++    }
++}
+
 --- a/codec-http/src/main/java/io/netty/handler/codec/spdy/SpdyFrameDecoder.java
 +++ b/codec-http/src/main/java/io/netty/handler/codec/spdy/SpdyFrameDecoder.java
 @@ -50,7 +50,9 @@
@@ -6097,108 +6248,6 @@ index 5b6406a..46eee95 100644
      protected byte[] compress(byte[] data) throws Exception {
          ByteArrayOutputStream os = new ByteArrayOutputStream();
 
-diff --git a/transport-native-unix-common/pom.xml b/transport-native-unix-common/pom.xml
---- a/transport-native-unix-common/pom.xml
-+++ b/transport-native-unix-common/pom.xml
-@@ -45,6 +45,9 @@
-     <nativeJarFile>${project.build.directory}/${project.build.finalName}-${jni.classifier}.jar</nativeJarFile>
-     <!-- Always check JNI during test run so we catch bugs that could cause crashes -->
-     <argLine.jni>-Xcheck:jni</argLine.jni>
-+    <!-- Central-only coords: use properties so alias-updater does not rewrite bare io.netty in plugin config -->
-+    <netty.jni.util.sources.groupId>io.netty</netty.jni.util.sources.groupId>
-+    <netty.jni.util.sources.version>0.0.9.Final</netty.jni.util.sources.version>
-   </properties>
- 
-   <build>
-@@ -58,16 +61,19 @@
-             <id>unpack</id>
-             <phase>generate-sources</phase>
-             <goals>
--              <goal>unpack-dependencies</goal>
-+              <goal>unpack</goal>
-             </goals>
-             <configuration>
--              <includeGroupIds>io.netty</includeGroupIds>
--              <includeArtifactIds>netty-jni-util</includeArtifactIds>
--              <classifier>sources</classifier>
--              <outputDirectory>${jniUtilIncludeDir}</outputDirectory>
--              <includes>**.h,**.c</includes>
--              <overWriteReleases>false</overWriteReleases>
--              <overWriteSnapshots>true</overWriteSnapshots>
-+              <artifactItems>
-+                <artifactItem>
-+                  <groupId>${netty.jni.util.sources.groupId}</groupId>
-+                  <artifactId>netty-jni-util</artifactId>
-+                  <version>${netty.jni.util.sources.version}</version>
-+                  <classifier>sources</classifier>
-+                  <outputDirectory>${jniUtilIncludeDir}</outputDirectory>
-+                  <includes>**.h,**.c</includes>
-+                </artifactItem>
-+              </artifactItems>
-             </configuration>
-           </execution>
-         </executions>
-
---- a/pom.xml
-+++ b/pom.xml
-@@ -17,12 +17,6 @@
- <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/maven-v4_0_0.xsd">
- 
-   <modelVersion>4.0.0</modelVersion>
--  <parent>
--    <groupId>org.sonatype.oss</groupId>
--    <artifactId>oss-parent</artifactId>
--    <version>9</version>
--  </parent>
--
-   <groupId>io.netty</groupId>
-   <artifactId>netty-parent</artifactId>
-   <packaging>pom</packaging>
-
---- a/pom.xml
-+++ b/pom.xml
-@@ -709,6 +709,7 @@
-   <properties>
-     <maven.compiler.source>1.6</maven.compiler.source>
-     <maven.compiler.target>1.6</maven.compiler.target>
-+    <netty.build.dev.tools.bundle>io.netty:netty-dev-tools:4.1.118.Final</netty.build.dev.tools.bundle>
-     <netty.dev.tools.directory>${project.build.directory}/dev-tools</netty.dev.tools.directory>
-     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
-@@ -832,9 +833,9 @@
-       </dependency>
- 
-       <dependency>
--        <groupId>${project.groupId}</groupId>
-+        <groupId>io.netty</groupId>
-         <artifactId>netty-dev-tools</artifactId>
--        <version>${project.version}</version>
-+        <version>4.1.118.Final</version>
-       </dependency>
- 
-       <!-- Needed for java11 and later as javax.activation is not part of the JDK anymore -->
-@@ -2112,7 +2113,7 @@
-           <version>1.5</version>
-           <configuration>
-             <resourceBundles>
--              <resourceBundle>io.netty:netty-dev-tools:${project.version}</resourceBundle>
-+              <resourceBundle>${netty.build.dev.tools.bundle}</resourceBundle>
-             </resourceBundles>
-             <outputDirectory>${netty.dev.tools.directory}</outputDirectory>
-             <!-- don't include netty-dev-tools in artifacts -->
---- a/all/pom.xml
-+++ b/all/pom.xml
-@@ -39,7 +39,7 @@
-     <dependencies>
-       <dependency>
-         <groupId>io.netty</groupId>
-         <artifactId>netty-bom</artifactId>
--        <version>${project.version}</version>
-+        <version>4.1.118.Final</version>
-         <type>pom</type>
-         <scope>import</scope>
-       </dependency>
-
 --- a/handler/src/main/java/io/netty/handler/ssl/SslClientHelloHandler.java
 +++ b/handler/src/main/java/io/netty/handler/ssl/SslClientHelloHandler.java
 @@ -52,6 +52,8 @@ public abstract class SslClientHelloHandler<T> extends ByteToMessageDecoder impl
@@ -6500,3 +6549,105 @@ diff --git a/transport-native-unix-common/pom.xml b/transport-native-unix-common
              final ByteBuf bb = clientHello.alloc().buffer(SslUtils.SSL_RECORD_HEADER_LENGTH + toRead);
              bb.writeByte(type);
              bb.writeShort(version);
+
+diff --git a/transport-native-unix-common/pom.xml b/transport-native-unix-common/pom.xml
+--- a/transport-native-unix-common/pom.xml
++++ b/transport-native-unix-common/pom.xml
+@@ -45,6 +45,9 @@
+     <nativeJarFile>${project.build.directory}/${project.build.finalName}-${jni.classifier}.jar</nativeJarFile>
+     <!-- Always check JNI during test run so we catch bugs that could cause crashes -->
+     <argLine.jni>-Xcheck:jni</argLine.jni>
++    <!-- Central-only coords: use properties so alias-updater does not rewrite bare io.netty in plugin config -->
++    <netty.jni.util.sources.groupId>io.netty</netty.jni.util.sources.groupId>
++    <netty.jni.util.sources.version>0.0.9.Final</netty.jni.util.sources.version>
+   </properties>
+ 
+   <build>
+@@ -58,16 +61,19 @@
+             <id>unpack</id>
+             <phase>generate-sources</phase>
+             <goals>
+-              <goal>unpack-dependencies</goal>
++              <goal>unpack</goal>
+             </goals>
+             <configuration>
+-              <includeGroupIds>io.netty</includeGroupIds>
+-              <includeArtifactIds>netty-jni-util</includeArtifactIds>
+-              <classifier>sources</classifier>
+-              <outputDirectory>${jniUtilIncludeDir}</outputDirectory>
+-              <includes>**.h,**.c</includes>
+-              <overWriteReleases>false</overWriteReleases>
+-              <overWriteSnapshots>true</overWriteSnapshots>
++              <artifactItems>
++                <artifactItem>
++                  <groupId>${netty.jni.util.sources.groupId}</groupId>
++                  <artifactId>netty-jni-util</artifactId>
++                  <version>${netty.jni.util.sources.version}</version>
++                  <classifier>sources</classifier>
++                  <outputDirectory>${jniUtilIncludeDir}</outputDirectory>
++                  <includes>**.h,**.c</includes>
++                </artifactItem>
++              </artifactItems>
+             </configuration>
+           </execution>
+         </executions>
+
+--- a/pom.xml
++++ b/pom.xml
+@@ -17,12 +17,6 @@
+ <project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/maven-v4_0_0.xsd">
+ 
+   <modelVersion>4.0.0</modelVersion>
+-  <parent>
+-    <groupId>org.sonatype.oss</groupId>
+-    <artifactId>oss-parent</artifactId>
+-    <version>9</version>
+-  </parent>
+-
+   <groupId>io.netty</groupId>
+   <artifactId>netty-parent</artifactId>
+   <packaging>pom</packaging>
+
+--- a/pom.xml
++++ b/pom.xml
+@@ -709,6 +709,7 @@
+   <properties>
+     <maven.compiler.source>1.6</maven.compiler.source>
+     <maven.compiler.target>1.6</maven.compiler.target>
++    <netty.build.dev.tools.bundle>io.netty:netty-dev-tools:4.1.118.Final</netty.build.dev.tools.bundle>
+     <netty.dev.tools.directory>${project.build.directory}/dev-tools</netty.dev.tools.directory>
+     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+     <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+@@ -832,9 +833,9 @@
+       </dependency>
+ 
+       <dependency>
+-        <groupId>${project.groupId}</groupId>
++        <groupId>io.netty</groupId>
+         <artifactId>netty-dev-tools</artifactId>
+-        <version>${project.version}</version>
++        <version>4.1.118.Final</version>
+       </dependency>
+ 
+       <!-- Needed for java11 and later as javax.activation is not part of the JDK anymore -->
+@@ -2112,7 +2113,7 @@
+           <version>1.5</version>
+           <configuration>
+             <resourceBundles>
+-              <resourceBundle>io.netty:netty-dev-tools:${project.version}</resourceBundle>
++              <resourceBundle>${netty.build.dev.tools.bundle}</resourceBundle>
+             </resourceBundles>
+             <outputDirectory>${netty.dev.tools.directory}</outputDirectory>
+             <!-- don't include netty-dev-tools in artifacts -->
+--- a/all/pom.xml
++++ b/all/pom.xml
+@@ -39,7 +39,7 @@
+     <dependencies>
+       <dependency>
+         <groupId>io.netty</groupId>
+         <artifactId>netty-bom</artifactId>
+-        <version>${project.version}</version>
++        <version>4.1.118.Final</version>
+         <type>pom</type>
+         <scope>import</scope>
+       </dependency>
