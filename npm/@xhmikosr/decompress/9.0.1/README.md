@@ -4,6 +4,7 @@ This patch is based on @xhmikosr/decompress version 9.0.1, which is available at
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-130799
 - CVE-2026-53486
 
 ## How to Apply:
