@@ -1,6 +1,6 @@
-# util-linux : 2.41.5-0+deb13u1.aikido.11
+# util-linux : 2.41.5-0+deb13u1.aikido.12
 
-This patch is based on util-linux version 2.41.5-0+deb13u1.aikido.11, which is available at:
+This patch is based on util-linux version 2.41.5-0+deb13u1.aikido.12, which is available at:
 https://sources.debian.org/src/util-linux/2.41.5-0+deb13u1/
 
 ## Affected CVEs:
