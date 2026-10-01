@@ -406,3 +406,487 @@ index 85dbe1133e..5d683a06f2 100644
      }
  
  
+
+Fix an allocation leak in the HTTP/2 backlog tracking on stream reset
+
+Backport of upstream commit 2a5ec806971627943db18601203129d9c58d959f for
+AIKIDO-2026-915093. When an HTTP/2 stream that is waiting in the connection
+window backlog is reset (or replaced by a RecycledStream), its reserved and/or
+granted connection-level flow-control allocation was not returned to the
+connection window nor removed from the backlog size tracking. Repeated stream
+resets therefore leaked the connection flow-control window, eventually stalling
+all streams on the connection (denial of service).
+
+--- a/java/org/apache/coyote/http2/AbstractStream.java
++++ b/java/org/apache/coyote/http2/AbstractStream.java
+@@ -173,8 +173,11 @@ abstract class AbstractStream {
+      * @param connectionAllocationRequested the value
+      */
+     final void setConnectionAllocationRequested(int connectionAllocationRequested) {
+-        log.trace(sm.getString("abstractStream.setConnectionAllocationRequested", getConnectionId(), getIdAsString(),
+-                Integer.toString(this.connectionAllocationRequested), Integer.toString(connectionAllocationRequested)));
++        if (log.isTraceEnabled()) {
++            log.trace(sm.getString("abstractStream.setConnectionAllocationRequested", getConnectionId(),
++                    getIdAsString(), Integer.toString(this.connectionAllocationRequested),
++                    Integer.toString(connectionAllocationRequested)));
++        }
+         this.connectionAllocationRequested = connectionAllocationRequested;
+     }
+
+@@ -193,8 +196,10 @@ abstract class AbstractStream {
+      * @param connectionAllocationMade the value
+      */
+     final void setConnectionAllocationMade(int connectionAllocationMade) {
+-        log.trace(sm.getString("abstractStream.setConnectionAllocationMade", getConnectionId(), getIdAsString(),
+-                Integer.toString(this.connectionAllocationMade), Integer.toString(connectionAllocationMade)));
++        if (log.isTraceEnabled()) {
++            log.trace(sm.getString("abstractStream.setConnectionAllocationMade", getConnectionId(), getIdAsString(),
++                    Integer.toString(this.connectionAllocationMade), Integer.toString(connectionAllocationMade)));
++        }
+         this.connectionAllocationMade = connectionAllocationMade;
+     }
+
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -959,7 +959,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                      * stream was not already added to the backlog due to a partial reservation (see next else if block)
+                      * add it to the backlog so it can obtain an allocation when capacity is available.
+                      */
+-                    if (stream.getConnectionAllocationMade() == 0 && stream.getConnectionAllocationRequested() == 0) {
++                    if (stream.getConnectionAllocationRequested() == 0) {
+                         stream.setConnectionAllocationRequested(reservation);
+                         backLogSize += reservation;
+                         backLogStreams.add(stream);
+@@ -967,16 +967,18 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                 } else if (windowSize < reservation) {
+                     /*
+-                     * The connection window has some capacity but not enough to fill this reservation. Allocate what
+-                     * capacity is available and add the stream to the backlog so it can obtain a further allocation
+-                     * when capacity is available.
++                     * The connection window has some capacity but not enough to fill this reservation. If the stream
++                     * has not been granted an allocation and the stream was not already added to the backlog, allocate
++                     * what capacity is available and add the stream to the backlog so it can obtain a further
++                     * allocation when capacity is available.
+                      */
+-                    allocation = (int) windowSize;
+-                    decrementWindowSize(allocation);
+-                    int reservationRemaining = reservation - allocation;
+-                    stream.setConnectionAllocationRequested(reservationRemaining);
+-                    backLogSize += reservationRemaining;
+-                    backLogStreams.add(stream);
+-
++                    if (stream.getConnectionAllocationRequested() == 0) {
++                        allocation = (int) windowSize;
++                        decrementWindowSize(allocation);
++                        int reservationRemaining = reservation - allocation;
++                        stream.setConnectionAllocationRequested(reservationRemaining);
++                        backLogSize += reservationRemaining;
++                        backLogStreams.add(stream);
++                    }
+                 } else {
+                     // The connection window has sufficient capacity for this reservation. Allocate the full amount.
+                     allocation = reservation;
+@@ -1018,8 +1019,14 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                             // stream is closing
+                             stream.doStreamCancel(msg, error);
+                         } else {
+-                            allocation = stream.getConnectionAllocationMade();
+-                            stream.setConnectionAllocationMade(0);
++                            // Don't consume the allocation if the stream can no longer use it.
++                            if (stream.canWrite()) {
++                                allocation = stream.getConnectionAllocationMade();
++                                stream.setConnectionAllocationMade(0);
++                            } else {
++                                stream.doStreamCancel(sm.getString("upgradeHandler.clientCancel"),
++                                        Http2Error.STREAM_CLOSED);
++                            }
+                         }
+                     } catch (InterruptedException e) {
+                         throw new IOException(sm.getString("upgradeHandler.windowSizeReservationInterrupted",
+@@ -1207,6 +1214,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                 int allocatedThisTime = Math.min(allocation, stream.getConnectionAllocationRequested());
+                 stream.setConnectionAllocationRequested(stream.getConnectionAllocationRequested() - allocatedThisTime);
+                 stream.setConnectionAllocationMade(stream.getConnectionAllocationMade() + allocatedThisTime);
++                backLogSize -= allocatedThisTime;
+                 leftToAllocate = leftToAllocate - allocatedThisTime;
+             }
+
+@@ -1847,6 +1861,47 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                 log.trace(sm.getString("upgradeHandler.replace.first", getConnectionId(), original.getIdAsString()));
+             }
+             streams.put(original.getIdentifier(), replacement);
++
++            int made;
++            original.windowAllocationLock.lock();
++            try {
++                windowAllocationLock.lock();
++                try {
++                    /*
++                     * If the stream being replaced is still in the backlog (usually because it has been reset) remove
++                     * the stream from the backlog along with its allocation request
++                     */
++                    if (backLogStreams.remove(original)) {
++                        // Remove unallocated request from the backlog
++                        backLogSize -= original.getConnectionAllocationRequested();
++                        // Not strictly necessary, but set for consistency
++                        original.setConnectionAllocationRequested(0);
++                    }
++                    made = original.getConnectionAllocationMade();
++                    // Not strictly necessary, but set for consistency
++                    original.setConnectionAllocationMade(0);
++                } finally {
++                    windowAllocationLock.unlock();
++                }
++            } finally {
++                original.windowAllocationLock.unlock();
++            }
++
++            /*
++             * If the stream had received an allocation but not used it, return that allocation to the connection
++             * window.
++             */
++            if (made > 0) {
++                try {
++                    incrementWindowSize(made);
++                } catch (Http2Exception e) {
++                    /*
++                     * Should not happen in normal usage. The exception only occurs if the Window size is increased
++                     * beyond 2^31-1. If a client tries hard enough, it will be able to break its own connection.
++                     */
++                    throw new IllegalStateException(e);
++                }
++            }
+         } else {
+             if (log.isTraceEnabled()) {
+                 log.trace(
+--- a/test/org/apache/coyote/http2/TestHttp2Section_5_2.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_5_2.java
+@@ -114,4 +114,53 @@ public class TestHttp2Section_5_2 extends Http2TestBase {
+         sendWindowUpdate(3, 8192);
+         parser.readFrame();
+     }
++
++
++    @Test
++    public void testFlowControlAndStreamReset() throws Exception {
++        // At start of test Stream 3 has 1k of 8k written and no capacity left
++
++        // Empty the connection window
++        sendWindowUpdate(3, 7 * 1024);
++        parser.readFrame();
++
++        sendWindowUpdate(0, 1);
++
++        for (int i = 5; i < 17; i += 2) {
++            sendSimpleGetRequest(i);
++            parser.readFrame();
++            parser.readFrame();
++            sendWindowUpdate(i, 7 * 1024);
++            parser.readFrame();
++        }
++
++        // Connection flow control window is now empty
++
++        // Put a stream on the backlog and then immediately cancel it
++        sendSimpleGetRequest(17);
++        sendRst(17, Http2Error.NO_ERROR.getCode());
++        // Read headers
++        parser.readFrame();
++        // Read reset from server
++        parser.readFrame();
++
++        // Increase default window size to 8k
++        sendSettings(0, false, new SettingValue(4, 8 * 1024));
++        // Settings ACK
++        parser.readFrame();
++
++        sendSimpleGetRequest(19);
++        // Read headers
++        parser.readFrame();
++
++        // Clear trace as what happens from this point is of primary interest in this test
++        output.clearTrace();
++
++        // This should release the entire body for stream 19
++        sendWindowUpdate(19, 7 * 1024);
++        sendWindowUpdate(0, 8 * 1024);
++
++        parser.readFrame();
++        Assert.assertEquals("19-Body-8192\n19-EndOfStream\n", output.getTrace());
++    }
+ }
+--- a/webapps/docs/changelog.xml
++++ b/webapps/docs/changelog.xml
+@@ -208,6 +208,10 @@
+         after a stream reset. (markt)
+       </fix>
+       <fix>
++        Fix an allocation leak in the HTTP/2 backlog tracking when a stream is
++        reset. (markt)
++      </fix>
++      <fix>
+         Align HTTP/2 trailer fields with HTTP/1.1 and filter out any fields
+         not permitted in trailers. (markt)
+       </fix>
+
+Fix RewriteValve chain/[N]/QSD handling so rules cannot skip access control
+
+Backport for AIKIDO-2026-388833. A failed rule in a [C] chain must skip the
+terminal rule as well; [N] must restart at the first rule (i = -1); QSD must
+suppress QSA query-string append; and a rewrite-map read error must stop
+processing rather than continue with a partial map.
+
+--- a/java/org/apache/catalina/valves/rewrite/RewriteValve.java
++++ b/java/org/apache/catalina/valves/rewrite/RewriteValve.java
+@@ -277,6 +277,7 @@
+                 }
+             } catch (IOException ioe) {
+                 containerLog.error(sm.getString("rewriteValve.readError"), ioe);
++                break;
+             }
+         }
+         this.mapsConfiguration = mapsConfiguration;
+@@ -440,11 +441,7 @@
+                                         REWRITE_QUERY_ENCODER.encode(rewrittenQueryStringRewriteEncoded, uriCharset));
+                                 urlStringEncoded.append('&');
+                                 urlStringEncoded.append(queryStringOriginalEncoded);
+-                            } else if (index == urlStringEncoded.length() - 1) {
+-                                // if the ? is the last character delete it, its only purpose was to
+-                                // prevent the rewrite module from appending the query string
+-                                urlStringEncoded.deleteCharAt(index);
+-                            } else {
++                            } else if (!rewrittenQueryStringRewriteEncoded.isEmpty()) {
+                                 urlStringEncoded.append('?');
+                                 urlStringEncoded.append(
+                                         REWRITE_QUERY_ENCODER.encode(rewrittenQueryStringRewriteEncoded, uriCharset));
+@@ -503,12 +500,13 @@
+ 
+                 // - chain (skip remaining chained rules if this one does not match)
+                 if (rule.isChain() && newtest == null) {
+-                    for (int j = i; j < rules.length; j++) {
+-                        if (!rules[j].isChain()) {
+-                            i = j;
+-                            break;
+-                        }
++                    // Skip the remaining rules in the chain, including the
++                    // terminal rule that does not have the chain flag set.
++                    int j = i + 1;
++                    while (j < rules.length && rules[j].isChain()) {
++                        j++;
+                     }
++                    i = j;
+                     continue;
+                 }
+                 // - last (stop rewriting here)
+@@ -517,7 +515,7 @@
+                 }
+                 // - next (redo again)
+                 if (rule.isNext() && newtest != null) {
+-                    i = 0;
++                    i = -1;
+                     continue;
+                 }
+                 // - skip (n rules)
+@@ -577,7 +575,7 @@
+                         request.getCoyoteRequest().queryString().setChars(MessageBytes.EMPTY_CHAR_ARRAY, 0, 0);
+                         chunk = request.getCoyoteRequest().queryString().getCharChunk();
+                         chunk.append(REWRITE_QUERY_ENCODER.encode(queryStringRewriteEncoded, uriCharset));
+-                        if (qsa && queryStringOriginalEncoded != null && !queryStringOriginalEncoded.isEmpty()) {
++                        if (!qsd && qsa && queryStringOriginalEncoded != null && !queryStringOriginalEncoded.isEmpty()) {
+                             chunk.append('&');
+                             chunk.append(queryStringOriginalEncoded);
+                         }
+--- a/test/org/apache/catalina/valves/rewrite/TestRewriteValve.java
++++ b/test/org/apache/catalina/valves/rewrite/TestRewriteValve.java
+@@ -88,6 +88,34 @@
+         doTestRewrite("RewriteRule ^/b/(.*) /b/../a/$1", "/b/%255A", "/b/../a/%255A");
+     }
+ 
++    @Test
++    public void testChainMatch() throws Exception {
++        // The first rule matches so the chained (second) rule is applied to the result
++        doTestRewrite("RewriteRule ^/a(.*) /b$1 [C]\n" +
++                "RewriteRule ^/b(.*) /c$1", "/a/x", "/c/x");
++    }
++
++    @Test
++    public void testChainHeadNoMatch() throws Exception {
++        // The first rule does not match so the whole chain, including the
++        // terminal rule that would otherwise match, must be skipped. If the
++        // terminal rule were incorrectly applied the request would be rewritten
++        // to /W/x.
++        doTestRewrite("RewriteRule ^/never(.*) /c$1 [C]\n" +
++                "RewriteRule ^/c(.*) /W$1", "/c/x", "/c/x");
++    }
++
++    @Test
++    public void testChainMiddleNoMatch() throws Exception {
++        // The first rule matches but the second (chained) rule does not, so the
++        // rest of the chain, including the terminal rule, must be skipped and
++        // the result of the first rule is retained. If the terminal rule were
++        // incorrectly applied the request would be rewritten to /W/y.
++        doTestRewrite("RewriteRule ^/a(.*) /c$1 [C]\n" +
++                "RewriteRule ^/nomatch(.*) /x$1 [C]\n" +
++                "RewriteRule ^/c(.*) /W$1", "/a/y", "/c/y");
++    }
++
+     // BZ 57863
+     @Test
+     public void testRewriteMap01() throws Exception {
+
+Fail closed in DataSourceRealm when the user is missing or role lookup fails
+
+Backport for AIKIDO-2026-116174. Authentication must not succeed if role
+lookup fails; getPrincipal must return null for unknown users or failed role
+lookups instead of a GenericPrincipal with no identity check.
+
+--- a/java/org/apache/catalina/realm/DataSourceRealm.java
++++ b/java/org/apache/catalina/realm/DataSourceRealm.java
+@@ -23,6 +23,7 @@
+ import java.sql.ResultSet;
+ import java.sql.SQLException;
+ import java.util.ArrayList;
++import java.util.List;
+ 
+ import javax.naming.Context;
+ import javax.sql.DataSource;
+@@ -297,9 +298,20 @@
+         }
+ 
+         // Validate the user's credentials
+-        boolean validated = getCredentialHandler().matches(credentials, dbCredentials);
++        boolean authenticationSuccess = getCredentialHandler().matches(credentials, dbCredentials);
+ 
+-        if (validated) {
++        ArrayList<String> list = null;
++
++        if (authenticationSuccess) {
++            // Obtain the roles
++            list = getRoles(dbConnection, username);
++            if (list == null) {
++                // Role lookup failed so fail authentication
++                authenticationSuccess = false;
++            }
++        }
++
++        if (authenticationSuccess) {
+             if (containerLog.isTraceEnabled()) {
+                 containerLog.trace(sm.getString("dataSourceRealm.authenticateSuccess", username));
+             }
+@@ -310,8 +322,6 @@
+             return null;
+         }
+ 
+-        ArrayList<String> list = getRoles(dbConnection, username);
+-
+         // Create and return a suitable Principal for this user
+         return new GenericPrincipal(username, list);
+     }
+@@ -427,26 +437,59 @@
+     }
+ 
+ 
++    /**
++     * Confirms if the given user exists in the database.
++     *
++     * @param dbConnection The database connection to be used
++     * @param username     Username to check
++     *
++     * @return {@code true} if the user exists, otherwise {@code false}
++     */
++    protected boolean validateUser(Connection dbConnection, String username) {
++        // Use the credentials lookup as a proxy for whether the user exists
++        try (PreparedStatement stmt = dbConnection.prepareStatement(preparedCredentials)) {
++            stmt.setString(1, username);
++
++            try (ResultSet rs = stmt.executeQuery()) {
++                if (rs.next()) {
++                    return true;
++                }
++            }
++        } catch (SQLException e) {
++            containerLog.error(sm.getString("dataSourceRealm.validateUser.exception", username), e);
++        }
++
++        return false;
++    }
++
++
+     @Override
+     protected Principal getPrincipal(String username) {
+         Connection dbConnection = open();
+         if (dbConnection == null) {
+-            return new GenericPrincipal(username, null);
++            return null;
+         }
+         try {
+-            return new GenericPrincipal(username, getRoles(dbConnection, username));
++            if (!validateUser(dbConnection, username)) {
++                return null;
++            }
++            List<String> roles = getRoles(dbConnection, username);
++            if (roles == null) {
++                return null;
++            }
++            return new GenericPrincipal(username, roles);
+         } finally {
+             close(dbConnection);
+         }
+-
+     }
+ 
++
+     /**
+      * Return the roles associated with the given username.
+      *
+      * @param username Username for which roles should be retrieved
+      *
+-     * @return an array list of the role names
++     * @return an array list of the role names or {@code null} if the lookup fails
+      */
+     protected ArrayList<String> getRoles(String username) {
+ 
+@@ -470,14 +513,14 @@
+      * @param dbConnection The database connection to be used
+      * @param username     Username for which roles should be retrieved
+      *
+-     * @return an array list of the role names
++     * @return an array list of the role names or {@code null} if the lookup fails
+      */
+     protected ArrayList<String> getRoles(Connection dbConnection, String username) {
+ 
+         if (allRolesMode != AllRolesMode.STRICT_MODE && !isRoleStoreDefined()) {
+             // Using an authentication only configuration and no role store has
+             // been defined so don't spend cycles looking
+-            return null;
++            return new ArrayList<>(0);
+         }
+ 
+         try (PreparedStatement stmt = dbConnection.prepareStatement(preparedRoles)) {
+--- a/java/org/apache/catalina/realm/LocalStrings.properties
++++ b/java/org/apache/catalina/realm/LocalStrings.properties
+@@ -36,6 +36,7 @@
+ dataSourceRealm.getPassword.exception=Exception retrieving password for [{0}]
+ dataSourceRealm.getRoles.exception=Exception retrieving roles for [{0}]
+ dataSourceRealm.noNamingContext=Cannot access the server to retrieve the naming context
++dataSourceRealm.validateUser.exception=Exception validating that user [{0}] exists
+ 
+ jaasCallback.username=Returned username [{0}]
+ 
+--- a/test/org/apache/catalina/realm/TestDataSourceRealm.java
++++ b/test/org/apache/catalina/realm/TestDataSourceRealm.java
+@@ -148,6 +148,14 @@
+         List<String> roles = db.getRoles("tomcat");
+         Assert.assertEquals(2, roles.size());
+ 
++        p = db.getPrincipal("blabla");
++        Assert.assertNull(p);
++
++        p = db.getPrincipal("random");
++        Assert.assertTrue(p instanceof GenericPrincipal);
++        gp = (GenericPrincipal) p;
++        Assert.assertEquals(0, gp.getRoles().length);
++
+         db.stop();
+ 
+     }
