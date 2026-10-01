@@ -31,6 +31,12 @@ unknown
 - GHSA-hv7x-3x78-gx53
 - GHSA-jwm3-qcfw-c5pp
 - CVE-2026-56348
+- GHSA-xmc9-4f2h-jf9c
+- CVE-2026-65592
+- CVE-2026-65591
+- CVE-2026-65016
+- GHSA-cj9h-qx8g-pq2g
+- GHSA-6qc9-mqvw-jg7x
 - CVE-2026-86081
 - CVE-2026-65597
 - CVE-2026-59207
