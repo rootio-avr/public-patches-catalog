@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-46490
+- CVE-2025-47949
 
 ## How to Apply:
 1. Clone or download the source code for samlify
