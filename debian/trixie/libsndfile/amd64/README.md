@@ -1,10 +1,11 @@
-# libsndfile : 1.2.2-2+deb13u1.aikido.3
+# libsndfile : 1.2.2-2+deb13u1.aikido.4
 
-This patch is based on libsndfile version 1.2.2-2+deb13u1.aikido.3, which is available at:
+This patch is based on libsndfile version 1.2.2-2+deb13u1.aikido.4, which is available at:
 https://sources.debian.org/src/libsndfile/1.2.2-2+deb13u1/
 
 ## Affected CVEs:
 - CVE-2026-37555
+- CVE-2026-88372
 
 ## How to Apply:
 1. Obtain the source package: `apt source libsndfile`
