@@ -9,6 +9,7 @@ unknown
 - CVE-2026-68525
 - AIKIDO-2026-388833
 - AIKIDO-2026-116174
+- AIKIDO-2026-915093
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.tomcat:tomcat
