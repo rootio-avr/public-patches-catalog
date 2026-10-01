@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-85731
 - CVE-2026-50163
+- CVE-2026-50151
 
 ## How to Apply:
 1. Clone or download the source code for oras.land/oras-go/v2
