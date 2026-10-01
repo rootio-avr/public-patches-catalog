@@ -1,0 +1,3786 @@
+--- a/plumbing/transport/ssh/common.go
++++ b/plumbing/transport/ssh/common.go
+@@ -252,7 +252,39 @@
+ }
+ 
+ func endpointToCommand(cmd string, ep *transport.Endpoint) string {
+-	return fmt.Sprintf("%s '%s'", cmd, ep.Path)
++	var b strings.Builder
++	b.WriteString(cmd)
++	b.WriteByte(' ')
++	writeShellQuote(&b, ep.Path)
++	return b.String()
++}
++
++// writeShellQuote writes s to b, wrapped in single quotes with
++// embedded single quotes and exclamation marks escaped using the
++// POSIX close-escape-reopen idiom:
++//
++//	' becomes '\''
++//	! becomes '\!'
++//
++// It is a direct port of canonical Git's sq_quote_buf (quote.c).
++// The bang escape keeps the result safe when re-evaluated under
++// csh-derived shells that perform history expansion. The output is
++// safe to pass as a single argument through any POSIX shell and
++// round-trips through git-shell's sq_dequote_to_argv.
++func writeShellQuote(b *strings.Builder, s string) {
++	b.Grow(len(s) + 2)
++	b.WriteByte('\'')
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if c == '\'' || c == '!' {
++			b.WriteString(`'\`)
++			b.WriteByte(c)
++			b.WriteByte('\'')
++			continue
++		}
++		b.WriteByte(c)
++	}
++	b.WriteByte('\'')
+ }
+ 
+ func overrideConfig(overrides *ssh.ClientConfig, c *ssh.ClientConfig) {
+--- a/plumbing/transport/ssh/common_test.go
++++ b/plumbing/transport/ssh/common_test.go
+@@ -7,6 +7,7 @@
+ 
+ 	"github.com/gliderlabs/ssh"
+ 	"github.com/kevinburke/ssh_config"
++	"github.com/stretchr/testify/assert"
+ 	stdssh "golang.org/x/crypto/ssh"
+ 	"golang.org/x/crypto/ssh/testdata"
+ 	. "gopkg.in/check.v1"
+@@ -251,4 +252,52 @@
+ 
+ 	c.Assert(err, NotNil)
+ 	c.Assert(err, ErrorMatches, "invalid auth method")
++}
++
++func TestEndpointToCommand(t *testing.T) {
++	t.Parallel()
++
++	for _, tc := range []struct {
++		name string
++		cmd  string
++		path string
++		want string
++	}{
++		{
++			name: "plain path",
++			cmd:  "git-upload-pack",
++			path: "/repo.git",
++			want: "git-upload-pack '/repo.git'",
++		},
++		{
++			name: "path with single-quote injection payload",
++			cmd:  "git-upload-pack",
++			path: "/repo.git'; touch /tmp/x ; #",
++			want: `git-upload-pack '/repo.git'\''; touch /tmp/x ; #'`,
++		},
++		{
++			name: "bang is escaped for csh history expansion",
++			cmd:  "git-upload-pack",
++			path: "/repo!.git",
++			want: `git-upload-pack '/repo'\!'.git'`,
++		},
++		{
++			name: "mixed quote and bang",
++			cmd:  "git-upload-pack",
++			path: "/a'b!c",
++			want: `git-upload-pack '/a'\''b'\!'c'`,
++		},
++		{
++			name: "inert shell metacharacters pass through",
++			cmd:  "git-upload-pack",
++			path: "/a\\b\"c$d`e",
++			want: "git-upload-pack '/a\\b\"c$d`e'",
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++			ep := &transport.Endpoint{Path: tc.path}
++			assert.Equal(t, tc.want, endpointToCommand(tc.cmd, ep))
++		})
++	}
+ }
+
+--- a/plumbing/object/commit.go
++++ b/plumbing/object/commit.go
+@@ -5,7 +5,7 @@ import (
+ 	"context"
+ 	"errors"
+ 	"fmt"
+-	"io"
++	"slices"
+ 	"strings"
+ 
+ 	"github.com/ProtonMail/go-crypto/openpgp"
+@@ -20,6 +20,7 @@ const (
+ 	beginpgp       string = "-----BEGIN PGP SIGNATURE-----"
+ 	endpgp         string = "-----END PGP SIGNATURE-----"
+ 	headerpgp      string = "gpgsig"
++	headerpgp256   string = "gpgsig-sha256"
+ 	headerencoding string = "encoding"
+ 
+ 	// https://github.com/git/git/blob/bcb6cae2966cc407ca1afc77413b3ef11103c175/Documentation/gitformat-signature.txt#L153
+@@ -41,6 +42,11 @@ type MessageEncoding string
+ // in time, such as a timestamp, the author of the changes since the last
+ // commit, a pointer to the previous commit(s), etc.
+ // http://shafiulazam.com/gitbook/1_the_git_object_model.html
++//
++// When a Commit is populated by Decode it retains a reference to the source
++// plumbing.EncodedObject so that EncodeWithoutSignature can reproduce the
++// exact bytes the signature was computed over. Refer to EncodeWithoutSignature
++// for more information.
+ type Commit struct {
+ 	// Hash of the commit object.
+ 	Hash plumbing.Hash
+@@ -66,6 +72,9 @@ type Commit struct {
+ 	ExtraHeaders []ExtraHeader
+ 
+ 	s storer.EncodedObjectStorer
++	// src holds the encoded object this Commit was decoded from, used by
++	// EncodeWithoutSignature to recover the canonical signed bytes.
++	src plumbing.EncodedObject
+ }
+ 
+ // ExtraHeader holds any non-standard header
+@@ -98,8 +107,8 @@ func (h ExtraHeader) Format(f fmt.State, verb rune) {
+ func parseExtraHeader(line []byte) (ExtraHeader, bool) {
+ 	split := bytes.SplitN(line, []byte{' '}, 2)
+ 
+-	out := ExtraHeader {
+-		Key: string(bytes.TrimRight(split[0], "\n")),
++	out := ExtraHeader{
++		Key:   string(bytes.TrimRight(split[0], "\n")),
+ 		Value: "",
+ 	}
+ 
+@@ -181,6 +190,11 @@ func (c *Commit) NumParents() int {
+ 
+ var ErrParentNotFound = errors.New("commit parent not found")
+ 
++// ErrMalformedCommit is returned when a commit object cannot be decoded
++// because its standard headers (tree, parent, author, committer) are missing,
++// duplicated, or out of order.
++var ErrMalformedCommit = errors.New("malformed commit")
++
+ // Parent returns the ith parent of a commit.
+ func (c *Commit) Parent(i int) (*Commit, error) {
+ 	if len(c.ParentHashes) == 0 || i > len(c.ParentHashes)-1 {
+@@ -227,14 +241,23 @@ func (c *Commit) Type() plumbing.ObjectType {
+ 	return plumbing.CommitObject
+ }
+ 
++func (c *Commit) reset() {
++	storer := c.s
++	*c = Commit{
++		Encoding: defaultUtf8CommitMessageEncoding,
++		s:        storer,
++	}
++}
++
+ // Decode transforms a plumbing.EncodedObject into a Commit struct.
+ func (c *Commit) Decode(o plumbing.EncodedObject) (err error) {
+ 	if o.Type() != plumbing.CommitObject {
+ 		return ErrUnsupportedObject
+ 	}
+ 
++	c.reset()
+ 	c.Hash = o.Hash()
+-	c.Encoding = defaultUtf8CommitMessageEncoding
++	c.src = o
+ 
+ 	reader, err := o.Reader()
+ 	if err != nil {
+@@ -245,97 +268,17 @@ func (c *Commit) Decode(o plumbing.EncodedObject) (err error) {
+ 	r := sync.GetBufioReader(reader)
+ 	defer sync.PutBufioReader(r)
+ 
+-	var message bool
+-	var mergetag bool
+-	var pgpsig bool
+-	var msgbuf bytes.Buffer
+-	var extraheader *ExtraHeader = nil
+-	for {
+-		line, err := r.ReadBytes('\n')
+-		if err != nil && err != io.EOF {
++	s := &commitScanner{r: r, c: c}
++	for state := scanTree; state != nil; {
++		state, err = state(s)
++		if err != nil {
+ 			return err
+ 		}
+-
+-		if mergetag {
+-			if len(line) > 0 && line[0] == ' ' {
+-				line = bytes.TrimLeft(line, " ")
+-				c.MergeTag += string(line)
+-				continue
+-			} else {
+-				mergetag = false
+-			}
+-		}
+-
+-		if pgpsig {
+-			if len(line) > 0 && line[0] == ' ' {
+-				line = bytes.TrimLeft(line, " ")
+-				c.PGPSignature += string(line)
+-				continue
+-			} else {
+-				pgpsig = false
+-			}
+-		}
+-
+-		if extraheader != nil {
+-			if len(line) > 0 && line[0] == ' ' {
+-				extraheader.Value += string(line[1:])
+-				continue
+-			} else {
+-				extraheader.Value = strings.TrimRight(extraheader.Value, "\n")
+-				c.ExtraHeaders = append(c.ExtraHeaders, *extraheader)
+-				extraheader = nil
+-			}
+-		}
+-
+-		if !message {
+-			original_line := line
+-			line = bytes.TrimSpace(line)
+-			if len(line) == 0 {
+-				message = true
+-				continue
+-			}
+-
+-			split := bytes.SplitN(line, []byte{' '}, 2)
+-
+-			var data []byte
+-			if len(split) == 2 {
+-				data = split[1]
+-			}
+-
+-			switch string(split[0]) {
+-			case "tree":
+-				c.TreeHash = plumbing.NewHash(string(data))
+-			case "parent":
+-				c.ParentHashes = append(c.ParentHashes, plumbing.NewHash(string(data)))
+-			case "author":
+-				c.Author.Decode(data)
+-			case "committer":
+-				c.Committer.Decode(data)
+-			case headermergetag:
+-				c.MergeTag += string(data) + "\n"
+-				mergetag = true
+-			case headerencoding:
+-				c.Encoding = MessageEncoding(data)
+-			case headerpgp:
+-				c.PGPSignature += string(data) + "\n"
+-				pgpsig = true
+-			default:
+-				h, maybecontinued := parseExtraHeader(original_line)
+-				if maybecontinued {
+-					extraheader = &h
+-				} else {
+-					c.ExtraHeaders = append(c.ExtraHeaders, h)
+-				}
+-			}
+-		} else {
+-			msgbuf.Write(line)
+-		}
+-
+-		if err == io.EOF {
+-			break
+-		}
+ 	}
+-	c.Message = msgbuf.String()
++	if !s.sawTree {
++		return fmt.Errorf("%w: missing tree header", ErrMalformedCommit)
++	}
++	c.Message = s.msgbuf.String()
+ 	return nil
+ }
+ 
+@@ -344,11 +287,73 @@ func (c *Commit) Encode(o plumbing.EncodedObject) error {
+ 	return c.encode(o, true)
+ }
+ 
+-// EncodeWithoutSignature export a Commit into a plumbing.EncodedObject without the signature (correspond to the payload of the PGP signature).
++// EncodeWithoutSignature exports a Commit into a plumbing.EncodedObject
++// without any signature headers, producing the payload that PGP/GPG
++// signatures are computed over.
++//
++// Behaviour depends on how the Commit was created:
++//
++//   - For Commits populated by Decode whose exported fields still match the
++//     source object, the payload is streamed from the raw source bytes with
++//     gpgsig and gpgsig-sha256 headers (and their continuation lines)
++//     stripped verbatim. This preserves the exact bytes the signature was
++//     computed over, regardless of any normalization performed by Decode.
++//
++//   - For Commits constructed in memory, or for decoded Commits whose
++//     exported fields have been mutated, the payload is derived from the
++//     current struct fields. Mutation is detected by re-decoding the source
++//     object and comparing exported fields; if any differ, the in-memory
++//     representation prevails.
+ func (c *Commit) EncodeWithoutSignature(o plumbing.EncodedObject) error {
++	if c.matchesSource() {
++		return stripObjectSignatures(o, c.src, plumbing.CommitObject)
++	}
+ 	return c.encode(o, false)
+ }
+ 
++// matchesSource reports whether c.src is set and re-decoding it produces a
++// Commit whose payload-affecting exported fields are identical to those of
++// c. It is the auto-detection used by EncodeWithoutSignature to decide
++// between the raw bytes and the struct-encoded payload.
++//
++// PGPSignature is intentionally excluded from the comparison: neither path
++// emits it, so mutating it must not trigger a switch to struct-encode (which
++// would change the byte layout the caller is trying to verify against).
++func (c *Commit) matchesSource() bool {
++	if c.src == nil {
++		return false
++	}
++	fresh := &Commit{}
++	if err := fresh.Decode(c.src); err != nil {
++		return false
++	}
++	return c.Hash == fresh.Hash &&
++		signatureEqual(c.Author, fresh.Author) &&
++		signatureEqual(c.Committer, fresh.Committer) &&
++		c.MergeTag == fresh.MergeTag &&
++		c.Message == fresh.Message &&
++		c.TreeHash == fresh.TreeHash &&
++		c.Encoding == fresh.Encoding &&
++		slices.Equal(c.ParentHashes, fresh.ParentHashes) &&
++		slices.Equal(c.ExtraHeaders, fresh.ExtraHeaders)
++}
++
++func signatureEqual(a, b Signature) bool {
++	return a.Name == b.Name &&
++		a.Email == b.Email &&
++		a.When.Unix() == b.When.Unix() &&
++		a.When.Format("-0700") == b.When.Format("-0700")
++}
++
++func isStandardHeader(key string) bool {
++	switch key {
++	case "tree", "parent", "author", "committer",
++		headerencoding, headermergetag, headerpgp, headerpgp256:
++		return true
++	}
++	return false
++}
++
+ func (c *Commit) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 	o.SetType(plumbing.CommitObject)
+ 	w, err := o.Writer()
+@@ -407,7 +412,9 @@ func (c *Commit) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 	}
+ 
+ 	for _, header := range c.ExtraHeaders {
+-		
++		if isStandardHeader(header.Key) {
++			continue
++		}
+ 		if _, err = fmt.Fprintf(w, "\n%s", header); err != nil {
+ 			return err
+ 		}
+@@ -478,9 +485,21 @@ func (c *Commit) String() string {
+ 	)
+ }
+ 
++// ErrMultipleSignatures is returned by Verify when the commit carries more
++// than one armored signature block. Mirrors upstream's parse_gpg_output
++// rejection of GOODSIG/BADSIG status lines after the first
++// (gpg-interface.c:257-269): multi-signature commits are intentionally
++// unsupported because their provenance cannot be reduced to a single
++// authoritative signer.
++var ErrMultipleSignatures = errors.New("commit has multiple signatures")
++
+ // Verify performs PGP verification of the commit with a provided armored
+ // keyring and returns openpgp.Entity associated with verifying key on success.
+ func (c *Commit) Verify(armoredKeyRing string) (*openpgp.Entity, error) {
++	if countSignatureBlocks([]byte(c.PGPSignature)) > 1 {
++		return nil, ErrMultipleSignatures
++	}
++
+ 	keyRingReader := strings.NewReader(armoredKeyRing)
+ 	keyring, err := openpgp.ReadArmoredKeyRing(keyRingReader)
+ 	if err != nil {
+new file mode 100644
+--- /dev/null
++++ b/plumbing/object/commit_scanner.go
+@@ -0,0 +1,377 @@
++package object
++
++import (
++	"bufio"
++	"bytes"
++	"fmt"
++	"io"
++	"strings"
++
++	"github.com/go-git/go-git/v5/plumbing"
++)
++
++// commitScanner holds the working state of the commit decoder driven by the
++// stateFn loop in (*Commit).Decode. Each commitState reads one or more lines
++// from r, updates the in-progress *Commit and the scanner's bookkeeping, and
++// returns the state that should run next (or nil to stop).
++type commitScanner struct {
++	r      *bufio.Reader
++	c      *Commit
++	msgbuf bytes.Buffer
++
++	// pending holds a line that was read but the current state decided to
++	// hand back to the next state, paired with the io.EOF flag that was
++	// returned when the line was originally read.
++	pending    []byte
++	pendingErr error
++
++	// First-occurrence tracking: once the corresponding field has been
++	// decoded, subsequent occurrences are silently dropped (matches
++	// upstream's find_commit_header / first-wins semantics).
++	//
++	// gpgsig is not tracked here: upstream's parse_buffer_signed_by_header
++	// (commit.c:1186) accumulates every occurrence into one signature buffer,
++	// so we do the same on the scanner side to keep verification payloads
++	// byte-aligned. gpgsig-sha256 is recognized and skipped without exposing a
++	// new field in v5.
++	sawTree, sawAuthor, sawCommitter bool
++	sawEncoding, sawMergetag         bool
++
++	// extra is the multi-line ExtraHeader currently being assembled.
++	extra *ExtraHeader
++}
++
++// commitState is one step of the decoder state machine. Each function reads
++// the lines it needs, mutates *Commit via s.c, and returns the next state to
++// run (or nil to terminate the loop).
++type commitState func(*commitScanner) (commitState, error)
++
++// readLine returns the next line from the buffer, transparently consuming any
++// line that was previously pushed back by a state that decided not to handle
++// it.
++func (s *commitScanner) readLine() ([]byte, error) {
++	if s.pending != nil {
++		line, err := s.pending, s.pendingErr
++		s.pending, s.pendingErr = nil, nil
++		return line, err
++	}
++	line, err := s.r.ReadBytes('\n')
++	if err != nil && err != io.EOF {
++		return line, err
++	}
++	return line, err
++}
++
++// pushBack stashes an unconsumed line so the next state's readLine call sees
++// it. Only one line can be pushed back at a time.
++func (s *commitScanner) pushBack(line []byte, err error) {
++	s.pending = line
++	s.pendingErr = err
++}
++
++// scanTree expects the first non-empty header to be `tree HASH`. Anything
++// else (or an empty buffer) is rejected with ErrMalformedCommit, matching
++// upstream's `bogus commit object` check.
++func scanTree(s *commitScanner) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 || isBlankLine(line) {
++		return nil, fmt.Errorf("%w: missing tree header", ErrMalformedCommit)
++	}
++
++	key, data := splitHeader(line)
++	if key != "tree" {
++		return nil, fmt.Errorf("%w: tree header must be first", ErrMalformedCommit)
++	}
++	h, herr := parseObjectIDHex(data, ErrMalformedCommit, "tree")
++	if herr != nil {
++		return nil, herr
++	}
++	s.c.TreeHash = h
++	s.sawTree = true
++	if err == io.EOF {
++		return nil, nil
++	}
++	return scanParents, nil
++}
++
++// scanParents consumes contiguous `parent HASH` lines. The first non-parent
++// line ends the parent block and is handed off to scanAuthor; any later
++// `parent` line is silently dropped (matches upstream's parse_commit_buffer
++// exiting its parent loop at the first non-parent line and
++// read_commit_extra_header_lines filtering `parent` out of extras).
++func scanParents(s *commitScanner) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, nil
++	}
++	if isBlankLine(line) {
++		return scanMessage, nil
++	}
++
++	key, data := splitHeader(line)
++	if key == "parent" {
++		h, herr := parseObjectIDHex(data, ErrMalformedCommit, "parent")
++		if herr != nil {
++			return nil, herr
++		}
++		s.c.ParentHashes = append(s.c.ParentHashes, h)
++		if err == io.EOF {
++			return nil, nil
++		}
++		return scanParents, nil
++	}
++	s.pushBack(line, err)
++	return scanAuthor, nil
++}
++
++// scanAuthor accepts an `author` line at its canonical position immediately
++// after the parent block. Any other header here is pushed back for
++// scanCommitter; an out-of-place author is therefore silently dropped.
++// Mirrors upstream's parse_commit_date func.
++func scanAuthor(s *commitScanner) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, nil
++	}
++	if isBlankLine(line) {
++		return scanMessage, nil
++	}
++
++	key, data := splitHeader(line)
++	if key == "author" {
++		s.c.Author.Decode(data)
++		s.sawAuthor = true
++		if err == io.EOF {
++			return nil, nil
++		}
++		return scanCommitter, nil
++	}
++	s.pushBack(line, err)
++	return scanCommitter, nil
++}
++
++// scanCommitter accepts a `committer` line at its canonical position
++// immediately after the author. Any other header is pushed back for
++// scanHeaders. Same upstream rationale as scanAuthor.
++func scanCommitter(s *commitScanner) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, nil
++	}
++	if isBlankLine(line) {
++		return scanMessage, nil
++	}
++
++	key, data := splitHeader(line)
++	if key == "committer" {
++		s.c.Committer.Decode(data)
++		s.sawCommitter = true
++		if err == io.EOF {
++			return nil, nil
++		}
++		return scanHeaders, nil
++	}
++	s.pushBack(line, err)
++	return scanHeaders, nil
++}
++
++// scanHeaders dispatches one header line. Continuation-bearing headers
++// (mergetag, gpgsig, gpgsig-sha256, and unknown extras whose value is
++// continued on subsequent lines) hand off to a dedicated continuation state
++// that handles the `<space>...` lines and then returns here.
++func scanHeaders(s *commitScanner) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, nil
++	}
++	if isBlankLine(line) {
++		return scanMessage, nil
++	}
++
++	originalLine := line
++	key, data := splitHeader(line)
++
++	var next commitState = scanHeaders
++	switch key {
++	case "tree", "parent", "author", "committer":
++		// Anything reaching scanHeaders with one of these keys is out of
++		// canonical position: duplicate tree, parent past the contiguous
++		// block, or author/committer not at their expected slot. Drop them
++		// the same way upstream's standard_header_field filter excludes
++		// them from the extras list (read_commit_extra_header_lines,
++		// commit.c:1520-1522).
++	case headerencoding:
++		if !s.sawEncoding {
++			s.c.Encoding = MessageEncoding(data)
++			s.sawEncoding = true
++		}
++	case headermergetag:
++		if s.sawMergetag {
++			next = scanSkipCont
++		} else {
++			s.c.MergeTag += string(data) + "\n"
++			s.sawMergetag = true
++			next = scanMergetagCont
++		}
++	case headerpgp:
++		s.c.PGPSignature += string(data) + "\n"
++		next = scanPgpCont
++	case headerpgp256:
++		next = scanSkipCont
++	default:
++		h, multiline := parseExtraHeader(originalLine)
++		if multiline {
++			s.extra = &h
++			next = scanExtraCont
++		} else {
++			s.c.ExtraHeaders = append(s.c.ExtraHeaders, h)
++		}
++	}
++
++	if err == io.EOF {
++		return nil, nil
++	}
++	return next, nil
++}
++
++// scanMergetagCont accumulates continuation lines for the first mergetag
++// header. Continuations strip exactly one leading space, mirroring upstream's
++// `line + 1` (commit.c:1509). The first non-continuation line is pushed back
++// so scanHeaders can dispatch it.
++func scanMergetagCont(s *commitScanner) (commitState, error) {
++	return continuationCont(s, &s.c.MergeTag, scanMergetagCont)
++}
++
++// scanPgpCont accumulates continuation lines for a signature header.
++// Continuations strip exactly one leading space, mirroring upstream's
++// `line + 1` (commit.c:1509). The first non-continuation line is pushed back
++// so scanHeaders can dispatch it. Repeat occurrences of the same signature
++// header land back here and concatenate, matching upstream's
++// parse_buffer_signed_by_header (commit.c:1186).
++func scanPgpCont(s *commitScanner) (commitState, error) {
++	return continuationCont(s, &s.c.PGPSignature, scanPgpCont)
++}
++
++func continuationCont(s *commitScanner, dst *string, self commitState) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) > 0 && line[0] == ' ' {
++		*dst += string(line[1:])
++		if err == io.EOF {
++			return nil, nil
++		}
++		return self, nil
++	}
++	if len(line) > 0 {
++		s.pushBack(line, err)
++	}
++	return scanHeaders, nil
++}
++
++// scanSkipCont discards continuation lines that belong to a header scanHeaders
++// chose to drop.
++func scanSkipCont(s *commitScanner) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) > 0 && line[0] == ' ' {
++		if err == io.EOF {
++			return nil, nil
++		}
++		return scanSkipCont, nil
++	}
++	if len(line) > 0 {
++		s.pushBack(line, err)
++	}
++	return scanHeaders, nil
++}
++
++// scanExtraCont accumulates continuation lines for an unknown ExtraHeader
++// whose value spans multiple lines, then finalises the entry once the
++// continuation block ends.
++func scanExtraCont(s *commitScanner) (commitState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) > 0 && line[0] == ' ' {
++		s.extra.Value += string(line[1:])
++		if err == io.EOF {
++			s.finaliseExtra()
++			return nil, nil
++		}
++		return scanExtraCont, nil
++	}
++	s.finaliseExtra()
++	if len(line) > 0 {
++		s.pushBack(line, err)
++	}
++	return scanHeaders, nil
++}
++
++func (s *commitScanner) finaliseExtra() {
++	s.extra.Value = strings.TrimRight(s.extra.Value, "\n")
++	s.c.ExtraHeaders = append(s.c.ExtraHeaders, *s.extra)
++	s.extra = nil
++}
++
++// scanMessage drains the remaining bytes into the message buffer.
++func scanMessage(s *commitScanner) (commitState, error) {
++	for {
++		line, err := s.readLine()
++		if err != nil && err != io.EOF {
++			return nil, err
++		}
++		if len(line) > 0 {
++			s.msgbuf.Write(line)
++		}
++		if err == io.EOF {
++			return nil, nil
++		}
++	}
++}
++
++// isBlankLine reports whether line is the canonical header/body separator:
++// a single newline. Mirrors upstream's `*line == '\n'` test in
++// read_commit_extra_header_lines (commit.c:1502).
++func isBlankLine(line []byte) bool {
++	return len(line) == 1 && line[0] == '\n'
++}
++
++// splitHeader returns the header keyword (everything before the first space)
++// and the value (everything after, with the trailing newline stripped). If
++// the header has no value the returned data is nil.
++func splitHeader(line []byte) (string, []byte) {
++	trimmed := bytes.TrimRight(line, "\n")
++	key, value, ok := bytes.Cut(trimmed, []byte{' '})
++	if !ok {
++		return string(trimmed), nil
++	}
++	return string(key), value
++}
++
++func parseObjectIDHex(data []byte, malformedErr error, header string) (plumbing.Hash, error) {
++	id := string(data)
++	if !plumbing.IsHash(id) {
++		return plumbing.ZeroHash, fmt.Errorf("%w: bad %s hash", malformedErr, header)
++	}
++	return plumbing.NewHash(id), nil
++}
+new file mode 100644
+--- /dev/null
++++ b/plumbing/object/commit_sha256_test.go
+@@ -0,0 +1,43 @@
++//go:build sha256
++// +build sha256
++
++package object
++
++import (
++	"testing"
++
++	"github.com/go-git/go-git/v5/plumbing"
++)
++
++func TestDecodeCommitSHA256ObjectIDs(t *testing.T) {
++	const (
++		treeID   = "151c11736080ee7fe882040a334ec2ae4a815deca7a3d63374500e107dbcda09"
++		parentID = "36561e87343747f0bc493eeeb04d910e5382c3419c42d412687e2aac5e4c40a1"
++		raw      = "tree " + treeID + "\n" +
++			"parent " + parentID + "\n" +
++			"author Foo <foo@example.local> 1427802494 +0200\n" +
++			"committer Foo <foo@example.local> 1427802494 +0200\n\n" +
++			"msg\n"
++	)
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.CommitObject)
++	if _, err := obj.Write([]byte(raw)); err != nil {
++		t.Fatal(err)
++	}
++
++	commit := &Commit{}
++	if err := commit.Decode(obj); err != nil {
++		t.Fatal(err)
++	}
++
++	if got := commit.TreeHash.String(); got != treeID {
++		t.Fatalf("TreeHash = %q, want %q", got, treeID)
++	}
++	if len(commit.ParentHashes) != 1 {
++		t.Fatalf("ParentHashes length = %d, want 1", len(commit.ParentHashes))
++	}
++	if got := commit.ParentHashes[0].String(); got != parentID {
++		t.Fatalf("ParentHashes[0] = %q, want %q", got, parentID)
++	}
++}
+--- a/plumbing/object/commit_test.go
++++ b/plumbing/object/commit_test.go
+@@ -3,6 +3,7 @@ package object
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"strings"
+@@ -41,6 +42,49 @@ func (s *SuiteCommit) TestDecodeNonCommit(c *C) {
+ 	c.Assert(err, Equals, ErrUnsupportedObject)
+ }
+ 
++func (s *SuiteCommit) TestDecodeClearsExistingState(c *C) {
++	const raw = "tree eba74343e2f15d62adedfd8c883ee0262b5c8021\n\nfresh message\n"
++
++	staleSrc := &plumbing.MemoryObject{}
++	commit := &Commit{
++		Hash:         plumbing.NewHash("1111111111111111111111111111111111111111"),
++		Author:       Signature{Name: "Stale Author", Email: "author@example.local", When: time.Unix(1, 0).UTC()},
++		Committer:    Signature{Name: "Stale Committer", Email: "committer@example.local", When: time.Unix(2, 0).UTC()},
++		MergeTag:     "stale merge tag",
++		PGPSignature: "stale signature",
++		Message:      "stale message",
++		TreeHash:     plumbing.NewHash("2222222222222222222222222222222222222222"),
++		ParentHashes: []plumbing.Hash{
++			plumbing.NewHash("3333333333333333333333333333333333333333"),
++		},
++		Encoding: MessageEncoding("latin-1"),
++		ExtraHeaders: []ExtraHeader{
++			{Key: "x-stale", Value: "stale"},
++		},
++		s:   s.Storer,
++		src: staleSrc,
++	}
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.CommitObject)
++	_, err := obj.Write([]byte(raw))
++	c.Assert(err, IsNil)
++
++	c.Assert(commit.Decode(obj), IsNil)
++	c.Assert(commit.Hash, Equals, obj.Hash())
++	c.Assert(commit.Author, DeepEquals, Signature{})
++	c.Assert(commit.Committer, DeepEquals, Signature{})
++	c.Assert(commit.MergeTag, Equals, "")
++	c.Assert(commit.PGPSignature, Equals, "")
++	c.Assert(commit.Message, Equals, "fresh message\n")
++	c.Assert(commit.TreeHash.String(), Equals, "eba74343e2f15d62adedfd8c883ee0262b5c8021")
++	c.Assert(commit.ParentHashes, IsNil)
++	c.Assert(commit.Encoding, Equals, defaultUtf8CommitMessageEncoding)
++	c.Assert(commit.ExtraHeaders, IsNil)
++	c.Assert(commit.s, Equals, s.Storer)
++	c.Assert(commit.src, Equals, obj)
++}
++
+ func (s *SuiteCommit) TestType(c *C) {
+ 	c.Assert(s.Commit.Type(), Equals, plumbing.CommitObject)
+ }
+@@ -277,6 +321,7 @@ change
+ 		err = newCommit.Decode(obj)
+ 		c.Assert(err, IsNil)
+ 		commit.Hash = obj.Hash()
++		commit.src = obj
+ 		c.Assert(newCommit, DeepEquals, commit)
+ 	}
+ }
+@@ -359,10 +404,6 @@ func (s *SuiteCommit) TestLongCommitMessageSerialization(c *C) {
+ }
+ 
+ func (s *SuiteCommit) TestPGPSignatureSerialization(c *C) {
+-	encoded := &plumbing.MemoryObject{}
+-	decoded := &Commit{}
+-	commit := *s.Commit
+-
+ 	pgpsignature := `-----BEGIN PGP SIGNATURE-----
+ 
+ iQEcBAABAgAGBQJTZbQlAAoJEF0+sviABDDrZbQH/09PfE51KPVPlanr6q1v4/Ut
+@@ -374,62 +415,40 @@ RUysgqjcpT8+iQM1PblGfHR4XAhuOqN5Fx06PSaFZhqvWFezJ28/CLyX5q+oIVk=
+ =EFTF
+ -----END PGP SIGNATURE-----
+ `
+-	commit.PGPSignature = pgpsignature
++	broken := beginpgp + "\nsome\ntrash\n" + endpgp + "text\n"
+ 
+-	err := commit.Encode(encoded)
+-	c.Assert(err, IsNil)
+-
+-	err = decoded.Decode(encoded)
+-	c.Assert(err, IsNil)
+-	c.Assert(decoded.PGPSignature, Equals, pgpsignature)
+-
+-	// signature with extra empty line, it caused "index out of range" when
+-	// parsing it
+-
+-	pgpsignature2 := "\n" + pgpsignature
+-
+-	commit.PGPSignature = pgpsignature2
+-	encoded = &plumbing.MemoryObject{}
+-	decoded = &Commit{}
+-
+-	err = commit.Encode(encoded)
+-	c.Assert(err, IsNil)
+-
+-	err = decoded.Decode(encoded)
+-	c.Assert(err, IsNil)
+-	c.Assert(decoded.PGPSignature, Equals, pgpsignature2)
+-
+-	// signature in author name
+-
+-	commit.PGPSignature = ""
+-	commit.Author.Name = beginpgp
+-	encoded = &plumbing.MemoryObject{}
+-	decoded = &Commit{}
+-
+-	err = commit.Encode(encoded)
+-	c.Assert(err, IsNil)
+-
+-	err = decoded.Decode(encoded)
+-	c.Assert(err, IsNil)
+-	c.Assert(decoded.PGPSignature, Equals, "")
+-	c.Assert(decoded.Author.Name, Equals, beginpgp)
++	cases := []struct {
++		name         string
++		pgpSignature string
++		authorName   string
++	}{
++		{name: "pgp signature", pgpSignature: pgpsignature},
++		{name: "pgp signature with leading empty line", pgpSignature: "\n" + pgpsignature},
++		{name: "beginpgp marker in author name is not parsed as signature", authorName: beginpgp},
++		{name: "garbage between begin and end markers round-trips", pgpSignature: broken},
++	}
+ 
+-	// broken signature
++	for _, tc := range cases {
++		c.Log(tc.name)
+ 
+-	commit.PGPSignature = beginpgp + "\n" +
+-		"some\n" +
+-		"trash\n" +
+-		endpgp +
+-		"text\n"
+-	encoded = &plumbing.MemoryObject{}
+-	decoded = &Commit{}
++		commit := *s.Commit
++		commit.PGPSignature = tc.pgpSignature
++		if tc.authorName != "" {
++			commit.Author.Name = tc.authorName
++		}
+ 
+-	err = commit.Encode(encoded)
+-	c.Assert(err, IsNil)
++		encoded := &plumbing.MemoryObject{}
++		decoded := &Commit{}
++		err := commit.Encode(encoded)
++		c.Assert(err, IsNil)
+ 
+-	err = decoded.Decode(encoded)
+-	c.Assert(err, IsNil)
+-	c.Assert(decoded.PGPSignature, Equals, commit.PGPSignature)
++		err = decoded.Decode(encoded)
++		c.Assert(err, IsNil)
++		c.Assert(decoded.PGPSignature, Equals, tc.pgpSignature)
++		if tc.authorName != "" {
++			c.Assert(decoded.Author.Name, Equals, tc.authorName)
++		}
++	}
+ }
+ 
+ func (s *SuiteCommit) TestStat(c *C) {
+@@ -515,6 +534,204 @@ func (s *SuiteCommit) TestPatchCancel(c *C) {
+ 
+ }
+ 
++func (s *SuiteCommit) TestDecodeRequiresTreeFirst(c *C) {
++	const (
++		validTree   = "eba74343e2f15d62adedfd8c883ee0262b5c8021"
++		validParent = "35e85108805c84807bc66a02d91535e1e24b38b9"
++		validIdent  = "Foo <foo@example.local> 1427802494 +0200"
++	)
++
++	cases := []struct {
++		name string
++		raw  string
++	}{
++		{
++			name: "missing tree",
++			raw:  "author " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "parent before tree",
++			raw:  "parent " + validParent + "\ntree " + validTree + "\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "extra header before tree",
++			raw:  "x-extra hi\ntree " + validTree + "\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "empty",
++			raw:  "",
++		},
++		{
++			name: "non-hex tree value",
++			raw:  "tree zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "tree value too short",
++			raw:  "tree abcd\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "tree value too long",
++			raw:  "tree " + validTree + "00\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "tree value missing",
++			raw:  "tree\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "non-hex parent value",
++			raw:  "tree " + validTree + "\nparent zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++		{
++			name: "parent value too short",
++			raw:  "tree " + validTree + "\nparent abcd\nauthor " + validIdent + "\ncommitter " + validIdent + "\n\nmsg\n",
++		},
++	}
++
++	for _, tc := range cases {
++		c.Log(tc.name)
++		obj := &plumbing.MemoryObject{}
++		obj.SetType(plumbing.CommitObject)
++		_, err := obj.Write([]byte(tc.raw))
++		c.Assert(err, IsNil)
++
++		err = (&Commit{}).Decode(obj)
++		c.Assert(errors.Is(err, ErrMalformedCommit), Equals, true)
++	}
++}
++
++func (s *SuiteCommit) TestDecodeFirstOccurrenceWins(c *C) {
++	const (
++		treeA       = "eba74343e2f15d62adedfd8c883ee0262b5c8021"
++		treeB       = "0000000000000000000000000000000000000001"
++		parentA     = "35e85108805c84807bc66a02d91535e1e24b38b9"
++		parentB     = "a5b8b09e2f8fcb0bb99d3ccb0958157b40890d69"
++		parentC     = "0000000000000000000000000000000000000002"
++		identA      = "Alice <alice@example.local> 1427802494 +0200"
++		identB      = "Bob <bob@example.local> 1427802495 +0200"
++		identAuthor = "Author Name <author@example.local> 1500000000 +0000"
++		identCommit = "Commit Name <commit@example.local> 1500000001 +0000"
++	)
++
++	cases := []struct {
++		name   string
++		raw    string
++		assert func(*Commit)
++	}{
++		{
++			name: "duplicate tree drops the second",
++			raw: "tree " + treeA + "\ntree " + treeB +
++				"\nauthor " + identAuthor + "\ncommitter " + identCommit + "\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.TreeHash.String(), Equals, treeA)
++			},
++		},
++		{
++			name: "duplicate author drops the second",
++			raw: "tree " + treeA + "\nauthor " + identA + "\nauthor " + identB +
++				"\ncommitter " + identCommit + "\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.Author.Name, Equals, "Alice")
++			},
++		},
++		{
++			name: "duplicate committer drops the second",
++			raw: "tree " + treeA + "\nauthor " + identAuthor +
++				"\ncommitter " + identA + "\ncommitter " + identB + "\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.Committer.Name, Equals, "Alice")
++			},
++		},
++		{
++			name: "parent after author is dropped",
++			raw: "tree " + treeA + "\nparent " + parentA +
++				"\nauthor " + identAuthor + "\nparent " + parentC +
++				"\ncommitter " + identCommit + "\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.ParentHashes, DeepEquals, []plumbing.Hash{plumbing.NewHash(parentA)})
++			},
++		},
++		{
++			name: "parent interleaved with extras is dropped",
++			raw: "tree " + treeA + "\nparent " + parentA + "\nparent " + parentB +
++				"\nx-other thing\nparent " + parentC +
++				"\nauthor " + identAuthor + "\ncommitter " + identCommit + "\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.ParentHashes, DeepEquals, []plumbing.Hash{
++					plumbing.NewHash(parentA),
++					plumbing.NewHash(parentB),
++				})
++			},
++		},
++		{
++			name: "missing committer is allowed (zero-valued)",
++			raw: "tree " + treeA + "\nauthor " + identAuthor +
++				"\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.Author.Name, Equals, "Author Name")
++				c.Assert(commit.Committer.Name, Equals, "")
++			},
++		},
++		{
++			name: "encoding between author and committer drops committer",
++			raw: "tree " + treeA + "\nauthor " + identAuthor +
++				"\nencoding latin-1\ncommitter " + identCommit + "\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.Author.Name, Equals, "Author Name")
++				c.Assert(commit.Encoding, Equals, MessageEncoding("latin-1"))
++				// committer was not at its canonical position
++				// (immediately after author) so it is dropped, matching
++				// upstream's parse_commit_date returning 0 and the
++				// subsequent standard_header_field filter.
++				c.Assert(commit.Committer.Name, Equals, "")
++			},
++		},
++		{
++			name: "author out of canonical position is dropped",
++			raw: "tree " + treeA + "\nencoding latin-1\nauthor " + identAuthor +
++				"\ncommitter " + identCommit + "\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.Encoding, Equals, MessageEncoding("latin-1"))
++				c.Assert(commit.Author.Name, Equals, "")
++				c.Assert(commit.Committer.Name, Equals, "")
++			},
++		},
++		{
++			// Multiple gpgsig headers concatenate into a single
++			// signature buffer, mirroring upstream's
++			// parse_buffer_signed_by_header (commit.c:1186).
++			name: "multiple gpgsig headers concatenate",
++			raw: "tree " + treeA + "\nauthor " + identAuthor +
++				"\ncommitter " + identCommit +
++				"\ngpgsig firstline\n morefirst\ngpgsig secondline\n moresecond\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.PGPSignature, Equals, "firstline\nmorefirst\nsecondline\nmoresecond\n")
++			},
++		},
++		{
++			name: "gpgsig-sha256 headers are not exposed as extras",
++			raw: "tree " + treeA + "\nauthor " + identAuthor +
++				"\ncommitter " + identCommit +
++				"\ngpgsig-sha256 firstline\n morefirst\ngpgsig-sha256 secondline\n moresecond\n\nmsg\n",
++			assert: func(commit *Commit) {
++				c.Assert(commit.PGPSignature, Equals, "")
++				c.Assert(len(commit.ExtraHeaders), Equals, 0)
++			},
++		},
++	}
++
++	for _, tc := range cases {
++		c.Log(tc.name)
++		obj := &plumbing.MemoryObject{}
++		obj.SetType(plumbing.CommitObject)
++		_, err := obj.Write([]byte(tc.raw))
++		c.Assert(err, IsNil)
++
++		commit := &Commit{}
++		c.Assert(commit.Decode(obj), IsNil)
++		tc.assert(commit)
++	}
++}
++
+ func (s *SuiteCommit) TestMalformedHeader(c *C) {
+ 	encoded := &plumbing.MemoryObject{}
+ 	decoded := &Commit{}
+@@ -534,34 +751,38 @@ func (s *SuiteCommit) TestMalformedHeader(c *C) {
+ }
+ 
+ func (s *SuiteCommit) TestEncodeWithoutSignature(c *C) {
+-	// Similar to TestString since no signature
+-	encoded := &plumbing.MemoryObject{}
+-	err := s.Commit.EncodeWithoutSignature(encoded)
+-	c.Assert(err, IsNil)
+-	er, err := encoded.Reader()
+-	c.Assert(err, IsNil)
+-	payload, err := io.ReadAll(er)
+-	c.Assert(err, IsNil)
+-
+-	c.Assert(string(payload), Equals, ""+
+-		"tree eba74343e2f15d62adedfd8c883ee0262b5c8021\n"+
+-		"parent 35e85108805c84807bc66a02d91535e1e24b38b9\n"+
+-		"parent a5b8b09e2f8fcb0bb99d3ccb0958157b40890d69\n"+
+-		"author Máximo Cuadros Ortiz <mcuadros@gmail.com> 1427802494 +0200\n"+
+-		"committer Máximo Cuadros Ortiz <mcuadros@gmail.com> 1427802494 +0200\n"+
+-		"\n"+
+-		"Merge branch 'master' of github.com:tyba/git-fixture\n")
+-}
++	tests := []struct {
++		name      string
++		commitRaw string
++		mutate    func(*Commit)
++		expected  string
++	}{
++		{
++			name: "commit without signature",
++			commitRaw: `tree eba74343e2f15d62adedfd8c883ee0262b5c8021
++parent 35e85108805c84807bc66a02d91535e1e24b38b9
++parent a5b8b09e2f8fcb0bb99d3ccb0958157b40890d69
++author Máximo Cuadros Ortiz <mcuadros@gmail.com> 1427802494 +0200
++committer Máximo Cuadros Ortiz <mcuadros@gmail.com> 1427802494 +0200
++
++Merge branch 'master' of github.com:tyba/git-fixture
++`,
++			expected: `tree eba74343e2f15d62adedfd8c883ee0262b5c8021
++parent 35e85108805c84807bc66a02d91535e1e24b38b9
++parent a5b8b09e2f8fcb0bb99d3ccb0958157b40890d69
++author Máximo Cuadros Ortiz <mcuadros@gmail.com> 1427802494 +0200
++committer Máximo Cuadros Ortiz <mcuadros@gmail.com> 1427802494 +0200
+ 
+-func (s *SuiteCommit) TestEncodeWithoutSignatureJujutsu(c *C) {
+-	object := &plumbing.MemoryObject{}
+-	object.SetType(plumbing.CommitObject)
+-	object.Write([]byte(`tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++Merge branch 'master' of github.com:tyba/git-fixture
++`,
++		},
++		{
++			name: "commit with change-id and gpgsig",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+ author John Doe <john.doe@example.com> 1755280730 -0700
+ committer John Doe <john.doe@example.com> 1755280730 -0700
+ change-id wxmuynokkzxmuwxwvnnpnptoyuypknwv
+ gpgsig -----BEGIN PGP SIGNATURE-----
+- 
+  iHUEABMIAB0WIQSZpnSpGKbQbDaLe5iiNQl48cTY5gUCaJ91XQAKCRCiNQl48cTY
+  5vCYAP9Sf1yV9oUviRIxEA+4rsGIx0hI6kqFajJ/3TtBjyCTggD+PFnKOxdXeFL2
+  GLwcCzFIsmQmkLxuLypsg+vueDSLpsM=
+@@ -571,20 +792,35 @@ gpgsig -----BEGIN PGP SIGNATURE-----
+ initial commit
+ 
+ Change-Id: I6a6a696432d51cbff02d53234ccaca6b151afc34
+-`))
++`,
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++change-id wxmuynokkzxmuwxwvnnpnptoyuypknwv
+ 
+-	commit, err := DecodeCommit(s.Storer, object)
+-	c.Assert(err, IsNil)
++initial commit
+ 
+-	// Similar to TestString since no signature
+-	encoded := &plumbing.MemoryObject{}
+-	err = commit.EncodeWithoutSignature(encoded)
+-	er, err := encoded.Reader()
+-	c.Assert(err, IsNil)
+-	payload, err := io.ReadAll(er)
+-	c.Assert(err, IsNil)
++Change-Id: I6a6a696432d51cbff02d53234ccaca6b151afc34
++`,
++		},
++		{
++			name: "gpgsig-sha256",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++change-id wxmuynokkzxmuwxwvnnpnptoyuypknwv
++gpgsig-sha256 -----BEGIN PGP SIGNATURE-----
++ iHUEABMIAB0WIQSZpnSpGKbQbDaLe5iiNQl48cTY5gUCaJ91XQAKCRCiNQl48cTY
++ 5vCYAP9Sf1yV9oUviRIxEA+4rsGIx0hI6kqFajJ/3TtBjyCTggD+PFnKOxdXeFL2
++ GLwcCzFIsmQmkLxuLypsg+vueDSLpsM=
++ =VucY
++ -----END PGP SIGNATURE-----
+ 
+-	c.Assert(string(payload), Equals, `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++initial commit
++
++Change-Id: I6a6a696432d51cbff02d53234ccaca6b151afc34
++`,
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+ author John Doe <john.doe@example.com> 1755280730 -0700
+ committer John Doe <john.doe@example.com> 1755280730 -0700
+ change-id wxmuynokkzxmuwxwvnnpnptoyuypknwv
+@@ -592,7 +828,183 @@ change-id wxmuynokkzxmuwxwvnnpnptoyuypknwv
+ initial commit
+ 
+ Change-Id: I6a6a696432d51cbff02d53234ccaca6b151afc34
+-`)
++`,
++		},
++		{
++			name: "gpgsig + gpgsig-sha256",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++change-id wxmuynokkzxmuwxwvnnpnptoyuypknwv
++gpgsig -----BEGIN PGP SIGNATURE-----
++ iHUEABMIAB0WIQSZpnSpGKbQbDaLe5iiNQl48cTY5gUCaJ91XQAKCRCiNQl48cTY
++ GLwcCzFIsmQmkLxuLypsg+vueDSLpsM=
++ =VucY
++ -----END PGP SIGNATURE-----
++gpgsig-sha256 -----BEGIN PGP SIGNATURE-----
++ iHUEABMIAB0WIQSZpnSpGKbQbDaLe5iiNQl48cTY5gUCaJ91XQAKCRCiNQl48cTY
++ =VucY
++ -----END PGP SIGNATURE-----
++
++initial commit
++
++Change-Id: I6a6a696432d51cbff02d53234ccaca6b151afc34
++`,
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++change-id wxmuynokkzxmuwxwvnnpnptoyuypknwv
++
++initial commit
++
++Change-Id: I6a6a696432d51cbff02d53234ccaca6b151afc34
++`,
++		},
++		{
++			name: "non-canonical gpgsig-prefixed extra header is preserved",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++gpgsig-key-id ABCDEF0123456789
++gpgsig -----BEGIN PGP SIGNATURE-----
++ sigline1
++ -----END PGP SIGNATURE-----
++
++initial commit
++`,
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++gpgsig-key-id ABCDEF0123456789
++
++initial commit
++`,
++		},
++		{
++			name: "raw bytes preserved when only PGPSignature is mutated",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++gpgsig -----BEGIN PGP SIGNATURE-----
++ sigline1
++ -----END PGP SIGNATURE-----
++gpgsig-sha256 -----BEGIN PGP SIGNATURE-----
++ sha256line1
++ -----END PGP SIGNATURE-----
++
++initial commit
++`,
++			mutate: func(c *Commit) {
++				c.PGPSignature = "different signature value"
++			},
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++
++initial commit
++`,
++		},
++		{
++			name: "timezone-only change triggers struct-encode",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++gpgsig -----BEGIN PGP SIGNATURE-----
++ sigline1
++ -----END PGP SIGNATURE-----
++
++initial commit
++`,
++			mutate: func(c *Commit) {
++				tz := time.FixedZone("CEST", 2*60*60)
++				c.Author.When = c.Author.When.In(tz)
++				c.Committer.When = c.Committer.When.In(tz)
++			},
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 +0200
++committer John Doe <john.doe@example.com> 1755280730 +0200
++
++initial commit
++`,
++		},
++		{
++			name: "field mutation triggers struct-encode",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++gpgsig -----BEGIN PGP SIGNATURE-----
++ sigline1
++ -----END PGP SIGNATURE-----
++
++initial commit
++`,
++			mutate: func(c *Commit) {
++				c.Message = "rewritten message\n"
++			},
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++
++rewritten message
++`,
++		},
++		{
++			name: "standard-keyed ExtraHeaders are dropped on encode",
++			commitRaw: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++
++initial commit
++`,
++			mutate: func(c *Commit) {
++				c.Message = "rewritten message\n"
++				c.ExtraHeaders = []ExtraHeader{
++					{Key: "tree", Value: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef"},
++					{Key: "parent", Value: "feedfacefeedfacefeedfacefeedfacefeedface"},
++					{Key: "author", Value: "Fake <fake@example.com> 0 +0000"},
++					{Key: "committer", Value: "Fake <fake@example.com> 0 +0000"},
++					{Key: "encoding", Value: "fake-enc"},
++					{Key: "mergetag", Value: "fake mergetag"},
++					{Key: "gpgsig", Value: "fake-sig"},
++					{Key: "gpgsig-sha256", Value: "fake-sig-256"},
++					{Key: "x-real-extra", Value: "kept"},
++				}
++			},
++			expected: `tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904
++author John Doe <john.doe@example.com> 1755280730 -0700
++committer John Doe <john.doe@example.com> 1755280730 -0700
++x-real-extra kept
++
++rewritten message
++`,
++		},
++	}
++
++	for _, tc := range tests {
++		c.Log(tc.name)
++
++		obj := &plumbing.MemoryObject{}
++		obj.SetType(plumbing.CommitObject)
++		obj.Write([]byte(tc.commitRaw))
++
++		commit, err := DecodeCommit(s.Storer, obj)
++		c.Assert(err, IsNil)
++		if tc.mutate != nil {
++			tc.mutate(commit)
++		}
++
++		encoded := &plumbing.MemoryObject{}
++		err = commit.EncodeWithoutSignature(encoded)
++		c.Assert(err, IsNil)
++
++		er, err := encoded.Reader()
++		c.Assert(err, IsNil)
++
++		payload, err := io.ReadAll(er)
++		c.Assert(err, IsNil)
++
++		c.Assert(string(payload), Equals, tc.expected)
++	}
+ }
+ 
+ func (s *SuiteCommit) TestEncodeExtraHeaders(c *C) {
+@@ -618,20 +1030,20 @@ initial commit
+ 	c.Assert(err, IsNil)
+ 
+ 	c.Assert(commit.ExtraHeaders, DeepEquals, []ExtraHeader{
+-		ExtraHeader {
+-			Key: "continuedheader",
++		ExtraHeader{
++			Key:   "continuedheader",
+ 			Value: "to be\ncontinued",
+ 		},
+-		ExtraHeader {
+-			Key: "continuedheader",
++		ExtraHeader{
++			Key:   "continuedheader",
+ 			Value: "to be\ncontinued\non\nmore than\na single line",
+ 		},
+-		ExtraHeader {
+-			Key: "simpleflag",
++		ExtraHeader{
++			Key:   "simpleflag",
+ 			Value: "",
+ 		},
+-		ExtraHeader {
+-			Key: "",
++		ExtraHeader{
++			Key:   "",
+ 			Value: "value no key",
+ 		},
+ 	})
+--- a/plumbing/object/object_test.go
++++ b/plumbing/object/object_test.go
+@@ -87,11 +87,11 @@ func (s *ObjectsSuite) TestParseTree(c *C) {
+ 
+ 	c.Assert(tree.Entries, HasLen, 8)
+ 
+-	tree.buildMap()
+-	c.Assert(tree.m, HasLen, 8)
+-	c.Assert(tree.m[".gitignore"].Name, Equals, ".gitignore")
+-	c.Assert(tree.m[".gitignore"].Mode, Equals, filemode.Regular)
+-	c.Assert(tree.m[".gitignore"].Hash.String(), Equals, "32858aad3c383ed1ff0a0f9bdf231d54a00c9e88")
++	entry, err := tree.entry(".gitignore")
++	c.Assert(err, IsNil)
++	c.Assert(entry.Name, Equals, ".gitignore")
++	c.Assert(entry.Mode, Equals, filemode.Regular)
++	c.Assert(entry.Hash.String(), Equals, "32858aad3c383ed1ff0a0f9bdf231d54a00c9e88")
+ 
+ 	count := 0
+ 	iter := tree.Files()
+--- a/plumbing/object/signature.go
++++ b/plumbing/object/signature.go
+@@ -1,6 +1,13 @@
+ package object
+ 
+-import "bytes"
++import (
++	"bytes"
++	"io"
++
++	"github.com/go-git/go-git/v5/plumbing"
++	"github.com/go-git/go-git/v5/utils/ioutil"
++	"github.com/go-git/go-git/v5/utils/sync"
++)
+ 
+ const (
+ 	signatureTypeUnknown signatureType = iota
+@@ -100,3 +107,116 @@ func parseSignedBytes(b []byte) (int, signatureType) {
+ 	}
+ 	return match, t
+ }
++
++// countSignatureBlocks reports how many distinct armored signature blocks
++// start at a line boundary in b. Used by verification paths to reject
++// multi-signature payloads, matching upstream's check in gpg-interface.c
++// where parse_gpg_output bails out the first time it sees a second
++// exclusive status line (a second GOODSIG/BADSIG/etc.).
++func countSignatureBlocks(b []byte) int {
++	n, count := 0, 0
++	for n < len(b) {
++		i := b[n:]
++		if typeForSignature(i) != signatureTypeUnknown {
++			count++
++		}
++		if eol := bytes.IndexByte(i, '\n'); eol >= 0 {
++			n += eol + 1
++			continue
++		}
++		break
++	}
++	return count
++}
++
++// isSignatureHeader reports whether line is a canonical "gpgsig "/
++// "gpgsig-sha256 " header line. Other "gpgsig"-prefixed extra headers
++// are intentionally not matched.
++func isSignatureHeader(line []byte) bool {
++	return bytes.HasPrefix(line, []byte(headerpgp+" ")) ||
++		bytes.HasPrefix(line, []byte(headerpgp256+" "))
++}
++
++// stripObjectSignatures streams src into dst, producing the byte sequence
++// over which a PGP/GPG signature is computed:
++//
++//   - Canonical "gpgsig" and "gpgsig-sha256" headers (and their
++//     continuation lines) are dropped, mirroring upstream's
++//     remove_signature in commit.c.
++//   - For tag objects, the inline trailing PGP signature is additionally
++//     truncated, mirroring upstream's parse_signature in gpg-interface.c
++//     used by gpg_verify_tag.
++//
++// The returned object's type is set to objType. Used by both
++// Commit.EncodeWithoutSignature and Tag.EncodeWithoutSignature to
++// reproduce the exact bytes the signature was computed over.
++func stripObjectSignatures(dst, src plumbing.EncodedObject, objType plumbing.ObjectType) (err error) {
++	dst.SetType(objType)
++
++	r, err := src.Reader()
++	if err != nil {
++		return err
++	}
++	defer ioutil.CheckClose(r, &err)
++
++	var input io.Reader = r
++	if objType == plumbing.TagObject {
++		raw, err := io.ReadAll(r)
++		if err != nil {
++			return err
++		}
++		if sm, _ := parseSignedBytes(raw); sm >= 0 {
++			raw = raw[:sm]
++		}
++		input = bytes.NewReader(raw)
++	}
++
++	w, err := dst.Writer()
++	if err != nil {
++		return err
++	}
++	defer ioutil.CheckClose(w, &err)
++
++	return stripHeaderSignatures(w, input)
++}
++
++// stripHeaderSignatures copies r to w, dropping canonical signature header
++// lines (gpgsig and gpgsig-sha256) and their continuation lines. Lines
++// past the blank line that closes the header block are copied verbatim.
++func stripHeaderSignatures(w io.Writer, r io.Reader) error {
++	br := sync.GetBufioReader(r)
++	defer sync.PutBufioReader(br)
++
++	var inBody, skipping bool
++	for {
++		line, rerr := br.ReadBytes('\n')
++		if rerr != nil && rerr != io.EOF {
++			return rerr
++		}
++
++		write := true
++		if !inBody {
++			switch {
++			case skipping && len(line) > 0 && line[0] == ' ':
++				write = false
++			case isSignatureHeader(line):
++				skipping = true
++				write = false
++			case len(line) == 1 && line[0] == '\n':
++				skipping = false
++				inBody = true
++			default:
++				skipping = false
++			}
++		}
++
++		if write && len(line) > 0 {
++			if _, werr := w.Write(line); werr != nil {
++				return werr
++			}
++		}
++		if rerr == io.EOF {
++			return nil
++		}
++	}
++}
+--- a/plumbing/object/tag.go
++++ b/plumbing/object/tag.go
+@@ -1,9 +1,8 @@
+ package object
+ 
+ import (
+-	"bytes"
++	"errors"
+ 	"fmt"
+-	"io"
+ 	"strings"
+ 
+ 	"github.com/ProtonMail/go-crypto/openpgp"
+@@ -13,6 +12,10 @@ import (
+ 	"github.com/go-git/go-git/v5/utils/sync"
+ )
+ 
++// ErrMalformedTag is returned when a tag object cannot be decoded because
++// its required headers (object, type, tag) are missing or out of order.
++var ErrMalformedTag = errors.New("malformed tag")
++
+ // Tag represents an annotated tag object. It points to a single git object of
+ // any type, but tags typically are applied to commit or blob objects. It
+ // provides a reference that associates the target with a tag name. It also
+@@ -39,6 +42,9 @@ type Tag struct {
+ 	Target plumbing.Hash
+ 
+ 	s storer.EncodedObjectStorer
++	// src holds the encoded object this Tag was decoded from, used by
++	// EncodeWithoutSignature to recover the canonical signed bytes.
++	src plumbing.EncodedObject
+ }
+ 
+ // GetTag gets a tag from an object storer and decodes it.
+@@ -77,13 +83,20 @@ func (t *Tag) Type() plumbing.ObjectType {
+ 	return plumbing.TagObject
+ }
+ 
++func (t *Tag) reset() {
++	storer := t.s
++	*t = Tag{s: storer}
++}
++
+ // Decode transforms a plumbing.EncodedObject into a Tag struct.
+ func (t *Tag) Decode(o plumbing.EncodedObject) (err error) {
+ 	if o.Type() != plumbing.TagObject {
+ 		return ErrUnsupportedObject
+ 	}
+ 
++	t.reset()
+ 	t.Hash = o.Hash()
++	t.src = o
+ 
+ 	reader, err := o.Reader()
+ 	if err != nil {
+@@ -94,42 +107,15 @@ func (t *Tag) Decode(o plumbing.EncodedObject) (err error) {
+ 	r := sync.GetBufioReader(reader)
+ 	defer sync.PutBufioReader(r)
+ 
+-	for {
+-		var line []byte
+-		line, err = r.ReadBytes('\n')
+-		if err != nil && err != io.EOF {
++	scanner := &tagScanner{r: r, t: t}
++	for state := scanTagObject; state != nil; {
++		state, err = state(scanner)
++		if err != nil {
+ 			return err
+ 		}
+-
+-		line = bytes.TrimSpace(line)
+-		if len(line) == 0 {
+-			break // Start of message
+-		}
+-
+-		split := bytes.SplitN(line, []byte{' '}, 2)
+-		switch string(split[0]) {
+-		case "object":
+-			t.Target = plumbing.NewHash(string(split[1]))
+-		case "type":
+-			t.TargetType, err = plumbing.ParseObjectType(string(split[1]))
+-			if err != nil {
+-				return err
+-			}
+-		case "tag":
+-			t.Name = string(split[1])
+-		case "tagger":
+-			t.Tagger.Decode(split[1])
+-		}
+-
+-		if err == io.EOF {
+-			return nil
+-		}
+ 	}
+ 
+-	data, err := io.ReadAll(r)
+-	if err != nil {
+-		return err
+-	}
++	data := scanner.msgbuf.Bytes()
+ 	if sm, _ := parseSignedBytes(data); sm >= 0 {
+ 		t.PGPSignature = string(data[sm:])
+ 		data = data[:sm]
+@@ -144,11 +130,54 @@ func (t *Tag) Encode(o plumbing.EncodedObject) error {
+ 	return t.encode(o, true)
+ }
+ 
+-// EncodeWithoutSignature export a Tag into a plumbing.EncodedObject without the signature (correspond to the payload of the PGP signature).
++// EncodeWithoutSignature exports a Tag into a plumbing.EncodedObject without
++// any signature data, producing the payload that PGP/GPG signatures are
++// computed over.
++//
++// Behaviour mirrors Commit.EncodeWithoutSignature:
++//
++//   - For Tags populated by Decode whose exported fields still match the
++//     source object, the payload is streamed from the raw source bytes with
++//     the inline trailing signature truncated and gpgsig/gpgsig-sha256
++//     headers (and their continuation lines) stripped verbatim. This
++//     preserves the exact bytes the signature was computed over, regardless
++//     of any normalization performed by Decode.
++//
++//   - For Tags constructed in memory, or for decoded Tags whose exported
++//     fields have been mutated, the payload is derived from the current
++//     struct fields. Mutation is detected by re-decoding the source object
++//     and comparing exported fields; if any differ, the in-memory
++//     representation prevails.
+ func (t *Tag) EncodeWithoutSignature(o plumbing.EncodedObject) error {
++	if t.matchesSource() {
++		return stripObjectSignatures(o, t.src, plumbing.TagObject)
++	}
+ 	return t.encode(o, false)
+ }
+ 
++// matchesSource reports whether t.src is set and re-decoding it produces a
++// Tag whose payload-affecting exported fields are identical to those of t.
++//
++// PGPSignature is intentionally excluded from the comparison: neither path
++// emits it as part of the verification payload, so mutating it must not
++// trigger a switch to struct-encode (which would change the byte layout the
++// caller is trying to verify against).
++func (t *Tag) matchesSource() bool {
++	if t.src == nil {
++		return false
++	}
++	fresh := &Tag{}
++	if err := fresh.Decode(t.src); err != nil {
++		return false
++	}
++	return t.Hash == fresh.Hash &&
++		t.Name == fresh.Name &&
++		signatureEqual(t.Tagger, fresh.Tagger) &&
++		t.Message == fresh.Message &&
++		t.TargetType == fresh.TargetType &&
++		t.Target == fresh.Target
++}
++
+ func (t *Tag) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 	o.SetType(plumbing.TagObject)
+ 	w, err := o.Writer()
+@@ -158,16 +187,26 @@ func (t *Tag) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 	defer ioutil.CheckClose(w, &err)
+ 
+ 	if _, err = fmt.Fprintf(w,
+-		"object %s\ntype %s\ntag %s\ntagger ",
++		"object %s\ntype %s\ntag %s\n",
+ 		t.Target.String(), t.TargetType.Bytes(), t.Name); err != nil {
+ 		return err
+ 	}
+ 
+-	if err = t.Tagger.Encode(w); err != nil {
+-		return err
++	if !isZeroSignature(t.Tagger) {
++		if _, err = fmt.Fprint(w, "tagger "); err != nil {
++			return err
++		}
++
++		if err = t.Tagger.Encode(w); err != nil {
++			return err
++		}
++
++		if _, err = fmt.Fprint(w, "\n"); err != nil {
++			return err
++		}
+ 	}
+ 
+-	if _, err = fmt.Fprint(w, "\n\n"); err != nil {
++	if _, err = fmt.Fprint(w, "\n"); err != nil {
+ 		return err
+ 	}
+ 
+@@ -175,11 +214,12 @@ func (t *Tag) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 		return err
+ 	}
+ 
+-	// Note that this is highly sensitive to what it sent along in the message.
+-	// Message *always* needs to end with a newline, or else the message and the
+-	// signature will be concatenated into a corrupt object. Since this is a
+-	// lower-level method, we assume you know what you are doing and have already
+-	// done the needful on the message in the caller.
++	// Note that this is highly sensitive to what is sent along in the
++	// message. Message *always* needs to end with a newline, or else the
++	// message and the trailing signature will be concatenated into a
++	// corrupt object. Since this is a lower-level method, we assume you
++	// know what you are doing and have already done the needful on the
++	// message in the caller.
+ 	if includeSig {
+ 		if _, err = fmt.Fprint(w, t.PGPSignature); err != nil {
+ 			return err
+@@ -189,6 +229,10 @@ func (t *Tag) encode(o plumbing.EncodedObject, includeSig bool) (err error) {
+ 	return err
+ }
+ 
++func isZeroSignature(s Signature) bool {
++	return s.Name == "" && s.Email == "" && s.When.IsZero()
++}
++
+ // Commit returns the commit pointed to by the tag. If the tag points to a
+ // different type of object ErrUnsupportedObject will be returned.
+ func (t *Tag) Commit() (*Commit, error) {
+@@ -256,7 +300,8 @@ func (t *Tag) String() string {
+ }
+ 
+ // Verify performs PGP verification of the tag with a provided armored
+-// keyring and returns openpgp.Entity associated with verifying key on success.
++// keyring and returns openpgp.Entity associated with verifying key on
++// success.
+ func (t *Tag) Verify(armoredKeyRing string) (*openpgp.Entity, error) {
+ 	keyRingReader := strings.NewReader(armoredKeyRing)
+ 	keyring, err := openpgp.ReadArmoredKeyRing(keyRingReader)
+new file mode 100644
+--- /dev/null
++++ b/plumbing/object/tag_scanner.go
+@@ -0,0 +1,237 @@
++package object
++
++import (
++	"bufio"
++	"bytes"
++	"fmt"
++	"io"
++
++	"github.com/go-git/go-git/v5/plumbing"
++)
++
++// tagScanner holds the working state of the tag decoder driven by the
++// stateFn loop in (*Tag).Decode. Each tagState reads one or more lines
++// from r, updates the in-progress *Tag and the scanner's bookkeeping,
++// and returns the state that should run next (or nil to stop).
++type tagScanner struct {
++	r      *bufio.Reader
++	t      *Tag
++	msgbuf bytes.Buffer
++
++	// pending holds a line that was read but the current state decided to
++	// hand back to the next state, paired with the io.EOF flag returned
++	// when the line was originally read.
++	pending    []byte
++	pendingErr error
++
++	// First-occurrence tracking: once the corresponding canonical
++	// header has been decoded at its expected position, subsequent
++	// occurrences (or out-of-position lines) are silently dropped,
++	// matching the strict layout enforced by upstream's
++	// parse_tag_buffer (tag.c:130).
++	//
++	// gpgsig-sha256 is recognized and skipped without exposing a new field
++	// in v5.
++	sawObject, sawType, sawName, sawTagger bool
++}
++
++// tagState is one step of the decoder state machine. Each function reads
++// the lines it needs, mutates *Tag via s.t, and returns the next state
++// to run (or nil to terminate the loop).
++type tagState func(*tagScanner) (tagState, error)
++
++// readLine returns the next line from the buffer, transparently
++// consuming any line that was previously pushed back by a state that
++// decided not to handle it.
++func (s *tagScanner) readLine() ([]byte, error) {
++	if s.pending != nil {
++		line, err := s.pending, s.pendingErr
++		s.pending, s.pendingErr = nil, nil
++		return line, err
++	}
++	return s.r.ReadBytes('\n')
++}
++
++// pushBack stashes an unconsumed line so the next state's readLine call
++// sees it. Only one line can be pushed back at a time.
++func (s *tagScanner) pushBack(line []byte, err error) {
++	s.pending = line
++	s.pendingErr = err
++}
++
++// scanTagObject requires the first line to be `object HASH`, mirroring
++// upstream's strict parse_tag_buffer (tag.c:151-156). Anything else
++// returns ErrMalformedTag.
++func scanTagObject(s *tagScanner) (tagState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 || isBlankLine(line) {
++		return nil, fmt.Errorf("%w: missing object header", ErrMalformedTag)
++	}
++
++	key, data := splitHeader(line)
++	if key != "object" {
++		return nil, fmt.Errorf("%w: object header must be first", ErrMalformedTag)
++	}
++	h, herr := parseObjectIDHex(data, ErrMalformedTag, "object")
++	if herr != nil {
++		return nil, herr
++	}
++	s.t.Target = h
++	s.sawObject = true
++	if err == io.EOF {
++		return nil, nil
++	}
++	return scanTagType, nil
++}
++
++// scanTagType requires a `type` line immediately after the object header,
++// mirroring upstream's parse_tag_buffer (tag.c:158-166).
++func scanTagType(s *tagScanner) (tagState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 || isBlankLine(line) {
++		return nil, fmt.Errorf("%w: missing type header", ErrMalformedTag)
++	}
++
++	key, data := splitHeader(line)
++	if key != "type" {
++		return nil, fmt.Errorf("%w: type header must follow object", ErrMalformedTag)
++	}
++	ot, perr := plumbing.ParseObjectType(string(data))
++	if perr != nil {
++		return nil, perr
++	}
++	s.t.TargetType = ot
++	s.sawType = true
++	if err == io.EOF {
++		return nil, nil
++	}
++	return scanTagName, nil
++}
++
++// scanTagName requires a `tag` line immediately after the type header,
++// mirroring upstream's parse_tag_buffer (tag.c:186-194).
++func scanTagName(s *tagScanner) (tagState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 || isBlankLine(line) {
++		return nil, fmt.Errorf("%w: missing tag header", ErrMalformedTag)
++	}
++
++	key, data := splitHeader(line)
++	if key != "tag" {
++		return nil, fmt.Errorf("%w: tag header must follow type", ErrMalformedTag)
++	}
++	s.t.Name = string(data)
++	s.sawName = true
++	if err == io.EOF {
++		return nil, nil
++	}
++	return scanTagTagger, nil
++}
++
++// scanTagTagger accepts a `tagger` line at its canonical position. Any
++// other header is pushed back for scanTagHeaders.
++func scanTagTagger(s *tagScanner) (tagState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, nil
++	}
++	if isBlankLine(line) {
++		return scanTagMessage, nil
++	}
++
++	key, data := splitHeader(line)
++	if key == "tagger" {
++		s.t.Tagger.Decode(data)
++		s.sawTagger = true
++		if err == io.EOF {
++			return nil, nil
++		}
++		return scanTagHeaders, nil
++	}
++	s.pushBack(line, err)
++	return scanTagHeaders, nil
++}
++
++// scanTagHeaders dispatches one header line. gpgsig-sha256 hands off to
++// scanTagSkipCont so the continuation block can be consumed; out-of-position
++// canonical fields and unknown headers are silently dropped.
++func scanTagHeaders(s *tagScanner) (tagState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) == 0 {
++		return nil, nil
++	}
++	if isBlankLine(line) {
++		return scanTagMessage, nil
++	}
++
++	key, _ := splitHeader(line)
++	next := scanTagHeaders
++	switch key {
++	case "object", "type", "tag", "tagger":
++		// Out-of-canonical-position duplicates are dropped, mirroring the
++		// strict ordering of upstream's parse_tag_buffer.
++	case headerpgp256:
++		next = scanTagSkipCont
++	default:
++		// Unknown header: silently dropped (the Tag struct does not
++		// expose ExtraHeaders).
++	}
++
++	if err == io.EOF {
++		return nil, nil
++	}
++	return next, nil
++}
++
++// scanTagSkipCont discards continuation lines for a header scanTagHeaders chose
++// to drop. The first non-continuation line is pushed back so scanTagHeaders can
++// dispatch it.
++func scanTagSkipCont(s *tagScanner) (tagState, error) {
++	line, err := s.readLine()
++	if err != nil && err != io.EOF {
++		return nil, err
++	}
++	if len(line) > 0 && line[0] == ' ' {
++		if err == io.EOF {
++			return nil, nil
++		}
++		return scanTagSkipCont, nil
++	}
++	if len(line) > 0 {
++		s.pushBack(line, err)
++	}
++	return scanTagHeaders, nil
++}
++
++// scanTagMessage drains the remaining bytes into the message buffer.
++// (*Tag).Decode then runs parseSignedBytes over those bytes to peel off
++// the optional inline trailing PGP signature.
++func scanTagMessage(s *tagScanner) (tagState, error) {
++	for {
++		line, err := s.readLine()
++		if err != nil && err != io.EOF {
++			return nil, err
++		}
++		if len(line) > 0 {
++			s.msgbuf.Write(line)
++		}
++		if err == io.EOF {
++			return nil, nil
++		}
++	}
++}
+--- a/plumbing/object/tag_test.go
++++ b/plumbing/object/tag_test.go
+@@ -1,6 +1,7 @@
+ package object
+ 
+ import (
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"strings"
+@@ -192,6 +193,17 @@ func (s *TagSuite) TestTagEncodeDecodeIdempotent(c *C) {
+ 			TargetType: plumbing.BlobObject,
+ 			Target:     plumbing.NewHash("b029517f6300c2da0f4b651b8642506cd6aaf45d"),
+ 		},
++		{
++			Name:       "signed",
++			Tagger:     Signature{Name: "Foo", Email: "foo@example.local", When: ts},
++			Message:    "Signed tag\n",
++			TargetType: plumbing.CommitObject,
++			Target:     plumbing.NewHash("c029517f6300c2da0f4b651b8642506cd6aaf45e"),
++			PGPSignature: "-----BEGIN PGP SIGNATURE-----\n" +
++				"\n" +
++				"inlineSig=\n" +
++				"-----END PGP SIGNATURE-----\n",
++		},
+ 	}
+ 	for _, tag := range tags {
+ 		obj := &plumbing.MemoryObject{}
+@@ -201,10 +213,371 @@ func (s *TagSuite) TestTagEncodeDecodeIdempotent(c *C) {
+ 		err = newTag.Decode(obj)
+ 		c.Assert(err, IsNil)
+ 		tag.Hash = obj.Hash()
++		tag.src = obj
+ 		c.Assert(newTag, DeepEquals, tag)
+ 	}
+ }
+ 
++func (s *TagSuite) TestTagEncodeOmitsZeroTagger(c *C) {
++	const raw = "object c029517f6300c2da0f4b651b8642506cd6aaf45e\n" +
++		"type commit\n" +
++		"tag v1\n" +
++		"\n" +
++		"msg\n"
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.TagObject)
++	_, err := obj.Write([]byte(raw))
++	c.Assert(err, IsNil)
++
++	tag := &Tag{}
++	c.Assert(tag.Decode(obj), IsNil)
++	c.Assert(tag.Tagger, DeepEquals, Signature{})
++
++	encoded := &plumbing.MemoryObject{}
++	c.Assert(tag.Encode(encoded), IsNil)
++
++	r, err := encoded.Reader()
++	c.Assert(err, IsNil)
++	defer r.Close()
++
++	body, err := io.ReadAll(r)
++	c.Assert(err, IsNil)
++	c.Assert(string(body), Equals, raw)
++}
++
++func (s *TagSuite) TestTagDecodeClearsExistingState(c *C) {
++	const raw = "object c029517f6300c2da0f4b651b8642506cd6aaf45e\n" +
++		"type commit\n" +
++		"tag fresh\n" +
++		"\n" +
++		"fresh message\n"
++
++	store := memory.NewStorage()
++	staleSrc := &plumbing.MemoryObject{}
++	tag := &Tag{
++		Hash:         plumbing.NewHash("1111111111111111111111111111111111111111"),
++		Name:         "stale",
++		Tagger:       Signature{Name: "Stale", Email: "stale@example.local", When: time.Unix(1, 0).UTC()},
++		Message:      "stale message",
++		PGPSignature: "stale signature",
++		TargetType:   plumbing.BlobObject,
++		Target:       plumbing.NewHash("2222222222222222222222222222222222222222"),
++		s:            store,
++		src:          staleSrc,
++	}
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.TagObject)
++	_, err := obj.Write([]byte(raw))
++	c.Assert(err, IsNil)
++
++	c.Assert(tag.Decode(obj), IsNil)
++	c.Assert(tag.Hash, Equals, obj.Hash())
++	c.Assert(tag.Name, Equals, "fresh")
++	c.Assert(tag.Tagger, DeepEquals, Signature{})
++	c.Assert(tag.Message, Equals, "fresh message\n")
++	c.Assert(tag.PGPSignature, Equals, "")
++	c.Assert(tag.TargetType, Equals, plumbing.CommitObject)
++	c.Assert(tag.Target.String(), Equals, "c029517f6300c2da0f4b651b8642506cd6aaf45e")
++	c.Assert(tag.s, Equals, store)
++	c.Assert(tag.src, Equals, obj)
++}
++
++func (s *TagSuite) TestTagDecodeSignatures(c *C) {
++	const (
++		target = "c029517f6300c2da0f4b651b8642506cd6aaf45e"
++		tagger = "Foo <foo@example.local> 1500000000 +0000"
++		inline = "-----BEGIN PGP SIGNATURE-----\n\ninlineline1\ninlineline2\n-----END PGP SIGNATURE-----\n"
++	)
++	headers := "object " + target + "\ntype commit\ntag t\ntagger " + tagger + "\n"
++	sha256Block := "gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n" +
++		" \n" +
++		" sha256line1\n" +
++		" sha256line2\n" +
++		" -----END PGP SIGNATURE-----\n"
++
++	tests := []struct {
++		name   string
++		raw    string
++		assert func(*Tag)
++	}{
++		{
++			name: "no signature",
++			raw:  headers + "\nplain tag message\n",
++			assert: func(t *Tag) {
++				c.Assert(t.PGPSignature, Equals, "")
++				c.Assert(t.Message, Equals, "plain tag message\n")
++			},
++		},
++		{
++			name: "inline trailing PGP signature",
++			raw:  headers + "\nTag body\n" + inline,
++			assert: func(t *Tag) {
++				c.Assert(t.Message, Equals, "Tag body\n")
++				c.Assert(t.PGPSignature, Equals, inline)
++			},
++		},
++		{
++			name: "gpgsig-sha256 header only (synthetic, no inline trailer)",
++			raw:  headers + sha256Block + "\nTag body, header sig only\n",
++			assert: func(t *Tag) {
++				c.Assert(t.Message, Equals, "Tag body, header sig only\n")
++				c.Assert(t.PGPSignature, Equals, "")
++			},
++		},
++		{
++			name: "compat-mode, primary SHA-1 (gpgsig-sha256 header + inline trailer)",
++			raw:  headers + sha256Block + "\nDual-signed tag body\n" + inline,
++			assert: func(t *Tag) {
++				c.Assert(t.Message, Equals, "Dual-signed tag body\n")
++				c.Assert(t.PGPSignature, Equals, inline)
++			},
++		},
++		{
++			// parseSignedBytes returns the position of the LAST PGP
++			// block in the buffer, mirroring upstream's
++			// parse_signed_buffer (gpg-interface.c:702). Any earlier
++			// PGP-armored bytes embedded in the body stay part of the
++			// message; only the trailing block becomes t.PGPSignature.
++			name: "multiple inline PGP blocks: last is the signature",
++			raw: headers + "\nbody line 1\n" +
++				"-----BEGIN PGP SIGNATURE-----\nfakeline\n-----END PGP SIGNATURE-----\n" +
++				"body line 2\n" +
++				"-----BEGIN PGP SIGNATURE-----\nrealline\n-----END PGP SIGNATURE-----\n",
++			assert: func(t *Tag) {
++				c.Assert(
++					t.Message,
++					Equals,
++					"body line 1\n"+
++						"-----BEGIN PGP SIGNATURE-----\nfakeline\n-----END PGP SIGNATURE-----\n"+
++						"body line 2\n",
++				)
++				c.Assert(
++					t.PGPSignature,
++					Equals,
++					"-----BEGIN PGP SIGNATURE-----\nrealline\n-----END PGP SIGNATURE-----\n",
++				)
++			},
++		},
++	}
++
++	for _, tc := range tests {
++		c.Log(tc.name)
++		obj := &plumbing.MemoryObject{}
++		obj.SetType(plumbing.TagObject)
++		_, err := obj.Write([]byte(tc.raw))
++		c.Assert(err, IsNil)
++
++		tag := &Tag{}
++		c.Assert(tag.Decode(obj), IsNil)
++		tc.assert(tag)
++	}
++}
++
++func (s *TagSuite) TestDecodeRequiresHeaders(c *C) {
++	const (
++		target = "c029517f6300c2da0f4b651b8642506cd6aaf45e"
++		tagger = "Foo <foo@example.local> 1500000000 +0000"
++	)
++
++	cases := []struct {
++		name string
++		raw  string
++	}{
++		{
++			name: "empty",
++			raw:  "",
++		},
++		{
++			name: "missing object",
++			raw:  "type commit\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "object out of canonical position",
++			raw:  "type commit\nobject " + target + "\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "missing type",
++			raw:  "object " + target + "\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "missing tag",
++			raw:  "object " + target + "\ntype commit\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "duplicate object before type",
++			raw: "object " + target + "\nobject " + target +
++				"\ntype commit\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "duplicate type before tag",
++			raw: "object " + target + "\ntype commit\ntype blob" +
++				"\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "truncated after object header",
++			raw:  "object " + target + "\n",
++		},
++		{
++			name: "truncated after type header",
++			raw:  "object " + target + "\ntype commit\n",
++		},
++		{
++			name: "non-hex object value",
++			raw:  "object zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz\ntype commit\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "object value too short",
++			raw:  "object abcd\ntype commit\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "object value too long",
++			raw:  "object " + target + "00\ntype commit\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++		{
++			name: "object value missing",
++			raw:  "object\ntype commit\ntag v1\ntagger " + tagger + "\n\nmsg\n",
++		},
++	}
++
++	for _, tc := range cases {
++		c.Log(tc.name)
++		obj := &plumbing.MemoryObject{}
++		obj.SetType(plumbing.TagObject)
++		_, err := obj.Write([]byte(tc.raw))
++		c.Assert(err, IsNil)
++
++		err = (&Tag{}).Decode(obj)
++		c.Assert(errors.Is(err, ErrMalformedTag), Equals, true)
++	}
++}
++
++func (s *TagSuite) TestDecodeFirstOccurrenceWins(c *C) {
++	const (
++		targetA   = "c029517f6300c2da0f4b651b8642506cd6aaf45e"
++		taggerA   = "Alice <alice@example.local> 1500000000 +0000"
++		taggerB   = "Bob <bob@example.local> 1500000001 +0000"
++		canonical = "object " + targetA +
++			"\ntype commit\ntag v1\ntagger " + taggerA + "\n"
++	)
++
++	cases := []struct {
++		name   string
++		raw    string
++		assert func(*Tag)
++	}{
++		{
++			name: "duplicate tag drops the second",
++			raw: "object " + targetA + "\ntype commit\ntag v1\ntag v1-override" +
++				"\ntagger " + taggerA + "\n\nmsg\n",
++			assert: func(t *Tag) {
++				c.Assert(t.Name, Equals, "v1")
++			},
++		},
++		{
++			name: "duplicate tagger drops the second",
++			raw: "object " + targetA + "\ntype commit\ntag v1\ntagger " + taggerA +
++				"\ntagger " + taggerB + "\n\nmsg\n",
++			assert: func(t *Tag) {
++				c.Assert(t.Tagger.Name, Equals, "Alice")
++			},
++		},
++		{
++			name: "missing tagger is allowed (zero-valued)",
++			raw:  "object " + targetA + "\ntype commit\ntag v1\n\nmsg\n",
++			assert: func(t *Tag) {
++				c.Assert(t.Name, Equals, "v1")
++				c.Assert(t.Tagger.Name, Equals, "")
++				c.Assert(t.Message, Equals, "msg\n")
++			},
++		},
++		{
++			name: "gpgsig-sha256 headers are skipped",
++			raw: canonical +
++				"gpgsig-sha256 firstline\n morefirst\n" +
++				"gpgsig-sha256 secondline\n moresecond\n\nmsg\n",
++			assert: func(t *Tag) {
++				c.Assert(t.PGPSignature, Equals, "")
++				c.Assert(t.Message, Equals, "msg\n")
++			},
++		},
++		{
++			name: "single-line gpgsig-sha256 (no continuation)",
++			raw:  canonical + "gpgsig-sha256 short\n\nmsg\n",
++			assert: func(t *Tag) {
++				c.Assert(t.PGPSignature, Equals, "")
++				c.Assert(t.Message, Equals, "msg\n")
++			},
++		},
++		{
++			name: "gpgsig-sha256 with empty value",
++			raw:  canonical + "gpgsig-sha256\n\nmsg\n",
++			assert: func(t *Tag) {
++				c.Assert(t.PGPSignature, Equals, "")
++				c.Assert(t.Message, Equals, "msg\n")
++			},
++		},
++		{
++			name: "unknown extra header is dropped",
++			raw:  canonical + "x-some-extra value\n\nmsg\n",
++			assert: func(t *Tag) {
++				c.Assert(t.Target.String(), Equals, targetA)
++				c.Assert(t.Name, Equals, "v1")
++				c.Assert(t.Tagger.Name, Equals, "Alice")
++				c.Assert(t.Message, Equals, "msg\n")
++				c.Assert(t.PGPSignature, Equals, "")
++			},
++		},
++		{
++			name: "EOF after tagger (no blank-line separator)",
++			raw:  "object " + targetA + "\ntype commit\ntag v1\ntagger " + taggerA + "\n",
++			assert: func(t *Tag) {
++				c.Assert(t.Target.String(), Equals, targetA)
++				c.Assert(t.TargetType, Equals, plumbing.CommitObject)
++				c.Assert(t.Name, Equals, "v1")
++				c.Assert(t.Tagger.Name, Equals, "Alice")
++				c.Assert(t.Message, Equals, "")
++			},
++		},
++		{
++			name: "EOF on blank line (empty body)",
++			raw:  "object " + targetA + "\ntype commit\ntag v1\ntagger " + taggerA + "\n\n",
++			assert: func(t *Tag) {
++				c.Assert(t.Name, Equals, "v1")
++				c.Assert(t.Message, Equals, "")
++			},
++		},
++		{
++			name: "message without trailing newline",
++			raw:  "object " + targetA + "\ntype commit\ntag v1\ntagger " + taggerA + "\n\npartial",
++			assert: func(t *Tag) {
++				c.Assert(t.Message, Equals, "partial")
++			},
++		},
++		{
++			name: "EOF mid-gpgsig-sha256 continuation",
++			raw:  canonical + "gpgsig-sha256 line1\n line2\n line3\n",
++			assert: func(t *Tag) {
++				c.Assert(t.PGPSignature, Equals, "")
++				c.Assert(t.Message, Equals, "")
++			},
++		},
++	}
++
++	for _, tc := range cases {
++		c.Log(tc.name)
++		obj := &plumbing.MemoryObject{}
++		obj.SetType(plumbing.TagObject)
++		_, err := obj.Write([]byte(tc.raw))
++		c.Assert(err, IsNil)
++
++		tag := &Tag{}
++		c.Assert(tag.Decode(obj), IsNil)
++		tc.assert(tag)
++	}
++}
++
+ func (s *TagSuite) TestString(c *C) {
+ 	tag := s.tag(c, plumbing.NewHash("b742a2a9fa0afcfa9a6fad080980fbc26b007c69"))
+ 	c.Assert(tag.String(), Equals, ""+
+@@ -250,6 +623,7 @@ func (s *TagSuite) TestStringNonCommit(c *C) {
+ 	tag := &Tag{
+ 		Target:     targetObj.Hash(),
+ 		Name:       "TAG TWO",
++		Tagger:     Signature{Name: "Test Tagger", Email: "tagger@example.local", When: time.Unix(0, 0).UTC()},
+ 		Message:    "tag two",
+ 		TargetType: plumbing.TagObject,
+ 	}
+@@ -263,7 +637,7 @@ func (s *TagSuite) TestStringNonCommit(c *C) {
+ 
+ 	c.Assert(tag.String(), Equals,
+ 		"tag TAG TWO\n"+
+-			"Tagger:  <>\n"+
++			"Tagger: Test Tagger <tagger@example.local>\n"+
+ 			"Date:   Thu Jan 01 00:00:00 1970 +0000\n"+
+ 			"\n"+
+ 			"tag two\n")
+@@ -458,22 +832,200 @@ eQnkGpsz85DfEviLtk8cZjY/t6o8lPDLiwVjIzUBaA==
+ }
+ 
+ func (s *TagSuite) TestEncodeWithoutSignature(c *C) {
+-	//Similar to TestString since no signature
+-	encoded := &plumbing.MemoryObject{}
+-	tag := s.tag(c, plumbing.NewHash("b742a2a9fa0afcfa9a6fad080980fbc26b007c69"))
+-	err := tag.EncodeWithoutSignature(encoded)
+-	c.Assert(err, IsNil)
+-	er, err := encoded.Reader()
+-	c.Assert(err, IsNil)
+-	payload, err := io.ReadAll(er)
+-	c.Assert(err, IsNil)
++	tests := []struct {
++		name     string
++		tagRaw   string
++		mutate   func(*Tag)
++		expected string
++	}{
++		{
++			name: "tag without signature",
++			tagRaw: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
+ 
+-	c.Assert(string(payload), Equals, ""+
+-		"object f7b877701fbf855b44c0a9e86f3fdce2c298b07f\n"+
+-		"type commit\n"+
+-		"tag annotated-tag\n"+
+-		"tagger Máximo Cuadros <mcuadros@gmail.com> 1474485215 +0200\n"+
+-		"\n"+
+-		"example annotated tag\n",
+-	)
++plain tag message
++`,
++			expected: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++plain tag message
++`,
++		},
++		{
++			name: "gpgsig-sha256 header",
++			tagRaw: "object 1eca38290a3131d0c90709496a9b2207a872631e\n" +
++				"type commit\n" +
++				"tag v1\n" +
++				"tagger Test Tagger <tagger@example.local> 1700000000 +0000\n" +
++				"gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n" +
++				" \n" +
++				" sha256line1\n" +
++				" sha256line2\n" +
++				" -----END PGP SIGNATURE-----\n" +
++				"\n" +
++				"tag message\n",
++			expected: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++tag message
++`,
++		},
++		{
++			name: "inline trailing signature",
++			tagRaw: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++tag message
++-----BEGIN PGP SIGNATURE-----
++
++inlineline1
++inlineline2
++-----END PGP SIGNATURE-----
++`,
++			expected: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++tag message
++`,
++		},
++		{
++			// Compat-mode primary SHA-1 layout: gpgsig-sha256 header
++			// (SHA-256 sig) plus inline trailing PGP block (SHA-1 sig).
++			// Both are stripped to produce the verification payload.
++			name: "gpgsig-sha256 + inline trailing",
++			tagRaw: "object 1eca38290a3131d0c90709496a9b2207a872631e\n" +
++				"type commit\n" +
++				"tag v1\n" +
++				"tagger Test Tagger <tagger@example.local> 1700000000 +0000\n" +
++				"gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n" +
++				" \n" +
++				" sha256line1\n" +
++				" -----END PGP SIGNATURE-----\n" +
++				"\n" +
++				"tag message\n" +
++				"-----BEGIN PGP SIGNATURE-----\n" +
++				"\n" +
++				"inlineline1\n" +
++				"-----END PGP SIGNATURE-----\n",
++			expected: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++tag message
++`,
++		},
++		{
++			// Mutating only the inline signature must not trigger
++			// struct-encode: the raw bytes, with all signature data
++			// stripped, are still the canonical signed payload.
++			name: "raw bytes preserved when only inline signature is mutated",
++			tagRaw: "object 1eca38290a3131d0c90709496a9b2207a872631e\n" +
++				"type commit\n" +
++				"tag v1\n" +
++				"tagger Test Tagger <tagger@example.local> 1700000000 +0000\n" +
++				"gpgsig-sha256 -----BEGIN PGP SIGNATURE-----\n" +
++				" sha256line1\n" +
++				" -----END PGP SIGNATURE-----\n" +
++				"\n" +
++				"tag message\n" +
++				"-----BEGIN PGP SIGNATURE-----\n" +
++				"inlineline1\n" +
++				"-----END PGP SIGNATURE-----\n",
++			mutate: func(t *Tag) {
++				t.PGPSignature = "different signature value"
++			},
++			expected: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++tag message
++`,
++		},
++		{
++			name: "timezone-only change triggers struct-encode",
++			tagRaw: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 -0700
++
++tag message
++-----BEGIN PGP SIGNATURE-----
++inlineline1
++-----END PGP SIGNATURE-----
++`,
++			mutate: func(t *Tag) {
++				tz := time.FixedZone("CEST", 2*60*60)
++				t.Tagger.When = t.Tagger.When.In(tz)
++			},
++			expected: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0200
++
++tag message
++`,
++		},
++		{
++			name: "field mutation triggers struct-encode",
++			tagRaw: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++tag message
++-----BEGIN PGP SIGNATURE-----
++inlineline1
++-----END PGP SIGNATURE-----
++`,
++			mutate: func(t *Tag) {
++				t.Name = "v1-rewritten"
++			},
++			expected: `object 1eca38290a3131d0c90709496a9b2207a872631e
++type commit
++tag v1-rewritten
++tagger Test Tagger <tagger@example.local> 1700000000 +0000
++
++tag message
++`,
++		},
++	}
++
++	for _, tc := range tests {
++		c.Log(tc.name)
++		obj := &plumbing.MemoryObject{}
++		obj.SetType(plumbing.TagObject)
++		_, err := obj.Write([]byte(tc.tagRaw))
++		c.Assert(err, IsNil)
++
++		tag := &Tag{}
++		c.Assert(tag.Decode(obj), IsNil)
++
++		if tc.mutate != nil {
++			tc.mutate(tag)
++		}
++
++		encoded := &plumbing.MemoryObject{}
++		err = tag.EncodeWithoutSignature(encoded)
++		c.Assert(err, IsNil)
++
++		er, err := encoded.Reader()
++		c.Assert(err, IsNil)
++
++		payload, err := io.ReadAll(er)
++		c.Assert(err, IsNil)
++
++		c.Assert(string(payload), Equals, tc.expected)
++	}
+ }
+--- a/plumbing/object/tree.go
++++ b/plumbing/object/tree.go
+@@ -29,6 +29,7 @@ var (
+ 	ErrDirectoryNotFound = errors.New("directory not found")
+ 	ErrEntryNotFound     = errors.New("entry not found")
+ 	ErrEntriesNotSorted  = errors.New("entries in tree are not sorted")
++	ErrMalformedTree     = errors.New("malformed tree")
+ )
+ 
+ // Tree is basically like a directory - it references a bunch of other trees
+@@ -37,9 +38,9 @@ type Tree struct {
+ 	Entries []TreeEntry
+ 	Hash    plumbing.Hash
+ 
+-	s storer.EncodedObjectStorer
+-	m map[string]*TreeEntry
+-	t map[string]*Tree // tree path cache
++	s             storer.EncodedObjectStorer
++	t             map[string]*Tree // tree path cache
++	entriesSorted bool
+ }
+ 
+ // GetTree gets a tree from an object storer and decodes it.
+@@ -182,16 +183,43 @@ func (t *Tree) dir(baseName string) (*Tree, error) {
+ }
+ 
+ func (t *Tree) entry(baseName string) (*TreeEntry, error) {
+-	if t.m == nil {
+-		t.buildMap()
++	if t.entriesSorted {
++		if entry := t.searchEntry(baseName); entry != nil {
++			return entry, nil
++		}
++		return nil, ErrEntryNotFound
+ 	}
+ 
+-	entry, ok := t.m[baseName]
+-	if !ok {
+-		return nil, ErrEntryNotFound
++	pastName := baseName + "/"
++	for i := range t.Entries {
++		entry := &t.Entries[i]
++		if entry.Name == baseName {
++			return entry, nil
++		}
++		if treeEntrySortName(entry) > pastName {
++			break
++		}
++	}
++
++	return nil, ErrEntryNotFound
++}
++
++func (t *Tree) searchEntry(baseName string) *TreeEntry {
++	if i := t.searchEntryIndex(baseName); i < len(t.Entries) && t.Entries[i].Name == baseName {
++		return &t.Entries[i]
++	}
++
++	if i := t.searchEntryIndex(baseName + "/"); i < len(t.Entries) && t.Entries[i].Name == baseName {
++		return &t.Entries[i]
+ 	}
+ 
+-	return entry, nil
++	return nil
++}
++
++func (t *Tree) searchEntryIndex(name string) int {
++	return sort.Search(len(t.Entries), func(i int) bool {
++		return treeEntrySortName(&t.Entries[i]) >= name
++	})
+ }
+ 
+ // Files returns a FileIter allowing to iterate over the Tree
+@@ -212,20 +240,25 @@ func (t *Tree) Type() plumbing.ObjectType {
+ 	return plumbing.TreeObject
+ }
+ 
++func (t *Tree) reset() {
++	storer := t.s
++	*t = Tree{s: storer}
++}
++
+ // Decode transform an plumbing.EncodedObject into a Tree struct
+ func (t *Tree) Decode(o plumbing.EncodedObject) (err error) {
+ 	if o.Type() != plumbing.TreeObject {
+ 		return ErrUnsupportedObject
+ 	}
+ 
++	t.reset()
+ 	t.Hash = o.Hash()
++	// assume tree is sorted as a valid tree should always be sorted.
++	t.entriesSorted = true
+ 	if o.Size() == 0 {
+ 		return nil
+ 	}
+ 
+-	t.Entries = nil
+-	t.m = nil
+-
+ 	reader, err := o.Reader()
+ 	if err != nil {
+ 		return err
+@@ -235,10 +268,14 @@ func (t *Tree) Decode(o plumbing.EncodedObject) (err error) {
+ 	r := sync.GetBufioReader(reader)
+ 	defer sync.PutBufioReader(r)
+ 
++	var prevSortName string
+ 	for {
+ 		str, err := r.ReadString(' ')
+ 		if err != nil {
+ 			if err == io.EOF {
++				if len(str) != 0 {
++					return fmt.Errorf("%w: missing mode terminator", ErrMalformedTree)
++				}
+ 				break
+ 			}
+ 
+@@ -248,25 +285,41 @@ func (t *Tree) Decode(o plumbing.EncodedObject) (err error) {
+ 
+ 		mode, err := filemode.New(str)
+ 		if err != nil {
+-			return err
++			return fmt.Errorf("%w: malformed mode", ErrMalformedTree)
+ 		}
++		mode = canonicalTreeMode(mode)
+ 
+ 		name, err := r.ReadString(0)
+-		if err != nil && err != io.EOF {
++		if err != nil {
++			if err == io.EOF {
++				return fmt.Errorf("%w: missing filename terminator", ErrMalformedTree)
++			}
+ 			return err
+ 		}
++		if len(name) == 1 {
++			return fmt.Errorf("%w: empty filename", ErrMalformedTree)
++		}
+ 
+ 		var hash plumbing.Hash
+ 		if _, err = io.ReadFull(r, hash[:]); err != nil {
++			if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
++				return fmt.Errorf("%w: truncated object id", ErrMalformedTree)
++			}
+ 			return err
+ 		}
+ 
+ 		baseName := name[:len(name)-1]
+-		t.Entries = append(t.Entries, TreeEntry{
++		entry := TreeEntry{
+ 			Hash: hash,
+ 			Mode: mode,
+ 			Name: baseName,
+-		})
++		}
++		sortName := treeEntrySortName(&entry)
++		if len(t.Entries) != 0 && prevSortName > sortName {
++			t.entriesSorted = false
++		}
++		prevSortName = sortName
++		t.Entries = append(t.Entries, entry)
+ 	}
+ 
+ 	return nil
+@@ -279,21 +332,37 @@ func (s TreeEntrySorter) Len() int {
+ }
+ 
+ func (s TreeEntrySorter) Less(i, j int) bool {
+-	name1 := s[i].Name
+-	name2 := s[j].Name
+-	if s[i].Mode == filemode.Dir {
+-		name1 += "/"
+-	}
+-	if s[j].Mode == filemode.Dir {
+-		name2 += "/"
+-	}
+-	return name1 < name2
++	return treeEntrySortName(&s[i]) < treeEntrySortName(&s[j])
+ }
+ 
+ func (s TreeEntrySorter) Swap(i, j int) {
+ 	s[i], s[j] = s[j], s[i]
+ }
+ 
++// Git compares tree entries as if directory names had a trailing slash.
++func treeEntrySortName(e *TreeEntry) string {
++	if e.Mode == filemode.Dir {
++		return e.Name + "/"
++	}
++	return e.Name
++}
++
++func canonicalTreeMode(mode filemode.FileMode) filemode.FileMode {
++	switch mode & 0o170000 {
++	case 0o040000:
++		return filemode.Dir
++	case 0o100000:
++		if mode&0o111 != 0 {
++			return filemode.Executable
++		}
++		return filemode.Regular
++	case 0o120000:
++		return filemode.Symlink
++	default:
++		return filemode.Submodule
++	}
++}
++
+ // Encode transforms a Tree into a plumbing.EncodedObject.
+ // The tree entries must be sorted by name.
+ func (t *Tree) Encode(o plumbing.EncodedObject) (err error) {
+@@ -329,13 +398,6 @@ func (t *Tree) Encode(o plumbing.EncodedObject) (err error) {
+ 	return err
+ }
+ 
+-func (t *Tree) buildMap() {
+-	t.m = make(map[string]*TreeEntry)
+-	for i := 0; i < len(t.Entries); i++ {
+-		t.m[t.Entries[i].Name] = &t.Entries[i]
+-	}
+-}
+-
+ // Diff returns a list of changes between this tree and the provided one
+ func (t *Tree) Diff(to *Tree) (Changes, error) {
+ 	return t.DiffContext(context.Background(), to)
+--- a/plumbing/object/tree_test.go
++++ b/plumbing/object/tree_test.go
+@@ -1,6 +1,7 @@
+ package object
+ 
+ import (
++	"bytes"
+ 	"context"
+ 	"errors"
+ 	"io"
+@@ -8,11 +9,15 @@ import (
+ 	"testing"
+ 
+ 	fixtures "github.com/go-git/go-git-fixtures/v4"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
+ 	"github.com/go-git/go-git/v5/plumbing"
+ 	"github.com/go-git/go-git/v5/plumbing/cache"
+ 	"github.com/go-git/go-git/v5/plumbing/filemode"
+ 	"github.com/go-git/go-git/v5/plumbing/storer"
+ 	"github.com/go-git/go-git/v5/storage/filesystem"
++	"github.com/go-git/go-git/v5/storage/memory"
+ 
+ 	. "gopkg.in/check.v1"
+ )
+@@ -56,8 +61,8 @@ func (s *TreeSuite) TestType(c *C) {
+ }
+ 
+ func (s *TreeSuite) TestTree(c *C) {
+-	expectedEntry, ok := s.Tree.m["vendor"]
+-	c.Assert(ok, Equals, true)
++	expectedEntry, err := s.Tree.entry("vendor")
++	c.Assert(err, IsNil)
+ 	expected := expectedEntry.Hash
+ 
+ 	obtainedTree, err := s.Tree.Tree("vendor")
+@@ -224,9 +229,9 @@ func (o *SortReadCloser) Read(p []byte) (int, error) {
+ func (s *TreeSuite) TestTreeEntriesSorted(c *C) {
+ 	tree := &Tree{
+ 		Entries: []TreeEntry{
+-			{"foo", filemode.Empty, plumbing.NewHash("b029517f6300c2da0f4b651b8642506cd6aaf45d")},
+-			{"bar", filemode.Empty, plumbing.NewHash("c029517f6300c2da0f4b651b8642506cd6aaf45d")},
+-			{"baz", filemode.Empty, plumbing.NewHash("d029517f6300c2da0f4b651b8642506cd6aaf45d")},
++			{"foo", filemode.Regular, plumbing.NewHash("b029517f6300c2da0f4b651b8642506cd6aaf45d")},
++			{"bar", filemode.Regular, plumbing.NewHash("c029517f6300c2da0f4b651b8642506cd6aaf45d")},
++			{"baz", filemode.Regular, plumbing.NewHash("d029517f6300c2da0f4b651b8642506cd6aaf45d")},
+ 		},
+ 	}
+ 
+@@ -249,9 +254,9 @@ func (s *TreeSuite) TestTreeDecodeEncodeIdempotent(c *C) {
+ 	trees := []*Tree{
+ 		{
+ 			Entries: []TreeEntry{
+-				{"foo", filemode.Empty, plumbing.NewHash("b029517f6300c2da0f4b651b8642506cd6aaf45d")},
+-				{"bar", filemode.Empty, plumbing.NewHash("c029517f6300c2da0f4b651b8642506cd6aaf45d")},
+-				{"baz", filemode.Empty, plumbing.NewHash("d029517f6300c2da0f4b651b8642506cd6aaf45d")},
++				{"foo", filemode.Regular, plumbing.NewHash("b029517f6300c2da0f4b651b8642506cd6aaf45d")},
++				{"bar", filemode.Regular, plumbing.NewHash("c029517f6300c2da0f4b651b8642506cd6aaf45d")},
++				{"baz", filemode.Regular, plumbing.NewHash("d029517f6300c2da0f4b651b8642506cd6aaf45d")},
+ 			},
+ 		},
+ 	}
+@@ -264,7 +269,8 @@ func (s *TreeSuite) TestTreeDecodeEncodeIdempotent(c *C) {
+ 		err = newTree.Decode(obj)
+ 		c.Assert(err, IsNil)
+ 		tree.Hash = obj.Hash()
+-		c.Assert(newTree, DeepEquals, tree)
++		c.Assert(newTree.Hash, Equals, tree.Hash)
++		c.Assert(newTree.Entries, DeepEquals, tree.Entries)
+ 	}
+ }
+ 
+@@ -1642,7 +1648,6 @@ func (s *TreeSuite) TestTreeDecodeReadBug(c *C) {
+ 		},
+ 		Hash: plumbing.Hash{0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0},
+ 		s:    (storer.EncodedObjectStorer)(nil),
+-		m:    map[string]*TreeEntry(nil),
+ 	}
+ 
+ 	var obtained Tree
+@@ -1666,3 +1671,390 @@ func FuzzDecode(f *testing.F) {
+ 		newTree.Decode(obj)
+ 	})
+ }
++
++type rawTreeEntry struct {
++	mode string
++	name string
++	hash []byte
++}
++
++func encodeRawTreeEntries(entries ...rawTreeEntry) []byte {
++	var buf bytes.Buffer
++	for _, e := range entries {
++		buf.WriteString(e.mode)
++		buf.WriteByte(' ')
++		buf.WriteString(e.name)
++		buf.WriteByte(0)
++		buf.Write(e.hash)
++	}
++	return buf.Bytes()
++}
++
++func newRawTreeObject(t *testing.T, body []byte) *plumbing.MemoryObject {
++	t.Helper()
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.TreeObject)
++	w, err := obj.Writer()
++	require.NoError(t, err)
++	_, err = w.Write(body)
++	require.NoError(t, err)
++	require.NoError(t, w.Close())
++
++	return obj
++}
++
++func decodeRawTree(t *testing.T, body []byte) (*Tree, error) {
++	t.Helper()
++
++	obj := newRawTreeObject(t, body)
++
++	var tree Tree
++	err := tree.Decode(obj)
++	return &tree, err
++}
++
++func TestTreeDecodeRejectsMalformedEntries(t *testing.T) {
++	t.Parallel()
++
++	hash := bytes.Repeat([]byte{0xAA}, 20)
++
++	cases := []struct {
++		name string
++		body []byte
++	}{
++		{
++			name: "short object id",
++			body: append(append([]byte{}, []byte("100644 foo\x00")...), hash[:19]...),
++		},
++		{
++			name: "empty filename",
++			body: encodeRawTreeEntries(rawTreeEntry{"100644", "", hash}),
++		},
++		{
++			name: "missing filename terminator",
++			body: append(append([]byte{}, []byte("100644 foo")...), hash...),
++		},
++		{
++			name: "malformed mode",
++			body: encodeRawTreeEntries(rawTreeEntry{"10064x", "foo", hash}),
++		},
++		{
++			name: "trailing partial entry",
++			body: append(encodeRawTreeEntries(rawTreeEntry{"100644", "foo", hash}), []byte("100644 trailing")...),
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++
++			tree, err := decodeRawTree(t, tc.body)
++			require.ErrorIs(t, err, ErrMalformedTree)
++			assert.NotNil(t, tree)
++		})
++	}
++}
++
++func TestTreeDecodeCanonicalizesModes(t *testing.T) {
++	t.Parallel()
++
++	hash := bytes.Repeat([]byte{0xAA}, 20)
++	body := encodeRawTreeEntries(
++		rawTreeEntry{"100664", "regular", hash},
++		rawTreeEntry{"100111", "executable", hash},
++		rawTreeEntry{"120777", "symlink", hash},
++		rawTreeEntry{"040755", "directory", hash},
++		rawTreeEntry{"42", "submodule", hash},
++	)
++
++	tree, err := decodeRawTree(t, body)
++	require.NoError(t, err)
++	require.Len(t, tree.Entries, 5)
++	assert.Equal(t, filemode.Regular, tree.Entries[0].Mode)
++	assert.Equal(t, filemode.Executable, tree.Entries[1].Mode)
++	assert.Equal(t, filemode.Symlink, tree.Entries[2].Mode)
++	assert.Equal(t, filemode.Dir, tree.Entries[3].Mode)
++	assert.Equal(t, filemode.Submodule, tree.Entries[4].Mode)
++}
++
++func TestTreeDecodeEmptyClearsExistingEntries(t *testing.T) {
++	t.Parallel()
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.TreeObject)
++
++	tree := &Tree{
++		Entries: []TreeEntry{
++			{Name: "stale", Mode: filemode.Regular},
++		},
++	}
++
++	require.NoError(t, tree.Decode(obj))
++	assert.Empty(t, tree.Entries)
++}
++
++func TestTreeDecodeClearsExistingState(t *testing.T) {
++	t.Parallel()
++
++	store := memory.NewStorage()
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.TreeObject)
++
++	tree := &Tree{
++		Hash: plumbing.NewHash("1111111111111111111111111111111111111111"),
++		Entries: []TreeEntry{
++			{Name: "stale", Mode: filemode.Regular},
++		},
++		s:             store,
++		t:             map[string]*Tree{"stale": &Tree{}},
++		entriesSorted: false,
++	}
++
++	require.NoError(t, tree.Decode(obj))
++	assert.Equal(t, obj.Hash(), tree.Hash)
++	assert.Empty(t, tree.Entries)
++	assert.Same(t, store, tree.s)
++	assert.Nil(t, tree.t)
++	assert.True(t, tree.entriesSorted)
++}
++
++func TestTreeDecodeClearsPathCache(t *testing.T) {
++	t.Parallel()
++
++	store := memory.NewStorage()
++	oldFileHash := bytes.Repeat([]byte{0xAA}, 20)
++	newFileHash := bytes.Repeat([]byte{0xBB}, 20)
++
++	oldSubtree := newRawTreeObject(t, encodeRawTreeEntries(
++		rawTreeEntry{"100644", "old", oldFileHash},
++	))
++	oldSubtreeHash, err := store.SetEncodedObject(oldSubtree)
++	require.NoError(t, err)
++
++	oldDir := newRawTreeObject(t, encodeRawTreeEntries(
++		rawTreeEntry{"40000", "sub", oldSubtreeHash[:]},
++	))
++	oldDirHash, err := store.SetEncodedObject(oldDir)
++	require.NoError(t, err)
++
++	oldRoot := newRawTreeObject(t, encodeRawTreeEntries(
++		rawTreeEntry{"40000", "dir", oldDirHash[:]},
++	))
++
++	newSubtree := newRawTreeObject(t, encodeRawTreeEntries(
++		rawTreeEntry{"100644", "new", newFileHash},
++	))
++	newSubtreeHash, err := store.SetEncodedObject(newSubtree)
++	require.NoError(t, err)
++
++	newDir := newRawTreeObject(t, encodeRawTreeEntries(
++		rawTreeEntry{"40000", "sub", newSubtreeHash[:]},
++	))
++	newDirHash, err := store.SetEncodedObject(newDir)
++	require.NoError(t, err)
++
++	newRoot := newRawTreeObject(t, encodeRawTreeEntries(
++		rawTreeEntry{"40000", "dir", newDirHash[:]},
++	))
++
++	tree := &Tree{s: store}
++	require.NoError(t, tree.Decode(oldRoot))
++	got, err := tree.FindEntry("dir/sub/old")
++	require.NoError(t, err)
++	assert.Equal(t, 0, bytes.Compare(oldFileHash, got.Hash[:]))
++
++	require.NoError(t, tree.Decode(newRoot))
++	got, err = tree.FindEntry("dir/sub/new")
++	require.NoError(t, err)
++	assert.Equal(t, 0, bytes.Compare(newFileHash, got.Hash[:]))
++}
++
++func TestTreeFindEntryDuplicates(t *testing.T) {
++	t.Parallel()
++
++	hashA := bytes.Repeat([]byte{0xAA}, 20)
++	hashB := bytes.Repeat([]byte{0xBB}, 20)
++	hashC := bytes.Repeat([]byte{0xCC}, 20)
++
++	cases := []struct {
++		name      string
++		body      []byte
++		lookup    string
++		wantHash  []byte
++		wantMode  filemode.FileMode
++		wantCount int
++	}{
++		{
++			name: "two regular files with same name",
++			body: encodeRawTreeEntries(
++				rawTreeEntry{"100644", "foo", hashA},
++				rawTreeEntry{"100644", "foo", hashB},
++			),
++			lookup:    "foo",
++			wantHash:  hashA,
++			wantMode:  filemode.Regular,
++			wantCount: 2,
++		},
++		{
++			name: "triplicate regular file",
++			body: encodeRawTreeEntries(
++				rawTreeEntry{"100644", "foo", hashA},
++				rawTreeEntry{"100644", "foo", hashB},
++				rawTreeEntry{"100644", "foo", hashC},
++			),
++			lookup:    "foo",
++			wantHash:  hashA,
++			wantMode:  filemode.Regular,
++			wantCount: 3,
++		},
++		{
++			name: "file shadows later directory of same name",
++			body: encodeRawTreeEntries(
++				rawTreeEntry{"100644", "foo", hashA},
++				rawTreeEntry{"40000", "foo", hashB},
++			),
++			lookup:    "foo",
++			wantHash:  hashA,
++			wantMode:  filemode.Regular,
++			wantCount: 2,
++		},
++		{
++			name: "directory shadows later file of same name",
++			body: encodeRawTreeEntries(
++				rawTreeEntry{"40000", "foo", hashA},
++				rawTreeEntry{"100644", "foo", hashB},
++			),
++			lookup:    "foo",
++			wantHash:  hashA,
++			wantMode:  filemode.Dir,
++			wantCount: 2,
++		},
++		{
++			name: "duplicate is not first entry",
++			body: encodeRawTreeEntries(
++				rawTreeEntry{"100644", "bar", hashC},
++				rawTreeEntry{"100644", "foo", hashA},
++				rawTreeEntry{"100644", "foo", hashB},
++			),
++			lookup:    "foo",
++			wantHash:  hashA,
++			wantMode:  filemode.Regular,
++			wantCount: 3,
++		},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			t.Parallel()
++
++			obj := &plumbing.MemoryObject{}
++			obj.SetType(plumbing.TreeObject)
++			w, err := obj.Writer()
++			require.NoError(t, err)
++			_, err = w.Write(tc.body)
++			require.NoError(t, err)
++			require.NoError(t, w.Close())
++
++			var tree Tree
++			require.NoError(t, tree.Decode(obj))
++			require.Len(t, tree.Entries, tc.wantCount,
++				"all duplicate entries must be preserved in storage order")
++
++			got, err := tree.FindEntry(tc.lookup)
++			require.NoError(t, err)
++			assert.Equal(t, tc.wantMode, got.Mode)
++			assert.Equal(t, 0, bytes.Compare(tc.wantHash, got.Hash[:]),
++				"FindEntry must return the first matching entry; got %s want %x",
++				got.Hash, tc.wantHash)
++		})
++	}
++}
++
++func TestTreeFindEntryStopsAtUnsortedEntryPastName(t *testing.T) {
++	t.Parallel()
++
++	hashA := bytes.Repeat([]byte{0xAA}, 20)
++	hashB := bytes.Repeat([]byte{0xBB}, 20)
++	body := encodeRawTreeEntries(
++		rawTreeEntry{"100644", "z", hashA},
++		rawTreeEntry{"100644", "foo", hashB},
++	)
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.TreeObject)
++	w, err := obj.Writer()
++	require.NoError(t, err)
++	_, err = w.Write(body)
++	require.NoError(t, err)
++	require.NoError(t, w.Close())
++
++	var tree Tree
++	require.NoError(t, tree.Decode(obj))
++
++	got, err := tree.FindEntry("foo")
++	require.ErrorIs(t, err, ErrEntryNotFound)
++	assert.Nil(t, got)
++}
++
++func TestTreeFindEntryFindsDirectoryAfterLexicallyEarlierFile(t *testing.T) {
++	t.Parallel()
++
++	hashA := bytes.Repeat([]byte{0xAA}, 20)
++	hashB := bytes.Repeat([]byte{0xBB}, 20)
++	body := encodeRawTreeEntries(
++		rawTreeEntry{"100644", "foo.bar", hashA},
++		rawTreeEntry{"40000", "foo", hashB},
++	)
++
++	obj := &plumbing.MemoryObject{}
++	obj.SetType(plumbing.TreeObject)
++	w, err := obj.Writer()
++	require.NoError(t, err)
++	_, err = w.Write(body)
++	require.NoError(t, err)
++	require.NoError(t, w.Close())
++
++	var tree Tree
++	require.NoError(t, tree.Decode(obj))
++
++	got, err := tree.FindEntry("foo")
++	require.NoError(t, err)
++	assert.Equal(t, filemode.Dir, got.Mode)
++	assert.Equal(t, 0, bytes.Compare(hashB, got.Hash[:]))
++}
++
++func TestTreeEncodePreservesDuplicateEntries(t *testing.T) {
++	t.Parallel()
++
++	hashABytes := bytes.Repeat([]byte{0xAA}, 20)
++	hashBBytes := bytes.Repeat([]byte{0xBB}, 20)
++	var hashA, hashB plumbing.Hash
++	copy(hashA[:], hashABytes)
++	copy(hashB[:], hashBBytes)
++
++	tree := &Tree{
++		Entries: []TreeEntry{
++			{Name: "foo", Mode: filemode.Regular, Hash: hashA},
++			{Name: "foo", Mode: filemode.Regular, Hash: hashB},
++		},
++	}
++
++	obj := &plumbing.MemoryObject{}
++	require.NoError(t, tree.Encode(obj))
++
++	r, err := obj.Reader()
++	require.NoError(t, err)
++	got, err := io.ReadAll(r)
++	require.NoError(t, err)
++	require.NoError(t, r.Close())
++
++	var want bytes.Buffer
++	want.WriteString("100644 foo")
++	want.WriteByte(0)
++	want.Write(hashABytes)
++	want.WriteString("100644 foo")
++	want.WriteByte(0)
++	want.Write(hashBBytes)
++	assert.Equal(t, want.Bytes(), got)
++}
+
+--- a/worktree.go
++++ b/worktree.go
+@@ -683,6 +683,10 @@
+ 			return err
+ 		}
+ 
++		if err := w.clearBlockingSymlinks(name); err != nil {
++			return err
++		}
++
+ 		if err := w.Filesystem.MkdirAll(name, mode); err != nil {
+ 			return err
+ 		}
+@@ -705,6 +709,10 @@
+ 
+ 		// to apply perm changes the file is deleted, billy doesn't implement
+ 		// chmod
++		if err := validNoLeadingSymlink(w.Filesystem, name); err != nil {
++			return err
++		}
++
+ 		if err := w.Filesystem.Remove(name); err != nil {
+ 			return err
+ 		}
+@@ -726,7 +734,99 @@
+ 	return nil
+ }
+ 
++// validNoLeadingSymlink rejects paths whose leading directory components
++// resolve through a symlink that already exists on the filesystem. validPath
++// guards the path string, this guards the on-disk state, so a write or a
++// delete cannot reach outside the worktree by traversing a symlink that a
++// tree or an earlier step left in place.
++//
++// A missing component is skipped, as it is created as a real directory by
++// the checkout. Any other Lstat error means we cannot prove the component
++// is not a symlink, so it fails closed.
++//
++// Mirrors upstream Git's has_symlink_leading_path (symlinks.c).
++func validNoLeadingSymlink(fs billy.Filesystem, paths ...string) error {
++	for _, p := range paths {
++		for dir := filepath.Dir(p); dir != "." && dir != "" && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
++			fi, err := fs.Lstat(dir)
++			if err != nil {
++				if os.IsNotExist(err) {
++					continue
++				}
++				return fmt.Errorf("invalid path %q: cannot stat leading component %q: %w", p, dir, err)
++			}
++			if fi.Mode()&os.ModeSymlink != 0 {
++				return fmt.Errorf("invalid path %q: leading component %q is a symlink", p, dir)
++			}
++		}
++	}
++	return nil
++}
++
++// clearBlockingSymlinks removes a symlink that is in the way of
++// materialising name, so the checkout writes a real entry in its place
++// instead of following the link out of the worktree. Two cases:
++//
++//   - a leading directory component that is a symlink (e.g. "s" while
++//     writing "s/config", where "s" links to ".git"): OpenFile/MkdirAll
++//     would traverse it, so the write would land under the link's target.
++//   - the final component itself being a symlink (e.g. writing "s" while
++//     "s" links to ".git/config"): OpenFile with O_TRUNC, or Symlink,
++//     would follow/replace through it and clobber the target.
++//
++// A symlink can never be a legitimate parent of, or the destination for,
++// a tracked entry, so removing it is always correct. This mirrors upstream
++// Git's forced checkout, which unlinks a blocking symlink in the leading
++// path (create_directories) and unlinks an existing entry before
++// write_entry.
++// https://github.com/git/git/blob/v2.54.0/entry.c#L50
++func (w *Worktree) clearBlockingSymlinks(name string) error {
++	var dirs []string
++	for dir := filepath.Dir(name); dir != "." && dir != "" && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
++		dirs = append(dirs, dir)
++	}
++	// Leading components, shallowest-first: removing the shallowest symlink
++	// invalidates every component beneath it, so a single removal is enough.
++	for i := len(dirs) - 1; i >= 0; i-- {
++		fi, err := w.Filesystem.Lstat(dirs[i])
++		if err != nil {
++			// A missing component is created as a real directory by the
++			// checkout. Any other error means we cannot tell whether it is
++			// a symlink, so surface it instead of leaving a blocking link in
++			// place and failing later in a harder-to-diagnose way.
++			if os.IsNotExist(err) {
++				continue
++			}
++			return err
++		}
++		if fi.Mode()&os.ModeSymlink != 0 {
++			return w.Filesystem.Remove(dirs[i])
++		}
++	}
++	// Final component: an existing symlink here would be followed by the
++	// subsequent OpenFile/Symlink/MkdirAll, so replace it.
++	fi, err := w.Filesystem.Lstat(name)
++	if err != nil {
++		if os.IsNotExist(err) {
++			return nil
++		}
++		return err
++	}
++	if fi.Mode()&os.ModeSymlink != 0 {
++		return w.Filesystem.Remove(name)
++	}
++	return nil
++}
++
+ func (w *Worktree) checkoutFile(f *object.File) (err error) {
++	// checkoutFile is the materialisation boundary for tracked entries.
++	// Remove any blocking symlink first so the subsequent OpenFile or
++	// Symlink call writes the entry itself instead of following a planted
++	// link in the underlying filesystem.
++	if err := w.clearBlockingSymlinks(f.Name); err != nil {
++		return err
++	}
++
+ 	mode, err := f.Mode.ToOSFileMode()
+ 	if err != nil {
+ 		return
+@@ -1124,6 +1224,10 @@
+ // will walk up the directory tree removing all encountered empty
+ // directories, not just the one containing this file
+ func rmFileAndDirsIfEmpty(fs billy.Filesystem, name string) error {
++	if err := validNoLeadingSymlink(fs, name); err != nil {
++		return err
++	}
++
+ 	if err := util.RemoveAll(fs, name); err != nil {
+ 		return err
+ 	}
+--- /dev/null
++++ b/worktree_symlink_test.go
+@@ -0,0 +1,156 @@
++package git
++
++import (
++	"os"
++	"path/filepath"
++	"runtime"
++	"testing"
++
++	"github.com/go-git/go-git/v5/plumbing/object"
++	"github.com/stretchr/testify/assert"
++)
++
++// symlinkTestRepo creates a repository on the OS filesystem with a single
++// commit that tracks the given files. It returns the worktree, the commit,
++// and the path of a directory living outside of the worktree.
++func symlinkTestRepo(t *testing.T, files map[string]string) (*Worktree, *object.Commit, string, string) {
++	t.Helper()
++
++	if runtime.GOOS == "windows" {
++		t.Skip("symlinks are not reliably available on windows")
++	}
++
++	base := t.TempDir()
++	root := filepath.Join(base, "wt")
++	outside := filepath.Join(base, "outside")
++	if err := os.MkdirAll(outside, 0o755); err != nil {
++		t.Fatal(err)
++	}
++
++	r, err := PlainInit(root, false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	w, err := r.Worktree()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	for name, content := range files {
++		p := filepath.Join(root, filepath.FromSlash(name))
++		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
++			t.Fatal(err)
++		}
++		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
++			t.Fatal(err)
++		}
++		if _, err := w.Add(name); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	h, err := w.Commit("tracked files", defaultTestCommitOptions())
++	if err != nil {
++		t.Fatal(err)
++	}
++	c, err := r.CommitObject(h)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	return w, c, root, outside
++}
++
++func TestCheckoutFileDoesNotFollowLeadingSymlink(t *testing.T) {
++	w, c, root, outside := symlinkTestRepo(t, map[string]string{"s/config": "tracked"})
++
++	// Replace the tracked directory by a symlink pointing out of the worktree.
++	if err := os.RemoveAll(filepath.Join(root, "s")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(outside, filepath.Join(root, "s")); err != nil {
++		t.Fatal(err)
++	}
++
++	f, err := c.File("s/config")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := w.checkoutFile(f); err != nil {
++		t.Fatal(err)
++	}
++
++	_, err = os.Lstat(filepath.Join(outside, "config"))
++	assert.True(t, os.IsNotExist(err), "checkout wrote through a symlink outside of the worktree")
++
++	fi, err := os.Lstat(filepath.Join(root, "s"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	assert.True(t, fi.IsDir(), "blocking symlink should have been replaced by a directory")
++
++	got, err := os.ReadFile(filepath.Join(root, "s", "config"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	assert.Equal(t, "tracked", string(got))
++}
++
++func TestCheckoutFileDoesNotFollowFinalSymlink(t *testing.T) {
++	w, c, root, outside := symlinkTestRepo(t, map[string]string{"f": "tracked"})
++
++	victim := filepath.Join(outside, "victim")
++	if err := os.WriteFile(victim, []byte("original"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	// Replace the tracked file by a symlink pointing to a file outside.
++	if err := os.Remove(filepath.Join(root, "f")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(victim, filepath.Join(root, "f")); err != nil {
++		t.Fatal(err)
++	}
++
++	f, err := c.File("f")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err := w.checkoutFile(f); err != nil {
++		t.Fatal(err)
++	}
++
++	got, err := os.ReadFile(victim)
++	if err != nil {
++		t.Fatal(err)
++	}
++	assert.Equal(t, "original", string(got), "checkout clobbered a file outside of the worktree")
++
++	fi, err := os.Lstat(filepath.Join(root, "f"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	assert.True(t, fi.Mode().IsRegular(), "blocking symlink should have been replaced by a regular file")
++}
++
++func TestRemoveDoesNotFollowLeadingSymlink(t *testing.T) {
++	w, _, root, outside := symlinkTestRepo(t, map[string]string{"s/config": "tracked"})
++
++	victim := filepath.Join(outside, "victim")
++	if err := os.WriteFile(victim, []byte("original"), 0o644); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := os.RemoveAll(filepath.Join(root, "s")); err != nil {
++		t.Fatal(err)
++	}
++	if err := os.Symlink(outside, filepath.Join(root, "s")); err != nil {
++		t.Fatal(err)
++	}
++
++	err := rmFileAndDirsIfEmpty(w.Filesystem, "s/victim")
++	assert.Error(t, err)
++
++	_, err = os.Stat(victim)
++	assert.NoError(t, err, "delete followed a symlink outside of the worktree")
++}
