@@ -8,6 +8,7 @@ unknown
 - GHSA-47qp-hqvx-6r3f
 - CVE-2026-56740
 - CVE-2026-77422
+- CVE-2026-56741
 
 ## How to Apply:
 1. Clone or download the source code for org.jline:jline-parent
