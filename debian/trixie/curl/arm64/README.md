@@ -1,6 +1,6 @@
-# curl : 8.14.1-2+deb13u5.aikido.21
+# curl : 8.14.1-2+deb13u5.aikido.22
 
-This patch is based on curl version 8.14.1-2+deb13u5.aikido.21, which is available at:
+This patch is based on curl version 8.14.1-2+deb13u5.aikido.22, which is available at:
 https://sources.debian.org/src/curl/8.14.1-2+deb13u5/
 
 ## Affected CVEs:
