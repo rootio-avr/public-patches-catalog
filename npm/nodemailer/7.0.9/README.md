@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-14874
+- CVE-2026-82659
 - GHSA-vvjj-xcjg-gr5g
 - GHSA-p6gq-j5cr-w38f
 - GHSA-wqvq-jvpq-h66f
