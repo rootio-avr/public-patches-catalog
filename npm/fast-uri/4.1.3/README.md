@@ -4,6 +4,7 @@ This patch is based on fast-uri version 4.1.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-84292
 - CVE-2026-84394
 
 ## How to Apply:
