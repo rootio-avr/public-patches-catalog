@@ -9,6 +9,7 @@ unknown
 - CVE-2026-14257
 - CVE-2026-33750
 - CVE-2026-69152
+- CVE-2026-102276
 
 ## How to Apply:
 1. Clone or download the source code for brace-expansion
