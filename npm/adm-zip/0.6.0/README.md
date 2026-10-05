@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-77301
+- GHSA-8238-w5pm-2374
 - CVE-2026-102282
 - GHSA-rcw4-f5rp-g42v
 
