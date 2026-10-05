@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2025-9910
+- CVE-2026-8657
 
 ## How to Apply:
 1. Clone or download the source code for jsondiffpatch
