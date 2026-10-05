@@ -8,6 +8,7 @@ unknown
 - CVE-2026-26280
 - CVE-2026-26318
 - CVE-2026-44724
+- CVE-2026-50289
 
 ## How to Apply:
 1. Clone or download the source code for systeminformation
