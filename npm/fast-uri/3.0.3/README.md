@@ -9,6 +9,7 @@ unknown
 - CVE-2026-13676
 - CVE-2026-16221
 - CVE-2026-18446
+- CVE-2026-75975
 
 ## How to Apply:
 1. Clone or download the source code for fast-uri
