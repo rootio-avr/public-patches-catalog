@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-29180
+- CVE-2026-76844
+- GHSA-p3f5-w63m-mxph
 
 ## How to Apply:
 1. Clone or download the source code for webpack-dev-middleware
