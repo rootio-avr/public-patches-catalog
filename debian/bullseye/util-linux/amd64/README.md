@@ -1,6 +1,6 @@
-# util-linux : 2.36.1-8+deb11u2.aikido.9
+# util-linux : 2.36.1-8+deb11u2.aikido.10
 
-This patch is based on util-linux version 2.36.1-8+deb11u2.aikido.9, which is available at:
+This patch is based on util-linux version 2.36.1-8+deb11u2.aikido.10, which is available at:
 https://sources.debian.org/src/util-linux/2.36.1-8+deb11u2/
 
 ## Affected CVEs:
