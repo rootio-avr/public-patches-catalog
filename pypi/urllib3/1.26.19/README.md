@@ -10,6 +10,7 @@ unknown
 - CVE-2025-66471
 - CVE-2026-21441
 - CVE-2026-44431
+- CVE-2026-97689
 
 ## How to Apply:
 1. Clone or download the source code for urllib3
