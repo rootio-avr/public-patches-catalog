@@ -14,6 +14,7 @@ unknown
 - AIKIDO-2026-11158
 - CVE-2024-22259
 - CVE-2024-22262
+- CVE-2026-41850
 
 ## How to Apply:
 1. Clone or download the source code for org.springframework:spring
