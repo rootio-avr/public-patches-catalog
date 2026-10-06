@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-53486
+- CVE-2026-101894
 
 ## How to Apply:
 1. Clone or download the source code for decompress
