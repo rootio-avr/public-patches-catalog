@@ -560,3 +560,285 @@
              try:
                  retries = retries.increment(method, url, response=response, _pool=self)
              except MaxRetryError:
+
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -408,6 +408,16 @@
+             self.proxy_config.ssl_context if proxy_is_forwarding else None
+         )
+ 
++        # The destination's TLS identity settings (SNI override, hostname and
++        # fingerprint assertions, client certificate) describe the destination
++        # server only. They must not be applied to a handshake with the proxy.
++        assert_hostname_ = self.assert_hostname
++        assert_fingerprint_ = self.assert_fingerprint
++        if proxy_is_forwarding:
++            server_hostname = hostname
++            assert_hostname_ = None
++            assert_fingerprint_ = None
++
+         # Wrap socket using verification with the root certs in
+         # trusted_root_certs
+         default_ssl_context = False
+@@ -437,9 +447,15 @@
+             ca_certs = self.ca_certs
+             ca_cert_dir = self.ca_cert_dir
+             ca_cert_data = self.ca_cert_data
+-            key_file = self.key_file
+-            cert_file = self.cert_file
+-            key_password = self.key_password
++            if proxy_is_forwarding:
++                # Never present the destination's client certificate to the proxy.
++                key_file = None
++                cert_file = None
++                key_password = None
++            else:
++                key_file = self.key_file
++                cert_file = self.cert_file
++                key_password = self.key_password
+ 
+         # Try to load OS default certs if none are given.
+         # Works well on Windows (requires Python3.4+)
+@@ -482,14 +498,14 @@
+                 DeprecationWarning,
+             )
+ 
+-        if self.assert_fingerprint:
++        if assert_fingerprint_:
+             assert_fingerprint(
+-                self.sock.getpeercert(binary_form=True), self.assert_fingerprint
++                self.sock.getpeercert(binary_form=True), assert_fingerprint_
+             )
+         elif (
+             context.verify_mode != ssl.CERT_NONE
+             and not getattr(context, "check_hostname", False)
+-            and self.assert_hostname is not False
++            and assert_hostname_ is not False
+         ):
+             # While urllib3 attempts to always turn off hostname matching from
+             # the TLS library, this cannot always be done. So we check whether
+@@ -505,11 +521,11 @@
+                     ),
+                     SubjectAltNameWarning,
+                 )
+-            _match_hostname(cert, self.assert_hostname or server_hostname)
++            _match_hostname(cert, assert_hostname_ or server_hostname)
+ 
+         verified = (
+             context.verify_mode == ssl.CERT_REQUIRED
+-            or self.assert_fingerprint is not None
++            or assert_fingerprint_ is not None
+         )
+ 
+         if proxy_is_forwarding:
+--- /dev/null
++++ b/test/test_cve_2026_97687.py
+@@ -0,0 +1,78 @@
++"""Regression test for CVE-2026-97687.
++
++The TLS handshake with an HTTPS forwarding proxy must not use the
++destination server's TLS identity settings (SNI override, assert_hostname,
++assert_fingerprint, client certificate).
++"""
++import ssl
++
++import pytest
++
++import urllib3.connection as connection_module
++from urllib3.poolmanager import ProxyManager
++
++
++class _FakeTLSSocket(object):
++    def version(self):
++        return "TLSv1.3"
++
++    def getpeercert(self, binary_form=False):
++        return {"subjectAltName": (("DNS", "proxy.invalid"),)}
++
++    def selected_alpn_protocol(self):
++        return None
++
++
++def _connect(monkeypatch, **pool_kw):
++    calls = []
++
++    def recording_wrapper(*args, **kwargs):
++        calls.append(kwargs)
++        return _FakeTLSSocket()
++
++    monkeypatch.setattr(connection_module, "ssl_wrap_socket", recording_wrapper)
++
++    proxy_context = ssl.create_default_context()
++    proxy_context.check_hostname = False
++    manager = ProxyManager(
++        "https://proxy.invalid:443",
++        proxy_ssl_context=proxy_context,
++        use_forwarding_for_https=True,
++        **pool_kw
++    )
++    pool = manager.connection_from_url("https://target.invalid:443")
++    conn = pool._new_conn()
++    monkeypatch.setattr(conn, "_new_conn", lambda: object())
++    conn.connect()
++    return conn, calls, proxy_context
++
++
++def test_target_sni_not_sent_to_proxy(monkeypatch):
++    conn, calls, _ = _connect(monkeypatch, server_hostname="target.invalid")
++    assert len(calls) == 1
++    assert calls[0]["server_hostname"] == "proxy.invalid"
++
++
++def test_target_assert_fingerprint_not_applied_to_proxy(monkeypatch):
++    # A bogus fingerprint would raise if applied to the proxy handshake.
++    conn, calls, _ = _connect(monkeypatch, assert_fingerprint="aa" * 20)
++    assert len(calls) == 1
++    assert conn.proxy_is_verified is True
++
++
++def test_target_assert_hostname_not_applied_to_proxy(monkeypatch):
++    conn, calls, _ = _connect(monkeypatch, assert_hostname="target.invalid")
++    assert len(calls) == 1
++    assert conn.proxy_is_verified is True
++
++
++def test_target_client_cert_not_sent_to_proxy(monkeypatch):
++    conn, calls, _ = _connect(
++        monkeypatch, cert_file="/nonexistent/c.pem", key_file="/nonexistent/k.pem"
++    )
++    assert calls[0]["certfile"] is None
++    assert calls[0]["keyfile"] is None
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__, "-v"]))
+
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -37,7 +37,13 @@
+ 
+ log = logging.getLogger(__name__)
+ 
++# Maximum length of a chunk-size line (and the trailing CRLF line) when reading a
++# chunked-transfer-encoded response. Matches ``http.client._MAXLINE`` so the
++# streaming path bounds these reads like the stdlib ``.read()`` path does,
++# preventing memory exhaustion via an unterminated chunk-size line.
++_MAX_CHUNK_LINE_LENGTH = 2 ** 16
+ 
++
+ class DeflateDecoder(object):
+     def __init__(self):
+         self._first_try = True
+@@ -856,7 +862,12 @@
+         # we'll try to read it from socket.
+         if self.chunk_left is not None:
+             return
+-        line = self._fp.fp.readline()
++        line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)
++        if len(line) > _MAX_CHUNK_LINE_LENGTH:
++            self.close()
++            raise ProtocolError(
++                "Response chunk size line exceeded maximum allowed length"
++            )
+         line = line.split(b";", 1)[0]
+         try:
+             self.chunk_left = int(line, 16)
+@@ -946,7 +957,11 @@
+ 
+             # Chunk content ends with \r\n: discard it.
+             while True:
+-                line = self._fp.fp.readline()
++                line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)
++                if len(line) > _MAX_CHUNK_LINE_LENGTH:
++                    raise ProtocolError(
++                        "Response chunk trailer line exceeded maximum allowed length"
++                    )
+                 if not line:
+                     # Some sites may not end with '\r\n'.
+                     break
+--- /dev/null
++++ b/test/test_cve_2026_97689.py
+@@ -0,0 +1,83 @@
++"""Regression test for CVE-2026-97689.
++
++The streaming chunked path (``read_chunked()`` / ``stream()``) used an unbounded
++``readline()`` for the chunk-size line and the trailing CRLF line, so a
++malicious server could force unbounded buffering. These reads are now capped at
++``_MAX_CHUNK_LINE_LENGTH`` and raise ``ProtocolError`` when exceeded.
++"""
++import pytest
++
++from urllib3.exceptions import ProtocolError
++from urllib3.packages.six.moves import http_client as httplib
++from urllib3.response import _MAX_CHUNK_LINE_LENGTH, HTTPResponse
++
++
++class _Sock(object):
++    @staticmethod
++    def makefile(*args, **kwargs):
++        return
++
++
++class _LineFp(object):
++    """File-like object whose readline() honours a size limit."""
++
++    def __init__(self, data):
++        self.data = data
++        self.pos = 0
++        self.max_requested = []
++
++    def readline(self, size=-1):
++        self.max_requested.append(size)
++        end = self.data.find(b"\n", self.pos)
++        end = len(self.data) if end == -1 else end + 1
++        if size is not None and size >= 0:
++            end = min(end, self.pos + size)
++        line = self.data[self.pos : end]
++        self.pos = end
++        return line
++
++    def read(self, amt=-1):
++        if amt is None or amt < 0:
++            amt = len(self.data)
++        chunk = self.data[self.pos : self.pos + amt]
++        self.pos += len(chunk)
++        return chunk
++
++    def close(self):
++        pass
++
++    def flush(self):
++        pass
++
++
++def _make_response(data):
++    fp = _LineFp(data)
++    r = httplib.HTTPResponse(_Sock)
++    r.fp = fp
++    r.chunked = True
++    r.chunk_left = None
++    resp = HTTPResponse(
++        r, preload_content=False, headers={"transfer-encoding": "chunked"}
++    )
++    return resp, fp
++
++
++class TestChunkLineLimit(object):
++    def test_oversized_chunk_size_line_rejected(self):
++        resp, fp = _make_response(b"A" * (_MAX_CHUNK_LINE_LENGTH * 4))
++        with pytest.raises(ProtocolError):
++            list(resp.read_chunked())
++        # Never buffered more than the limit (+1 sentinel byte) in one read.
++        assert max(fp.max_requested) == _MAX_CHUNK_LINE_LENGTH + 1
++        assert fp.pos <= _MAX_CHUNK_LINE_LENGTH + 1
++
++    def test_oversized_trailer_line_rejected(self):
++        data = b"3\r\nfoo\r\n0\r\n" + b"B" * (_MAX_CHUNK_LINE_LENGTH * 4)
++        resp, _ = _make_response(data)
++        with pytest.raises(ProtocolError):
++            list(resp.read_chunked())
++
++    def test_normal_chunked_response_still_works(self):
++        data = b"3\r\nfoo\r\n3;ext=1\r\nbar\r\n0\r\n\r\n"
++        resp, _ = _make_response(data)
++        assert b"".join(resp.read_chunked()) == b"foobar"
