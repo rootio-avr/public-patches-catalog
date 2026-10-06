@@ -1,10 +1,12 @@
-# libxfont : 1:2.0.4-1.aikido.1
+# libxfont : 1:2.0.4-1.aikido.2
 
-This patch is based on libxfont version 1:2.0.4-1.aikido.1, which is available at:
+This patch is based on libxfont version 1:2.0.4-1.aikido.2, which is available at:
 https://sources.debian.org/src/libxfont/1:2.0.4-1/
 
 ## Affected CVEs:
 - CVE-2026-56001
+- CVE-2026-56002
+- CVE-2026-56003
 
 ## How to Apply:
 1. Obtain the source package: `apt source libxfont`
