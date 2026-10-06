@@ -1,6 +1,6 @@
-# xorg-server : 2:1.20.11-1+deb11u13.aikido.11
+# xorg-server : 2:1.20.11-1+deb11u13.aikido.12
 
-This patch is based on xorg-server version 2:1.20.11-1+deb11u13.aikido.11, which is available at:
+This patch is based on xorg-server version 2:1.20.11-1+deb11u13.aikido.12, which is available at:
 https://sources.debian.org/src/xorg-server/2:1.20.11-1+deb11u17/
 
 ## Affected CVEs:
@@ -18,6 +18,7 @@ https://sources.debian.org/src/xorg-server/2:1.20.11-1+deb11u17/
 - CVE-2026-50258
 - CVE-2026-50261
 - CVE-2026-55999
+- CVE-2026-56000
 
 ## How to Apply:
 1. Obtain the source package: `apt source xorg-server`
