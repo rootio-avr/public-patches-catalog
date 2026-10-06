@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-2x7j-588g-ccc2
+- GHSA-v53p-9fqp-m79j
 
 ## How to Apply:
 1. Clone or download the source code for nodemailer
