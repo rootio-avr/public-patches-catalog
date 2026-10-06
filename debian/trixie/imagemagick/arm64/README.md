@@ -1,9 +1,10 @@
-# imagemagick : 8:7.1.1.43+dfsg1-1+deb13u12.aikido.40
+# imagemagick : 8:7.1.1.43+dfsg1-1+deb13u12.aikido.41
 
-This patch is based on imagemagick version 8:7.1.1.43+dfsg1-1+deb13u12.aikido.40, which is available at:
+This patch is based on imagemagick version 8:7.1.1.43+dfsg1-1+deb13u12.aikido.41, which is available at:
 https://sources.debian.org/src/imagemagick/8:7.1.1.43+dfsg1-1+deb13u12/
 
 ## Affected CVEs:
+- CVE-2018-15607
 - CVE-2023-34152
 - CVE-2025-55160
 - CVE-2026-62343
