@@ -1,6 +1,6 @@
-# gnupg2 : 2.4.7-21+deb13u1.aikido.10
+# gnupg2 : 2.4.7-21+deb13u1.aikido.11
 
-This patch is based on gnupg2 version 2.4.7-21+deb13u1.aikido.10, which is available at:
+This patch is based on gnupg2 version 2.4.7-21+deb13u1.aikido.11, which is available at:
 https://sources.debian.org/src/gnupg2/2.4.7-21+deb13u1/
 
 ## Affected CVEs:
