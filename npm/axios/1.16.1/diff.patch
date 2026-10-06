@@ -1739,3 +1739,676 @@ index 0000000..ab1ed91
            let bytesSent = 0;
            uploadStream = stream.pipeline(
              [
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -141,6 +141,7 @@
+ 
+   getSession(authority, options) {
+     options = Object.assign(
++      Object.create(null),
+       {
+         sessionTimeout: 1000,
+       },
+@@ -226,6 +227,7 @@
+     }
+ 
+     session.once('close', removeSession);
++    session.once('error', removeSession);
+ 
+     let entry = [session, options];
+ 
+@@ -262,12 +264,20 @@
+  * @param {http.ClientRequestArgs} options
+  * @param {AxiosProxyConfig} configProxy configuration from Axios options object
+  * @param {string} location
++ * @param {boolean} [allowEnvProxy=true] whether environment proxy configuration can be used
+  *
+- * @returns {http.ClientRequestArgs}
++ * @returns {boolean} whether a proxy applies to the selected transport
+  */
+-function setProxy(options, configProxy, location, isRedirect, configHttpsAgent) {
++function setProxy(
++  options,
++  configProxy,
++  location,
++  isRedirect,
++  configHttpsAgent,
++  allowEnvProxy = true
++) {
+   let proxy = configProxy;
+-  if (!proxy && proxy !== false) {
++  if (!proxy && proxy !== false && allowEnvProxy) {
+     const proxyUrl = getProxyForUrl(location);
+     if (proxyUrl) {
+       if (!shouldBypassProxy(location)) {
+@@ -418,8 +428,17 @@
+   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
+     // Configure proxy for redirected request, passing the original config proxy to apply
+     // the exact same logic as if the redirected request was performed by axios directly.
+-    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent);
++    setProxy(
++      redirectOptions,
++      configProxy,
++      redirectOptions.href,
++      true,
++      configHttpsAgent,
++      allowEnvProxy
++    );
+   };
++
++  return Boolean(proxy);
+ }
+ 
+ const isHttpAdapterSupported =
+@@ -465,6 +484,37 @@
+ const buildAddressEntry = (address, family) =>
+   resolveFamily(utils.isObject(address) ? address : { address, family });
+ 
++const normalizedLookupCache = new WeakMap();
++
++const normalizeLookup = (lookup) => {
++  let normalized = normalizedLookupCache.get(lookup);
++
++  if (normalized) {
++    return normalized;
++  }
++
++  const callbackLookup = callbackify(lookup, (value) => (utils.isArray(value) ? value : [value]));
++
++  // Support opt.all, which is required by current Node.js releases.
++  normalized = (hostname, opt, cb) => {
++    callbackLookup(hostname, opt, (err, arg0, arg1) => {
++      if (err) {
++        return cb(err);
++      }
++
++      const addresses = utils.isArray(arg0)
++        ? arg0.map((addr) => buildAddressEntry(addr))
++        : [buildAddressEntry(arg0, arg1)];
++
++      opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
++    });
++  };
++
++  normalizedLookupCache.set(lookup, normalized);
++
++  return normalized;
++};
++
+ const http2Transport = {
+   request(options, cb) {
+     const authority =
+@@ -557,21 +607,7 @@
+       const isHttp2 = httpVersion === 2;
+ 
+       if (lookup) {
+-        const _lookup = callbackify(lookup, (value) => (utils.isArray(value) ? value : [value]));
+-        // hotfix to support opt.all option which is required for node 20.x
+-        lookup = (hostname, opt, cb) => {
+-          _lookup(hostname, opt, (err, arg0, arg1) => {
+-            if (err) {
+-              return cb(err);
+-            }
+-
+-            const addresses = utils.isArray(arg0)
+-              ? arg0.map((addr) => buildAddressEntry(addr))
+-              : [buildAddressEntry(arg0, arg1)];
+-
+-            opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
+-          });
+-        };
++        lookup = normalizeLookup(lookup);
+       }
+ 
+       const abortEmitter = new EventEmitter();
+@@ -879,6 +915,10 @@
+         false
+       );
+ 
++      if (isHttp2 && lookup) {
++        http2Options = Object.assign(Object.create(null), http2Options, { lookup });
++      }
++
+       // Null-prototype to block prototype pollution gadgets on properties read
+       // directly by Node's http.request (e.g. insecureHTTPParser, lookup).
+       const options = Object.assign(Object.create(null), {
+@@ -892,11 +932,14 @@
+         beforeRedirect: dispatchBeforeRedirect,
+         beforeRedirects: Object.create(null),
+         http2Options,
++        createConnection: undefined,
+       });
+ 
+       // cacheable-lookup integration hotfix
+       !utils.isUndefined(lookup) && (options.lookup = lookup);
+ 
++      let proxyApplied = false;
++
+       if (config.socketPath) {
+         if (typeof config.socketPath !== 'string') {
+           return reject(
+@@ -931,12 +974,16 @@
+           ? parsed.hostname.slice(1, -1)
+           : parsed.hostname;
+         options.port = parsed.port;
+-        setProxy(
++        proxyApplied = setProxy(
+           options,
+           own('proxy'),
+           protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path,
+           false,
+-          own('httpsAgent')
++          own('httpsAgent'),
++          // The HTTP/2 transport connects independently of HTTP/1 agents, so it
++          // cannot apply environment proxies. Explicit proxy config is still
++          // processed and rejected below.
++          !isHttp2
+         );
+       }
+       let transport;
+@@ -954,6 +1001,16 @@
+       }
+ 
+       if (isHttp2) {
++        if (proxyApplied) {
++          return reject(
++            new AxiosError(
++              'HTTP/2 requests with a proxy are not supported',
++              AxiosError.ERR_NOT_SUPPORT,
++              config
++            )
++          );
++        }
++
+         transport = http2Transport;
+       } else {
+         const configTransport = own('transport');
+--- /dev/null
++++ b/tests/unit/adapters/cve-2026-101898.test.js
+@@ -0,0 +1,85 @@
++import { describe, it } from 'vitest';
++import assert from 'assert';
++import { startHTTPServer, stopHTTPServer } from '../../setup/server.js';
++import axios from '../../../index.js';
++import AxiosError from '../../../lib/core/AxiosError.js';
++
++// Regression test for CVE-2026-101898 (GHSA-3pq3-5fj3-cg6v).
++//
++// The HTTP/2 transport ignored the `lookup` option, silently picked up
++// environment proxy settings it cannot honor, and did not reject explicit
++// proxy configuration. Custom DNS resolution and proxy policy could therefore
++// be bypassed when `httpVersion: 2` was used.
++describe('CVE-2026-101898: HTTP/2 lookup and proxy handling', () => {
++  const createServer = () =>
++    startHTTPServer(
++      (req, res) => {
++        res.setHeader('Content-Type', 'application/json');
++        res.end(JSON.stringify({ ok: true }));
++      },
++      { useHTTP2: true }
++    );
++
++  it('should forward the custom lookup option to the HTTP/2 connection', async () => {
++    const server = await createServer();
++    const calls = [];
++
++    try {
++      const port = server.address().port;
++      const response = await axios.get(`https://axios-lookup-test.invalid:${port}/`, {
++        httpVersion: 2,
++        http2Options: { rejectUnauthorized: false },
++        lookup: (hostname, options, cb) => {
++          calls.push(hostname);
++          cb(null, '127.0.0.1', 4);
++        },
++      });
++
++      assert.strictEqual(response.status, 200);
++      assert.ok(calls.includes('axios-lookup-test.invalid'));
++    } finally {
++      await stopHTTPServer(server);
++    }
++  });
++
++  it('should reject HTTP/2 requests with an explicit proxy', async () => {
++    await assert.rejects(
++      axios.get('https://localhost:1/', {
++        httpVersion: 2,
++        proxy: { protocol: 'http', host: '127.0.0.1', port: 9 },
++      }),
++      (error) => {
++        assert.strictEqual(error.code, AxiosError.ERR_NOT_SUPPORT);
++        assert.match(error.message, /HTTP\/2 requests with a proxy are not supported/);
++        return true;
++      }
++    );
++  });
++
++  it('should not apply environment proxies to HTTP/2 requests', async () => {
++    const server = await createServer();
++    const keys = ['https_proxy', 'HTTPS_PROXY', 'http_proxy', 'HTTP_PROXY', 'no_proxy', 'NO_PROXY'];
++    const saved = {};
++    keys.forEach((key) => {
++      saved[key] = process.env[key];
++      delete process.env[key];
++    });
++    process.env.https_proxy = 'http://127.0.0.1:9';
++    process.env.HTTPS_PROXY = 'http://127.0.0.1:9';
++
++    try {
++      const response = await axios.get(`https://localhost:${server.address().port}/`, {
++        httpVersion: 2,
++        http2Options: { rejectUnauthorized: false },
++      });
++
++      assert.strictEqual(response.status, 200);
++    } finally {
++      keys.forEach((key) => {
++        if (saved[key] === undefined) delete process.env[key];
++        else process.env[key] = saved[key];
++      });
++      await stopHTTPServer(server);
++    }
++  });
++});
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -1388,3 +1388,4 @@ export default isHttpAdapterSupported &&
+   };
+ 
+ export const __setProxy = setProxy;
++export const __Http2Sessions = Http2Sessions;
+--- /dev/null
++++ b/tests/unit/helpers/cve-2026-101901.test.js
+@@ -0,0 +1,58 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
++import { EventEmitter } from 'events';
++import http2 from 'http2';
++import { __Http2Sessions as Http2Sessions } from '../../../lib/adapters/http.js';
++
++function createFakeSession() {
++  const session = new EventEmitter();
++  session.destroyed = false;
++  session.closed = false;
++  session.close = vi.fn(() => {
++    session.closed = true;
++    session.emit('close');
++  });
++  session.request = vi.fn(() => {
++    const stream = new EventEmitter();
++    stream.endStream = vi.fn();
++    return stream;
++  });
++  return session;
++}
++
++describe('CVE-2026-101901: Http2Sessions hardening', () => {
++  let connectSpy;
++  let pool;
++
++  beforeEach(() => {
++    connectSpy = vi.spyOn(http2, 'connect').mockImplementation(() => createFakeSession());
++    pool = new Http2Sessions();
++  });
++
++  afterEach(() => {
++    connectSpy.mockRestore();
++    delete Object.prototype.createConnection;
++  });
++
++  it('handles a session error and removes the failed session', () => {
++    const first = pool.getSession('https://example.test');
++
++    expect(() => first.emit('error', new Error('connection failed'))).not.toThrow();
++
++    const second = pool.getSession('https://example.test');
++
++    expect(second).not.toBe(first);
++    expect(connectSpy).toHaveBeenCalledTimes(2);
++  });
++
++  it('does not pass inherited Object.prototype properties to http2.connect', () => {
++    Object.prototype.createConnection = () => {
++      throw new Error('polluted');
++    };
++
++    pool.getSession('https://example.test', { sessionTimeout: 1000 });
++
++    const passed = connectSpy.mock.calls[0][1];
++    expect(Object.getPrototypeOf(passed)).toBe(null);
++    expect(passed.createConnection).toBeUndefined();
++  });
++});
+
+--- a/lib/helpers/fromDataURI.js
++++ b/lib/helpers/fromDataURI.js
+@@ -6,7 +6,7 @@
+ 
+ // RFC 2397: data:[<mediatype>][;base64],<data>
+ // mediatype = type/subtype followed by optional ;name=value parameters
+-const DATA_URL_PATTERN = /^([^,;]+\/[^,;]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
++const DATA_URL_PATTERN = /^([^,;/]+\/[^,;/]+)?((?:;[^,;=]+=[^,;]+)*)(;base64)?,([\s\S]*)$/;
+ 
+ /**
+  * Parse data uri to a Buffer or Blob
+--- a/tests/unit/fromDataURI.test.js
++++ b/tests/unit/fromDataURI.test.js
+@@ -85,4 +85,22 @@
+       fromDataURI('data:hi', false);
+     }, (err) => err.code === 'ERR_INVALID_URL');
+   });
++
++  it('should reject a media type containing more than one slash', () => {
++    assert.throws(
++      () => {
++        fromDataURI('data:text/plain/extra,hello', false);
++      },
++      (err) => err.code === 'ERR_INVALID_URL'
++    );
++  });
++
++  it('should reject a long malformed media type within the test timeout', () => {
++    assert.throws(
++      () => {
++        fromDataURI(`data:${'a/'.repeat(50000)}invalid`, false);
++      },
++      (err) => err.code === 'ERR_INVALID_URL'
++    );
++  }, 1000);
+ });
+
+--- /dev/null
++++ b/tests/unit/adapters/ghsa-m8m8-qj5v-23w3.test.js
+@@ -0,0 +1,42 @@
++import { describe, it, afterEach } from 'vitest';
++import assert from 'assert';
++import http from 'http';
++import axios from '../../../index.js';
++
++// Regression test for GHSA-m8m8-qj5v-23w3 (CVE-2026-101905):
++// the http adapter must pass `createConnection` as an own property of the
++// transport options so a polluted Object.prototype.createConnection is never
++// inherited by http.request (which would let an attacker hijack the socket).
++describe('GHSA-m8m8-qj5v-23w3: createConnection prototype pollution', () => {
++  afterEach(() => {
++    delete Object.prototype.createConnection;
++  });
++
++  it('should pass an own inert createConnection option to transports', async () => {
++    Object.prototype.createConnection = () => {
++      throw new Error('unexpected inherited createConnection');
++    };
++
++    const server = http.createServer((req, res) => res.end('ok'));
++    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
++
++    try {
++      const response = await axios.get(`http://127.0.0.1:${server.address().port}/`, {
++        transport: {
++          request(options, handleResponse) {
++            assert.strictEqual(
++              Object.prototype.hasOwnProperty.call(options, 'createConnection'),
++              true
++            );
++            assert.strictEqual(options.createConnection, undefined);
++            return http.request(options, handleResponse);
++          },
++        },
++      });
++
++      assert.strictEqual(response.data, 'ok');
++    } finally {
++      await new Promise((resolve) => server.close(resolve));
++    }
++  }, 10000);
++});
+
+--- a/lib/helpers/shouldBypassProxy.js
++++ b/lib/helpers/shouldBypassProxy.js
+@@ -1,5 +1,17 @@
+ const LOOPBACK_HOSTNAMES = new Set(['localhost', '0.0.0.0']);
+ 
++// Linear-time trailing dot trimmer. Avoids the polynomial backtracking of
++// /\.+$/ on inputs containing long runs of dots not at the end of the string.
++const trimTrailingDots = (value) => {
++  let end = value.length;
++
++  while (end && value.charCodeAt(end - 1) === 46) {
++    end--;
++  }
++
++  return end === value.length ? value : value.slice(0, end);
++};
++
+ const isIPv4Loopback = (host) => {
+   const parts = host.split('.');
+   if (parts.length !== 4) return false;
+@@ -153,7 +165,7 @@
+     hostname = hostname.slice(1, -1);
+   }
+ 
+-  return unmapIPv4MappedIPv6(hostname.replace(/\.+$/, ''));
++  return unmapIPv4MappedIPv6(trimTrailingDots(hostname));
+ };
+ 
+ export default function shouldBypassProxy(location) {
+
+--- a/lib/helpers/toFormData.js
++++ b/lib/helpers/toFormData.js
+@@ -98,28 +98,18 @@ function toFormData(obj, formData, options) {
+   // eslint-disable-next-line no-param-reassign
+   formData = formData || new (PlatformFormData || FormData)();
+ 
+-  // eslint-disable-next-line no-param-reassign
+-  options = utils.toFlatObject(
+-    options,
+-    {
+-      metaTokens: true,
+-      dots: false,
+-      indexes: false,
+-    },
+-    false,
+-    function defined(option, source) {
+-      // eslint-disable-next-line no-eq-null,eqeqeq
+-      return !utils.isUndefined(source[option]);
+-    }
+-  );
++  const option = (name, fallback) => {
++    const value = utils.getSafeProp(options, name);
++    return utils.isUndefined(value) ? fallback : value;
++  };
+ 
+-  const metaTokens = options.metaTokens;
++  const metaTokens = option('metaTokens', true);
+   // eslint-disable-next-line no-use-before-define
+-  const visitor = options.visitor || defaultVisitor;
+-  const dots = options.dots;
+-  const indexes = options.indexes;
+-  const _Blob = options.Blob || (typeof Blob !== 'undefined' && Blob);
+-  const maxDepth = options.maxDepth === undefined ? DEFAULT_FORM_DATA_MAX_DEPTH : options.maxDepth;
++  const visitor = option('visitor') || defaultVisitor;
++  const dots = option('dots', false);
++  const indexes = option('indexes', false);
++  const _Blob = option('Blob') || (typeof Blob !== 'undefined' && Blob);
++  const maxDepth = option('maxDepth', DEFAULT_FORM_DATA_MAX_DEPTH);
+   const useBlob = _Blob && utils.isSpecCompliantForm(formData);
+   const stack = [];
+ 
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -15,12 +15,65 @@ const hasOwnProperty = (
+     hasOwnProperty.call(obj, prop)
+ )(Object.prototype);
+ 
++const isUnsafeObjectKey = (prop) =>
++  typeof prop === 'string' &&
++  (prop === '__proto__' || prop === 'constructor' || prop === 'prototype');
++
++/**
++ * Determine whether an inherited object must be treated as a shared-prototype
++ * boundary. Cross-realm Object.prototype objects cannot be distinguished
++ * reliably from application-created null-prototype objects because their
++ * properties are mutable, so all inherited terminal prototypes are excluded
++ * as a fail-closed boundary. A null-prototype source still keeps its own
++ * properties, as produced by mergeConfig and other safe materialization paths.
++ *
++ * @param {*} obj The object to inspect
++ * @param {*} prototype The object's prototype
++ * @param {boolean} source Whether obj is the original traversal source
++ *
++ * @returns {boolean} True when obj is a safe prototype traversal boundary
++ */
++const isPrototypeBoundary = (obj, prototype, source) =>
++  obj === Object.prototype || (!source && prototype === null);
++
++/**
++ * Determine whether an object can retain its identity through code paths that
++ * add, replace, and remove config properties without bypassing unsafe-key
++ * filtering. Immutable objects, unsafe-key-bearing objects, and objects with
++ * accessor or restricted data properties must be materialized instead.
++ *
++ * @param {*} obj The object to inspect
++ *
++ * @returns {boolean} True when every own property is safe and fully mutable
++ */
++const isSafeAndFullyMutable = (obj) => {
++  if (!Object.isExtensible(obj)) {
++    return false;
++  }
++
++  const props = Object.getOwnPropertyNames(obj);
++
++  if (Object.getOwnPropertySymbols) {
++    props.push(...Object.getOwnPropertySymbols(obj));
++  }
++
++  return props.every((prop) => {
++    if (isUnsafeObjectKey(prop)) {
++      return false;
++    }
++
++    const descriptor = Object.getOwnPropertyDescriptor(obj, prop);
++
++    return !!descriptor && descriptor.configurable && descriptor.writable === true;
++  });
++};
++
+ /**
+- * Walk the prototype chain (excluding the shared Object.prototype) looking for
+- * an own `prop`. This distinguishes genuine own/inherited members — including
+- * class accessors and template prototypes — from members injected via
+- * Object.prototype pollution (e.g. `Object.prototype.username = '...'`), which
+- * live on Object.prototype itself and are therefore never matched.
++ * Walk the prototype chain (excluding the source realm's Object.prototype)
++ * looking for an own `prop`. This distinguishes genuine own/inherited members
++ * — including class accessors and template prototypes — from members injected
++ * via Object.prototype pollution (e.g. `Object.prototype.username = '...'`),
++ * which live on Object.prototype itself and are therefore never matched.
+  *
+  * @param {*} thing The value whose chain to inspect
+  * @param {string|symbol} prop The property key to look for
+@@ -31,16 +84,22 @@ const hasOwnInPrototypeChain = (thing, prop) => {
+   let obj = thing;
+   const seen = [];
+ 
+-  while (obj != null && obj !== Object.prototype) {
++  while (obj != null) {
+     if (seen.indexOf(obj) !== -1) {
+       return false;
+     }
+     seen.push(obj);
+ 
++    const prototype = getPrototypeOf(obj);
++
++    if (isPrototypeBoundary(obj, prototype, obj === thing)) {
++      return false;
++    }
++
+     if (hasOwnProperty(obj, prop)) {
+       return true;
+     }
+-    obj = getPrototypeOf(obj);
++    obj = prototype;
+   }
+   return false;
+ };
+@@ -59,6 +118,69 @@ const hasOwnInPrototypeChain = (thing, prop) => {
+ const getSafeProp = (obj, prop) =>
+   obj != null && hasOwnInPrototypeChain(obj, prop) ? obj[prop] : undefined;
+ 
++/**
++ * Flatten an object and its application-defined prototype chain into a
++ * null-prototype object. Members inherited only from the source realm's
++ * Object.prototype are deliberately excluded, while class/template members
++ * below that boundary are preserved.
++ *
++ * @param {*} thing The value to flatten
++ *
++ * @returns {*} A null-prototype copy, or the original value when it is already
++ * structurally safe or is not an object
++ */
++const toSafeFlatObject = (thing) => {
++  if (thing == null || (typeof thing !== 'object' && typeof thing !== 'function')) {
++    return thing;
++  }
++
++  const sourcePrototype = getPrototypeOf(thing);
++
++  if (sourcePrototype === null && isSafeAndFullyMutable(thing)) {
++    return thing;
++  }
++
++  const result = Object.create(null);
++  const merged = Object.create(null);
++  const seen = [];
++  let current = thing;
++
++  while (current != null) {
++    if (seen.indexOf(current) !== -1) {
++      break;
++    }
++
++    seen.push(current);
++
++    const prototype = current === thing ? sourcePrototype : getPrototypeOf(current);
++
++    if (isPrototypeBoundary(current, prototype, current === thing)) {
++      break;
++    }
++
++    const props = Object.getOwnPropertyNames(current);
++
++    if (Object.getOwnPropertySymbols) {
++      props.push(...Object.getOwnPropertySymbols(current));
++    }
++
++    for (const prop of props) {
++      if (isUnsafeObjectKey(prop)) {
++        continue;
++      }
++
++      if (!hasOwnProperty(merged, prop)) {
++        result[prop] = thing[prop];
++        merged[prop] = true;
++      }
++    }
++
++    current = prototype;
++  }
++
++  return result;
++};
++
+ const kindOf = ((cache) => (thing) => {
+   const str = toString.call(thing);
+   return cache[str] || (cache[str] = str.slice(8, -1).toLowerCase());
+@@ -973,6 +1095,7 @@ export default {
+   hasOwnProp: hasOwnProperty, // an alias to avoid ESLint no-prototype-builtins detection
+   hasOwnInPrototypeChain,
+   getSafeProp,
++  toSafeFlatObject,
+   reduceDescriptors,
+   freezeMethods,
+   toObjectSet,
