@@ -29,6 +29,9 @@ unknown
 - GHSA-mmx7-hfxf-jppx
 - GHSA-jqh4-m9w3-8hp9
 - GHSA-42h9-826w-cgv3
+- CVE-2026-101906
+- CVE-2026-101901
+- CVE-2026-101898
 
 ## How to Apply:
 1. Clone or download the source code for axios
