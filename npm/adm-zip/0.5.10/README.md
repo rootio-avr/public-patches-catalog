@@ -8,6 +8,7 @@ unknown
 - CVE-2026-77301
 - CVE-2026-102282
 - GHSA-rcw4-f5rp-g42v
+- GHSA-8238-w5pm-2374
 
 ## How to Apply:
 1. Clone or download the source code for adm-zip
