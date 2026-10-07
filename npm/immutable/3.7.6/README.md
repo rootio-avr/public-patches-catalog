@@ -7,6 +7,8 @@ unknown
 - CVE-2026-29063
 - CVE-2026-59879
 - CVE-2026-59880
+- AIKIDO-2026-281048
+- AIKIDO-2026-428611
 
 ## How to Apply:
 1. Clone or download the source code for immutable
