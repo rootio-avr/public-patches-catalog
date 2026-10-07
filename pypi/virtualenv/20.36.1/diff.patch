@@ -307,6 +307,271 @@
  
  @pytest.mark.parametrize(
 
+--- a/src/virtualenv/seed/wheels/acquire.py
++++ b/src/virtualenv/seed/wheels/acquire.py
+@@ -9,12 +9,25 @@
+ from subprocess import PIPE, CalledProcessError, Popen
+ 
+ from .bundle import from_bundle
+-from .periodic_update import add_wheel_to_update_log
++from .periodic_update import add_wheel_to_update_log, verify_wheel_digest
+ from .util import Version, Wheel, discover_wheels
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
++# A private index can legitimately serve a rebuilt wheel under the same distribution, version, and
++# filename PyPI also uses - an internal mirror re-signing or re-packaging a release for policy reasons,
++# for example. Verifying that file against PyPI's own digest would then reject a wheel that came from
++# exactly the source it was configured to come from, not a compromised one. This does not attempt to
++# find every way pip can be pointed elsewhere (a pip.conf file has the same effect and is invisible
++# here), only the common, explicit one, so treat this as a conservative signal rather than proof either
++# way: it exists to avoid false rejections, not to guarantee verification runs whenever it safely could.
++_CUSTOM_INDEX_ENV_VARS = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX")
+ 
++
++def _uses_default_index(env):
++    return not any(env.get(var) for var in _CUSTOM_INDEX_ENV_VARS)
++
++
+ def get_wheel(  # noqa: PLR0913
+     distribution,
+     version,
+@@ -69,6 +82,7 @@
+         str(to_folder),
+         to_download,
+     ]
++    verify_against_pypi = _uses_default_index(env)
+     # pip has no interface in python - must be a new sub-process
+     env = pip_wheel_env_run(search_dirs, app_data, env)
+     process = Popen(cmd, env=env, stdout=PIPE, stderr=PIPE, universal_newlines=True, encoding="utf-8")
+@@ -77,7 +91,12 @@
+         kwargs = {"output": out, "stderr": err}
+         raise CalledProcessError(process.returncode, cmd, **kwargs)
+     result = _find_downloaded_wheel(distribution, version_spec, for_py_version, to_folder, out)
++    if result is None:
++        msg = f"could not find downloaded wheel for {to_download}"
++        raise RuntimeError(msg)
+     LOGGER.debug("downloaded wheel %s", result.name)
++    if verify_against_pypi:
++        verify_wheel_digest(result)
+     return result
+ 
+ 
+--- a/src/virtualenv/seed/wheels/periodic_update.py
++++ b/src/virtualenv/seed/wheels/periodic_update.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import logging
+ import os
+@@ -330,6 +331,42 @@
+     return None
+ 
+ 
++def verify_wheel_digest(wheel):
++    """
++    Verify a downloaded wheel's sha256 against the digest PyPI's JSON API reports for that release.
++
++    ``pip download`` trusts whatever index it is configured to use, and nothing else in this module checks the bytes it
++    hands back. A missing PyPI record only means this check cannot run - the wheel may come from a private index PyPI
++    has never heard of - so that case is logged and let through. An actual mismatch means the file on disk is not the
++    release PyPI published under that filename, which is what a compromised index, a stale mirror, or a MITM'd download
++    would produce, so that case is fatal: the wheel must never be cached or seeded into a venv.
++
++    :raises RuntimeError: if PyPI's record for this exact filename exists and the digest does not match.
++    """
++    entry = _pypi_release_entry_for_wheel(wheel)
++    if entry is None:
++        LOGGER.debug("could not verify %s against PyPI: no matching release record", wheel.name)
++        return
++    digests = entry.get("digests")
++    expected = digests.get("sha256") if isinstance(digests, dict) else None
++    if not isinstance(expected, str):
++        LOGGER.debug("could not verify %s against PyPI: no sha256 digest published", wheel.name)
++        return
++    actual = hashlib.sha256(wheel.path.read_bytes()).hexdigest()
++    if actual != expected:
++        msg = f"downloaded wheel {wheel.name} has sha256 {actual}, but PyPI reports {expected} for this release"
++        raise RuntimeError(msg)
++
++
++def _pypi_release_entry_for_wheel(wheel):
++    content = _pypi_get_distribution_info_cached(wheel.distribution)
++    releases = content.get("releases") if isinstance(content, dict) else None
++    entries = releases.get(wheel.version) if isinstance(releases, dict) else None
++    if not isinstance(entries, list):
++        return None
++    return next((entry for entry in entries if isinstance(entry, dict) and entry.get("filename") == wheel.name), None)
++
++
+ def _request_context():
+     yield None
+     # fallback to non verified HTTPS (the information we request is not sensitive, so fallback)
+@@ -425,4 +462,5 @@
+     "periodic_update",
+     "release_date_for_wheel_path",
+     "trigger_update",
++    "verify_wheel_digest",
+ ]
+--- a/tests/unit/seed/wheels/test_acquire.py
++++ b/tests/unit/seed/wheels/test_acquire.py
+@@ -38,6 +38,7 @@
+     distribution = "setuptools"
+     p_open = mocker.MagicMock()
+     mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
++    mocker.patch("virtualenv.seed.wheels.acquire.verify_wheel_digest")
+     p_open.communicate.return_value = "", ""
+     p_open.returncode = 0
+ 
+@@ -58,6 +59,19 @@
+     assert result.path == embed.path
+ 
+ 
++def test_download_wheel_not_found_raises(mocker, for_py_version, session_app_data):
++    """download_wheel must raise a clear error rather than crash when no wheel can be identified at all."""
++    p_open = mocker.MagicMock()
++    mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
++    p_open.communicate.return_value = "", ""
++    p_open.returncode = 0
++    as_path = mocker.MagicMock()
++    as_path.iterdir.return_value = []
++
++    with pytest.raises(RuntimeError, match="could not find downloaded wheel"):
++        download_wheel("setuptools", None, for_py_version, [], session_app_data, as_path, os.environ)
++
++
+ def test_download_fails(mocker, for_py_version, session_app_data):
+     p_open = mocker.MagicMock()
+     mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
+@@ -94,11 +108,50 @@
+     mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
+     mock_popen.return_value.returncode = 0
+     mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    mocker.patch("virtualenv.seed.wheels.acquire.verify_wheel_digest")
+ 
+     download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", os.environ.copy())
+ 
+     env = mock_popen.call_args[1]["env"]
+     assert env["PYTHONIOENCODING"] == "utf-8"
++
++
++def test_download_wheel_verifies_digest(mocker, for_py_version, session_app_data):
++    """download_wheel must reject a wheel whose bytes do not match PyPI's published digest."""
++    mock_popen = mocker.patch("virtualenv.seed.wheels.acquire.Popen")
++    mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
++    mock_popen.return_value.returncode = 0
++    mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    verify = mocker.patch(
++        "virtualenv.seed.wheels.acquire.verify_wheel_digest",
++        side_effect=RuntimeError("digest mismatch"),
++    )
++    env = {k: v for k, v in os.environ.items() if k not in ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX")}
++
++    with pytest.raises(RuntimeError, match="digest mismatch"):
++        download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", env)
++
++    assert verify.call_count == 1
++
++
++@pytest.mark.parametrize("env_var", ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX"])
++def test_download_wheel_skips_digest_check_for_custom_index(mocker, for_py_version, session_app_data, env_var):
++    """A configured custom index may legitimately serve a same-named wheel PyPI never built."""
++    mock_popen = mocker.patch("virtualenv.seed.wheels.acquire.Popen")
++    mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
++    mock_popen.return_value.returncode = 0
++    mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    verify = mocker.patch(
++        "virtualenv.seed.wheels.acquire.verify_wheel_digest",
++        side_effect=RuntimeError("would have rejected a legitimate wheel"),
++    )
++    env = os.environ.copy()
++    env[env_var] = "https://example.com/simple"
++
++    result = download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", env)
++
++    assert result.name == "a-b-c.whl"
++    assert verify.call_count == 0
+ 
+ 
+ @pytest.fixture
+--- a/tests/unit/seed/wheels/test_periodic_update.py
++++ b/tests/unit/seed/wheels/test_periodic_update.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import subprocess
+@@ -29,6 +30,7 @@
+     periodic_update,
+     release_date_for_wheel_path,
+     trigger_update,
++    verify_wheel_digest,
+ )
+ from virtualenv.util.subprocess import CREATE_NO_WINDOW
+ 
+@@ -545,6 +547,56 @@
+     assert result is None
+     assert url_o.call_count == 1
+     assert repr(exc) in caplog.text
++
++
++def _pypi_release_response(mocker, filename, digests, version="20.1"):
++    entry = {"filename": filename, "digests": digests}
++    body = json.dumps({"releases": {version: [entry]}})
++    return mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", return_value=StringIO(body))
++
++
++def test_verify_wheel_digest_matches(tmp_path, mocker):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    sha256 = hashlib.sha256(b"content").hexdigest()
++    _pypi_release_response(mocker, wheel.name, {"sha256": sha256})
++
++    verify_wheel_digest(wheel)  # must not raise
++
++
++def test_verify_wheel_digest_mismatch(tmp_path, mocker):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    _pypi_release_response(mocker, wheel.name, {"sha256": "0" * 64})
++
++    with pytest.raises(RuntimeError, match=r"has sha256 .* but PyPI reports"):
++        verify_wheel_digest(wheel)
++
++
++@pytest.mark.parametrize(
++    ("filename", "digests", "version"),
++    [
++        pytest.param("setuptools-99.0-py3-none-any.whl", {"sha256": "0" * 64}, "20.1", id="filename_not_in_release"),
++        pytest.param(
++            "pip-20.1-py3-none-any.whl", {"md5": "d41d8cd98f00b204e9800998ecf8427e"}, "20.1", id="no_sha256_digest"
++        ),
++        pytest.param("pip-20.1-py3-none-any.whl", {"sha256": "0" * 64}, "19.0", id="version_not_in_releases"),
++    ],
++)
++def test_verify_wheel_digest_skips_when_unverifiable(tmp_path, mocker, filename, digests, version):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    _pypi_release_response(mocker, filename, digests, version)
++
++    verify_wheel_digest(wheel)  # must not raise: nothing to compare against
++
++
++def test_verify_wheel_digest_skips_on_pypi_lookup_failure(tmp_path, mocker):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", side_effect=URLError("offline"))
++
++    verify_wheel_digest(wheel)  # must not raise: a private mirror PyPI never heard of is legitimate
+ 
+ 
+ def mock_download(mocker, pip_version_remote):
+
 --- a/tests/unit/activation/test_batch.py
 +++ b/tests/unit/activation/test_batch.py
 @@ -135,8 +135,32 @@
