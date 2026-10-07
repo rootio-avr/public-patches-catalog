@@ -1,0 +1,816 @@
+--- a/src/virtualenv/seed/wheels/acquire.py
++++ b/src/virtualenv/seed/wheels/acquire.py
+@@ -8,10 +8,10 @@
+ from operator import eq, lt
+ from pathlib import Path
+ from subprocess import PIPE, CalledProcessError, Popen
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Final
+ 
+ from .bundle import from_bundle
+-from .periodic_update import add_wheel_to_update_log
++from .periodic_update import UnverifiedWheelError, add_wheel_to_update_log, verify_wheel_digest
+ from .util import Version, Wheel, discover_wheels
+ 
+ if TYPE_CHECKING:
+@@ -19,6 +19,20 @@
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
++# A private index can legitimately serve a rebuilt wheel under the same distribution, version, and
++# filename PyPI also uses - an internal mirror re-signing or re-packaging a release for policy reasons,
++# for example. Verifying that file against PyPI's own digest would then reject a wheel that came from
++# exactly the source it was configured to come from, not a compromised one. This does not attempt to
++# find every way pip can be pointed elsewhere (a pip.conf file has the same effect and is invisible
++# here), only the common, explicit one, so treat this as a conservative signal rather than proof either
++# way: it exists to avoid false rejections, not to guarantee verification runs whenever it safely could.
++_CUSTOM_INDEX_ENV_VARS: Final[tuple[str, ...]] = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX")
++
++
++def _uses_default_index(env: dict[str, str]) -> bool:
++    return not any(env.get(var) for var in _CUSTOM_INDEX_ENV_VARS)
++
++
+ # PEP 503 normalized distribution name. Anything outside this character set on the way to ``pip download`` means
+ # somebody is smuggling pip options or extras, so reject it before we build the command line.
+ _DISTRIBUTION_RE = re.compile(
+@@ -68,15 +82,22 @@
+ 
+     if download and wheel is None and version != Version.embed:
+         # 2. download from the internet
+-        wheel = download_wheel(
+-            distribution=distribution,
+-            version_spec=Version.as_version_spec(version),
+-            for_py_version=for_py_version,
+-            search_dirs=search_dirs,
+-            app_data=app_data,
+-            to_folder=app_data.house,
+-            env=env,
+-        )
++        try:
++            wheel = download_wheel(
++                distribution=distribution,
++                version_spec=Version.as_version_spec(version),
++                for_py_version=for_py_version,
++                search_dirs=search_dirs,
++                app_data=app_data,
++                to_folder=app_data.house,
++                env=env,
++            )
++        except UnverifiedWheelError as exception:
++            # only the bundle request has a local wheel that satisfies it; a pinned version must fail
++            if version != Version.bundle:
++                raise
++            LOGGER.warning("%s, seeding the bundled %s instead", exception, distribution)
++            return from_bundle(distribution, version, for_py_version, search_dirs, app_data, do_periodic_update, env)
+         if wheel is not None and app_data.can_update:
+             add_wheel_to_update_log(wheel, for_py_version, app_data)
+ 
+@@ -108,6 +129,9 @@
+ 
+     :raises ValueError: if ``distribution`` or ``version_spec`` fail the strict allow-list check.
+     :raises CalledProcessError: if ``pip download`` exits with a non-zero status.
++    :raises RuntimeError: if no downloaded wheel can be identified from ``pip``'s output or the search directory, or if
++        the caller has not configured a custom index and PyPI's sha256 for the downloaded filename cannot be obtained or
++        does not match, see :func:`virtualenv.seed.wheels.periodic_update.verify_wheel_digest`.
+ 
+     """
+     _check_distribution(distribution)
+@@ -130,6 +154,7 @@
+         str(to_folder),
+         to_download,
+     ]
++    verify_against_pypi = _uses_default_index(env)
+     # pip has no interface in python - must be a new sub-process
+     env = pip_wheel_env_run(search_dirs, app_data, env)
+     process = Popen(cmd, env=env, stdout=PIPE, stderr=PIPE, universal_newlines=True, encoding="utf-8")
+@@ -138,8 +163,13 @@
+         kwargs = {"output": out, "stderr": err}
+         raise CalledProcessError(process.returncode, cmd, **kwargs)
+     result = _find_downloaded_wheel(distribution, version_spec, for_py_version, to_folder, out)
+-    LOGGER.debug("downloaded wheel %s", result.name)  # ty: ignore[unresolved-attribute]
+-    return result  # ty: ignore[invalid-return-type]
++    if result is None:
++        msg = f"could not find downloaded wheel for {to_download}"
++        raise RuntimeError(msg)
++    LOGGER.debug("downloaded wheel %s", result.name)
++    if verify_against_pypi:
++        verify_wheel_digest(result)
++    return result
+ 
+ 
+ def _find_downloaded_wheel(
+--- a/src/virtualenv/seed/wheels/periodic_update.py
++++ b/src/virtualenv/seed/wheels/periodic_update.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import logging
+ import os
+@@ -14,7 +15,8 @@
+ from subprocess import DEVNULL, Popen
+ from textwrap import dedent
+ from threading import Thread
+-from typing import TYPE_CHECKING
++from time import sleep
++from typing import TYPE_CHECKING, Final
+ from urllib.error import URLError
+ from urllib.request import urlopen
+ 
+@@ -360,6 +362,55 @@
+     return None
+ 
+ 
++#: Pauses between PyPI metadata lookups before refusing a wheel we could not verify, to ride out a brief outage or a JSON
++#: API that has not caught up with a fresh upload.
++_DIGEST_RETRY_DELAYS: Final[tuple[float, ...]] = (1.0, 2.0, 4.0)
++
++
++def verify_wheel_digest(wheel: Wheel) -> None:
++    """Verify a downloaded wheel's sha256 against the digest PyPI's JSON API reports for that release.
++
++    ``pip download`` trusts whatever index it is configured to use, and nothing else in this module checks the bytes it
++    hands back. Callers run this only when pip used the default index, so PyPI served the file and must list its digest.
++    A failed metadata request, an unknown filename or a missing sha256 therefore fails like a mismatch: accepting the
++    wheel in those cases would let anyone who can block ``pypi.org/pypi`` turn the check off.
++
++    :raises UnverifiedWheelError: if PyPI's sha256 for this exact filename cannot be obtained after retrying.
++    :raises RuntimeError: if the sha256 does not match.
++
++    """
++    expected = _pypi_sha256_for_wheel(wheel)
++    for delay in _DIGEST_RETRY_DELAYS:
++        if expected is not None:
++            break
++        LOGGER.warning("could not obtain the sha256 of %s from PyPI, retrying in %s seconds", wheel.name, delay)
++        _PYPI_CACHE.pop(wheel.distribution, None)
++        sleep(delay)
++        expected = _pypi_sha256_for_wheel(wheel)
++    if expected is None:
++        msg = f"refusing downloaded wheel {wheel.name}: could not obtain its sha256 from PyPI to verify it"
++        raise UnverifiedWheelError(msg)
++    if (actual := hashlib.sha256(wheel.path.read_bytes()).hexdigest()) != expected:
++        msg = f"downloaded wheel {wheel.name} has sha256 {actual}, but PyPI reports {expected} for this release"
++        raise RuntimeError(msg)
++
++
++class UnverifiedWheelError(RuntimeError):
++    """PyPI's digest for a downloaded wheel was unavailable, so a caller may fall back to the bundled wheel."""
++
++
++def _pypi_sha256_for_wheel(wheel: Wheel) -> str | None:
++    content = _pypi_get_distribution_info_cached(wheel.distribution)
++    releases = content.get("releases") if isinstance(content, dict) else None
++    entries = releases.get(wheel.version) if isinstance(releases, dict) else None
++    if not isinstance(entries, list):
++        return None
++    entry = next((entry for entry in entries if isinstance(entry, dict) and entry.get("filename") == wheel.name), {})
++    digests = entry.get("digests")
++    sha256 = digests.get("sha256") if isinstance(digests, dict) else None
++    return sha256 if isinstance(sha256, str) else None
++
++
+ #: Opt-in escape hatch to restore the pre-2026 behavior of falling back to an unverified HTTPS context when the
+ #: verified request fails. Off by default: a failed TLS handshake on the PyPI metadata lookup now aborts the update
+ #: instead of silently downgrading, because the response drives which wheel version virtualenv thinks is up to date.
+@@ -461,6 +512,7 @@
+ 
+ __all__ = [
+     "NewVersion",
++    "UnverifiedWheelError",
+     "UpdateLog",
+     "add_wheel_to_update_log",
+     "do_update",
+@@ -470,4 +522,5 @@
+     "periodic_update",
+     "release_date_for_wheel_path",
+     "trigger_update",
++    "verify_wheel_digest",
+ ]
+--- a/tests/unit/seed/wheels/test_acquire.py
++++ b/tests/unit/seed/wheels/test_acquire.py
+@@ -12,7 +12,7 @@
+ from virtualenv.app_data import AppDataDiskFolder
+ from virtualenv.seed.wheels.acquire import download_wheel, get_wheel, pip_wheel_env_run
+ from virtualenv.seed.wheels.embed import BUNDLE_FOLDER, get_embed_wheel
+-from virtualenv.seed.wheels.periodic_update import dump_datetime
++from virtualenv.seed.wheels.periodic_update import UnverifiedWheelError, dump_datetime
+ from virtualenv.seed.wheels.util import Wheel, discover_wheels
+ 
+ if TYPE_CHECKING:
+@@ -38,6 +38,7 @@
+     distribution = "setuptools"
+     p_open = mocker.MagicMock()
+     mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
++    mocker.patch("virtualenv.seed.wheels.acquire.verify_wheel_digest")
+     p_open.communicate.return_value = "", ""
+     p_open.returncode = 0
+ 
+@@ -58,6 +59,19 @@
+     assert result.path == embed.path
+ 
+ 
++def test_download_wheel_not_found_raises(mocker, for_py_version, session_app_data) -> None:
++    """download_wheel must raise a clear error rather than crash when no wheel can be identified at all."""
++    p_open = mocker.MagicMock()
++    mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
++    p_open.communicate.return_value = "", ""
++    p_open.returncode = 0
++    as_path = mocker.MagicMock()
++    as_path.iterdir.return_value = []
++
++    with pytest.raises(RuntimeError, match="could not find downloaded wheel"):
++        download_wheel("setuptools", None, for_py_version, [], session_app_data, as_path, os.environ)
++
++
+ def test_download_fails(mocker, for_py_version, session_app_data) -> None:
+     p_open = mocker.MagicMock()
+     mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
+@@ -94,6 +108,7 @@
+     mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
+     mock_popen.return_value.returncode = 0
+     mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    mocker.patch("virtualenv.seed.wheels.acquire.verify_wheel_digest")
+ 
+     download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", os.environ.copy())
+ 
+@@ -101,6 +116,43 @@
+     assert env["PYTHONIOENCODING"] == "utf-8"
+ 
+ 
++def test_download_wheel_verifies_digest(mocker, for_py_version, session_app_data) -> None:
++    """download_wheel must reject a wheel whose bytes do not match PyPI's published digest."""
++    mock_popen = mocker.patch("virtualenv.seed.wheels.acquire.Popen")
++    mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
++    mock_popen.return_value.returncode = 0
++    mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    verify = mocker.patch(
++        "virtualenv.seed.wheels.acquire.verify_wheel_digest",
++        side_effect=RuntimeError("digest mismatch"),
++    )
++
++    with pytest.raises(RuntimeError, match="digest mismatch"):
++        download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", os.environ.copy())
++
++    assert verify.call_count == 1
++
++
++@pytest.mark.parametrize("env_var", ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX"])
++def test_download_wheel_skips_digest_check_for_custom_index(mocker, for_py_version, session_app_data, env_var) -> None:
++    """A configured custom index may legitimately serve a same-named wheel PyPI never built."""
++    mock_popen = mocker.patch("virtualenv.seed.wheels.acquire.Popen")
++    mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
++    mock_popen.return_value.returncode = 0
++    mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    verify = mocker.patch(
++        "virtualenv.seed.wheels.acquire.verify_wheel_digest",
++        side_effect=RuntimeError("would have rejected a legitimate wheel"),
++    )
++    env = os.environ.copy()
++    env[env_var] = "https://example.com/simple"
++
++    result = download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", env)
++
++    assert result.name == "a-b-c.whl"
++    assert verify.call_count == 0
++
++
+ @pytest.fixture
+ def downloaded_wheel(mocker):
+     wheel = Wheel.from_path(Path("setuptools-0.0.0-py2.py3-none-any.whl"))
+@@ -130,6 +182,26 @@
+     assert wheel.name == expected.name
+     assert downloaded_wheel[1].call_count == 0
+     assert write.call_count == 0
++
++
++def test_get_wheel_falls_back_to_bundle_when_unverified(
++    mocker: MockerFixture, for_py_version: str, session_app_data: AppDataDiskFolder
++) -> None:
++    mocker.patch("virtualenv.seed.wheels.acquire.download_wheel", side_effect=UnverifiedWheelError("refusing"))
++
++    wheel = get_wheel("setuptools", "bundle", for_py_version, [], True, session_app_data, False, os.environ)
++
++    assert wheel is not None
++    assert wheel.name == get_embed_wheel("setuptools", for_py_version).name
++
++
++def test_get_wheel_unverified_pinned_version_fails(
++    mocker: MockerFixture, for_py_version: str, session_app_data: AppDataDiskFolder
++) -> None:
++    mocker.patch("virtualenv.seed.wheels.acquire.download_wheel", side_effect=UnverifiedWheelError("refusing"))
++
++    with pytest.raises(UnverifiedWheelError, match="refusing"):
++        get_wheel("setuptools", "0.0.0", for_py_version, [], True, session_app_data, False, os.environ)
+ 
+ 
+ def test_get_wheel_download_cached(
+--- a/tests/unit/seed/wheels/test_periodic_update.py
++++ b/tests/unit/seed/wheels/test_periodic_update.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import subprocess
+@@ -11,6 +12,7 @@
+ from itertools import zip_longest
+ from pathlib import Path
+ from textwrap import dedent
++from typing import TYPE_CHECKING
+ from urllib.error import URLError
+ 
+ import pytest
+@@ -21,6 +23,7 @@
+ from virtualenv.seed.wheels.embed import BUNDLE_SUPPORT, get_embed_wheel
+ from virtualenv.seed.wheels.periodic_update import (
+     NewVersion,
++    UnverifiedWheelError,
+     UpdateLog,
+     do_update,
+     dump_datetime,
+@@ -29,17 +32,33 @@
+     periodic_update,
+     release_date_for_wheel_path,
+     trigger_update,
++    verify_wheel_digest,
+ )
+ from virtualenv.util.subprocess import CREATE_NO_WINDOW
+ 
+ 
++if TYPE_CHECKING:
++    from collections.abc import Generator
++    from unittest.mock import MagicMock
++
++    from pytest_mock import MockerFixture
++
++
+ @pytest.fixture(autouse=True)
+-def _clear_pypi_info_cache() -> None:
++def _clear_pypi_info_cache() -> Generator[None, None, None]:
+     from virtualenv.seed.wheels.periodic_update import _PYPI_CACHE  # noqa: PLC0415
+ 
+     _PYPI_CACHE.clear()
++    yield
++    # the mocked responses must not leak into later tests that verify real downloads in this process
++    _PYPI_CACHE.clear()
+ 
+ 
++@pytest.fixture
++def retry_sleep(mocker: MockerFixture) -> MagicMock:
++    return mocker.patch("virtualenv.seed.wheels.periodic_update.sleep")
++
++
+ def test_manual_upgrade(session_app_data, caplog, mocker, for_py_version) -> None:
+     wheel = get_embed_wheel("pip", for_py_version)
+     new_version = NewVersion(
+@@ -543,6 +562,72 @@
+     assert result is None
+     assert url_o.call_count == 1
+     assert repr(exc) in caplog.text
++
++
++def _pypi_release_response(mocker, filename, digests, version="20.1"):
++    entry = {"filename": filename, "digests": digests}
++    body = json.dumps({"releases": {version: [entry]}})
++    return mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", return_value=StringIO(body))
++
++
++def test_verify_wheel_digest_matches(tmp_path, mocker) -> None:
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    sha256 = hashlib.sha256(b"content").hexdigest()
++    _pypi_release_response(mocker, wheel.name, {"sha256": sha256})
++
++    verify_wheel_digest(wheel)  # must not raise
++
++
++def test_verify_wheel_digest_mismatch(tmp_path, mocker) -> None:
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    _pypi_release_response(mocker, wheel.name, {"sha256": "0" * 64})
++
++    with pytest.raises(RuntimeError, match=r"has sha256 .* but PyPI reports"):
++        verify_wheel_digest(wheel)
++
++
++@pytest.mark.parametrize(
++    ("filename", "digests", "version"),
++    [
++        pytest.param("setuptools-99.0-py3-none-any.whl", {"sha256": "0" * 64}, "20.1", id="filename_not_in_release"),
++        pytest.param(
++            "pip-20.1-py3-none-any.whl", {"md5": "d41d8cd98f00b204e9800998ecf8427e"}, "20.1", id="no_sha256_digest"
++        ),
++        pytest.param("pip-20.1-py3-none-any.whl", {"sha256": "0" * 64}, "19.0", id="version_not_in_releases"),
++    ],
++)
++@pytest.mark.usefixtures("retry_sleep")
++def test_verify_wheel_digest_rejects_when_unverifiable(tmp_path, mocker, filename, digests, version) -> None:
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    _pypi_release_response(mocker, filename, digests, version)
++
++    with pytest.raises(UnverifiedWheelError, match=r"could not obtain its sha256 from PyPI"):
++        verify_wheel_digest(wheel)
++
++
++def test_verify_wheel_digest_rejects_after_retrying_pypi_lookup(tmp_path, mocker, retry_sleep) -> None:
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", side_effect=URLError("offline"))
++
++    with pytest.raises(UnverifiedWheelError, match=r"could not obtain its sha256 from PyPI"):
++        verify_wheel_digest(wheel)
++
++    assert [entry.args for entry in retry_sleep.call_args_list] == [(1.0,), (2.0,), (4.0,)]
++
++
++@pytest.mark.usefixtures("retry_sleep")
++def test_verify_wheel_digest_recovers_on_retry(tmp_path, mocker) -> None:
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    body = json.dumps({"releases": {"20.1": [{"filename": wheel.name, "digests": {"sha256": "0" * 64}}]}})
++    mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", side_effect=[URLError("offline"), StringIO(body)])
++
++    with pytest.raises(RuntimeError, match=r"has sha256 .* but PyPI reports 0{64}"):
++        verify_wheel_digest(wheel)
+ 
+ 
+ def mock_download(mocker, pip_version_remote):
+
+--- /dev/null
++++ b/docs/changelog/3252.bugfix.rst
+@@ -0,0 +1,2 @@
++Fix ``activate`` and ``activate.fish`` running commands embedded in the virtual environment path or in the interpreter's
++Tcl/Tk library paths.
+--- a/src/virtualenv/activation/bash/activate.sh
++++ b/src/virtualenv/activation/bash/activate.sh
+@@ -60,7 +60,7 @@
+ deactivate nondestructive
+ 
+ if [ ! -d __VIRTUAL_ENV__ ]; then
+-    echo "Virtual environment directory __VIRTUAL_ENV__ does not exist!" >&2
++    echo "Virtual environment directory" __VIRTUAL_ENV__ "does not exist!" >&2
+     CURRENT_PATH=$(realpath "${BASH_SOURCE[0]}")
+     CURRENT_DIR=$(dirname "${CURRENT_PATH}")
+     VIRTUAL_ENV="$(realpath "${CURRENT_DIR}/../")"
+--- a/src/virtualenv/activation/fish/activate.fish
++++ b/src/virtualenv/activation/fish/activate.fish
+@@ -75,13 +75,13 @@
+   if set -q TCL_LIBRARY;
+     set -gx _OLD_VIRTUAL_TCL_LIBRARY $TCL_LIBRARY;
+   end
+-  set -gx TCL_LIBRARY '__TCL_LIBRARY__'
++  set -gx TCL_LIBRARY __TCL_LIBRARY__
+ end
+ if test -n __TK_LIBRARY__
+   if set -q TK_LIBRARY;
+     set -gx _OLD_VIRTUAL_TK_LIBRARY $TK_LIBRARY;
+   end
+-  set -gx TK_LIBRARY '__TK_LIBRARY__'
++  set -gx TK_LIBRARY __TK_LIBRARY__
+ end
+ 
+ # Prompt override provided?
+--- a/tests/unit/activation/test_bash.py
++++ b/tests/unit/activation/test_bash.py
+@@ -75,9 +75,8 @@
+         assert "export TCL_LIBRARY" in content
+ 
+ 
+-@pytest.mark.skipif(IS_WIN, reason="Github Actions ships with WSL bash")
+-def test_bash_activate_relocation_resolves_virtual_env(tmp_path, current_fastest) -> None:
+-    original = tmp_path / "original"
++def _source_after_move(tmp_path, current_fastest, name):
++    original = tmp_path / name
+     cli_run([
+         "--without-pip",
+         str(original),
+@@ -98,9 +97,33 @@
+         capture_output=True,
+         text=True,
+         cwd=str(work_dir),
++        check=False,
+     )
++    return result, relocated, work_dir
++
++
++@pytest.mark.skipif(IS_WIN, reason="Github Actions ships with WSL bash")
++@pytest.mark.parametrize(
++    "name", [pytest.param("original", id="plain"), pytest.param("has(paren)and'quote", id="shell-metacharacters")]
++)
++def test_bash_activate_relocation_resolves_virtual_env(tmp_path, current_fastest, name) -> None:
++    result, relocated, _ = _source_after_move(tmp_path, current_fastest, name)
+     assert result.returncode == 0
+     assert result.stdout.strip() == str(relocated)
++
++
++@pytest.mark.skipif(IS_WIN, reason="Github Actions ships with WSL bash")
++@pytest.mark.parametrize(
++    "payload",
++    [
++        pytest.param("x'$(id > PWNED)'y", id="command-substitution"),
++        pytest.param("x'`id > PWNED`'y", id="backticks"),
++        pytest.param("a';id > PWNED;'b", id="statement-separator"),
++    ],
++)
++def test_bash_activate_relocation_does_not_run_path_commands(tmp_path, current_fastest, payload) -> None:
++    _, _, work_dir = _source_after_move(tmp_path, current_fastest, payload)
++    assert not (work_dir / "PWNED").exists()
+ 
+ 
+ @pytest.mark.skipif(IS_WIN, reason="Github Actions ships with WSL bash")
+--- a/tests/unit/activation/test_fish.py
++++ b/tests/unit/activation/test_fish.py
+@@ -1,19 +1,26 @@
+ from __future__ import annotations
+ 
+ import os
++import shlex
++import shutil
++import subprocess
+ import sys
+ from argparse import Namespace
++from types import SimpleNamespace
+ 
+ import pytest
+ 
+ from virtualenv.activation import FishActivator
+ from virtualenv.info import IS_WIN
+ 
++FISH = shutil.which("fish")
+ 
++
+ @pytest.mark.parametrize(
+     ("tcl_lib", "tk_lib", "present"),
+     [
+         ("/path/to/tcl", "/path/to/tk", True),
++        ("/Program Files/tcl", "/Program Files/tk", True),
+         (None, None, False),
+     ],
+ )
+@@ -50,11 +57,31 @@
+     assert "set -e _OLD_PKG_CONFIG_PATH" in content
+ 
+     if present:
+-        assert "set -gx TCL_LIBRARY '/path/to/tcl'" in content
+-        assert "set -gx TK_LIBRARY '/path/to/tk'" in content
++        assert f"set -gx TCL_LIBRARY {shlex.quote(tcl_lib)}\n" in content
++        assert f"set -gx TK_LIBRARY {shlex.quote(tk_lib)}\n" in content
+     else:
+         assert "if test -n ''\n  if set -q TCL_LIBRARY;" in content
+         assert "if test -n ''\n  if set -q TK_LIBRARY;" in content
++
++
++@pytest.mark.skipif(IS_WIN, reason="fish is not available on Windows")
++@pytest.mark.skipif(FISH is None, reason="fish is not installed")
++def test_fish_tkinter_path_does_not_run_commands(tmp_path) -> None:
++    marker = tmp_path / "PWNED"
++    creator = SimpleNamespace(
++        dest=tmp_path,
++        bin_dir=tmp_path / "bin",
++        interpreter=SimpleNamespace(tcl_lib=f"/tcl/(touch {marker})/lib", tk_lib="/tk/lib"),
++        pyenv_cfg={},
++        env_name="my-env",
++    )
++    creator.bin_dir.mkdir()
++    FishActivator(Namespace(prompt=None)).generate(creator)
++    script = creator.bin_dir / "activate.fish"
++
++    subprocess.run([FISH, "-c", f"source '{script}'"], capture_output=True, text=True, timeout=60, check=False)
++
++    assert not marker.exists()
+ 
+ 
+ @pytest.mark.skipif(IS_WIN, reason="we have not setup fish in CI yet")
+
+--- /dev/null
++++ b/docs/changelog/3250.bugfix.rst
+@@ -0,0 +1,2 @@
++Fix ``activate.bat`` running arbitrary commands from a crafted ``--prompt``, ``VIRTUALENV_PROMPT``, or config file
++value.
+--- a/src/virtualenv/activation/batch/__init__.py
++++ b/src/virtualenv/activation/batch/__init__.py
+@@ -1,18 +1,48 @@
+ from __future__ import annotations
+ 
++import logging
+ import os
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Final
+ 
+ from virtualenv.activation.via_template import ViaTemplateActivator
++from virtualenv.util.text import collapse_line_boundaries
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Iterator
++    from pathlib import Path
+ 
+     from python_discovery import PythonInfo
+ 
+     from virtualenv.create.creator import Creator
+ 
++LOGGER = logging.getLogger(__name__)
+ 
++# cmd.exe's own command-line parser looks for these regardless of surrounding quotes: confirmed on a
++# real Windows runner that `@set "VAR=x & cmd"` still runs `cmd` as a second statement even though the
++# whole VAR=value expression is quoted. `(` and `)` are not in this set - confirmed on the same runner
++# that `@set "VAR=C:\Program Files (x86)\..."` round-trips unchanged, since parentheses are only special
++# to cmd.exe as block delimiters in control-flow syntax (if/for), not as bare characters in a value. `!`
++# is only live when the caller already has delayed expansion enabled (`setlocal enabledelayedexpansion`,
++# `cmd /V:ON`) - not cmd.exe's default, but confirmed on a real runner that a prompt like `foo!SECRET!`
++# then substitutes the actual value of an existing SECRET variable into the prompt, so it is neutered
++# unconditionally rather than only when that mode happens to be on.
++_CMD_OPERATORS: Final[tuple[str, ...]] = ("&", "|", "<", ">", "^", "!", '"')
++
++# Of _CMD_OPERATORS, only `&` can actually occur in a real Windows path: `|`, `<`, `>` and `"` are
++# already illegal in Windows filenames, and a literal `^` is silently dropped by cmd.exe itself even
++# with no help from quote(), confirmed on a real Windows runner - never exploitable, just a value that
++# reads one character short. `&` is different: quote() can neuter it in free text like the prompt, but
++# doing that to a path would silently point activate.bat at a directory that does not exist. There is no
++# way to represent it here and no way to fake the path, so refuse instead.
++_PATH_UNSAFE_CHARS: Final[tuple[str, ...]] = ("&",)
++
++_PATH_REPLACEMENT_NAMES: Final[dict[str, str]] = {
++    "__VIRTUAL_ENV__": "the destination directory",
++    "__TCL_LIBRARY__": "the interpreter's Tcl library path",
++    "__TK_LIBRARY__": "the interpreter's Tk library path",
++}
++
++
+ class BatchActivator(ViaTemplateActivator):
+     @classmethod
+     def supports(cls, interpreter: PythonInfo) -> bool:
+@@ -23,14 +53,45 @@
+         yield "deactivate.bat"
+         yield "pydoc.bat"
+ 
++    def generate(self, creator: Creator) -> list[Path]:
++        values = super().replacements(creator, creator.bin_dir)
++        problems = [reason for key in _PATH_REPLACEMENT_NAMES if (reason := _unsafe_path_reason(key, values[key]))]
++        if problems:
++            for problem in problems:
++                LOGGER.warning("skipping batch activation scripts: %s", problem)
++            return []
++        return super().generate(creator)
++
+     @staticmethod
+     def quote(string: str) -> str:
+-        return string
++        """Make a value safe to sit inside ``@set "VAR=value"``.
+ 
++        Batch has no escape for a double quote in this context either: it always closes the quoted string, and whatever
++        follows on the line runs as live cmd.exe syntax. A raw line boundary is worse - batch is line-oriented
++        regardless of quote state, so it starts a brand-new statement instead of staying inside the value. None of these
++        can be represented literally here, so replace them with a space. ``%`` still triggers variable expansion inside
++        the quotes, but doubling it to ``%%`` is a real, in-file escape that keeps the literal character.
++
++        """
++        string = string.replace("%", "%%")
++        for operator in _CMD_OPERATORS:
++            string = string.replace(operator, " ")
++        return collapse_line_boundaries(string)
++
+     def instantiate_template(self, replacements: dict[str, str], template: str, creator: Creator) -> str:
+         # ensure the text has all newlines as \r\n - required by batch
+         base = super().instantiate_template(replacements, template, creator)
+         return base.replace(os.linesep, "\n").replace("\n", os.linesep)
++
++
++def _unsafe_path_reason(key: str, value: str) -> str | None:
++    found = sorted({char for char in value if char in _PATH_UNSAFE_CHARS})
++    if not found:
++        return None
++    return (
++        f"{_PATH_REPLACEMENT_NAMES[key]} ({value!r}) contains {''.join(found)!r}, and cmd.exe has no way "
++        f'to keep that literal inside the @set "VAR=value" lines activate.bat relies on'
++    )
+ 
+ 
+ __all__ = [
+--- a/src/virtualenv/create/pyenv_cfg.py
++++ b/src/virtualenv/create/pyenv_cfg.py
+@@ -5,6 +5,8 @@
+ from collections import OrderedDict
+ from typing import TYPE_CHECKING
+ 
++from virtualenv.util.text import collapse_line_boundaries
++
+ if TYPE_CHECKING:
+     from pathlib import Path
+ 
+@@ -47,7 +49,7 @@
+                 normalized_value = f'"{value}"'
+             else:
+                 normalized_value = os.path.abspath(value) if value and os.path.exists(value) else value
+-            line = f"{key} = {normalized_value}"
++            line = f"{collapse_line_boundaries(key)} = {collapse_line_boundaries(normalized_value)}"
+             LOGGER.debug("\t%s", line)
+             text += line
+             text += "\n"
+--- /dev/null
++++ b/src/virtualenv/util/text.py
+@@ -0,0 +1,33 @@
++"""Shared text-safety helpers for values written into line-based formats."""
++
++from __future__ import annotations
++
++from typing import Final
++
++# A line-based format with no escape syntax reads any character str.splitlines() treats as a
++# boundary back as an extra line - or, for a script, runs it as one. This is the exact boundary
++# set splitlines() recognizes, per the Python string documentation.
++_LINE_BOUNDARIES: Final[tuple[str, ...]] = (
++    "\n",
++    "\r",
++    "\v",
++    "\f",
++    "\x1c",
++    "\x1d",
++    "\x1e",
++    "\x85",
++    chr(0x2028),  # line separator
++    chr(0x2029),  # paragraph separator
++)
++
++
++def collapse_line_boundaries(text: str) -> str:
++    """Replace every line-boundary character with a space so text can never become extra lines."""
++    for boundary in _LINE_BOUNDARIES:
++        text = text.replace(boundary, " ")
++    return text
++
++
++__all__ = [
++    "collapse_line_boundaries",
++]
+--- a/tests/unit/activation/test_batch.py
++++ b/tests/unit/activation/test_batch.py
+@@ -91,6 +91,63 @@
+         assert '@if NOT ""=="" @set "TK_LIBRARY="' in activate_content
+ 
+ 
++@pytest.mark.parametrize(
++    "value",
++    [
++        "x\" & calc & rem \"",
++        "foo & calc",
++        "foo | calc",
++        "foo > out.txt",
++        "foo < in.txt",
++        "foo ^ bar",
++        "foo!SECRET!",
++        "foo\r\ncalc",
++        "foo\ncalc",
++        "foo\u2028calc",
++    ],
++)
++def test_batch_quote_neuters_cmd_syntax(value) -> None:
++    quoted = BatchActivator.quote(value)
++
++    for char in '&|<>^!"\r\n\u2028':
++        assert char not in quoted
++
++
++def test_batch_quote_doubles_percent() -> None:
++    assert BatchActivator.quote("100%PATH%") == "100%%PATH%%"
++
++
++def test_batch_quote_keeps_plain_text() -> None:
++    assert BatchActivator.quote(r"C:\Program Files (x86)\env") == r"C:\Program Files (x86)\env"
++
++
++def test_batch_skips_destination_with_ampersand(tmp_path, caplog) -> None:
++    """An `&` in the destination can never be represented, so generation must skip it, not guess."""
++
++    class MockInterpreter:
++        os = "nt"
++        tcl_lib = None
++        tk_lib = None
++
++    class MockCreator:
++        def __init__(self, dest) -> None:
++            self.dest = dest
++            self.bin_dir = dest / "Scripts"
++            self.bin_dir.mkdir(parents=True)
++            self.interpreter = MockInterpreter()
++            self.pyenv_cfg = {}
++            self.env_name = "test-env"
++
++    creator = MockCreator(tmp_path / "weird&dest")
++    activator = BatchActivator(Namespace(prompt=None))
++
++    generated = activator.generate(creator)
++
++    assert generated == []
++    assert list(creator.bin_dir.iterdir()) == []
++    assert "skipping batch activation scripts" in caplog.text
++
++
+ @pytest.mark.usefixtures("activation_python")
+ def test_batch(activation_tester_class, activation_tester, tmp_path) -> None:
+     version_script = tmp_path / "version.bat"
