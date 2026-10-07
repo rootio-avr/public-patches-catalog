@@ -1,6 +1,6 @@
-# wget : 1.21.3-1+deb12u1.aikido.5
+# wget : 1.21.3-1+deb12u1.aikido.6
 
-This patch is based on wget version 1.21.3-1+deb12u1.aikido.5, which is available at:
+This patch is based on wget version 1.21.3-1+deb12u1.aikido.6, which is available at:
 https://sources.debian.org/src/wget/1.21.3-1+deb12u1/
 
 ## Affected CVEs:
@@ -9,6 +9,7 @@ https://sources.debian.org/src/wget/1.21.3-1+deb12u1/
 - CVE-2021-31879
 - CVE-2026-58471
 - CVE-2026-58472
+- CVE-2026-58469
 
 ## How to Apply:
 1. Obtain the source package: `apt source wget`
