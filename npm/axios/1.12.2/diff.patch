@@ -1189,6 +1189,298 @@ Last-Update: 2026-08-10
 
      remove(name) {
 
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -59,8 +59,8 @@
+ 
+ 
+ /**
+- * If the proxy or config beforeRedirects functions are defined, call them with the options
+- * object.
++ * If the proxy, sensitive header, or config beforeRedirects functions are defined, call them
++ * with the options object.
+  *
+  * @param {Object<string, any>} options - The options object that was passed to the request.
+  *
+@@ -70,11 +70,35 @@
+   if (options.beforeRedirects.proxy) {
+     options.beforeRedirects.proxy(options);
+   }
++  if (options.beforeRedirects.sensitiveHeaders) {
++    options.beforeRedirects.sensitiveHeaders(options);
++  }
+   if (options.beforeRedirects.config) {
+     options.beforeRedirects.config(options, responseDetails);
+   }
+ }
+ 
++function stripMatchingHeaders(headers, sensitiveSet) {
++  if (!headers) {
++    return;
++  }
++
++  Object.keys(headers).forEach((header) => {
++    if (sensitiveSet.has(header.toLowerCase())) {
++      delete headers[header];
++    }
++  });
++}
++
++function getOrigin(href) {
++  try {
++    return new URL(href).origin;
++  } catch (e) {
++    // Unparseable URL: callers treat a null origin as cross-origin (fail closed).
++    return null;
++  }
++}
++
+ /**
+  * If the proxy or config afterRedirects functions are defined, call them with the options
+  *
+@@ -483,12 +507,51 @@
+     } else if (config.maxRedirects === 0) {
+       transport = isHttpsRequest ? https : http;
+     } else {
++      options.sensitiveHeaders = [];
+       if (config.maxRedirects) {
+         options.maxRedirects = config.maxRedirects;
+       }
+       const beforeRedirect = own('beforeRedirect');
+       if (beforeRedirect) {
+         options.beforeRedirects.config = beforeRedirect;
++      }
++      const sensitiveHeaders = own('sensitiveHeaders');
++      if (sensitiveHeaders != null) {
++        if (!utils.isArray(sensitiveHeaders)) {
++          return reject(new AxiosError(
++            'sensitiveHeaders must be an array of strings',
++            AxiosError.ERR_BAD_OPTION_VALUE,
++            config
++          ));
++        }
++
++        const sensitiveSet = new Set();
++        for (const header of sensitiveHeaders) {
++          if (!utils.isString(header)) {
++            return reject(new AxiosError(
++              'sensitiveHeaders must be an array of strings',
++              AxiosError.ERR_BAD_OPTION_VALUE,
++              config
++            ));
++          }
++
++          sensitiveSet.add(header.toLowerCase());
++        }
++
++        if (sensitiveSet.size) {
++          options.sensitiveHeaders = Array.from(sensitiveSet);
++          // follow-redirects releases that do not pass the previous request URL to
++          // beforeRedirect cannot be asked where the redirect came from, so track the
++          // origin of the last hop here.
++          let currentOrigin = getOrigin(parsed.href);
++          options.beforeRedirects.sensitiveHeaders = function beforeRedirectSensitiveHeaders(redirectOptions) {
++            const nextOrigin = getOrigin(redirectOptions.href);
++            if (currentOrigin === null || nextOrigin === null || nextOrigin !== currentOrigin) {
++              stripMatchingHeaders(redirectOptions.headers, sensitiveSet);
++            }
++            currentOrigin = nextOrigin;
++          };
++        }
+       }
+       transport = isHttpsRequest ? httpsFollow : httpFollow;
+     }
+--- a/index.d.ts
++++ b/index.d.ts
+@@ -348,6 +348,7 @@
+   httpAgent?: any;
+   httpsAgent?: any;
+   proxy?: AxiosProxyConfig | false;
++  sensitiveHeaders?: string[];
+   cancelToken?: CancelToken;
+   decompress?: boolean;
+   transitional?: TransitionalOptions;
+--- a/index.d.cts
++++ b/index.d.cts
+@@ -416,6 +416,7 @@
+     httpAgent?: any;
+     httpsAgent?: any;
+     proxy?: AxiosProxyConfig | false;
++    sensitiveHeaders?: string[];
+     cancelToken?: CancelToken;
+     decompress?: boolean;
+     transitional?: TransitionalOptions;
+--- a/test/unit/adapters/http.js
++++ b/test/unit/adapters/http.js
+@@ -539,6 +539,167 @@
+     });
+   });
+ 
++  it('should strip sensitiveHeaders on cross-origin redirect', async () => {
++    let capturedHeaders;
++
++    // destination server - different port means different origin
++    const destination = await startHTTPServer((req, res) => {
++      capturedHeaders = req.headers;
++      res.statusCode = 200;
++      res.end('ok');
++    }, {port: 4445});
++
++    // origin server - redirects to destination (cross-origin)
++    const origin = await startHTTPServer((req, res) => {
++      res.setHeader('Location', 'http://localhost:4445/dest');
++      res.statusCode = 302;
++      res.end();
++    }, {port: 4444});
++
++    try {
++      await axios.get('http://localhost:4444/src', {
++        maxRedirects: 5,
++        headers: {'X-API-Key': 'secret', 'X-Other': 'keep'},
++        sensitiveHeaders: ['x-api-key']
++      });
++
++      assert.strictEqual(capturedHeaders['x-api-key'], undefined, 'X-API-Key should be stripped');
++      assert.strictEqual(capturedHeaders['x-other'], 'keep', 'X-Other should be preserved');
++    } finally {
++      await stopHTTPServer(origin);
++      await stopHTTPServer(destination);
++    }
++  });
++
++  it('should preserve sensitiveHeaders on same-origin redirect', async () => {
++    let capturedHeaders;
++    let requestCount = 0;
++
++    server = await startHTTPServer((req, res) => {
++      requestCount++;
++      if (requestCount === 1) {
++        res.setHeader('Location', '/dest');
++        res.statusCode = 302;
++        res.end();
++      } else {
++        capturedHeaders = req.headers;
++        res.statusCode = 200;
++        res.end('ok');
++      }
++    }, {port: 4444});
++
++    await axios.get('http://localhost:4444/src', {
++      maxRedirects: 5,
++      headers: {'X-API-Key': 'secret'},
++      sensitiveHeaders: ['X-API-Key']
++    });
++
++    assert.strictEqual(capturedHeaders['x-api-key'], 'secret');
++  });
++
++  it('should not forward stripped sensitiveHeaders when a redirect chain returns to the original origin', async () => {
++    let capturedHeaders;
++    let originRequests = 0;
++
++    const other = await startHTTPServer((req, res) => {
++      res.setHeader('Location', 'http://localhost:4444/back');
++      res.statusCode = 302;
++      res.end();
++    }, {port: 4445});
++
++    server = await startHTTPServer((req, res) => {
++      originRequests++;
++      if (originRequests === 1) {
++        res.setHeader('Location', 'http://localhost:4445/hop');
++        res.statusCode = 302;
++        res.end();
++      } else {
++        capturedHeaders = req.headers;
++        res.statusCode = 200;
++        res.end('ok');
++      }
++    }, {port: 4444});
++
++    try {
++      await axios.get('http://localhost:4444/src', {
++        maxRedirects: 5,
++        headers: {'X-API-Key': 'secret'},
++        sensitiveHeaders: ['X-API-Key']
++      });
++
++      assert.strictEqual(capturedHeaders['x-api-key'], undefined);
++    } finally {
++      await stopHTTPServer(other);
++    }
++  });
++
++  it('should strip sensitiveHeaders configured on an instance', async () => {
++    let capturedHeaders;
++
++    const destination = await startHTTPServer((req, res) => {
++      capturedHeaders = req.headers;
++      res.statusCode = 200;
++      res.end('ok');
++    }, {port: 4445});
++
++    server = await startHTTPServer((req, res) => {
++      res.setHeader('Location', 'http://localhost:4445/dest');
++      res.statusCode = 302;
++      res.end();
++    }, {port: 4444});
++
++    const client = axios.create({
++      headers: {'X-API-Key': 'secret', 'X-Other': 'keep'},
++      sensitiveHeaders: ['X-API-Key']
++    });
++
++    try {
++      await client.get('http://localhost:4444/src', {maxRedirects: 5});
++
++      assert.strictEqual(capturedHeaders['x-api-key'], undefined);
++      assert.strictEqual(capturedHeaders['x-other'], 'keep');
++    } finally {
++      await stopHTTPServer(destination);
++    }
++  });
++
++  it('should reject invalid sensitiveHeaders config', async () => {
++    for (const invalid of ['X-API-Key', [null]]) {
++      await assert.rejects(
++        axios.get('http://localhost:1/', {sensitiveHeaders: invalid}),
++        (error) => {
++          assert.strictEqual(error.code, AxiosError.ERR_BAD_OPTION_VALUE);
++          assert.strictEqual(error.message, 'sensitiveHeaders must be an array of strings');
++          return true;
++        }
++      );
++    }
++  });
++
++  it('should not pick up Object.prototype.sensitiveHeaders', async () => {
++    let capturedHeaders;
++    const destination = await startHTTPServer((req, res) => {
++      capturedHeaders = req.headers;
++      res.statusCode = 200;
++      res.end('ok');
++    }, {port: 4445});
++
++    server = await startHTTPServer((req, res) => {
++      res.setHeader('Location', 'http://localhost:4445/dest');
++      res.statusCode = 302;
++      res.end();
++    }, {port: 4444});
++
++    Object.prototype.sensitiveHeaders = ['X-Secret'];
++    try {
++      await axios.get('http://localhost:4444/src', {headers: {'X-Secret': 'keep'}});
++      assert.strictEqual(capturedHeaders['x-secret'], 'keep');
++    } finally {
++      delete Object.prototype.sensitiveHeaders;
++      await stopHTTPServer(destination);
++    }
++  });
++
+   it('should preserve the HTTP verb on redirect', function (done) {
+     server = http.createServer(function (req, res) {
+       if (req.method.toLowerCase() !== "head") {
+
 Backport of upstream axios PR #10858 (merge caa00a9, released as v1.16.1) to
 axios v1.12.2, addressing AIKIDO-2026-10823 (CWE-319: HTTPS request data sent
 in cleartext to HTTP proxy).
