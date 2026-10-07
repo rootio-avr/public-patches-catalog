@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-22702
+- CVE-2026-102937
 
 ## How to Apply:
 1. Clone or download the source code for virtualenv
