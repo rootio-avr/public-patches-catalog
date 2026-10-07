@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-674766
 - AIKIDO-2026-785880
+- CVE-2026-102937
 - CVE-2026-102925
 
 ## How to Apply:
