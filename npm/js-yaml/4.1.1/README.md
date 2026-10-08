@@ -8,6 +8,8 @@ unknown
 - CVE-2026-59869
 - GHSA-5p4m-2wfm-xmqj
 - CVE-2026-84375
+- AIKIDO-2026-633502
+- AIKIDO-2026-641142
 
 ## How to Apply:
 1. Clone or download the source code for js-yaml
