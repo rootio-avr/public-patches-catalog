@@ -1,25 +1,12 @@
-# perl : 5.36.0-7+deb12u3.aikido.19
+# perl : 5.36.0-7+deb12u4.aikido.20
 
-This patch is based on perl version 5.36.0-7+deb12u3.aikido.19, which is available at:
-https://sources.debian.org/src/perl/5.36.0-7+deb12u3/
+This patch is based on perl version 5.36.0-7+deb12u4.aikido.20, which is available at:
+https://sources.debian.org/src/perl/5.36.0-7+deb12u4/
 
 ## Affected CVEs:
 - CVE-2011-4116
 - CVE-2023-31486
-- CVE-2026-42496
 - CVE-2026-9538
-- CVE-2026-42497
-- CVE-2026-48962
-- CVE-2026-8376
-- CVE-2026-48959
-- CVE-2026-7010
-- CVE-2025-15649
-- CVE-2026-12087
-- CVE-2026-13221
-- CVE-2026-48961
-- CVE-2026-57432
-- CVE-2026-57433
-- CVE-2026-7017
 - CVE-2026-82560
 
 ## How to Apply:
