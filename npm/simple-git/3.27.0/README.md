@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-261915
+- AIKIDO-2026-378256
 - AIKIDO-2026-566884
 
 ## How to Apply:
