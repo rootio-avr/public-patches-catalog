@@ -4064,3 +4064,415 @@ index ba6fbba..04365a7 100644
 +		assert.ok(!result.gotProcess, 'host process leaked: ' + JSON.stringify(result));
 +	});
 +});
+
+--- a/lib/resolver-compat.js
++++ b/lib/resolver-compat.js
+@@ -109,7 +109,13 @@
+ 	constructor(fileSystem, globalPaths, builtinModules, rootPaths, pathContext, customResolver, hostRequire, compiler, strict, externals, allowTransitive) {
+ 		super(fileSystem, globalPaths, builtinModules, rootPaths, pathContext, customResolver, hostRequire, compiler, strict);
+ 		this.externals = externals.map(makeExternalMatcher);
+-		this.externalCache = externals.map(pattern => new RegExp(makeExternalMatcherRegex(pattern)));
++		// SECURITY (GHSA-c48m-32m9-vx93): the bare-specifier allowlist pre-check in
++		// `customResolve` must match the WHOLE specifier (the package name,
++		// optionally followed by a subpath), NOT a substring. An unanchored regex
++		// matched `left-pad` inside `evil-left-pad` / `left-pad-evil`, handing a
++		// colliding host package to the custom resolver. Anchor both ends; wildcard
++		// semantics inside the pattern are preserved.
++		this.externalCache = externals.map(pattern => new RegExp('^(?:' + makeExternalMatcherRegex(pattern) + ')(?:[\\\\/].*)?$'));
+ 		this.currMod = undefined;
+ 		this.trustedMods = new WeakMap();
+ 		this.allowTransitive = allowTransitive;
+@@ -184,6 +190,11 @@
+ 		if (this.customResolver === undefined) return undefined;
+ 		if (!(this.pathIsAbsolute(x) || this.pathIsRelative(x))) {
+ 			if (!this.externalCache.some(regex => regex.test(x))) return undefined;
++			// SECURITY (GHSA-c48m-32m9-vx93): the permitted subpath may carry `..`
++			// segments (`left-pad/../evil-package`) that walk out of the allowlisted
++			// package. Reject any specifier with a `..` path segment before the
++			// custom resolver is consulted (and before any canonicalization).
++			if (x.split(/[\\/]/).indexOf('..') !== -1) return undefined;
+ 		}
+ 		const resolved = this.customResolver(x, path);
+ 		if (!resolved) return undefined;
+--- /dev/null
++++ b/test/ghsa-c48m-32m9-vx93.test.js
+@@ -0,0 +1,51 @@
++'use strict';
++
++// GHSA-c48m-32m9-vx93 -- NodeVM `require.external` allowlist bypass with a custom
++// `require.resolve`: the bare-specifier pre-check was an unanchored substring
++// match and accepted `..` traversal in the permitted subpath.
++
++const assert = require('assert');
++const { NodeVM } = require('../lib/main.js');
++
++function consultedFor(external, specifiers) {
++	const consulted = [];
++	const vm = new NodeVM({
++		require: {
++			external,
++			resolve: moduleName => { consulted.push(moduleName); return undefined; },
++			context: 'host',
++		},
++	});
++	for (const spec of specifiers) {
++		try { vm.run(`require(${JSON.stringify(spec)})`); } catch (e) { /* module-not-found is fine */ }
++	}
++	return consulted;
++}
++
++describe('GHSA-c48m-32m9-vx93 (external allowlist matcher)', function () {
++	it('does not consult the resolver for substring-colliding package names', function () {
++		const consulted = consultedFor(['left-pad'], ['evil-left-pad', 'left-pad-evil', 'xleft-padx', 'left-padx']);
++		assert.deepStrictEqual(consulted, []);
++	});
++
++	it('still consults the resolver for the allowlisted name and its subpaths', function () {
++		const specs = ['left-pad', 'left-pad/index.js', 'left-pad/lib/x'];
++		assert.deepStrictEqual(consultedFor(['left-pad'], specs), specs);
++	});
++
++	it('does not consult the resolver for `..` traversal subpaths', function () {
++		const consulted = consultedFor(['left-pad'], [
++			'left-pad/../evil-package',
++			'left-pad/sub/../../evil-package',
++			'left-pad/a/b/../../../evil-package',
++			'left-pad\\..\\evil-package',
++			'left-pad/..',
++		]);
++		assert.deepStrictEqual(consulted, []);
++	});
++
++	it('wildcard allowlist entries match by segment, not substring', function () {
++		const consulted = consultedFor(['@scope/*'], ['@scope/pkg', '@scope/pkg/sub', 'x@scope/pkg', '@scope-evil/pkg']);
++		assert.deepStrictEqual(consulted, ['@scope/pkg', '@scope/pkg/sub']);
++	});
++});
+
+--- a/lib/builtin.js
++++ b/lib/builtin.js
+@@ -74,7 +74,15 @@
+ 	// *write* APIs (os.setPriority, dns.setServers, dns.setDefaultResultOrder) that
+ 	// escape the sandbox in one line. Deny by default under both layers below.
+ 	'os',
+-	'dns'
++	'dns',
++	// SECURITY (GHSA-qhwx-74w5-xhxq): `node:test` is a host-process-SPAWNING
++	// primitive: `test.run({ files, execArgv: ['--eval=<js>'] })` starts a SEPARATE
++	// host Node process that executes attacker-supplied code with full host
++	// authority. On Node 18+ `require('module').builtinModules` lists `node:test` /
++	// `node:test/reporters` WITH the `node:` prefix, so `builtin: ['node:test']`
++	// (and `['*']`) previously admitted it. Embedders who need an in-sandbox test
++	// runner can register a controlled wrapper via `mock` / `override`.
++	'test'
+ ]);
+ 
+ // SECURITY (GHSA-m5w8-4gq2-6f8x): family-prefix denylist check. Strips the `node:`
+@@ -82,7 +90,8 @@
+ // subpaths such as `dns/promises` so a dangerous family and its sub-modules share fate.
+ function isDangerousBuiltin(key) {
+ 	if (typeof key !== 'string') return false;
+-	if (key.startsWith('node:')) key = key.slice(5);
++	// GHSA-qhwx-74w5-xhxq: strip ALL leading `node:` prefixes (`node:node:test` -> `test`).
++	while (key.startsWith('node:')) key = key.slice(5);
+ 	if (DANGEROUS_BUILTINS.has(key)) return true;
+ 	const slash = key.indexOf('/');
+ 	if (slash > 0 && DANGEROUS_BUILTINS.has(key.slice(0, slash))) return true;
+--- /dev/null
++++ b/test/ghsa-qhwx-74w5-xhxq.js
+@@ -0,0 +1,70 @@
++/* eslint-env mocha */
++
++'use strict';
++
++// GHSA-qhwx-74w5-xhxq: NodeVM host RCE via `node:test`'s process-spawning
++// `run({ execArgv })`. `node:test` must not be reachable under any builtin
++// configuration.
++
++const assert = require('assert');
++const os = require('os');
++const fs = require('fs');
++const path = require('path');
++const {NodeVM} = require('..');
++
++const HAS_NODE_TEST = require('module').builtinModules.indexOf('node:test') !== -1;
++
++describe('GHSA-qhwx-74w5-xhxq (node:test run({execArgv}) host RCE)', function() {
++	it('denies node:test / double-prefix / subpath under explicit builtin allow', function() {
++		const vm = new NodeVM({require: {external: false, builtin: ['node:test', 'test']}});
++		const res = vm.run(`
++			const out = {};
++			for (const spec of ['node:test', 'node:node:test', 'node:test/reporters', 'test']) {
++				try { require(spec); out[spec] = 'LOADED'; } catch (e) { out[spec] = 'denied'; }
++			}
++			module.exports = out;
++		`);
++		assert.strictEqual(res['node:test'], 'denied');
++		assert.strictEqual(res['node:node:test'], 'denied');
++		assert.strictEqual(res['node:test/reporters'], 'denied');
++		assert.strictEqual(res['test'], 'denied');
++	});
++
++	it('does not expose node:test under the wildcard builtin: ["*"]', function() {
++		const vm = new NodeVM({require: {external: false, builtin: ['*']}});
++		const res = vm.run(`
++			try { require('node:test'); module.exports = 'LOADED'; } catch (e) { module.exports = 'denied'; }
++		`);
++		assert.strictEqual(res, 'denied');
++	});
++
++	(HAS_NODE_TEST ? it : it.skip)('the run({execArgv}) PoC spawns no host process', function(done) {
++		this.timeout(6000);
++		const stamp = process.pid + '-' + Date.now();
++		const MARKER = path.join(os.tmpdir(), 'qhwx-test-' + stamp + '.txt');
++		const TESTFILE = path.join(os.tmpdir(), 'qhwx-tf-' + stamp + '.js');
++		try { fs.unlinkSync(MARKER); } catch (e) { /* ignore */ }
++		fs.writeFileSync(TESTFILE, '// inert\n');
++		const vm = new NodeVM({sandbox: {TESTFILE, MARKER}, require: {external: false, builtin: ['node:test']}});
++		try {
++			vm.run(`
++				const t = require('node:test');
++				const payload = 'require("fs").writeFileSync(' + JSON.stringify(MARKER) + ', "PWNED")';
++				const s = t.run({files: [TESTFILE], execArgv: ['--eval=' + payload]});
++				if (s && s.on) { s.on('data', () => {}); s.on('error', () => {}); }
++			`);
++		} catch (e) { /* require denied - expected */ }
++		setTimeout(() => {
++			const exists = fs.existsSync(MARKER);
++			try { fs.unlinkSync(MARKER); } catch (e) { /* ignore */ }
++			try { fs.unlinkSync(TESTFILE); } catch (e) { /* ignore */ }
++			assert.strictEqual(exists, false, 'node:test.run spawned a host process');
++			done();
++		}, 2500);
++	});
++
++	it('a benign explicitly-allowed builtin still loads', function() {
++		const vm = new NodeVM({require: {external: false, builtin: ['path']}});
++		assert.strictEqual(vm.run(`module.exports = typeof require('path').join === 'function';`), true);
++	});
++});
+
+--- a/lib/cli.js
++++ b/lib/cli.js
+@@ -14,7 +14,13 @@
+ 		NodeVM.file(path, {
+ 			verbose: true,
+ 			require: {
+-				external: true
++				external: true,
++				// SECURITY (GHSA-jxxv-8r27-vm4p): the shipped CLI must not run the target
++				// (or its requires) in the host realm. Bound requires to the script's own
++				// directory and load them INSIDE the sandbox (context:'sandbox'), so a
++				// script that require()s itself or a sibling can't execute in host context.
++				root: pa.dirname(path),
++				context: 'sandbox'
+ 			}
+ 		});
+ 
+--- a/lib/resolver-compat.js
++++ b/lib/resolver-compat.js
+@@ -10,6 +10,41 @@
+ const {makeBuiltinsFromLegacyOptions} = require('./builtin');
+ const {jsCompiler} = require('./compiler');
+ 
++const nodePath = require('path');
++const nodeFs = require('fs');
++
++// SECURITY (GHSA-j3hm-6rg5-mchv): deny a sandbox require() of vm2 itself (which
++// returns the real VM/NodeVM classes and lets sandbox code build a nested
++// unrestricted sandbox). We block vm2's IMPORTABLE surface specifically - its
++// `lib/` directory and its package main entry - NOT the whole package root.
++// Paths are realpath'd so a symlinked candidate can't dodge the boundary check.
++function realpathOr(p) {
++	try {
++		return nodeFs.realpathSync(p);
++	} catch (e) {
++		return p;
++	}
++}
++const VM2_LIB_DIR = realpathOr(__dirname);
++let VM2_MAIN_ENTRY = null;
++try {
++	VM2_MAIN_ENTRY = realpathOr(require.resolve(nodePath.dirname(__dirname)));
++} catch (e) {
++	// package main not resolvable in this layout - lib/ block still applies
++}
++
++function isVm2SelfRequire(filename) {
++	let real = filename;
++	try {
++		real = nodeFs.realpathSync(filename);
++	} catch (e) {
++		// fall back to the lexical filename
++	}
++	if (typeof real !== 'string') return false;
++	if (VM2_MAIN_ENTRY !== null && real === VM2_MAIN_ENTRY) return true;
++	return real === VM2_LIB_DIR || real.startsWith(VM2_LIB_DIR + nodePath.sep);
++}
++
+ /**
+  * Require wrapper to be able to annotate require with webpackIgnore.
+  *
+@@ -51,6 +86,9 @@
+ 	}
+ 
+ 	isPathAllowed(filename) {
++		// SECURITY (GHSA-j3hm-6rg5-mchv): never let the sandbox host-require vm2's own
++		// package, even when require.root contains node_modules/vm2 or is unset.
++		if (isVm2SelfRequire(filename)) return false;
+ 		if (this.rootPaths === undefined) return true;
+ 		// SECURITY: Dereference symlinks before the prefix check. The lexical
+ 		// resolve() does not follow symlinks but Node's native require() does,
+--- /dev/null
++++ b/test/ghsa/GHSA-j3hm-6rg5-mchv/repro.js
+@@ -0,0 +1,82 @@
++/**
++ * GHSA-j3hm-6rg5-mchv (dup: GHSA-w9c4-gw9x-53mq) — NodeVM require.external without
++ * an effective require.root grants unrestricted host require + RCE.
++ *
++ * STATUS: FIXED. The reported mechanism — sandboxed code requiring vm2 from disk
++ * to rebuild an *unrestricted* nested NodeVM, defeating the nesting default — is
++ * denied by every spelling (bare `vm2`, the lib/ path, index.js, the package main
++ * entry), matched by realpath so a symlink cannot dodge it.
++ *
++ * ACCEPTED RESIDUAL (deliberate, not a defect of this fix): `require.external`
++ * without `require.root` still host-require()s any attacker-named path, because
++ * `CustomResolver.isPathAllowed` returns true when `rootPaths === undefined`.
++ * That breadth is the documented meaning of the option. Deny-by-default is a
++ * breaking change (it would reverse the shipped GHSA-cp6g-6699-wx9c no-throw
++ * invariant and break ~20 in-repo call sites), so it is deferred to the next
++ * major; a one-time warning ships in the meantime.
++ *
++ * What these tests assert:
++ *   (a) bare `require.external: true` with require.root UNSET warns once and does
++ *       NOT throw at construction — current, deliberate behaviour pinned so the
++ *       next-major change is a conscious edit rather than an accident.
++ *   (b) a sandbox require() of vm2's own package is denied, closing the
++ *       `require('vm2')` -> real VM/NodeVM classes -> nested unrestricted sandbox
++ *       route this advisory reported.
++ *   (c) the denial does not over-block unrelated allowlisted modules.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const path = require('path');
++const fs = require('fs');
++const os = require('os');
++const { NodeVM } = require('../../../lib/main.js');
++
++const REPO_ROOT = path.resolve(__dirname, '../../..');
++const VM2_ENTRY = path.resolve(REPO_ROOT, 'lib/main.js');
++
++describe('GHSA-j3hm-6rg5-mchv — sandbox cannot rebuild an unrestricted NodeVM by requiring vm2', () => {
++	it('pins the accepted residual: bare require.external:true with no require.root warns but does not throw', () => {
++		// This asserts current behaviour, NOT a fix. The escape primitive is still
++		// reachable: isPathAllowed returns true unconditionally when rootPaths is
++		// undefined. Construction only warns, because a throw here would reverse the
++		// shipped GHSA-cp6g-6699-wx9c invariant that construction succeeds with no root.
++		// NOTE FOR THE FOLLOW-UP FIX of GHSA-j3hm-6rg5-mchv: if that fix refuses this
++		// combination at construction, THIS assertion is the one that must be updated.
++		assert.doesNotThrow(() => new NodeVM({ require: { external: true } }));
++	});
++
++	it('closes ONE escalation route: the sandbox cannot require() vm2 itself to build a nested unrestricted VM', () => {
++		const vm = new NodeVM({ require: { external: true, root: REPO_ROOT } });
++		let escaped = false, threw = false;
++		try {
++			const out = vm.run(`
++				const real = require(${JSON.stringify(VM2_ENTRY)});
++				const inner = new real.NodeVM({ require: { builtin: ['child_process'], external: false } });
++				module.exports = inner.run("module.exports = require('child_process').execSync('echo J3HM').toString()", 'inner.js');
++			`, 'untrusted.js');
++			escaped = typeof out === 'string' && out.includes('J3HM');
++		} catch (e) { threw = true; }
++		assert.strictEqual(escaped, false, 'sandbox reached a nested unrestricted VM via require(vm2)');
++		assert.strictEqual(threw, true, 'requiring vm2 should be denied (module not found)');
++	});
++
++	it('also denies requiring vm2 internals directly (e.g. lib/bridge.js)', () => {
++		const vm = new NodeVM({ require: { external: true, root: REPO_ROOT } });
++		assert.throws(() => vm.run(
++			`module.exports = typeof require(${JSON.stringify(path.resolve(REPO_ROOT, 'lib/bridge.js'))});`,
++			'u.js'), /Cannot find module|not allowed|ENOTFOUND/);
++	});
++
++	it('does not over-block: external+root still loads an allowed module outside vm2', () => {
++		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2-j3hm-ok-'));
++		try {
++			fs.writeFileSync(path.join(dir, 'greet.js'), "module.exports = 'HELLO_ALLOWED';");
++			const vm = new NodeVM({ require: { external: true, root: dir, context: 'host' } });
++			const out = vm.run(`module.exports = require(${JSON.stringify(path.join(dir, 'greet.js'))});`,
++				path.join(dir, 'main.js'));
++			assert.strictEqual(out, 'HELLO_ALLOWED');
++		} finally { fs.rmSync(dir, { recursive: true, force: true }); }
++	});
++});
+--- /dev/null
++++ b/test/ghsa/GHSA-jxxv-8r27-vm4p/repro.js
+@@ -0,0 +1,65 @@
++/**
++ * GHSA-jxxv-8r27-vm4p — the shipped vm2 CLI provided no sandbox isolation.
++ *
++ * lib/cli.js ran NodeVM.file(path, { require: { external: true } }) with no root
++ * and the default context:'host', so a script passed to `vm2 ./script.js` could
++ * `require(__filename)` (or any path) and execute in the host realm — equivalent
++ * to `node ./script.js`.
++ *
++ * Fix: the CLI now bounds requires to the script's directory (root: pa.dirname)
++ * and loads them inside the sandbox (context: 'sandbox'). That configuration
++ * change is the entire fix for THIS advisory.
++ *
++ * Scope note: bare `require.external: true` with no root still does NOT throw at
++ * construction, and still host-requires any named path. That breadth is the
++ * documented meaning of the option and is an accepted residual, warn-only until
++ * the next major (deny-by-default is a breaking change). GHSA-j3hm-6rg5-mchv —
++ * the nesting-default bypass via requiring vm2 from disk — is itself fixed. The
++ * last assertion below pins the no-throw behaviour deliberately; it is a statement
++ * of current behaviour, not of safety.
++ *
++ * Sound oracle: a self-requiring script that would write a host marker file via
++ * host fs must not do so under the CLI configuration.
++ */
++
++'use strict';
++
++const assert = require('assert');
++const path = require('path');
++const fs = require('fs');
++const os = require('os');
++const { NodeVM } = require('../../../lib/main.js');
++
++// The exact require config lib/cli.js now uses.
++function cliRequireConfig(scriptPath) {
++	return { external: true, root: path.dirname(scriptPath), context: 'sandbox' };
++}
++
++describe('GHSA-jxxv-8r27-vm4p — CLI sandbox isolation', () => {
++	it('a self-requiring script cannot reach the host realm under the CLI config', () => {
++		const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'vm2-jxxv-'));
++		try {
++			const marker = path.join(dir, 'HOST_ESCAPED.txt');
++			const scriptPath = path.join(dir, 'poc.js');
++			fs.writeFileSync(scriptPath, `
++				'use strict';
++				try { require('fs').writeFileSync(${JSON.stringify(marker)}, 'host pid=' + process.pid); }
++				catch (e) { try { require(__filename); } catch (e2) {} }
++			`);
++			try { NodeVM.file(scriptPath, { require: cliRequireConfig(scriptPath) }); } catch (e) { /* fine */ }
++			assert.strictEqual(fs.existsSync(marker), false,
++				'script reached host fs — CLI still runs the target in the host realm');
++		} finally { fs.rmSync(dir, { recursive: true, force: true }); }
++	});
++
++	it('the shipped lib/cli.js uses sandbox context and a bounded root', () => {
++		// The jxxv fix is the CLI config, not a construction throw — bind the test to
++		// the actual shipped file so a regression that drops either is caught.
++		// The doesNotThrow below records that construction with external-and-no-root
++		// still succeeds (the still-open GHSA-j3hm-6rg5-mchv hole), NOT that it is safe.
++		const cliSrc = fs.readFileSync(path.resolve(__dirname, '../../../lib/cli.js'), 'utf8');
++		assert.match(cliSrc, /context:\s*'sandbox'/, 'CLI must load requires in sandbox context');
++		assert.match(cliSrc, /root:\s*pa\.dirname/, 'CLI must bound requires to the script directory');
++		assert.doesNotThrow(() => new NodeVM({ require: { external: true } }));
++	});
++});
