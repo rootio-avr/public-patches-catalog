@@ -270,3 +270,155 @@
 +
 +	t.is(await fs.readFile(path.join(outputDir, 'safe.txt'), 'utf8'), 'hello');
 +});
+
+--- a/index.js
++++ b/index.js
+@@ -1,4 +1,5 @@
+ import {Buffer} from 'node:buffer';
++import {realpath as nativeRealpath} from 'node:fs/promises';
+ import path from 'node:path';
+ import process from 'node:process';
+ import {promisify} from 'node:util';
+@@ -25,25 +26,29 @@
+ 	return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+ };
+ 
+-// realpath the longest existing prefix (follows sibling symlinks), then append the missing tail
++// Walk one component at a time with node:fs realpath. graceful-fs realpath
++// collapses `..` lexically, so `a/../secret` looks inside when `a -> .`.
+ const resolveMaybeMissing = async target => {
+-	let existing = target;
+-	const tail = [];
++	const root = path.parse(target).root;
++	let current = root;
++	const parts = target.slice(root.length).split(path.sep).filter(part => part && part !== '.');
++	const pending = [];
++
++	for (const part of parts) {
++		if (pending.length > 0) {
++			pending.push(part);
++			continue;
++		}
+ 
+-	for (;;) {
+ 		try {
+ 			// eslint-disable-next-line no-await-in-loop
+-			return path.join(await realpath(existing), ...tail);
++			current = await nativeRealpath(path.join(current, part));
+ 		} catch {
+-			const parent = path.dirname(existing);
+-			if (parent === existing) {
+-				return target;
+-			}
+-
+-			tail.unshift(path.basename(existing));
+-			existing = parent;
++			pending.push(part);
+ 		}
+ 	}
++
++	return pending.length > 0 ? path.join(current, ...pending) : current;
+ };
+ 
+ // A self-referential linkname resolves inside lexically but escapes via the kernel
+@@ -68,12 +73,6 @@
+ 		.then(files => files.reduce((a, b) => [...a, ...b]));
+ };
+ 
+-const isInsideOutput = (target, root) => {
+-	const rel = path.relative(root, target);
+-	// '' is the dir itself; a `..` or an absolute path (different drive on Windows) is outside it
+-	return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+-};
+-
+ const safeMakeDir = (dir, realOutputPath) => realpath(dir)
+ 	.catch(_ => {
+ 		const parent = path.dirname(dir);
+@@ -145,7 +144,7 @@
+ 		return files;
+ 	}
+ 
+-	return Promise.all(files.map(x => {
++	const extractOne = x => {
+ 		const dest = path.join(output, x.path);
+ 		// Never honor setuid/setgid/sticky bits from an archive
+ 		const mode = (x.mode & 0o777) & ~process.umask(); // eslint-disable-line no-bitwise
+@@ -171,9 +170,9 @@
+ 						throw new Error(`Refusing to write outside output directory: ${realDestinationDir}`);
+ 					}
+ 
+-					return realOutputPath;
++					return {realOutputPath, realDestinationDir};
+ 				}))
+-			.then(realOutputPath => {
++			.then(({realOutputPath, realDestinationDir}) => {
+ 				if (x.type === 'link') {
+ 					// Hardlink target is relative to the extraction root
+ 					return ensureLinkTargetInsideOutput(x.linkname, realOutputPath, realOutputPath)
+@@ -181,14 +180,14 @@
+ 				}
+ 
+ 				if (x.type === 'symlink' && process.platform === 'win32') {
+-					// No symlinks on Windows; emulate with a hardlink relative to the link's dir
+-					return ensureLinkTargetInsideOutput(x.linkname, path.dirname(dest), realOutputPath)
++					// No symlinks on Windows; emulate with a hardlink relative to the link's real dir
++					return ensureLinkTargetInsideOutput(x.linkname, realDestinationDir, realOutputPath)
+ 						.then(target => link(target, dest));
+ 				}
+ 
+ 				if (x.type === 'symlink') {
+-					// Target is relative to the link's own dir
+-					return ensureLinkTargetInsideOutput(x.linkname, path.dirname(dest), realOutputPath)
++					// Lexical fast-reject; assertSymlinkResolvesInside is the real guard
++					return ensureLinkTargetInsideOutput(x.linkname, realDestinationDir, realOutputPath)
+ 						.then(() => symlink(x.linkname, dest));
+ 				}
+ 
+@@ -198,19 +197,37 @@
+ 			})
+ 			.then(() => x.type === 'file' && utimes(dest, now, x.mtime))
+ 			.then(() => x);
+-	})).then(async extracted => {
+-		// Every symlink now exists, so self-referential chains can be resolved for real.
+-		// realpath follows symlinks, so a target that escapes via a symlink is caught here.
+-		const symlinks = files.filter(x => x.type === 'symlink' && process.platform !== 'win32');
++	};
++
++	// Files and directories first, then symlinks shallow-to-deep, then hardlinks.
++	// Parallel symlink creation races a parent link against a child path and can
++	// miss the chain check.
++	const isSymlinkEntry = x => x.type === 'symlink' && process.platform !== 'win32';
++	const isHardlinkEntry = x => x.type === 'link' || (x.type === 'symlink' && process.platform === 'win32');
++	const depth = x => x.path.split(/[/\\]/).length;
++	const regular = files.filter(x => !isSymlinkEntry(x) && !isHardlinkEntry(x));
++	const symlinks = files.filter(isSymlinkEntry).sort((a, b) => depth(a) - depth(b));
++	const hardlinks = files.filter(isHardlinkEntry);
++
++	return (async () => {
++		await Promise.all(regular.map(x => extractOne(x)));
++		for (const x of symlinks) {
++			// eslint-disable-next-line no-await-in-loop
++			await extractOne(x);
++		}
++
++		await Promise.all(hardlinks.map(x => extractOne(x)));
++
+ 		if (symlinks.length > 0) {
+-			const realOutputPath = await realpath(output);
+-			await Promise.all(symlinks.map(x =>
+-				assertSymlinkResolvesInside(path.join(output, x.path), x.linkname, realOutputPath),
+-			));
++			const realOutputPath = await nativeRealpath(output);
++			for (const x of symlinks) {
++				// eslint-disable-next-line no-await-in-loop
++				await assertSymlinkResolvesInside(path.join(output, x.path), x.linkname, realOutputPath);
++			}
+ 		}
+ 
+-		return extracted;
+-	});
++		return files;
++	})();
+ });
+ 
+ const decompress = (input, output, options) => {

@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-130799
 - CVE-2026-53486
+- CVE-2026-101894
 
 ## How to Apply:
 1. Clone or download the source code for @xhmikosr/decompress
