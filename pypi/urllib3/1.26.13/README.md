@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-499214
+- CVE-2026-97687
+- CVE-2026-97689
 
 ## How to Apply:
 1. Clone or download the source code for urllib3
