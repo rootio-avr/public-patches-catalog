@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - GHSA-72hv-8253-57qq
 - GHSA-r7wm-3cxj-wff9
+- CVE-2026-89407
+- CVE-2026-89425
 - AIKIDO-2026-665392
 
 ## How to Apply:
