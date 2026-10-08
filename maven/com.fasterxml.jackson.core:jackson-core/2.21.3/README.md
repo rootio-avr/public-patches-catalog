@@ -5,6 +5,9 @@ unknown
 
 ## Affected CVEs:
 - GHSA-r7wm-3cxj-wff9
+- CVE-2026-89425
+- CVE-2026-68494
+- CVE-2026-89407
 
 ## How to Apply:
 1. Clone or download the source code for com.fasterxml.jackson.core:jackson-core
