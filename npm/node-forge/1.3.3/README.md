@@ -8,6 +8,7 @@ unknown
 - CVE-2026-33894
 - CVE-2026-33895
 - CVE-2026-33896
+- CVE-2026-85393
 
 ## How to Apply:
 1. Clone or download the source code for node-forge
