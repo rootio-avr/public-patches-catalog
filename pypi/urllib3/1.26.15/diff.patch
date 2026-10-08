@@ -785,6 +785,204 @@
                  method = "GET"
  
 
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -407,6 +407,10 @@
+         proxy_ssl_context = (
+             self.proxy_config.ssl_context if proxy_is_forwarding else None
+         )
++        if proxy_is_forwarding:
++            # The target's SNI override must never be sent to (or used to
++            # verify) the proxy; always address the proxy by its own host.
++            server_hostname = hostname
+ 
+         # Wrap socket using verification with the root certs in
+         # trusted_root_certs
+@@ -437,9 +441,15 @@
+             ca_certs = self.ca_certs
+             ca_cert_dir = self.ca_cert_dir
+             ca_cert_data = self.ca_cert_data
+-            key_file = self.key_file
+-            cert_file = self.cert_file
+-            key_password = self.key_password
++            if proxy_is_forwarding:
++                # Never present the target's client certificate to the proxy.
++                key_file = None
++                cert_file = None
++                key_password = None
++            else:
++                key_file = self.key_file
++                cert_file = self.cert_file
++                key_password = self.key_password
+ 
+         # Try to load OS default certs if none are given.
+         # Works well on Windows (requires Python3.4+)
+@@ -482,14 +492,21 @@
+                 DeprecationWarning,
+             )
+ 
+-        if self.assert_fingerprint:
++        # ``assert_fingerprint`` and ``assert_hostname`` describe the target
++        # server, so they must not be applied to a forwarding proxy handshake.
++        target_assert_fingerprint = (
++            None if proxy_is_forwarding else self.assert_fingerprint
++        )
++        target_assert_hostname = None if proxy_is_forwarding else self.assert_hostname
++
++        if target_assert_fingerprint:
+             assert_fingerprint(
+-                self.sock.getpeercert(binary_form=True), self.assert_fingerprint
++                self.sock.getpeercert(binary_form=True), target_assert_fingerprint
+             )
+         elif (
+             context.verify_mode != ssl.CERT_NONE
+             and not getattr(context, "check_hostname", False)
+-            and self.assert_hostname is not False
++            and target_assert_hostname is not False
+         ):
+             # While urllib3 attempts to always turn off hostname matching from
+             # the TLS library, this cannot always be done. So we check whether
+@@ -505,11 +522,11 @@
+                     ),
+                     SubjectAltNameWarning,
+                 )
+-            _match_hostname(cert, self.assert_hostname or server_hostname)
++            _match_hostname(cert, target_assert_hostname or server_hostname)
+ 
+         verified = (
+             context.verify_mode == ssl.CERT_REQUIRED
+-            or self.assert_fingerprint is not None
++            or target_assert_fingerprint is not None
+         )
+ 
+         if proxy_is_forwarding:
+--- /dev/null
++++ b/test/test_cve_2026_97687.py
+@@ -0,0 +1,123 @@
++"""Regression test for CVE-2026-97687.
++
++When a forwarding HTTPS proxy is used (``use_forwarding_for_https=True`` and no
++CONNECT tunnel) the TLS handshake is performed against the *proxy*. The TLS
++settings that describe the *target* server (SNI override, ``assert_hostname``,
++``assert_fingerprint``, client certificates, ``cert_reqs``) must not be applied
++to that handshake, and ``ProxyConfig.ssl_context`` must not be mutated.
++
++The test does not touch the network: ``ssl_wrap_socket`` is stubbed.
++"""
++import ssl
++
++import pytest
++
++import urllib3.connection as connection_module
++from urllib3.util.ssl_match_hostname import CertificateError
++from urllib3.poolmanager import ProxyManager
++
++PROXY_HOST = "proxy.invalid"
++
++
++class _FakeTLSSocket(object):
++    def __init__(self, cert=None):
++        self._cert = cert if cert is not None else {}
++
++    def version(self):
++        return "TLSv1.3"
++
++    def getpeercert(self, binary_form=False):
++        if binary_form:
++            return b"proxy-certificate"
++        return self._cert
++
++
++def _connect(monkeypatch, proxy_context, fake_socket, **pool_kw):
++    calls = []
++
++    def recording_wrapper(*args, **kwargs):
++        calls.append(kwargs)
++        return fake_socket
++
++    monkeypatch.setattr(connection_module, "ssl_wrap_socket", recording_wrapper)
++
++    manager = ProxyManager(
++        "https://%s:443" % PROXY_HOST,
++        proxy_ssl_context=proxy_context,
++        use_forwarding_for_https=True,
++        **pool_kw
++    )
++    pool = manager.connection_from_url("https://target.invalid:443")
++    conn = pool._new_conn()
++    monkeypatch.setattr(conn, "_new_conn", lambda: object())
++    conn.connect()
++    return conn, calls
++
++
++def test_forwarding_proxy_does_not_receive_target_tls_settings(monkeypatch):
++    proxy_context = ssl.create_default_context()
++    assert proxy_context.verify_mode == ssl.CERT_REQUIRED
++
++    conn, calls = _connect(
++        monkeypatch,
++        proxy_context,
++        _FakeTLSSocket(),
++        cert_reqs=ssl.CERT_NONE,
++        server_hostname="target.invalid",
++        cert_file="/target/client.crt",
++        key_file="/target/client.key",
++    )
++
++    assert len(calls) == 1
++    kwargs = calls[0]
++    assert kwargs["ssl_context"] is proxy_context
++    # Target SNI must not leak to the proxy.
++    assert kwargs["server_hostname"] == PROXY_HOST
++    # Target client credentials must not be presented to the proxy.
++    assert kwargs.get("certfile") is None
++    assert kwargs.get("keyfile") is None
++    # Target cert_reqs must not mutate the proxy context.
++    assert proxy_context.verify_mode == ssl.CERT_REQUIRED
++    assert conn.proxy_is_verified is True
++    assert conn.is_verified is False
++
++
++def test_forwarding_proxy_ignores_target_assert_fingerprint(monkeypatch):
++    proxy_context = ssl.create_default_context()
++    # A target fingerprint that cannot match the proxy certificate.
++    conn, _ = _connect(
++        monkeypatch,
++        proxy_context,
++        _FakeTLSSocket(),
++        assert_fingerprint="aa:" * 19 + "aa",
++    )
++    assert conn.proxy_is_verified is True
++
++
++def test_forwarding_proxy_ignores_target_assert_hostname(monkeypatch):
++    proxy_context = ssl.create_default_context()
++    proxy_context.check_hostname = False
++    cert = {"subjectAltName": (("DNS", PROXY_HOST),)}
++
++    # Matching is done against the proxy host, not the target assert_hostname.
++    conn, _ = _connect(
++        monkeypatch,
++        proxy_context,
++        _FakeTLSSocket(cert),
++        assert_hostname="other.invalid",
++    )
++    assert conn.proxy_is_verified is True
++
++
++def test_forwarding_proxy_still_verifies_proxy_hostname(monkeypatch):
++    proxy_context = ssl.create_default_context()
++    proxy_context.check_hostname = False
++    cert = {"subjectAltName": (("DNS", "not-the-proxy.invalid"),)}
++
++    with pytest.raises(CertificateError):
++        _connect(
++            monkeypatch,
++            proxy_context,
++            _FakeTLSSocket(cert),
++            assert_hostname="not-the-proxy.invalid",
++        )
+
 --- a/src/urllib3/response.py
 +++ b/src/urllib3/response.py
 @@ -38,7 +38,14 @@
