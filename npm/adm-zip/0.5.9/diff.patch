@@ -175,3 +175,513 @@
 +        expect(round.readFile("d.txt").equals(payload)).to.equal(true);
 +    });
 +});
+
+--- a/methods/inflater.js
++++ b/methods/inflater.js
+@@ -2,12 +2,16 @@
+ 
+ module.exports = function (/*Buffer*/ inbuf, /*number*/ expectedLength) {
+     var zlib = require("zlib");
++    var Errors = require("../util/errors");
+ 
+-    // Cap the inflater output at the declared uncompressed size so a bogus,
+-    // attacker-controlled size can no longer trigger an eager multi-gigabyte
+-    // allocation before the data is validated (CVE-2026-39244). On Node < 15
+-    // maxOutputLength is unavailable, so we fall back to the default behaviour.
+-    const option = version >= 15 && expectedLength > 0 ? { maxOutputLength: expectedLength } : {};
++    // Cap decompression output at the entry's declared uncompressed size to bound
++    // decompression bombs (CVE-2026-77301). A declared size of 0 must not disable
++    // the cap: a genuinely empty entry inflates to 0 bytes, so a 1-byte floor
++    // still lets it through while stopping a bomb that lies about its size.
++    // zlib requires maxOutputLength >= 1. On Node < 15 maxOutputLength is unavailable,
++    // so we fall back to the default behaviour.
++    var maxOutputLength = expectedLength > 0 ? expectedLength : 1;
++    const option = version >= 15 ? { maxOutputLength: maxOutputLength } : {};
+ 
+     return {
+         inflate: function () {
+@@ -17,12 +21,35 @@
+         inflateAsync: function (/*Function*/ callback) {
+             var tmp = zlib.createInflateRaw(option),
+                 parts = [],
+-                total = 0;
++                total = 0,
++                done = false;
++            var fail = function (err) {
++                if (done) return;
++                done = true;
++                tmp.destroy();
++                callback && callback(Buffer.alloc(0), err);
++            };
++            // Route stream errors (e.g. Z_DATA_ERROR on malformed input) through the
++            // callback. Without an "error" listener zlib re-throws the event as an
++            // uncaught exception on a later tick, crashing the host process instead
++            // of failing the call.
++            tmp.on("error", function (err) {
++                fail(err);
++            });
+             tmp.on("data", function (data) {
+-                parts.push(data);
++                if (done) return;
+                 total += data.length;
++                // The streaming API ignores maxOutputLength, so enforce the cap by
++                // hand; otherwise the async path decompresses without limit while the
++                // sync path is capped (CVE-2026-77301).
++                if (total > maxOutputLength) {
++                    return fail(new Error(Errors.MAX_OUTPUT_EXCEEDED));
++                }
++                parts.push(data);
+             });
+             tmp.on("end", function () {
++                if (done) return;
++                done = true;
+                 var buf = Buffer.alloc(total),
+                     written = 0;
+                 buf.fill(0);
+--- a/util/errors.js
++++ b/util/errors.js
+@@ -7,6 +7,7 @@
+     /* ZipEntry error messages*/
+     NO_DATA: "Nothing to decompress",
+     BAD_CRC: "CRC32 checksum failed",
++    MAX_OUTPUT_EXCEEDED: "Decompressed data exceeds the declared uncompressed size",
+     FILE_IN_THE_WAY: "There is a file in the way: %s",
+     UNKNOWN_METHOD: "Invalid/unsupported compression method",
+ 
+--- a/zipEntry.js
++++ b/zipEntry.js
+@@ -92,13 +92,17 @@
+                     }
+                     return data;
+                 } else {
+-                    inflater.inflateAsync(function (result) {
+-                        if (callback) {
+-                            if (!crc32OK(result)) {
+-                                callback(result, Utils.Errors.BAD_CRC); //si added error
+-                            } else {
+-                                callback(result);
+-                            }
++                    inflater.inflateAsync(function (result, err) {
++                        if (!callback) return;
++                        if (err) {
++                            // surface inflater/stream failures (including the
++                            // maxOutputLength cap being exceeded) instead of
++                            // validating an empty placeholder buffer (CVE-2026-77301)
++                            callback(Buffer.alloc(0), err);
++                        } else if (!crc32OK(result)) {
++                            callback(result, Utils.Errors.BAD_CRC); //si added error
++                        } else {
++                            callback(result);
+                         }
+                     });
+                 }
+--- /dev/null
++++ b/test/cve-2026-77301.test.js
+@@ -0,0 +1,122 @@
++"use strict";
++
++const { expect } = require("chai");
++const Zip = require("../adm-zip");
++
++// Regression test for CVE-2026-77301:
++// adm-zip allocated the entry output buffer from the attacker-declared
++// uncompressed size (central-directory / local-header size field) before any
++// validation. A tiny crafted archive could declare a ~3 GB size and force a
++// matching Buffer.alloc, OOM-killing the process. The allocation must be bound
++// by the data actually present in the archive, not by the declared size.
++
++const u16 = (n) => {
++    const b = Buffer.alloc(2);
++    b.writeUInt16LE(n >>> 0);
++    return b;
++};
++const u32 = (n) => {
++    const b = Buffer.alloc(4);
++    b.writeUInt32LE(n >>> 0);
++    return b;
++};
++
++// Build a single-entry zip that declares `declaredSize` uncompressed bytes while
++// only carrying `content` bytes of (crc-invalid) payload.
++function craftBomb(declaredSize, method, content) {
++    const name = Buffer.from("a");
++    const crc = 0; // deliberately wrong: alloc used to happen before the crc check
++    const lfh = Buffer.concat([
++        u32(0x04034b50),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(crc),
++        u32(content.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        name,
++        content
++    ]);
++    const cd = Buffer.concat([
++        u32(0x02014b50),
++        u16(20),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(crc),
++        u32(content.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        u16(0),
++        u16(0),
++        u16(0),
++        u32(0),
++        u32(0),
++        name
++    ]);
++    const eocd = Buffer.concat([u32(0x06054b50), u16(0), u16(0), u16(1), u16(1), u32(cd.length), u32(lfh.length), u16(0)]);
++    return Buffer.concat([lfh, cd, eocd]);
++}
++
++describe("decompression bomb (declared size) - CVE-2026-77301", () => {
++    const DECLARED = 3 * 1024 * 1024 * 1024; // ~3 GB, far above any plausible RSS budget
++
++    it("does not allocate the declared size for a STORED entry", () => {
++        const zip = new Zip(craftBomb(DECLARED, 0 /* STORED */, Buffer.from("A")));
++        const before = process.memoryUsage().rss;
++        // invalid crc -> must throw, but crucially without committing gigabytes
++        expect(() => zip.getEntries()[0].getData()).to.throw(/CRC32/);
++        const grewMB = (process.memoryUsage().rss - before) / (1024 * 1024);
++        expect(grewMB, "RSS growth must stay bounded by real data, not declared size").to.be.below(256);
++    });
++
++    it("does not allocate the declared size for a DEFLATED entry", () => {
++        const zip = new Zip(craftBomb(DECLARED, 8 /* DEFLATED */, Buffer.from([0x00])));
++        const before = process.memoryUsage().rss;
++        // bogus deflate stream / crc -> must throw without a huge eager allocation
++        expect(() => zip.getEntries()[0].getData()).to.throw();
++        const grewMB = (process.memoryUsage().rss - before) / (1024 * 1024);
++        expect(grewMB, "RSS growth must stay bounded by real data, not declared size").to.be.below(256);
++    });
++
++    it("still reads a legitimate STORED entry", () => {
++        const zip = new Zip();
++        zip.addFile("s.bin", Buffer.from([1, 2, 3, 4, 5]));
++        const round = new Zip(zip.toBuffer());
++        expect([...round.readFile("s.bin")]).to.eql([1, 2, 3, 4, 5]);
++    });
++
++    it("still reads a legitimate DEFLATED entry", () => {
++        const zip = new Zip();
++        const payload = Buffer.from("hello world ".repeat(5000));
++        zip.addFile("d.txt", payload);
++        const round = new Zip(zip.toBuffer());
++        expect(round.readFile("d.txt").equals(payload)).to.equal(true);
++    });
++
++    it("caps async inflation of a DEFLATED entry at the declared size", (done) => {
++        const zlib = require("zlib");
++        const payload = Buffer.alloc(1024 * 1024, 0x41);
++        // declares 16 bytes but the deflate stream inflates to 1 MiB
++        const zip = new Zip(craftBomb(16, 8 /* DEFLATED */, zlib.deflateRawSync(payload)));
++        zip.getEntries()[0].getDataAsync((data, err) => {
++            expect(err).to.be.an("error");
++            expect(err.message).to.match(/declared uncompressed size/);
++            expect(data.length).to.equal(0);
++            done();
++        });
++    });
++
++    it("caps sync inflation of a DEFLATED entry declaring size 0", () => {
++        const zlib = require("zlib");
++        const zip = new Zip(craftBomb(0, 8 /* DEFLATED */, zlib.deflateRawSync(Buffer.alloc(1024 * 1024, 0x41))));
++        expect(() => zip.getEntries()[0].getData()).to.throw();
++    });
++});
+
+--- a/headers/entryHeader.js
++++ b/headers/entryHeader.js
+@@ -149,7 +149,12 @@
+ 
+         // get Unix file permissions
+         get fileAttr() {
+-            return _attr ? (((_attr >>> 0) | 0) >> 16) & 0xfff : 0;
++            // Mask to the 9 rwxrwxrwx bits only. The setuid (0o4000), setgid
++            // (0o2000) and sticky (0o1000) bits are attacker-controlled archive
++            // metadata; preserving them on extraction (keepOriginalPermission)
++            // lets a crafted zip plant a setuid-root binary when extracting as
++            // root, a local privilege escalation.
++            return _attr ? (((_attr >>> 0) | 0) >> 16) & 0o777 : 0;
+         },
+ 
+         get offset() {
+--- /dev/null
++++ b/test/cve-2026-102282.test.js
+@@ -0,0 +1,39 @@
++"use strict";
++const { expect } = require("chai");
++const fs = require("fs");
++const os = require("os");
++const pth = require("path");
++const Zip = require("../adm-zip");
++
++describe("CVE-2026-102282 - setuid/setgid/sticky bits must not be preserved", () => {
++    const build = () => {
++        const zip = new Zip();
++        zip.addFile("suidbin", Buffer.from("#!/bin/sh\n"), "", 0o4755);
++        zip.addFile("sgidbin", Buffer.from("#!/bin/sh\n"), "", 0o2755);
++        zip.addFile("stickybin", Buffer.from("#!/bin/sh\n"), "", 0o1755);
++        zip.addFile("normal", Buffer.from("data"), "", 0o644);
++        return new Zip(zip.toBuffer());
++    };
++
++    it("header.fileAttr only exposes rwxrwxrwx bits", () => {
++        const zip = build();
++        expect(zip.getEntry("suidbin").header.fileAttr).to.equal(0o755);
++        expect(zip.getEntry("sgidbin").header.fileAttr).to.equal(0o755);
++        expect(zip.getEntry("stickybin").header.fileAttr).to.equal(0o755);
++        expect(zip.getEntry("normal").header.fileAttr).to.equal(0o644);
++    });
++
++    it("extractAllTo with keepOriginalPermission does not set special bits", function () {
++        if (process.platform === "win32") this.skip();
++        const dir = fs.mkdtempSync(pth.join(os.tmpdir(), "admzip-cve-"));
++        try {
++            build().extractAllTo(dir, true, true);
++            expect(fs.statSync(pth.join(dir, "suidbin")).mode & 0o7777).to.equal(0o755);
++            expect(fs.statSync(pth.join(dir, "sgidbin")).mode & 0o7777).to.equal(0o755);
++            expect(fs.statSync(pth.join(dir, "stickybin")).mode & 0o7777).to.equal(0o755);
++            expect(fs.statSync(pth.join(dir, "normal")).mode & 0o7777).to.equal(0o644);
++        } finally {
++            fs.rmSync(dir, { recursive: true, force: true });
++        }
++    });
++});
+
+--- a/methods/inflater.js
++++ b/methods/inflater.js
+@@ -32,7 +32,7 @@
+             // Route stream errors (e.g. Z_DATA_ERROR on malformed input) through the
+             // callback. Without an "error" listener zlib re-throws the event as an
+             // uncaught exception on a later tick, crashing the host process instead
+-            // of failing the call.
++            // of failing the call (GHSA-8238-w5pm-2374).
+             tmp.on("error", function (err) {
+                 fail(err);
+             });
+--- a/zipEntry.js
++++ b/zipEntry.js
+@@ -97,7 +97,7 @@
+                         if (err) {
+                             // surface inflater/stream failures (including the
+                             // maxOutputLength cap being exceeded) instead of
+-                            // validating an empty placeholder buffer (CVE-2026-77301)
++                            // validating an empty placeholder buffer (CVE-2026-77301 / GHSA-8238-w5pm-2374)
+                             callback(Buffer.alloc(0), err);
+                         } else if (!crc32OK(result)) {
+                             callback(result, Utils.Errors.BAD_CRC); //si added error
+--- /dev/null
++++ b/test/ghsa-8238-w5pm-2374.test.js
+@@ -0,0 +1,122 @@
++"use strict";
++
++const { expect } = require("chai");
++const Zip = require("../adm-zip");
++
++// Regression test for GHSA-8238-w5pm-2374:
++// The async decompression path (getDataAsync / readFileAsync) created a zlib
++// inflate stream without an "error" listener. Malformed DEFLATE data makes zlib
++// emit an "error" event (Z_DATA_ERROR), which without a listener is re-thrown as
++// an uncaught exception and crashes the host process. The error must instead be
++// delivered through the callback.
++
++const u16 = (n) => {
++    const b = Buffer.alloc(2);
++    b.writeUInt16LE(n >>> 0);
++    return b;
++};
++const u32 = (n) => {
++    const b = Buffer.alloc(4);
++    b.writeUInt32LE(n >>> 0);
++    return b;
++};
++
++// Single-entry DEFLATED zip whose compressed payload is `deflated` (arbitrary bytes).
++function craftDeflatedZip(declaredSize, deflated) {
++    const name = Buffer.from("a");
++    const method = 8; // DEFLATED
++    const lfh = Buffer.concat([
++        u32(0x04034b50),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(0),
++        u32(deflated.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        name,
++        deflated
++    ]);
++    const cd = Buffer.concat([
++        u32(0x02014b50),
++        u16(20),
++        u16(20),
++        u16(0),
++        u16(method),
++        u16(0),
++        u16(0),
++        u32(0),
++        u32(deflated.length),
++        u32(declaredSize),
++        u16(name.length),
++        u16(0),
++        u16(0),
++        u16(0),
++        u16(0),
++        u32(0),
++        u32(0),
++        name
++    ]);
++    const eocd = Buffer.concat([u32(0x06054b50), u16(0), u16(0), u16(1), u16(1), u32(cd.length), u32(lfh.length), u16(0)]);
++    return Buffer.concat([lfh, cd, eocd]);
++}
++
++describe("async decompression of malformed DEFLATE data - GHSA-8238-w5pm-2374", () => {
++    // 0xFF 0xFF ... => reserved/invalid DEFLATE block type, zlib raises Z_DATA_ERROR
++    const malformed = Buffer.alloc(32, 0xff);
++
++    it("getDataAsync reports an error through the callback instead of crashing", (done) => {
++        const zip = new Zip(craftDeflatedZip(64, malformed));
++        let calls = 0;
++        zip.getEntries()[0].getDataAsync(function (data, err) {
++            calls++;
++            try {
++                expect(err, "malformed data must surface an error").to.be.an("error");
++                expect(Buffer.isBuffer(data)).to.equal(true);
++                expect(data.length).to.equal(0);
++            } catch (e) {
++                return done(e);
++            }
++            // allow any (incorrect) extra callbacks to be observed before finishing
++            setTimeout(() => {
++                try {
++                    expect(calls, "callback must be invoked exactly once").to.equal(1);
++                    done();
++                } catch (e) {
++                    done(e);
++                }
++            }, 20);
++        });
++    });
++
++    it("readFileAsync reports an error through the callback instead of crashing", (done) => {
++        const zip = new Zip(craftDeflatedZip(64, malformed));
++        zip.readFileAsync("a", function (data, err) {
++            try {
++                expect(err, "malformed data must surface an error").to.be.an("error");
++                done();
++            } catch (e) {
++                done(e);
++            }
++        });
++    });
++
++    it("still reads a legitimate DEFLATED entry on the async path", (done) => {
++        const zip = new Zip();
++        const payload = Buffer.from("hello world ".repeat(500));
++        zip.addFile("d.txt", payload);
++        const round = new Zip(zip.toBuffer());
++        round.readFileAsync("d.txt", function (data, err) {
++            try {
++                expect(err == null, "legit entry must not error: " + err).to.equal(true);
++                expect(data.equals(payload)).to.equal(true);
++                done();
++            } catch (e) {
++                done(e);
++            }
++        });
++    });
++});
+
+--- a/methods/inflater.js
++++ b/methods/inflater.js
+@@ -5,7 +5,7 @@
+     var Errors = require("../util/errors");
+ 
+     // Cap decompression output at the entry's declared uncompressed size to bound
+-    // decompression bombs (CVE-2026-77301). A declared size of 0 must not disable
++    // decompression bombs (CVE-2026-77301 / GHSA-rcw4-f5rp-g42v). A declared size of 0 must not disable
+     // the cap: a genuinely empty entry inflates to 0 bytes, so a 1-byte floor
+     // still lets it through while stopping a bomb that lies about its size.
+     // zlib requires maxOutputLength >= 1. On Node < 15 maxOutputLength is unavailable,
+@@ -41,7 +41,7 @@
+                 total += data.length;
+                 // The streaming API ignores maxOutputLength, so enforce the cap by
+                 // hand; otherwise the async path decompresses without limit while the
+-                // sync path is capped (CVE-2026-77301).
++                // sync path is capped (CVE-2026-77301 / GHSA-rcw4-f5rp-g42v).
+                 if (total > maxOutputLength) {
+                     return fail(new Error(Errors.MAX_OUTPUT_EXCEEDED));
+                 }
+--- /dev/null
++++ b/test/ghsa-rcw4-f5rp-g42v.test.js
+@@ -0,0 +1,54 @@
++"use strict";
++const { expect } = require("chai");
++const zlib = require("zlib");
++const Inflater = require("../methods/inflater");
++const Errors = require("../util/errors");
++
++// Highly compressible payload: a small deflate stream that expands to 8 MiB.
++const BOMB_SIZE = 8 * 1024 * 1024;
++const bomb = zlib.deflateRawSync(Buffer.alloc(BOMB_SIZE));
++const nodeMajor = +process.versions.node.split(".")[0];
++
++describe("GHSA-rcw4-f5rp-g42v - decompression size cap", () => {
++    it("async path rejects output larger than the declared size", (done) => {
++        new Inflater(bomb, 1024).inflateAsync((result, err) => {
++            expect(err).to.be.an("error");
++            expect(err.message).to.equal(Errors.MAX_OUTPUT_EXCEEDED);
++            expect(result.length).to.equal(0);
++            done();
++        });
++    });
++
++    it("async path does not treat a declared size of 0 as unlimited", (done) => {
++        new Inflater(bomb, 0).inflateAsync((result, err) => {
++            expect(err).to.be.an("error");
++            expect(err.message).to.equal(Errors.MAX_OUTPUT_EXCEEDED);
++            expect(result.length).to.equal(0);
++            done();
++        });
++    });
++
++    it("sync path does not treat a declared size of 0 as unlimited", function () {
++        if (nodeMajor < 15) this.skip();
++        expect(() => new Inflater(bomb, 0).inflate()).to.throw();
++    });
++
++    it("async path still inflates data that matches the declared size", (done) => {
++        const plain = Buffer.from("hello hello hello hello");
++        new Inflater(zlib.deflateRawSync(plain), plain.length).inflateAsync((result, err) => {
++            expect(err).to.equal(undefined);
++            expect(result.equals(plain)).to.equal(true);
++            done();
++        });
++    });
++
++    it("an empty entry with declared size 0 still inflates to 0 bytes", (done) => {
++        const empty = zlib.deflateRawSync(Buffer.alloc(0));
++        expect(new Inflater(empty, 0).inflate().length).to.equal(0);
++        new Inflater(empty, 0).inflateAsync((result, err) => {
++            expect(err).to.equal(undefined);
++            expect(result.length).to.equal(0);
++            done();
++        });
++    });
++});
