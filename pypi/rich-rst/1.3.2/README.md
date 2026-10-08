@@ -4,6 +4,7 @@ This patch is based on rich-rst version 1.3.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-387556
 - AIKIDO-2026-826619
 
 ## How to Apply:
