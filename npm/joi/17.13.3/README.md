@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-48038
 - GHSA-6h2x-m376-mqjq
+- AIKIDO-2026-912310
 
 ## How to Apply:
 1. Clone or download the source code for joi
