@@ -1046,6 +1046,231 @@ index 2777e9c..a1b5a3e 100644
                  retries = retries.increment(method, url, response=response, _pool=self)
              except MaxRetryError:
 
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -405,6 +405,16 @@ class HTTPSConnection(HTTPConnection):
+             self.proxy_config.ssl_context if proxy_is_forwarding else None
+         )
+ 
++        # The target's TLS identity settings (SNI override, assert_hostname,
++        # assert_fingerprint and client certificates) describe the destination
++        # server and must never be applied to the handshake with the proxy.
++        assert_hostname = self.assert_hostname
++        assert_fingerprint_value = self.assert_fingerprint
++        if proxy_is_forwarding:
++            server_hostname = hostname
++            assert_hostname = None
++            assert_fingerprint_value = None
++
+         # Wrap socket using verification with the root certs in
+         # trusted_root_certs
+         default_ssl_context = False
+@@ -434,9 +444,14 @@ class HTTPSConnection(HTTPConnection):
+             ca_certs = self.ca_certs
+             ca_cert_dir = self.ca_cert_dir
+             ca_cert_data = self.ca_cert_data
+-            key_file = self.key_file
+-            cert_file = self.cert_file
+-            key_password = self.key_password
++            if proxy_is_forwarding:
++                key_file = None
++                cert_file = None
++                key_password = None
++            else:
++                key_file = self.key_file
++                cert_file = self.cert_file
++                key_password = self.key_password
+ 
+         # Try to load OS default certs if none are given.
+         # Works well on Windows (requires Python3.4+)
+@@ -479,14 +494,14 @@ class HTTPSConnection(HTTPConnection):
+                 DeprecationWarning,
+             )
+ 
+-        if self.assert_fingerprint:
++        if assert_fingerprint_value:
+             assert_fingerprint(
+-                self.sock.getpeercert(binary_form=True), self.assert_fingerprint
++                self.sock.getpeercert(binary_form=True), assert_fingerprint_value
+             )
+         elif (
+             context.verify_mode != ssl.CERT_NONE
+             and not getattr(context, "check_hostname", False)
+-            and self.assert_hostname is not False
++            and assert_hostname is not False
+         ):
+             # While urllib3 attempts to always turn off hostname matching from
+             # the TLS library, this cannot always be done. So we check whether
+@@ -502,11 +517,11 @@ class HTTPSConnection(HTTPConnection):
+                     ),
+                     SubjectAltNameWarning,
+                 )
+-            _match_hostname(cert, self.assert_hostname or server_hostname)
++            _match_hostname(cert, assert_hostname or server_hostname)
+ 
+         verified = (
+             context.verify_mode == ssl.CERT_REQUIRED
+-            or self.assert_fingerprint is not None
++            or assert_fingerprint_value is not None
+         )
+ 
+         if proxy_is_forwarding:
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -3,6 +3,7 @@ from __future__ import absolute_import
+ import collections
+ import functools
+ import logging
++import warnings
+ 
+ from ._collections import HTTPHeaderDict, RecentlyUsedContainer
+ from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, port_by_scheme
+@@ -498,13 +499,31 @@ class ProxyManager(PoolManager):
+         if proxy.scheme not in ("http", "https"):
+             raise ProxySchemeUnknown(proxy.scheme)
+ 
++        # Keep the deprecated ssl_context fallback on the manager for
++        # compatibility, while passing only explicit proxy policy to connections.
++        self.proxy_ssl_context = proxy_ssl_context
++        if (
++            use_forwarding_for_https
++            and proxy.scheme == "https"
++            and connection_pool_kw.get("ssl_context") is not None
++        ):
++            warnings.warn(
++                "Passing ssl_context when use_forwarding_for_https=True is "
++                "deprecated and will raise an error in urllib3 v2.0. "
++                "Use proxy_ssl_context to configure the TLS connection to the "
++                "proxy.",
++                FutureWarning,
++                stacklevel=2,
++            )
++            if self.proxy_ssl_context is None:
++                self.proxy_ssl_context = connection_pool_kw.get("ssl_context")
++
+         if not proxy.port:
+             port = port_by_scheme.get(proxy.scheme, 80)
+             proxy = proxy._replace(port=port)
+ 
+         self.proxy = proxy
+         self.proxy_headers = proxy_headers or {}
+-        self.proxy_ssl_context = proxy_ssl_context
+         self.proxy_config = ProxyConfig(proxy_ssl_context, use_forwarding_for_https)
+ 
+         connection_pool_kw["_proxy"] = self.proxy
+--- /dev/null
++++ b/test/test_cve_2026_97687.py
+@@ -0,0 +1,109 @@
++"""Regression test for CVE-2026-97687.
++
++For an HTTPS proxy used with ``use_forwarding_for_https=True`` (no CONNECT
++tunnel) the TLS handshake performed in ``HTTPSConnection.connect()`` is with
++the *proxy*. The destination's TLS settings (``assert_hostname``,
++``assert_fingerprint``, the SNI override and client certificates) must not be
++applied to that handshake, and ``proxy_ssl_context`` must be honoured.
++
++This test does not touch the network: ``ssl_wrap_socket`` is stubbed.
++"""
++import ssl
++
++import pytest
++
++import urllib3.connection as connection_module
++from urllib3.poolmanager import ProxyManager
++
++
++class _FakeTLSSocket(object):
++    def version(self):
++        return "TLSv1.3"
++
++    def getpeercert(self, binary_form=False):
++        # Only matches the proxy's hostname, so any attempt to apply the
++        # destination's assertions (hostname / fingerprint) to the proxy
++        # handshake fails.
++        if binary_form:
++            return b""
++        return {"subjectAltName": (("DNS", "proxy.invalid"),)}
++
++    def selected_alpn_protocol(self):
++        return None
++
++
++def _connect_forwarding(monkeypatch, **manager_kw):
++    calls = []
++
++    def recording_wrapper(*args, **kwargs):
++        calls.append(kwargs)
++        return _FakeTLSSocket()
++
++    monkeypatch.setattr(connection_module, "ssl_wrap_socket", recording_wrapper)
++
++    manager = ProxyManager(
++        "https://proxy.invalid:443", use_forwarding_for_https=True, **manager_kw
++    )
++    pool = manager.connection_from_url("https://target.invalid:443")
++    conn = pool._new_conn()
++    monkeypatch.setattr(conn, "_new_conn", lambda: object())
++    conn.connect()
++    return conn, calls
++
++
++def test_target_tls_settings_not_applied_to_proxy(monkeypatch):
++    proxy_context = ssl.create_default_context()
++
++    conn, calls = _connect_forwarding(
++        monkeypatch,
++        proxy_ssl_context=proxy_context,
++        assert_hostname="target.invalid",
++        assert_fingerprint="aa" * 20,
++        server_hostname="target.invalid",
++        cert_file="client.crt",
++        key_file="client.key",
++        cert_reqs=ssl.CERT_NONE,
++    )
++
++    assert len(calls) == 1
++    assert calls[0]["ssl_context"] is proxy_context
++    assert calls[0]["server_hostname"] == "proxy.invalid"
++    assert not calls[0].get("certfile")
++    assert not calls[0].get("keyfile")
++    assert proxy_context.verify_mode == ssl.CERT_REQUIRED
++    assert conn.proxy_is_verified is True
++    assert conn.is_verified is False
++
++
++def test_target_tls_settings_not_applied_without_proxy_context(monkeypatch):
++    conn, calls = _connect_forwarding(
++        monkeypatch,
++        assert_hostname="target.invalid",
++        assert_fingerprint="aa" * 20,
++        server_hostname="target.invalid",
++        cert_file="client.crt",
++        key_file="client.key",
++    )
++
++    assert len(calls) == 1
++    assert calls[0]["server_hostname"] == "proxy.invalid"
++    assert not calls[0].get("certfile")
++    assert not calls[0].get("keyfile")
++    assert conn.is_verified is False
++
++
++def test_ssl_context_with_forwarding_is_deprecated():
++    context = ssl.create_default_context()
++    with pytest.warns(FutureWarning):
++        manager = ProxyManager(
++            "https://proxy.invalid:443",
++            use_forwarding_for_https=True,
++            ssl_context=context,
++        )
++    assert manager.proxy_ssl_context is context
++    # Only explicit proxy policy is handed to connections.
++    assert manager.proxy_config.ssl_context is None
++
++
++if __name__ == "__main__":
++    raise SystemExit(pytest.main([__file__, "-v"]))
+
 --- a/src/urllib3/response.py
 +++ b/src/urllib3/response.py
 @@ -33,7 +33,14 @@
