@@ -1,6 +1,6 @@
-# webkit2gtk : 2.50.6-1~deb12u2.aikido.6
+# webkit2gtk : 2.50.6-1~deb12u2.aikido.7
 
-This patch is based on webkit2gtk version 2.50.6-1~deb12u2.aikido.6, which is available at:
+This patch is based on webkit2gtk version 2.50.6-1~deb12u2.aikido.7, which is available at:
 https://sources.debian.org/src/webkit2gtk/2.50.6-1~deb12u2/
 
 ## Affected CVEs:
@@ -8,6 +8,7 @@ https://sources.debian.org/src/webkit2gtk/2.50.6-1~deb12u2/
 - CVE-2026-20664
 - CVE-2026-28847
 - CVE-2026-28859
+- CVE-2026-28857
 - CVE-2026-28902
 - CVE-2026-28903
 - CVE-2026-28904
