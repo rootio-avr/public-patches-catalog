@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-961622
+- CVE-2026-19481
+- AIKIDO-2026-87401
 
 ## How to Apply:
 1. Clone or download the source code for @fastify/busboy
