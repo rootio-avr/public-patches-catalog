@@ -5,8 +5,13 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-64641
-- CVE-2026-64645
 - CVE-2026-64649
+- CVE-2026-64645
+- AIKIDO-2026-284523
+- AIKIDO-2026-283297
+- AIKIDO-2026-228418
+- AIKIDO-2026-573829
+- AIKIDO-2026-553733
 
 ## How to Apply:
 1. Clone or download the source code for next
