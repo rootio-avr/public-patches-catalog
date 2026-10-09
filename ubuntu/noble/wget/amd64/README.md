@@ -1,7 +1,7 @@
-# wget : 1.21.4-1ubuntu4.4.aikido.2
+# wget : 1.21.4-1ubuntu4.5.aikido.3
 
-This patch is based on wget version 1.21.4-1ubuntu4.4.aikido.2, which is available at:
-https://sources.debian.org/src/wget/1.21.4-1ubuntu4.4/
+This patch is based on wget version 1.21.4-1ubuntu4.5.aikido.3, which is available at:
+https://sources.debian.org/src/wget/1.21.4-1ubuntu4.5/
 
 ## Affected CVEs:
 - CVE-2021-31879
