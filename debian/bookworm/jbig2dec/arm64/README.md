@@ -1,7 +1,7 @@
-# jbig2dec : 0.19-3.root.io.1
+# jbig2dec : 0.19-3+deb12u1.aikido.4
 
-This patch is based on jbig2dec version 0.19-3.root.io.1, which is available at:
-https://sources.debian.org/src/jbig2dec/0.19-3/
+This patch is based on jbig2dec version 0.19-3+deb12u1.aikido.4, which is available at:
+https://sources.debian.org/src/jbig2dec/0.19-3+deb12u1/
 
 ## Affected CVEs:
 - CVE-2023-46361
