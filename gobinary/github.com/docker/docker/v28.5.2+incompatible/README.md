@@ -8,6 +8,7 @@ unknown
 - CVE-2026-34040
 - CVE-2026-41568
 - CVE-2026-42306
+- CVE-2026-41567
 
 ## How to Apply:
 1. Clone or download the source code for github.com/docker/docker
