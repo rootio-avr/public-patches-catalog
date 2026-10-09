@@ -1,7 +1,7 @@
-# pam : 1.5.3-5ubuntu5.6.aikido.6
+# pam : 1.5.3-5ubuntu5.7.aikido.7
 
-This patch is based on pam version 1.5.3-5ubuntu5.6.aikido.6, which is available at:
-https://sources.debian.org/src/pam/1.5.3-5ubuntu5.6/
+This patch is based on pam version 1.5.3-5ubuntu5.7.aikido.7, which is available at:
+https://sources.debian.org/src/pam/1.5.3-5ubuntu5.7/
 
 ## Affected CVEs:
 - CVE-2024-10041
