@@ -1,19 +1,10 @@
-# apache2 : 2.4.67-1~deb12u3.aikido.13
+# apache2 : 2.4.68-1~deb12u1.aikido.14
 
-This patch is based on apache2 version 2.4.67-1~deb12u3.aikido.13, which is available at:
-https://sources.debian.org/src/apache2/2.4.67-1~deb12u3/
+This patch is based on apache2 version 2.4.68-1~deb12u1.aikido.14, which is available at:
+https://sources.debian.org/src/apache2/2.4.68-1~deb12u1/
 
 ## Affected CVEs:
 - CVE-2007-0086
-- CVE-2026-29167
-- CVE-2026-34355
-- CVE-2026-34356
-- CVE-2026-42535
-- CVE-2026-42536
-- CVE-2026-44185
-- CVE-2026-44186
-- CVE-2026-44631
-- CVE-2026-48913
 
 ## How to Apply:
 1. Obtain the source package: `apt source apache2`
