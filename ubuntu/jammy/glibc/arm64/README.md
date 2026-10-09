@@ -1,12 +1,9 @@
-# glibc : 2.35-0ubuntu3.14.aikido.3
+# glibc : 2.35-0ubuntu3.15.aikido.4
 
-This patch is based on glibc version 2.35-0ubuntu3.14.aikido.3, which is available at:
-https://sources.debian.org/src/glibc/2.35-0ubuntu3.14/
+This patch is based on glibc version 2.35-0ubuntu3.15.aikido.4, which is available at:
+https://sources.debian.org/src/glibc/2.35-0ubuntu3.15/
 
 ## Affected CVEs:
-- CVE-2026-4046
-- CVE-2026-5435
-- CVE-2026-6238
 - CVE-2026-4437
 - CVE-2026-4438
 
