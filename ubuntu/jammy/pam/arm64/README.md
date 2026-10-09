@@ -1,7 +1,7 @@
-# pam : 1.4.0-11ubuntu2.7.aikido.8
+# pam : 1.4.0-11ubuntu2.8.aikido.9
 
-This patch is based on pam version 1.4.0-11ubuntu2.7.aikido.8, which is available at:
-https://sources.debian.org/src/pam/1.4.0-11ubuntu2.7/
+This patch is based on pam version 1.4.0-11ubuntu2.8.aikido.9, which is available at:
+https://sources.debian.org/src/pam/1.4.0-11ubuntu2.8/
 
 ## Affected CVEs:
 - CVE-2025-8941
