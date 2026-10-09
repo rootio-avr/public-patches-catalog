@@ -1,22 +1,10 @@
-# xorg-server : 2:1.20.11-1+deb11u13.aikido.12
+# xorg-server : 2:1.20.11-1+deb11u18.aikido.13
 
-This patch is based on xorg-server version 2:1.20.11-1+deb11u13.aikido.12, which is available at:
-https://sources.debian.org/src/xorg-server/2:1.20.11-1+deb11u17/
+This patch is based on xorg-server version 2:1.20.11-1+deb11u18.aikido.13, which is available at:
+https://sources.debian.org/src/xorg-server/2:1.20.11-1+deb11u18/
 
 ## Affected CVEs:
 - CVE-2023-5574
-- CVE-2026-50259
-- CVE-2026-50260
-- CVE-2026-50264
-- CVE-2026-50256
-- CVE-2026-50257
-- CVE-2026-34001
-- CVE-2026-34003
-- CVE-2026-33999
-- CVE-2026-34000
-- CVE-2026-34002
-- CVE-2026-50258
-- CVE-2026-50261
 - CVE-2026-55999
 - CVE-2026-56000
 
