@@ -4,6 +4,7 @@ This patch is based on virtualenv version 21.6.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-102930
 - CVE-2026-102925
 - CVE-2026-102937
 
