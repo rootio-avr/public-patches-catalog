@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-48068
 - CVE-2026-48069
+- CVE-2026-101916
 
 ## How to Apply:
 1. Clone or download the source code for @grpc/grpc-js
