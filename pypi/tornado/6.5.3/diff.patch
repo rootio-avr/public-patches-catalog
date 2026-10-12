@@ -673,3 +673,723 @@
  
  class RequestProxyTest(unittest.TestCase):
      def test_request_set(self):
+
+--- a/tornado/curl_httpclient.py	2025-12-11 09:30:25.000000000 +0530
++++ b/tornado/curl_httpclient.py	2026-10-12 14:24:51.875220484 +0530
+@@ -37,7 +37,7 @@
+ )
+ from tornado.log import app_log
+ 
+-from typing import Dict, Any, Callable, Union, Optional
++from typing import Dict, Any, Callable, Optional
+ import typing
+ 
+ if typing.TYPE_CHECKING:
+@@ -48,11 +48,138 @@
+ CR_OR_LF_RE = re.compile(b"\r|\n")
+ 
+ 
++class _CurlStreamingBuffer:
++    """Delivers response body chunks from libcurl to a ``streaming_callback``.
++
++    libcurl runs its write callback from inside
++    ``curl_multi_socket_action``, where it is not safe to run application
++    code (which may reenter this client, or raise exceptions that libcurl
++    would turn into transfer errors). Chunks are therefore queued here and
++    delivered later from the `.IOLoop`.
++
++    Queuing alone would let the amount of buffered data grow with whatever
++    the server chooses to send, which is a problem when
++    ``decompress_response`` is in use: a "decompression bomb" lets a server
++    turn a few kilobytes on the wire into gigabytes of decompressed data,
++    all of which would pile up in the `.IOLoop`'s callback queue before any
++    of it reached the application. To bound this, the transfer is paused
++    once more than `max_buffer_size` bytes are waiting, and resumed after
++    the callback has consumed them.
++    """
++
++    # Pause the transfer while at least this many bytes are waiting to be
++    # delivered. This bounds our own queue only: a paused libcurl still
++    # finishes decoding the socket read it already has (there is no way to
++    # tell its decoder to stop) and buffers the result internally, so the
++    # real high-water mark is one read's worth of expansion -- roughly 16MB
++    # for gzip at libcurl's default CURLOPT_BUFFERSIZE. libcurl limits that
++    # buffer to 64MB and fails the transfer with CURLE_TOO_LARGE past it,
++    # which a codec with a higher ratio than deflate's (brotli, say) will
++    # reach. That is libcurl's call to make; we just avoid holding a copy.
++    max_buffer_size = 1024 * 1024
++
++    def __init__(
++        self,
++        client: "CurlAsyncHTTPClient",
++        curl: pycurl.Curl,
++        callback: Callable[[bytes], Any],
++    ) -> None:
++        self.client = client
++        self.io_loop = client.io_loop
++        # Set to None in finish(); the handle may be reused after that.
++        self.curl = curl  # type: Optional[pycurl.Curl]
++        self.callback = callback
++        self.chunks = collections.deque()  # type: Deque[bytes]
++        self.size = 0
++        self.total = 0
++        self.body_too_large = False
++        self.paused = False
++        self.flush_scheduled = False
++
++    def write(self, chunk: bytes) -> int:
++        """libcurl ``WRITEFUNCTION`` callback."""
++        if self.total + len(chunk) > self.client.max_body_size:
++            # max_body_size applies here as well as to a buffered response:
++            # it is a safeguard for applications that do not impose a limit
++            # of their own on what they do with the chunks. Writing less
++            # than we were given makes libcurl fail the transfer.
++            self.body_too_large = True
++            return 0
++        if self.size >= self.max_buffer_size:
++            # Tell libcurl to stop reading from the socket until flush()
++            # resumes it. This chunk is not consumed here: libcurl holds
++            # on to it and passes it to us again when we unpause.
++            self.paused = True
++            return pycurl.WRITEFUNC_PAUSE
++        self.chunks.append(chunk)
++        self.size += len(chunk)
++        self.total += len(chunk)
++        self._schedule_flush()
++        return len(chunk)
++
++    def _schedule_flush(self) -> None:
++        if not self.flush_scheduled:
++            self.flush_scheduled = True
++            self.io_loop.add_callback(self.flush)
++
++    def flush(self) -> None:
++        """Pass everything we have buffered to the ``streaming_callback``."""
++        self.flush_scheduled = False
++        try:
++            while self.chunks:
++                chunk = self.chunks.popleft()
++                self.size -= len(chunk)
++                self.callback(chunk)
++        finally:
++            if self.chunks:
++                # The callback raised; deliver the rest (and unpause) later.
++                self._schedule_flush()
++            elif self.paused:
++                self.paused = False
++                if self.curl is not None:
++                    try:
++                        # Note that this may call write() again
++                        # (synchronously) with data libcurl buffered while
++                        # paused, so it must come after our own buffer has
++                        # been drained.
++                        self.curl.pause(pycurl.PAUSE_CONT)
++                    except pycurl.error:
++                        # The transfer failed while it was paused (libcurl
++                        # reports the pending error here). Nothing to do:
++                        # _finish will pass the error to the callback.
++                        pass
++                    else:
++                        # Ask for a socket_action so the unpaused transfer
++                        # makes progress. libcurl has notified us of this
++                        # itself (through the timer callback) since 7.69,
++                        # which is below the version we require, so this is
++                        # redundant there and costs one timeout per
++                        # max_buffer_size of body. But without it a libcurl
++                        # older than that stalls until unrelated socket
++                        # activity happens to wake the transfer, and a
++                        # streaming fetch that used to work would hang.
++                        self.client._set_timeout(0)
++
++    def finish(self) -> None:
++        """Deliver any remaining data at the end of the request.
++
++        The curl handle may be reset and reused after this, so we must not
++        touch it again.
++        """
++        self.curl = None
++        self.paused = False
++        self.flush()
++
++
+ class CurlAsyncHTTPClient(AsyncHTTPClient):
+     def initialize(  # type: ignore
+-        self, max_clients: int = 10, defaults: Optional[Dict[str, Any]] = None
++        self,
++        max_clients: int = 10,
++        defaults: Optional[Dict[str, Any]] = None,
++        max_body_size: int = 104857600,
+     ) -> None:
+         super().initialize(defaults=defaults)
++        self.max_body_size = max_body_size
+         # Typeshed is incomplete for CurlMulti, so just use Any for now.
+         self._multi = pycurl.CurlMulti()  # type: Any
+         self._multi.setopt(pycurl.M_TIMERFUNCTION, self._set_timeout)
+@@ -227,6 +354,8 @@
+                 curl.info = {  # type: ignore
+                     "headers": httputil.HTTPHeaders(),
+                     "buffer": BytesIO(),
++                    "streaming_buffer": None,
++                    "body_too_large": False,
+                     "request": request,
+                     "callback": callback,
+                     "queue_start_time": queue_start_time,
+@@ -266,10 +395,23 @@
+         info = curl.info  # type: ignore
+         curl.info = None  # type: ignore
+         self._multi.remove_handle(curl)
+-        self._free_list.append(curl)
++        streaming_buffer = info["streaming_buffer"]
++        body_too_large = info["body_too_large"]
++        if streaming_buffer is not None:
++            body_too_large = body_too_large or streaming_buffer.body_too_large
++            # Make sure everything that was received reaches the
++            # streaming_callback before the final response.
++            try:
++                streaming_buffer.finish()
++            except Exception:
++                self.handle_callback_exception(info["request"].streaming_callback)
+         buffer = info["buffer"]
+         if curl_error:
+             assert curl_message is not None
++            if body_too_large:
++                curl_message = "body exceeded max_body_size of %d bytes" % (
++                    self.max_body_size,
++                )
+             error = CurlError(curl_error, curl_message)  # type: Optional[CurlError]
+             assert error is not None
+             code = error.code
+@@ -310,6 +452,7 @@
+             )
+         except Exception:
+             self.handle_callback_exception(info["callback"])
++        self._free_list.append(curl)
+ 
+     def handle_callback_exception(self, callback: Any) -> None:
+         app_log.error("Exception in callback %r", callback, exc_info=True)
+@@ -366,15 +509,30 @@
+                 self._curl_header_callback, headers, request.header_callback
+             ),
+         )
++        write_function: Callable[[bytes], int]
+         if request.streaming_callback:
+-
+-            def write_function(b: Union[bytes, bytearray]) -> int:
+-                assert request.streaming_callback is not None
+-                self.io_loop.add_callback(request.streaming_callback, b)
+-                return len(b)
+-
++            streaming_buffer = _CurlStreamingBuffer(
++                self, curl, request.streaming_callback
++            )
++            curl.info["streaming_buffer"] = streaming_buffer  # type: ignore
++            write_function = streaming_buffer.write
+         else:
+-            write_function = buffer.write  # type: ignore
++            # Count the buffered body against max_body_size, as
++            # _CurlStreamingBuffer does for the streaming case. Here the
++            # whole body is held in memory, so a response that decompresses
++            # past the limit cannot be retrieved at all -- only refused
++            # before it exhausts memory. libcurl's CURLOPT_MAXFILESIZE is
++            # no help: outside of very recent versions it is measured
++            # against the compressed size, which a bomb keeps small.
++            def write_function(chunk: bytes) -> int:
++                if buffer.tell() + len(chunk) > self.max_body_size:
++                    curl.info["body_too_large"] = True  # type: ignore
++                    # Writing less than we were given makes libcurl fail
++                    # the transfer with CURLE_WRITE_ERROR; _finish uses the
++                    # flag above to replace its message with ours.
++                    return 0
++                return buffer.write(chunk)
++
+         curl.setopt(pycurl.WRITEFUNCTION, write_function)
+         curl.setopt(pycurl.FOLLOWLOCATION, request.follow_redirects)
+         curl.setopt(pycurl.MAXREDIRS, request.max_redirects)
+--- a/tornado/test/curl_httpclient_test.py	2025-12-11 09:30:25.000000000 +0530
++++ b/tornado/test/curl_httpclient_test.py	2026-10-12 14:24:51.875278230 +0530
+@@ -1,8 +1,10 @@
+ from hashlib import md5
++import gzip
+ import unittest
++from unittest import mock
+ 
+ from tornado.escape import utf8
+-from tornado.testing import AsyncHTTPTestCase
++from tornado.testing import AsyncHTTPTestCase, AsyncTestCase
+ from tornado.test import httpclient_test
+ from tornado.web import Application, RequestHandler
+ 
+@@ -13,7 +15,11 @@
+     pycurl = None  # type: ignore
+ 
+ if pycurl is not None:
+-    from tornado.curl_httpclient import CurlAsyncHTTPClient
++    from tornado.curl_httpclient import (
++        CurlAsyncHTTPClient,
++        CurlError,
++        _CurlStreamingBuffer,
++    )
+ 
+ 
+ @unittest.skipIf(pycurl is None, "pycurl module not present")
+@@ -123,3 +129,109 @@
+             auth_password="barユ£",
+         )
+         self.assertEqual(response.body, b"ok")
++
++
++class BombHandler(RequestHandler):
++    def get(self):
++        # A small gzip response that expands well past the client's limit.
++        self.set_header("Content-Encoding", "gzip")
++        self.write(gzip.compress(b"a" * (1024 * 1024), 9))
++
++
++class SmallHandler(RequestHandler):
++    def get(self):
++        self.write(b"ok")
++
++
++@unittest.skipIf(pycurl is None, "pycurl module not present")
++class CurlHTTPClientMaxBodySizeTestCase(AsyncHTTPTestCase):
++    MAX_BODY_SIZE = 64 * 1024
++
++    def get_app(self):
++        return Application([("/bomb", BombHandler), ("/small", SmallHandler)])
++
++    def get_http_client(self):
++        # max_clients=1 so that the handle is reused between tests.
++        return CurlAsyncHTTPClient(
++            force_instance=True,
++            defaults=dict(allow_ipv6=False),
++            max_body_size=self.MAX_BODY_SIZE,
++            max_clients=1,
++        )
++
++    def test_buffered_body_too_large(self):
++        with self.assertRaises(CurlError) as cm:
++            self.fetch("/bomb", raise_error=True)
++        self.assertIn("max_body_size", str(cm.exception))
++
++    def test_streaming_body_too_large(self):
++        chunks = []
++        with self.assertRaises(CurlError) as cm:
++            self.fetch(
++                "/bomb", streaming_callback=chunks.append, raise_error=True
++            )
++        self.assertIn("max_body_size", str(cm.exception))
++        self.assertLessEqual(sum(len(c) for c in chunks), self.MAX_BODY_SIZE)
++
++    def test_client_reusable_after_refusal(self):
++        # A libcurl failure is not an HTTP status, so CurlError is raised
++        # even when raise_error is false. max_clients=1 reuses the same
++        # handle; the following request must still succeed.
++        with self.assertRaises(CurlError) as cm:
++            self.fetch("/bomb")
++        self.assertIn("max_body_size", str(cm.exception))
++        response = self.fetch("/small")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"ok")
++
++
++@unittest.skipIf(pycurl is None, "pycurl module not present")
++class CurlStreamingBufferTest(AsyncTestCase):
++    """Unit tests for the buffer that feeds a ``streaming_callback``."""
++
++    def setUp(self):
++        super().setUp()
++        self.timeouts_requested = []
++        test = self
++
++        class FakeClient:
++            io_loop = test.io_loop
++            max_body_size = 1024 * 1024
++
++            def _set_timeout(self, msecs):
++                test.timeouts_requested.append(msecs)
++
++        self.client = FakeClient()
++
++    def test_pause_and_resume(self):
++        paused = []
++
++        class FakeCurl:
++            def pause(self, flags):
++                paused.append(flags)
++
++        chunks = []
++        buf = _CurlStreamingBuffer(self.client, FakeCurl(), chunks.append)
++        with mock.patch.object(_CurlStreamingBuffer, "max_buffer_size", 4):
++            self.assertEqual(buf.write(b"hello"), 5)
++            self.assertEqual(buf.write(b"world"), pycurl.WRITEFUNC_PAUSE)
++        buf.flush()
++        self.assertEqual(chunks, [b"hello"])
++        self.assertEqual(paused, [pycurl.PAUSE_CONT])
++        self.assertEqual(self.timeouts_requested, [0])
++
++    def test_body_too_large(self):
++        class FakeCurl:
++            def pause(self, flags):
++                raise AssertionError("should not pause")
++
++        chunks = []
++        buf = _CurlStreamingBuffer(self.client, FakeCurl(), chunks.append)
++        self.client.max_body_size = 8
++        self.assertEqual(buf.write(b"12345"), 5)
++        self.assertFalse(buf.body_too_large)
++        # 5 + 5 > 8, so this chunk is refused rather than truncated.
++        self.assertEqual(buf.write(b"67890"), 0)
++        self.assertTrue(buf.body_too_large)
++        buf.flush()
++        self.assertEqual(chunks, [b"12345"])
+
+--- a/tornado/web.py
++++ b/tornado/web.py
+@@ -76,6 +76,7 @@
+ import os.path
+ import re
+ import socket
++import stat
+ import sys
+ import threading
+ import time
+@@ -2575,6 +2576,13 @@
+     in your application settings, or add ``default_filename`` as an initializer
+     argument for your ``StaticFileHandler``.
+ 
++    Symlinks are not followed out of the directory being served: if a path
++    resolves to a location outside it, the request is rejected with a 403
++    error. Deployments that deliberately serve content through symlinks
++    pointing elsewhere can set the ``allowed_symlink_directory`` initializer
++    argument to a directory containing all of the intended targets. It
++    defaults to the ``path`` argument.
++
+     To maximize the effectiveness of browser caching, this class supports
+     versioned urls (by default using the argument ``?v=``).  If a version
+     is given, we instruct the browser to cache this file indefinitely.
+@@ -2613,6 +2621,11 @@
+ 
+     .. versionchanged:: 3.1
+        Many of the methods for subclasses were added in Tornado 3.1.
++
++    .. versionchanged:: 6.5.9
++       Symlinks pointing outside the served directory are no longer
++       followed, and the ``allowed_symlink_directory`` argument was added
++       to configure this.
+     """
+ 
+     CACHE_MAX_AGE = 86400 * 365 * 10  # 10 years
+@@ -2620,9 +2633,17 @@
+     _static_hashes = {}  # type: Dict[str, Optional[str]]
+     _lock = threading.Lock()  # protects _static_hashes
+ 
+-    def initialize(self, path: str, default_filename: Optional[str] = None) -> None:
++    def initialize(
++        self,
++        path: str,
++        default_filename: Optional[str] = None,
++        allowed_symlink_directory: Optional[str] = None,
++    ) -> None:
+         self.root = path
+         self.default_filename = default_filename
++        if allowed_symlink_directory is None:
++            allowed_symlink_directory = path
++        self.allowed_symlink_directory = allowed_symlink_directory
+ 
+     @classmethod
+     def reset(cls) -> None:
+@@ -2830,6 +2851,15 @@
+         # the requested path so a request to root/ will match.
+         if not (absolute_path + os.path.sep).startswith(root):
+             raise HTTPError(403, "%s is not in root static directory", self.path)
++        # The check above is on the path as written, which is cheap and
++        # rejects traversal without touching the filesystem. Resolve
++        # symlinks only once it has passed, so that the remaining checks -
++        # and the path this method returns - refer to the file that will
++        # actually be opened rather than to the link. The two checks
++        # cannot be merged: this one must stay on the unresolved path,
++        # because allowed_symlink_directory may be wider than the root and
++        # would then let a ../ traversal through.
++        absolute_path = self._resolve_symlink_target(absolute_path)
+         if os.path.isdir(absolute_path) and self.default_filename is not None:
+             # need to look at the request.path here for when path is empty
+             # but there is some prefix to the path that was already
+@@ -2847,12 +2877,71 @@
+                 self.redirect(self.request.path + "/", permanent=True)
+                 return None
+             absolute_path = os.path.join(absolute_path, self.default_filename)
+-        if not os.path.exists(absolute_path):
++            # The default filename may be a symlink even when the directory
++            # containing it is not. Resolving here rather than deferring a
++            # single resolution until after this block is deliberate: the
++            # isdir() above, and the redirect it can trigger, must not run
++            # on a path that has already escaped, or the difference between
++            # a redirect and a 403 would reveal whether an out-of-bounds
++            # directory exists.
++            absolute_path = self._resolve_symlink_target(absolute_path)
++        # Stat the resolved path once and keep the result, instead of
++        # letting os.path.exists, os.path.isfile and the later header
++        # generation each resolve the path again. Every one of those is a
++        # separate trip through the filesystem that could observe a
++        # different file from the one validated here.
++        try:
++            stat_result = os.stat(absolute_path)
++        except OSError:
++            # Matches the previous os.path.exists() check, which is also
++            # false when the path cannot be stat'ed at all.
+             raise HTTPError(404)
+-        if not os.path.isfile(absolute_path):
++        if not stat.S_ISREG(stat_result.st_mode):
+             raise HTTPError(403, "%s is not a file", self.path)
++        self._stat_result = stat_result
+         return absolute_path
+ 
++    def _resolve_symlink_target(self, absolute_path: str) -> str:
++        """Resolves symlinks in ``absolute_path`` and validates the result.
++
++        The path checks in `validate_absolute_path` operate on the path as
++        written, which says nothing about where a symlink points: a symlink
++        inside the static directory can name any file on the system. The
++        resolved path must therefore stay inside
++        ``allowed_symlink_directory``, which defaults to the directory being
++        served.
++
++        Raises `HTTPError` (403) if the resolved path escapes that directory.
++
++        Note that this is a check against the state of the filesystem at
++        one moment: a path that is replaced by a symlink after this returns
++        but before the file is opened would not be caught. Closing that
++        race entirely would require holding file descriptors across the
++        whole operation. This check is not a substitute for filesystem
++        permissions on a directory that untrusted users can write to.
++        """
++        # realpath() is applied to the allowed directory as well, because it
++        # may itself be reached through a symlink (a static directory of
++        # /var/www that links to /srv/www, say). Comparing a resolved path
++        # against an unresolved directory would reject every request.
++        allowed_directory = os.path.realpath(self.allowed_symlink_directory)
++        if not allowed_directory.endswith(os.path.sep):
++            # As in validate_absolute_path, the separator must not be
++            # doubled when the directory is the filesystem root.
++            allowed_directory += os.path.sep
++        # A path that does not exist resolves to itself, which the caller
++        # then reports as a 404.
++        resolved_path = os.path.realpath(absolute_path)
++        # The trailing separator lets the allowed directory itself match, as
++        # well as anything beneath it. This is reachable because the path may
++        # still be a directory at this point (when default_filename is set).
++        if not (resolved_path + os.path.sep).startswith(allowed_directory):
++            # Deliberately the same error as the check on the path as
++            # written, so that a caller cannot tell which way a path left
++            # the served directory.
++            raise HTTPError(403, "%s is not in root static directory", self.path)
++        return resolved_path
++
+     @classmethod
+     def get_content(
+         cls, abspath: str, start: Optional[int] = None, end: Optional[int] = None
+@@ -2912,6 +3001,10 @@
+ 
+     def _stat(self) -> os.stat_result:
+         assert self.absolute_path is not None
++        # validate_absolute_path normally populates this, so that the size
++        # and modification time reported here describe the same file that
++        # was validated. Subclasses that override validate_absolute_path
++        # without calling super() fall back to stat'ing here.
+         if not hasattr(self, "_stat_result"):
+             self._stat_result = os.stat(self.absolute_path)
+         return self._stat_result
+--- a/tornado/test/web_test.py
++++ b/tornado/test/web_test.py
+@@ -51,7 +51,9 @@
+ import logging
+ import os
+ import re
++import shutil
+ import socket
++import tempfile
+ import typing  # noqa: F401
+ import unittest
+ import urllib.parse
+@@ -1379,6 +1381,14 @@
+         response = self.get_and_head("/static/blarg")
+         self.assertEqual(response.code, 404)
+ 
++    def test_static_directory_without_default_filename(self):
++        # Without a default_filename, a directory is not servable. This
++        # shares the stat() that validate_absolute_path performs, so it is
++        # worth pinning the status it produces.
++        with ExpectLog(gen_log, ".*is not a file"):
++            response = self.get_and_head("/static/dir/")
++        self.assertEqual(response.code, 403)
++
+     def test_path_traversal_protection(self):
+         # curl_httpclient processes ".." on the client side, so we
+         # must test this with simple_httpclient.
+@@ -1403,6 +1413,166 @@
+         )
+         response = self.get_and_head("/root_static" + urllib.parse.quote(path))
+         self.assertEqual(response.code, 200)
++
++
++@unittest.skipIf(os.name != "posix", "non-posix OS")
++class StaticFileSymlinkTest(WebTestCase):
++    """Symlinks must not be followed out of the static directory unless the
++    application opts in with ``allowed_symlink_directory``.
++    """
++
++    def setUp(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.addCleanup(shutil.rmtree, self.tmpdir)
++        self.root = os.path.join(self.tmpdir, "static")
++        self.outside = os.path.join(self.tmpdir, "outside")
++        os.mkdir(self.root)
++        os.mkdir(self.outside)
++        with open(os.path.join(self.root, "inside.txt"), "w") as f:
++            f.write("inside")
++        with open(os.path.join(self.outside, "secret.txt"), "w") as f:
++            f.write("secret")
++        with open(os.path.join(self.root, "index.html"), "w") as f:
++            f.write("root index")
++        # A symlink to a file outside the root.
++        os.symlink(
++            os.path.join(self.outside, "secret.txt"),
++            os.path.join(self.root, "link.txt"),
++        )
++        # A symlink to a directory outside the root.
++        os.symlink(self.outside, os.path.join(self.root, "linkdir"))
++        # Out-of-bounds symlink targets, one existing and one not, for the
++        # existence-oracle test below.
++        os.mkdir(os.path.join(self.outside, "realdir"))
++        os.symlink(
++            os.path.join(self.outside, "realdir"),
++            os.path.join(self.root, "link_exists"),
++        )
++        os.symlink(
++            os.path.join(self.outside, "nope"),
++            os.path.join(self.root, "link_missing"),
++        )
++        # A symlink that stays inside the root.
++        os.symlink(
++            os.path.join(self.root, "inside.txt"),
++            os.path.join(self.root, "internal.txt"),
++        )
++        super().setUp()
++
++    def get_handlers(self):
++        return [
++            ("/default/(.*)", StaticFileHandler, dict(path=self.root)),
++            (
++                "/permissive/(.*)",
++                StaticFileHandler,
++                dict(path=self.root, allowed_symlink_directory=self.tmpdir),
++            ),
++            (
++                "/default_filename/(.*)",
++                StaticFileHandler,
++                dict(path=self.root, default_filename="index.html"),
++            ),
++        ]
++
++    def get_app_kwargs(self):
++        return dict()
++
++    def test_regular_file(self):
++        response = self.fetch("/default/inside.txt")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"inside")
++
++    def test_symlink_within_root(self):
++        # A symlink is fine as long as it resolves inside the root.
++        response = self.fetch("/default/internal.txt")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"inside")
++
++    def test_symlinked_file_escaping_root(self):
++        with ExpectLog(gen_log, ".*is not in root static directory"):
++            response = self.fetch("/default/link.txt")
++        self.assertEqual(response.code, 403)
++
++    def test_symlinked_directory_escaping_root(self):
++        with ExpectLog(gen_log, ".*is not in root static directory"):
++            response = self.fetch("/default/linkdir/secret.txt")
++        self.assertEqual(response.code, 403)
++
++    def test_served_directory_itself(self):
++        # A request for the served directory itself resolves to the allowed
++        # directory exactly, rather than to something beneath it. That must
++        # still be allowed.
++        response = self.fetch("/default_filename/")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"root index")
++
++    def test_symlinked_default_filename(self):
++        # The default filename is appended after the directory has been
++        # resolved, so it must be checked in its own right.
++        os.mkdir(os.path.join(self.root, "dir"))
++        os.symlink(
++            os.path.join(self.outside, "secret.txt"),
++            os.path.join(self.root, "dir", "index.html"),
++        )
++        with ExpectLog(gen_log, ".*is not in root static directory"):
++            response = self.fetch("/default_filename/dir/")
++        self.assertEqual(response.code, 403)
++
++    def test_no_existence_oracle_for_symlinked_directory(self):
++        # A symlink pointing out of bounds must be rejected identically
++        # whether or not its target exists, so that it cannot be used to
++        # probe the server's filesystem. This pins the ordering in
++        # validate_absolute_path: resolving only after the isdir() check
++        # would let an existing directory trigger a redirect (301) while a
++        # missing one still gave 403.
++        codes = []
++        for name in ("link_exists", "link_missing"):
++            with ExpectLog(gen_log, ".*is not in root static directory"):
++                codes.append(
++                    self.fetch("/default_filename/" + name, follow_redirects=False).code
++                )
++        self.assertEqual(codes, [403, 403])
++
++    def test_allowed_symlink_directory(self):
++        # With an explicit allowed_symlink_directory that contains the
++        # target, the same symlinks are served.
++        response = self.fetch("/permissive/link.txt")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"secret")
++
++        response = self.fetch("/permissive/linkdir/secret.txt")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"secret")
++
++
++class StaticFileSymlinkedRootTest(WebTestCase):
++    """The root itself may be reached through a symlink; that must not make
++    every request look like an escape.
++    """
++
++    def setUp(self):
++        self.tmpdir = tempfile.mkdtemp()
++        self.addCleanup(shutil.rmtree, self.tmpdir)
++        real_root = os.path.join(self.tmpdir, "real")
++        os.mkdir(real_root)
++        with open(os.path.join(real_root, "inside.txt"), "w") as f:
++            f.write("inside")
++        # Serve through a symlink to the real directory.
++        self.root = os.path.join(self.tmpdir, "link")
++        os.symlink(real_root, self.root)
++        super().setUp()
++
++    def get_handlers(self):
++        return [("/static/(.*)", StaticFileHandler, dict(path=self.root))]
++
++    def get_app_kwargs(self):
++        return dict()
++
++    @unittest.skipIf(os.name != "posix", "non-posix OS")
++    def test_symlinked_root(self):
++        response = self.fetch("/static/inside.txt")
++        self.assertEqual(response.code, 200)
++        self.assertEqual(response.body, b"inside")
+ 
+ 
+ class StaticDefaultFilenameTest(WebTestCase):

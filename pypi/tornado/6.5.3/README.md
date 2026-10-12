@@ -9,6 +9,8 @@ unknown
 - CVE-2026-82397
 - CVE-2026-31958
 - CVE-2026-49853
+- GHSA-chx6-46f5-w4vp
+- GHSA-c2m8-h5v5-343r
 
 ## How to Apply:
 1. Clone or download the source code for tornado
