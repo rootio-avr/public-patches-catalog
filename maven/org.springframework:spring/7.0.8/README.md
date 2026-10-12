@@ -4,6 +4,7 @@ This patch is based on org.springframework:spring version 7.0.8, which is availa
 unknown
 
 ## Affected CVEs:
+- CVE-2026-47884
 - CVE-2026-47890
 
 ## How to Apply:
