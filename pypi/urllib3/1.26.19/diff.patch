@@ -664,6 +664,199 @@
                  retries = retries.increment(method, url, response=response, _pool=self)
              except MaxRetryError:
 
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -358,12 +358,36 @@
+         self.ca_cert_dir = ca_cert_dir and os.path.expanduser(ca_cert_dir)
+         self.ca_cert_data = ca_cert_data
+ 
++    @property
++    def proxy_is_forwarding(self):
++        """
++        Whether this connection talks TLS directly to an HTTPS proxy that
++        forwards the request (i.e. no HTTP CONNECT tunnel is established).
++        """
++        return bool(
++            self.proxy is not None
++            and self.proxy.scheme == "https"
++            and self.proxy_config is not None
++            and self.proxy_config.use_forwarding_for_https
++            and not self._is_using_tunnel()
++        )
++
+     def connect(self):
+         # Add certificate verification
+         self.sock = conn = self._new_conn()
+         hostname = self.host
+         tls_in_tls = False
+ 
++        if self.proxy_is_forwarding:
++            # The TLS session is with the proxy, not the target. Only the
++            # proxy's TLS settings apply; the target's SNI, hostname and
++            # fingerprint assertions, client certificate and certificate
++            # policy must not leak into (or weaken) the proxy handshake.
++            self.sock = self._connect_tls_proxy(hostname, conn)
++            # The target itself is not verified over a forwarding proxy.
++            self.is_verified = False
++            return
++
+         if self._is_using_tunnel():
+             if self.tls_in_tls_required:
+                 self.sock = conn = self._connect_tls_proxy(hostname, conn)
+@@ -478,34 +502,48 @@
+ 
+     def _connect_tls_proxy(self, hostname, conn):
+         """
+-        Establish a TLS connection to the proxy using the provided SSL context.
++        Establish a TLS connection to the proxy using proxy-specific policy.
+         """
+         proxy_config = self.proxy_config
+-        ssl_context = proxy_config.ssl_context
+-        if ssl_context:
+-            # If the user provided a proxy context, we assume CA and client
+-            # certificates have already been set
+-            return ssl_wrap_socket(
+-                sock=conn,
+-                server_hostname=hostname,
+-                ssl_context=ssl_context,
+-            )
++        proxy_ssl_context = proxy_config.ssl_context
+ 
+-        ssl_context = create_proxy_ssl_context(
+-            self.ssl_version,
+-            self.cert_reqs,
+-            self.ca_certs,
+-            self.ca_cert_dir,
+-            self.ca_cert_data,
+-        )
++        if proxy_ssl_context is not None:
++            # Prefer the proxy's cert policy for the proxy connection. The
++            # user provided a proxy context, so we assume CA and client
++            # certificates have already been set and never apply the
++            # target's TLS settings to it.
++            ssl_context = proxy_ssl_context
++            cert_reqs = proxy_ssl_context.verify_mode
++            ca_certs = None
++            ca_cert_dir = None
++            ca_cert_data = None
++            ssl_version = None
++        else:
++            # Otherwise we inherit the pool's cert policies. When forwarding
++            # we fall back to the connection's ssl_context, if any.
++            ssl_context = self.ssl_context if self.proxy_is_forwarding else None
++            cert_reqs = self.cert_reqs
++            ca_certs = self.ca_certs
++            ca_cert_dir = self.ca_cert_dir
++            ca_cert_data = self.ca_cert_data
++            ssl_version = self.ssl_version
+ 
++        if ssl_context is None:
++            ssl_context = create_proxy_ssl_context(
++                ssl_version,
++                cert_reqs,
++                ca_certs,
++                ca_cert_dir,
++                ca_cert_data,
++            )
++
+         # If no cert was provided, use only the default options for server
+         # certificate validation
+         socket = ssl_wrap_socket(
+             sock=conn,
+-            ca_certs=self.ca_certs,
+-            ca_cert_dir=self.ca_cert_dir,
+-            ca_cert_data=self.ca_cert_data,
++            ca_certs=ca_certs,
++            ca_cert_dir=ca_cert_dir,
++            ca_cert_data=ca_cert_data,
+             server_hostname=hostname,
+             ssl_context=ssl_context,
+         )
+--- a/test/with_dummyserver/test_proxy_poolmanager.py
++++ b/test/with_dummyserver/test_proxy_poolmanager.py
+@@ -148,6 +148,81 @@
+             r = https.request("GET", "%s/" % self.https_url)
+             assert r.status == 200
+ 
++    @onlyPy3
++    def test_https_proxy_forwarding_uses_proxy_ssl_context(self):
++        proxy_ssl_context = create_urllib3_context()
++        proxy_ssl_context.load_verify_locations(DEFAULT_CA)
++
++        with proxy_from_url(
++            self.https_proxy_url,
++            proxy_ssl_context=proxy_ssl_context,
++            use_forwarding_for_https=True,
++        ) as https:
++            pool = https.connection_from_url(self.https_url)
++            conn = pool._new_conn()
++            try:
++                conn.connect()
++                assert isinstance(conn.sock, ssl.SSLSocket)
++                assert conn.sock.context is proxy_ssl_context
++                assert conn.proxy_is_verified is True
++                assert not conn.is_verified
++            finally:
++                conn.close()
++
++            r = https.request("GET", "%s/" % self.https_url)
++            assert r.status == 200
++
++    @onlyPy3
++    def test_https_proxy_forwarding_ignores_target_tls_policy(self):
++        # Proxy verifies, but has no CA loaded: the handshake with the proxy
++        # must fail even though the target asks for ``cert_reqs=CERT_NONE``.
++        proxy_ssl_context = create_urllib3_context(cert_reqs=ssl.CERT_REQUIRED)
++
++        with proxy_from_url(
++            self.https_proxy_url,
++            proxy_ssl_context=proxy_ssl_context,
++            cert_reqs=ssl.CERT_NONE,
++            use_forwarding_for_https=True,
++        ) as https:
++            with pytest.raises(MaxRetryError) as e:
++                https.request("GET", "%s/" % self.https_url)
++            assert type(e.value.reason) == SSLError
++
++        assert proxy_ssl_context.verify_mode == ssl.CERT_REQUIRED
++
++    @onlyPy3
++    @pytest.mark.parametrize(
++        "target_tls_kwargs",
++        [
++            {"server_hostname": "example.com"},
++            {"assert_hostname": "example.com"},
++            {"assert_fingerprint": "00" * 32},
++            {"cert_reqs": ssl.CERT_NONE, "ca_certs": DEFAULT_CA},
++        ],
++    )
++    def test_https_proxy_forwarding_ignores_target_identity_settings(
++        self, target_tls_kwargs
++    ):
++        proxy_ssl_context = create_urllib3_context(cert_reqs=ssl.CERT_REQUIRED)
++        proxy_ssl_context.load_verify_locations(DEFAULT_CA)
++
++        with proxy_from_url(
++            self.https_proxy_url,
++            proxy_ssl_context=proxy_ssl_context,
++            use_forwarding_for_https=True,
++            **target_tls_kwargs
++        ) as https:
++            pool = https.connection_from_url(self.https_url)
++            conn = pool._new_conn()
++            try:
++                conn.connect()
++                assert isinstance(conn.sock, ssl.SSLSocket)
++                assert conn.sock.context is proxy_ssl_context
++            finally:
++                conn.close()
++
++        assert proxy_ssl_context.verify_mode == ssl.CERT_REQUIRED
++
+     def test_nagle_proxy(self):
+         """Test that proxy connections do not have TCP_NODELAY turned on"""
+         with ProxyManager(self.proxy_url) as http:
+
 --- a/src/urllib3/response.py
 +++ b/src/urllib3/response.py
 @@ -37,7 +37,14 @@
