@@ -4,6 +4,7 @@ This patch is based on pypdf version 6.16.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-103000
 - CVE-2026-102996
 - CVE-2026-102997
 - CVE-2026-102998
