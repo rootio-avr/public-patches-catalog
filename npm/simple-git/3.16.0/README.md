@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-261915
 - AIKIDO-2026-566884
+- AIKIDO-2026-378256
 
 ## How to Apply:
 1. Clone or download the source code for simple-git
