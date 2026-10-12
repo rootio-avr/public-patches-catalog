@@ -360,3 +360,193 @@
                  return (_currToken = JsonToken.NOT_AVAILABLE);
              }
              int ch = getByteFromBuffer(_inputPtr) & 0xFF;
+
+--- a/src/main/java/com/fasterxml/jackson/core/json/UTF8DataInputJsonParser.java
++++ b/src/main/java/com/fasterxml/jackson/core/json/UTF8DataInputJsonParser.java
+@@ -2816,6 +2816,10 @@
+                  break;
+              }
+              sb.append(c);
++             if (sb.length() >= MAX_ERROR_TOKEN_LENGTH) {
++                 sb.append("...");
++                 break;
++             }
+              ch = _inputData.readUnsignedByte();
+          }
+          _reportError("Unrecognized token '"+sb.toString()+"': was expecting "+msg);
+--- a/src/test/java/com/fasterxml/jackson/core/json/TestMaxErrorSize.java
++++ b/src/test/java/com/fasterxml/jackson/core/json/TestMaxErrorSize.java
+@@ -47,6 +47,12 @@
+         jp.close();
+     }
+ 
++    // GHSA-7hhh-6rmp-j9qf: DataInput-backed parser must also truncate long tokens
++    public void testLongErrorMessageDataInput() throws Exception
++    {
++        _testLongErrorMessage(MODE_DATA_INPUT);
++    }
++
+     public void testShortErrorMessage() throws Exception
+     {
+         _testShortErrorMessage(MODE_INPUT_STREAM);
+
+--- a/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingUtf8JsonParserBase.java
++++ b/src/main/java/com/fasterxml/jackson/core/json/async/NonBlockingUtf8JsonParserBase.java
+@@ -1695,8 +1695,9 @@
+             if (_inputPtr >= _inputEnd) {
+                 _minorState = MINOR_NUMBER_INTEGER_DIGITS;
+                 _textBuffer.setCurrentLength(outPtr);
+-                // [GHSA-r7wm-3cxj-wff9] validate accumulated length before yielding
+-                // NOT_AVAILABLE, so chunked digit-only input cannot bypass the cap.
++                // [core#1556]: validate accumulated integer length so far before yielding
++                // NOT_AVAILABLE; otherwise a stream of digit-only chunks can grow the buffer
++                // past `StreamReadConstraints.maxNumberLength` (sibling of #1555).
+                 _setIntLength(outPtr+negMod);
+                 return (_currToken = JsonToken.NOT_AVAILABLE);
+             }
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/core/json/async/AsyncNumberLengthConsistencyTest.java
+@@ -0,0 +1,143 @@
++package com.fasterxml.jackson.core.json.async;
++
++import com.fasterxml.jackson.core.JsonFactory;
++import com.fasterxml.jackson.core.JsonFactoryBuilder;
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.core.JsonToken;
++import com.fasterxml.jackson.core.StreamReadConstraints;
++import com.fasterxml.jackson.core.async.ByteArrayFeeder;
++import com.fasterxml.jackson.core.exc.StreamConstraintsException;
++
++/**
++ * Tests that {@code maxNumberLength} is enforced consistently across sync and async
++ * parsers when digit-only input is fed across multiple chunks (no terminator, no
++ * {@code endOfInput()}).
++ */
++public class AsyncNumberLengthConsistencyTest
++    extends com.fasterxml.jackson.core.BaseTest
++{
++    private static final int MAX_NUM_LEN = 1000;
++    // Chunk size kept modest so the test runs quickly but still exceeds
++    // maxNumberLength after the very first chunk.
++    private static final int CHUNK_SIZE = 4 * 1024;
++    // Hard cap on chunks fed: well past maxNumberLength but bounded so a regressed
++    // build cannot OOM the machine.
++    private static final int MAX_CHUNKS = 32;
++
++    private final JsonFactory STRICT_F = new JsonFactoryBuilder()
++            .streamReadConstraints(StreamReadConstraints.builder()
++                    .maxNumberLength(MAX_NUM_LEN)
++                    .build())
++            .build();
++
++    public void testIntegerPathStreamingChunksRejected() throws Exception {
++        _verifyStreamingRejected("{\"v\":", CHUNK_SIZE, "integer", 2, 1);
++    }
++
++    public void testFractionPathStreamingChunksRejected() throws Exception {
++        _verifyStreamingRejected("{\"v\":0.", CHUNK_SIZE, "fraction", 2, 1);
++    }
++
++    public void testIntegerPathSmallChunksAccumulate() throws Exception {
++        final int smallChunk = 100;
++        final int expectedFailChunk = (MAX_NUM_LEN / smallChunk) + 1;
++        _verifyStreamingRejected("{\"v\":", smallChunk, "integer",
++                expectedFailChunk + 1, expectedFailChunk);
++    }
++
++    public void testNegativeIntegerPathSmallChunksAccumulate() throws Exception {
++        // Sign is excluded from the validated length, so failure boundary is the same
++        final int smallChunk = 100;
++        final int expectedFailChunk = (MAX_NUM_LEN / smallChunk) + 1;
++        _verifyStreamingRejected("{\"v\":-", smallChunk, "negative integer",
++                expectedFailChunk + 1, expectedFailChunk);
++    }
++
++    /**
++     * Guards against the validator becoming over-eager: an integer just below
++     * {@code maxNumberLength}, fed across many small chunks, must still parse cleanly.
++     */
++    public void testIntegerPathJustUnderMaxNumberLength() throws Exception {
++        final int digitCount = MAX_NUM_LEN - 1;
++        StringBuilder sb = new StringBuilder(digitCount);
++        for (int i = 0; i < digitCount; i++) {
++            sb.append((char) ('1' + (i % 9)));
++        }
++        final String number = sb.toString();
++
++        JsonParser ap = STRICT_F.createNonBlockingByteArrayParser();
++        try {
++            ByteArrayFeeder feeder = (ByteArrayFeeder) ap.getNonBlockingInputFeeder();
++            _feedPreamble(ap, feeder, "{\"v\":");
++
++            byte[] digits = utf8Bytes(number);
++            final int smallChunk = 100;
++            for (int off = 0; off < digits.length; off += smallChunk) {
++                int len = Math.min(smallChunk, digits.length - off);
++                feeder.feedInput(digits, off, off + len);
++                assertEquals(JsonToken.NOT_AVAILABLE, ap.nextToken());
++            }
++            byte[] tail = utf8Bytes("}");
++            feeder.feedInput(tail, 0, tail.length);
++            feeder.endOfInput();
++
++            assertEquals(JsonToken.VALUE_NUMBER_INT, ap.nextToken());
++            assertEquals(number, ap.getText());
++            assertEquals(JsonToken.END_OBJECT, ap.nextToken());
++        } finally {
++            ap.close();
++        }
++    }
++
++    private void _feedPreamble(JsonParser ap, ByteArrayFeeder feeder, String preambleStr)
++        throws Exception
++    {
++        byte[] preamble = utf8Bytes(preambleStr);
++        feeder.feedInput(preamble, 0, preamble.length);
++        JsonToken t;
++        while ((t = ap.nextToken()) != JsonToken.NOT_AVAILABLE) {
++            if (t == null) {
++                fail("Parser ended unexpectedly while draining preamble");
++            }
++        }
++    }
++
++    private void _verifyStreamingRejected(String preambleStr, int chunkSize, String desc,
++            int maxChunksAllowed, int minChunksAllowed) throws Exception
++    {
++        JsonParser ap = STRICT_F.createNonBlockingByteArrayParser();
++        try {
++            ByteArrayFeeder feeder = (ByteArrayFeeder) ap.getNonBlockingInputFeeder();
++            _feedPreamble(ap, feeder, preambleStr);
++
++            byte[] digits = new byte[chunkSize];
++            for (int i = 0; i < digits.length; i++) {
++                digits[i] = (byte) ('1' + (i % 9));
++            }
++
++            int chunksFed = 0;
++            try {
++                for (int c = 0; c < MAX_CHUNKS; c++) {
++                    feeder.feedInput(digits, 0, digits.length);
++                    chunksFed++;
++                    JsonToken tt = ap.nextToken();
++                    if (tt != JsonToken.NOT_AVAILABLE) {
++                        fail("Expected NOT_AVAILABLE while streaming " + desc + " digits, got: " + tt);
++                    }
++                }
++                fail("Async parser accepted " + (chunkSize * MAX_CHUNKS) + " " + desc
++                        + " digits with maxNumberLength=" + MAX_NUM_LEN
++                        + "; expected StreamConstraintsException");
++            } catch (StreamConstraintsException e) {
++                verifyException(e, "Number value length");
++                verifyException(e, "exceeds the maximum allowed");
++                assertTrue("StreamConstraintsException raised too late: after " + chunksFed
++                        + " chunks of " + chunkSize, chunksFed <= maxChunksAllowed);
++                assertTrue("StreamConstraintsException raised too early: after " + chunksFed
++                        + " chunks of " + chunkSize, chunksFed >= minChunksAllowed);
++            }
++        } finally {
++            ap.close();
++        }
++    }
++}
