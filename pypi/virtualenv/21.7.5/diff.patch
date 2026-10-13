@@ -1,4 +1,275 @@
 --- /dev/null
++++ b/docs/changelog/3250.bugfix.rst
+@@ -0,0 +1,2 @@
++Fix ``activate.bat`` running arbitrary commands from a crafted ``--prompt``, ``VIRTUALENV_PROMPT``, or config file
++value.
+--- a/src/virtualenv/activation/batch/__init__.py
++++ b/src/virtualenv/activation/batch/__init__.py
+@@ -1,18 +1,48 @@
+ from __future__ import annotations
+ 
++import logging
+ import os
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Final
+ 
+ from virtualenv.activation.via_template import ViaTemplateActivator
++from virtualenv.util.text import collapse_line_boundaries
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Iterator
++    from pathlib import Path
+ 
+     from python_discovery import PythonInfo
+ 
+     from virtualenv.create.creator import Creator
+ 
++LOGGER = logging.getLogger(__name__)
+ 
++# cmd.exe's own command-line parser looks for these regardless of surrounding quotes: confirmed on a
++# real Windows runner that `@set "VAR=x & cmd"` still runs `cmd` as a second statement even though the
++# whole VAR=value expression is quoted. `(` and `)` are not in this set - confirmed on the same runner
++# that `@set "VAR=C:\Program Files (x86)\..."` round-trips unchanged, since parentheses are only special
++# to cmd.exe as block delimiters in control-flow syntax (if/for), not as bare characters in a value. `!`
++# is only live when the caller already has delayed expansion enabled (`setlocal enabledelayedexpansion`,
++# `cmd /V:ON`) - not cmd.exe's default, but confirmed on a real runner that a prompt like `foo!SECRET!`
++# then substitutes the actual value of an existing SECRET variable into the prompt, so it is neutered
++# unconditionally rather than only when that mode happens to be on.
++_CMD_OPERATORS: Final[tuple[str, ...]] = ("&", "|", "<", ">", "^", "!", '"')
++
++# Of _CMD_OPERATORS, only `&` can actually occur in a real Windows path: `|`, `<`, `>` and `"` are
++# already illegal in Windows filenames, and a literal `^` is silently dropped by cmd.exe itself even
++# with no help from quote(), confirmed on a real Windows runner - never exploitable, just a value that
++# reads one character short. `&` is different: quote() can neuter it in free text like the prompt, but
++# doing that to a path would silently point activate.bat at a directory that does not exist. There is no
++# way to represent it here and no way to fake the path, so refuse instead.
++_PATH_UNSAFE_CHARS: Final[tuple[str, ...]] = ("&",)
++
++_PATH_REPLACEMENT_NAMES: Final[dict[str, str]] = {
++    "__VIRTUAL_ENV__": "the destination directory",
++    "__TCL_LIBRARY__": "the interpreter's Tcl library path",
++    "__TK_LIBRARY__": "the interpreter's Tk library path",
++}
++
++
+ class BatchActivator(ViaTemplateActivator):
+     @classmethod
+     def supports(cls, interpreter: PythonInfo) -> bool:
+@@ -23,14 +53,45 @@
+         yield "deactivate.bat"
+         yield "pydoc.bat"
+ 
++    def generate(self, creator: Creator) -> list[Path]:
++        values = super().replacements(creator, creator.bin_dir)
++        problems = [reason for key in _PATH_REPLACEMENT_NAMES if (reason := _unsafe_path_reason(key, values[key]))]
++        if problems:
++            for problem in problems:
++                LOGGER.warning("skipping batch activation scripts: %s", problem)
++            return []
++        return super().generate(creator)
++
+     @staticmethod
+     def quote(string: str) -> str:
+-        return string
++        """Make a value safe to sit inside ``@set "VAR=value"``.
+ 
++        Batch has no escape for a double quote in this context either: it always closes the quoted string, and whatever
++        follows on the line runs as live cmd.exe syntax. A raw line boundary is worse - batch is line-oriented
++        regardless of quote state, so it starts a brand-new statement instead of staying inside the value. None of these
++        can be represented literally here, so replace them with a space. ``%`` still triggers variable expansion inside
++        the quotes, but doubling it to ``%%`` is a real, in-file escape that keeps the literal character.
++
++        """
++        string = string.replace("%", "%%")
++        for operator in _CMD_OPERATORS:
++            string = string.replace(operator, " ")
++        return collapse_line_boundaries(string)
++
+     def instantiate_template(self, replacements: dict[str, str], template: str, creator: Creator) -> str:
+         # ensure the text has all newlines as \r\n - required by batch
+         base = super().instantiate_template(replacements, template, creator)
+         return base.replace(os.linesep, "\n").replace("\n", os.linesep)
++
++
++def _unsafe_path_reason(key: str, value: str) -> str | None:
++    found = sorted({char for char in value if char in _PATH_UNSAFE_CHARS})
++    if not found:
++        return None
++    return (
++        f"{_PATH_REPLACEMENT_NAMES[key]} ({value!r}) contains {''.join(found)!r}, and cmd.exe has no way "
++        f'to keep that literal inside the @set "VAR=value" lines activate.bat relies on'
++    )
+ 
+ 
+ __all__ = [
+--- a/src/virtualenv/create/pyenv_cfg.py
++++ b/src/virtualenv/create/pyenv_cfg.py
+@@ -5,6 +5,8 @@
+ from collections import OrderedDict
+ from typing import TYPE_CHECKING
+ 
++from virtualenv.util.text import collapse_line_boundaries
++
+ if TYPE_CHECKING:
+     from pathlib import Path
+ 
+@@ -47,7 +49,7 @@
+                 normalized_value = f'"{value}"'
+             else:
+                 normalized_value = os.path.abspath(value) if value and os.path.exists(value) else value
+-            line = f"{key} = {normalized_value}"
++            line = f"{collapse_line_boundaries(key)} = {collapse_line_boundaries(normalized_value)}"
+             LOGGER.debug("\t%s", line)
+             text += line
+             text += "\n"
+--- /dev/null
++++ b/src/virtualenv/util/text.py
+@@ -0,0 +1,33 @@
++"""Shared text-safety helpers for values written into line-based formats."""
++
++from __future__ import annotations
++
++from typing import Final
++
++# A line-based format with no escape syntax reads any character str.splitlines() treats as a
++# boundary back as an extra line - or, for a script, runs it as one. This is the exact boundary
++# set splitlines() recognizes, per the Python string documentation.
++_LINE_BOUNDARIES: Final[tuple[str, ...]] = (
++    "\n",
++    "\r",
++    "\v",
++    "\f",
++    "\x1c",
++    "\x1d",
++    "\x1e",
++    "\x85",
++    chr(0x2028),  # line separator
++    chr(0x2029),  # paragraph separator
++)
++
++
++def collapse_line_boundaries(text: str) -> str:
++    """Replace every line-boundary character with a space so text can never become extra lines."""
++    for boundary in _LINE_BOUNDARIES:
++        text = text.replace(boundary, " ")
++    return text
++
++
++__all__ = [
++    "collapse_line_boundaries",
++]
+--- a/tests/unit/activation/test_batch.py
++++ b/tests/unit/activation/test_batch.py
+@@ -1,12 +1,33 @@
+ from __future__ import annotations
+ 
++import sys
+ from argparse import Namespace
+ 
+ import pytest
+ 
+ from virtualenv.activation import BatchActivator
++from virtualenv.info import IS_WIN
+ 
+ 
++@pytest.fixture(scope="session")
++def special_char_name():
++    """The shared tests/conftest.py fixture, minus &: cmd.exe cannot represent that one at all."""
++    base = "'\";e-$ èрт🚒♞中片-j"
++    if IS_WIN:
++        base = base.replace('"', "").replace(";", "")
++    encoding = "ascii" if IS_WIN else sys.getfilesystemencoding()
++    result = ""
++    for char in base:
++        try:
++            trip = char.encode(encoding, errors="strict").decode(encoding)
++            if char == trip:
++                result += char
++        except ValueError:  # ruff:ignore[try-except-in-loop]
++            continue
++    assert result
++    return result
++
++
+ def test_batch_pydoc_bat_quoting(tmp_path) -> None:
+     """Test that pydoc.bat properly quotes python.exe path to handle spaces."""
+ 
+@@ -91,8 +112,59 @@
+         assert '@if NOT ""=="" @set "TK_LIBRARY="' in activate_content
+ 
+ 
+-@pytest.mark.usefixtures("activation_python")
+-def test_batch(activation_tester_class, activation_tester, tmp_path) -> None:
++def test_batch_skips_destination_with_ampersand(tmp_path, caplog) -> None:
++    """An `&` in the destination can never be represented, so generation must skip it, not guess."""
++
++    class MockInterpreter:
++        os = "nt"
++        tcl_lib = None
++        tk_lib = None
++
++    class MockCreator:
++        def __init__(self, dest) -> None:
++            self.dest = dest
++            self.bin_dir = dest / "Scripts"
++            self.bin_dir.mkdir(parents=True)
++            self.interpreter = MockInterpreter()
++            self.pyenv_cfg = {}
++            self.env_name = "test-env"
++
++    creator = MockCreator(tmp_path / "weird&dest")
++    activator = BatchActivator(Namespace(prompt=None))
++
++    generated = activator.generate(creator)
++
++    assert generated == []
++    assert list(creator.bin_dir.iterdir()) == []
++    assert "skipping batch activation scripts" in caplog.text
++    assert "&" in caplog.text
++
++
++@pytest.mark.parametrize(
++    "value",
++    [
++        'x" & type nul > pwned.marker & "',
++        "x^& type nul ^> pwned.marker ^& ",
++        "x\n@type nul > pwned.marker\n@rem ",
++        'a"&type nul>pwned.marker&"b',
++        "foo!SECRET!bar",
++    ],
++)
++def test_batch_quote_neuters_cmd_syntax(value) -> None:
++    quoted = BatchActivator.quote(value)
++
++    assert not set(quoted) & set('"&|<>^!')
++    assert not set(quoted) & set("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
++
++
++def test_batch_quote_keeps_parentheses_and_doubles_percent() -> None:
++    assert BatchActivator.quote("C:\\Program Files (x86)") == "C:\\Program Files (x86)"
++    assert BatchActivator.quote("50%") == "50%%"
++
++
++def test_batch(activation_python, activation_tester_class, activation_tester, tmp_path) -> None:
++    if not (activation_python.creator.bin_dir / "activate.bat").exists():
++        pytest.skip("cmd.exe cannot represent this destination, batch activation was skipped on purpose")
+     version_script = tmp_path / "version.bat"
+     version_script.write_text("ver", encoding="utf-8")
+ 
+@@ -121,8 +193,9 @@
+     activation_tester(Batch)
+ 
+ 
+-@pytest.mark.usefixtures("activation_python")
+-def test_batch_output(activation_tester_class, activation_tester, tmp_path) -> None:
++def test_batch_output(activation_python, activation_tester_class, activation_tester, tmp_path) -> None:
++    if not (activation_python.creator.bin_dir / "activate.bat").exists():
++        pytest.skip("cmd.exe cannot represent this destination, batch activation was skipped on purpose")
+     version_script = tmp_path / "version.bat"
+     version_script.write_text("ver", encoding="utf-8")
+ 
+
+--- /dev/null
 +++ b/docs/changelog/3252.bugfix.rst
 @@ -0,0 +1,2 @@
 +Fix ``activate`` and ``activate.fish`` running commands embedded in the virtual environment path or in the interpreter's
