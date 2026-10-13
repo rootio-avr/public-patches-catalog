@@ -11,6 +11,8 @@ unknown
 - CVE-2026-54516
 - CVE-2026-54517
 - CVE-2026-54518
+- CVE-2026-91776
+- CVE-2026-91777
 
 ## How to Apply:
 1. Clone or download the source code for com.fasterxml.jackson.core:jackson-databind
