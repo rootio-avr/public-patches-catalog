@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-vcvr-r3jv-pc5j
+- CVE-2026-94483
 
 ## How to Apply:
 1. Clone or download the source code for next
