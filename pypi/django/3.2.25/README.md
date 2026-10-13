@@ -9,6 +9,7 @@ unknown
 - CVE-2025-57833
 - CVE-2025-64458
 - CVE-2025-64459
+- CVE-2026-15307
 
 ## How to Apply:
 1. Clone or download the source code for django
