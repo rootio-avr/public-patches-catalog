@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-6h2x-m376-mqjq
+- CVE-2026-92599
 
 ## How to Apply:
 1. Clone or download the source code for joi
