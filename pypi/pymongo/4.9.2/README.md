@@ -4,6 +4,7 @@ This patch is based on pymongo version 4.9.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-96748
 - CVE-2026-96749
 
 ## How to Apply:
