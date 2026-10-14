@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-101201
+- CVE-2026-90711
 
 ## How to Apply:
 1. Clone or download the source code for proxy-addr
