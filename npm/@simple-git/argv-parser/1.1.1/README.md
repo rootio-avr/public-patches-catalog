@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-455143
+- CVE-2026-102829
 
 ## How to Apply:
 1. Clone or download the source code for @simple-git/argv-parser
