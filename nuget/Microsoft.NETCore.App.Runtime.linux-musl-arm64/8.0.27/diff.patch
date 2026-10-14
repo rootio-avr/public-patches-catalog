@@ -1,0 +1,885 @@
+--- a/src/libraries/System.Net.WebSockets/src/Resources/Strings.resx
++++ b/src/libraries/System.Net.WebSockets/src/Resources/Strings.resx
+@@ -162,6 +162,9 @@
+   <data name="ZLibUnsupportedCompression" xml:space="preserve">
+     <value>The message was compressed using an unsupported compression method.</value>
+   </data>
++  <data name="net_WebSockets_DataAfterBFinal" xml:space="preserve">
++    <value>Data received after the DEFLATE stream was terminated with BFINAL.</value>
++  </data>
+   <data name="net_WebSockets_Argument_MessageFlagsHasDifferentCompressionOptions" xml:space="preserve">
+     <value>The compression options for a continuation cannot be different than the options used to send the first fragment of the message.</value>
+   </data>
+--- a/src/libraries/System.Net.WebSockets/src/System/Net/WebSockets/Compression/WebSocketInflater.cs
++++ b/src/libraries/System.Net.WebSockets/src/System/Net/WebSockets/Compression/WebSocketInflater.cs
+@@ -127,6 +127,8 @@
+         {
+             _stream ??= CreateInflater();
+ 
++            bool streamEnded = false;
++
+             if (_available > 0 && output.Length > 0)
+             {
+                 int consumed;
+@@ -136,7 +138,7 @@
+                     _stream.NextIn = (IntPtr)(bufferPtr + _position);
+                     _stream.AvailIn = (uint)_available;
+ 
+-                    written = Inflate(_stream, output, FlushCode.NoFlush);
++                    written = Inflate(_stream, output, FlushCode.NoFlush, out streamEnded);
+                     consumed = _available - (int)_stream.AvailIn;
+                 }
+ 
+@@ -154,6 +156,16 @@
+                 return _endOfMessage ? Finish(output, ref written) : true;
+             }
+ 
++            if (streamEnded && _available > 0)
++            {
++                // zlib reached the end of the DEFLATE stream (a BFINAL=1 final block) while compressed
++                // bytes still remain that it will never consume. permessage-deflate messages are not
++                // expected to contain a final block; continuing would make no forward progress (the
++                // inflater would report empty results forever and hang the caller's receive loop), so
++                // reject the message.
++                throw new WebSocketException(SR.net_WebSockets_DataAfterBFinal);
++            }
++
+             return false;
+         }
+ 
+@@ -180,7 +192,7 @@
+             // If we have more space in the output, try to inflate
+             if (output.Length > written)
+             {
+-                written += Inflate(_stream, output[written..], FlushCode.SyncFlush);
++                written += Inflate(_stream, output[written..], FlushCode.SyncFlush, out _);
+             }
+ 
+             // After inflate, if we have more space in the output then it means that we
+@@ -215,7 +227,7 @@
+             // There is no other way to make sure that we've consumed all data
+             // but to try to inflate again with at least one byte of output buffer.
+             byte b;
+-            if (Inflate(stream, new Span<byte>(&b, 1), FlushCode.SyncFlush) == 0)
++            if (Inflate(stream, new Span<byte>(&b, 1), FlushCode.SyncFlush, out _) == 0)
+             {
+                 remainingByte = null;
+                 return true;
+@@ -225,7 +237,7 @@
+             return false;
+         }
+ 
+-        private static unsafe int Inflate(ZLibStreamHandle stream, Span<byte> destination, FlushCode flushCode)
++        private static unsafe int Inflate(ZLibStreamHandle stream, Span<byte> destination, FlushCode flushCode, out bool streamEnded)
+         {
+             Debug.Assert(destination.Length > 0);
+             ErrorCode errorCode;
+@@ -239,6 +251,7 @@
+ 
+                 if (errorCode is ErrorCode.Ok or ErrorCode.StreamEnd or ErrorCode.BufError)
+                 {
++                    streamEnded = errorCode == ErrorCode.StreamEnd;
+                     return destination.Length - (int)stream.AvailOut;
+                 }
+             }
+--- a/src/libraries/System.Net.WebSockets/src/System/Net/WebSockets/ManagedWebSocket.cs
++++ b/src/libraries/System.Net.WebSockets/src/System/Net/WebSockets/ManagedWebSocket.cs
+@@ -828,7 +828,6 @@
+                             if (_receiveBufferCount > 0)
+                             {
+                                 int receiveBufferBytesToCopy = Math.Min(limit, _receiveBufferCount);
+-                                Debug.Assert(receiveBufferBytesToCopy > 0);
+ 
+                                 _receiveBuffer.Span.Slice(_receiveBufferOffset, receiveBufferBytesToCopy).CopyTo(
+                                     header.Compressed ? _inflater!.Span : payloadBuffer.Span);
+--- a/src/libraries/System.Net.WebSockets/tests/WebSocketDeflateTests.cs
++++ b/src/libraries/System.Net.WebSockets/tests/WebSocketDeflateTests.cs
+@@ -646,6 +646,65 @@
+             Assert.Equal(frame1.Length + frame2.Length, messageSize);
+         }
+ 
++        public static IEnumerable<object[]> BFinalTerminatedFrames()
++        {
++            // A complete (FIN=1) compressed message terminated with a BFINAL=1 final block (decodes
++            // to "Hello"). 0xf3 sets the BFINAL bit.
++            yield return new object[] { new byte[] { 0xc1, 0x07, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00 } };
++
++            // A non-final (FIN=0) compressed frame whose payload is a BFINAL=1 final block ("Hello")
++            // followed by trailing bytes that can never be consumed.
++            yield return new object[] { new byte[] { 0x42, 0x09, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00, 0x00, 0x00 } };
++        }
++
++        [Theory]
++        [MemberData(nameof(BFinalTerminatedFrames))]
++        public async Task CompressedMessageWithBFinalBitSet_Throws(byte[] frame)
++        {
++            // permessage-deflate messages are not expected to contain a final DEFLATE block. zlib stops
++            // at the BFINAL=1 block leaving compressed bytes unconsumed, so the message is rejected
++            // instead of having the inflater spin forever returning empty results.
++            WebSocketTestStream stream = new();
++            stream.Enqueue(frame);
++            using WebSocket websocket = WebSocket.CreateFromStream(stream, new WebSocketCreationOptions
++            {
++                DangerousDeflateOptions = new WebSocketDeflateOptions()
++            });
++
++            Memory<byte> buffer = new byte[64];
++            var exception = await Assert.ThrowsAsync<WebSocketException>(
++                async () => await websocket.ReceiveAsync(buffer, CancellationToken));
++            Assert.Contains("BFINAL", exception.Message);
++            Assert.Equal(WebSocketState.Aborted, websocket.State);
++        }
++
++        [Fact]
++        public async Task CompressedMessageWithBFinalBitSet_PrecededByValidMessage_Throws()
++        {
++            WebSocketTestStream stream = new();
++            // A valid sync-flushed message (0xf2, BFINAL not set) decodes successfully...
++            stream.Enqueue(0xc1, 0x07, 0xf2, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00);
++            using WebSocket websocket = WebSocket.CreateFromStream(stream, new WebSocketCreationOptions
++            {
++                DangerousDeflateOptions = new WebSocketDeflateOptions()
++            });
++
++            Memory<byte> buffer = new byte[64];
++            ValueWebSocketReceiveResult result = await websocket.ReceiveAsync(buffer, CancellationToken);
++
++            Assert.True(result.EndOfMessage);
++            Assert.Equal("Hello".Length, result.Count);
++            Assert.Equal(WebSocketMessageType.Text, result.MessageType);
++            Assert.Equal("Hello", Encoding.UTF8.GetString(buffer.Span.Slice(0, result.Count)));
++
++            // ...but a subsequent message terminated with BFINAL=1 (0xf3) is rejected.
++            stream.Enqueue(0xc1, 0x07, 0xf3, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x00);
++            buffer.Span.Clear();
++            var exception = await Assert.ThrowsAsync<WebSocketException>(
++                async () => await websocket.ReceiveAsync(buffer, CancellationToken));
++            Assert.Contains("BFINAL", exception.Message);
++        }
++
+         [Fact]
+         public async Task DisposeShouldNotCorruptStateWhileReceiving()
+         {
+
+--- a/src/libraries/System.Net.Security/src/System/Net/Security/SslStream.IO.cs
++++ b/src/libraries/System.Net.Security/src/System/Net/Security/SslStream.IO.cs
+@@ -440,6 +440,8 @@ private async ValueTask<int> ReceiveHandshakeFrameAsync<TIOAdapter>(Cancellation
+         // Calls crypto on received data. No IO inside.
+         private void ProcessTlsFrame(int frameSize, out ProtocolToken message)
+         {
++            Debug.Assert(frameSize > 0);
++
+             int chunkSize = frameSize;
+ 
+             ReadOnlySpan<byte> availableData = _buffer.EncryptedReadOnlySpan;
+@@ -452,9 +454,12 @@ private void ProcessTlsFrame(int frameSize, out ProtocolToken message)
+             {
+                 TlsFrameHeader nextHeader = default;
+ 
++                // we should always have at least TlsFrameHelper.HeaderSize bytes left, so
++                // if TryGetFrameHeader fails, it means the frame is malformed and we should not continue processing.
+                 if (!TlsFrameHelper.TryGetFrameHeader(_buffer.EncryptedReadOnlySpan, ref nextHeader))
+                 {
+-                    break;
++                    if (NetEventSource.Log.IsEnabled()) NetEventSource.Error(this, "invalid TLS frame size");
++                    throw new AuthenticationException(SR.net_frame_read_size);
+                 }
+ 
+                 frameSize = nextHeader.Length;
+@@ -467,6 +472,7 @@ private void ProcessTlsFrame(int frameSize, out ProtocolToken message)
+                     break;
+                 }
+ 
++                Debug.Assert(frameSize > 0);
+                 chunkSize += frameSize;
+                 _buffer.DiscardEncrypted(frameSize);
+             }
+@@ -985,11 +991,6 @@ private int GetFrameSize(ReadOnlySpan<byte> buffer)
+             }
+ 
+             if (!TlsFrameHelper.TryGetFrameHeader(buffer, ref _lastFrame.Header))
+-            {
+-                throw new IOException(SR.net_ssl_io_frame);
+-            }
+-
+-            if (_lastFrame.Header.Length < 0)
+             {
+                 if (NetEventSource.Log.IsEnabled()) NetEventSource.Error(this, "invalid TLS frame size");
+                 throw new AuthenticationException(SR.net_frame_read_size);
+--- a/src/libraries/System.Net.Security/src/System/Net/Security/TlsFrameHelper.cs
++++ b/src/libraries/System.Net.Security/src/System/Net/Security/TlsFrameHelper.cs
+@@ -212,7 +212,9 @@ public static bool TryGetFrameHeader(ReadOnlySpan<byte> frame, ref TlsFrameHeade
+             }
+             else
+             {
++                // unknown format
+                 header.Length = -1;
++                return false;
+             }
+ 
+             return true;
+--- a/src/libraries/System.Net.Security/tests/FunctionalTests/SslStreamStreamToStreamTest.cs
++++ b/src/libraries/System.Net.Security/tests/FunctionalTests/SslStreamStreamToStreamTest.cs
+@@ -729,5 +729,37 @@ public async Task AuthenticateAsServerAsync_Sockets_CanceledAfterStart_ThrowsOpe
+                 await Assert.ThrowsAnyAsync<OperationCanceledException>(() => t);
+             }
+         }
++
++        [ConditionalFact(typeof(TestConfiguration), nameof(TestConfiguration.SupportsRenegotiation))]
++        public async Task MalformedPacketsDuringHandshake_ThrowsAuthenticationException()
++        {
++            (Stream client, Stream server) = TestHelper.GetConnectedStreams();
++
++            using (client)
++            using (server)
++            using (var clientSslStream = new SslStream(client, false, AllowAnyServerCertificate))
++            using (var serverSslStream = new SslStream(server))
++            using (X509Certificate2 serverCert = Configuration.Certificates.GetServerCertificate())
++            using (X509Certificate2 clientCert = Configuration.Certificates.GetClientCertificate())
++            {
++                Task t1 = clientSslStream.AuthenticateAsClientAsync(new SslClientAuthenticationOptions()
++                {
++                    TargetHost = serverCert.GetNameInfo(X509NameType.SimpleName, false),
++                    ClientCertificates = new X509CertificateCollection() { clientCert }
++                }, CancellationToken.None);
++                Task t2 = serverSslStream.AuthenticateAsServerAsync(new SslServerAuthenticationOptions()
++                {
++                    ServerCertificate = serverCert
++                }, CancellationToken.None);
++
++                await TestConfiguration.WhenAllOrAnyFailedWithTimeout(t1, t2);
++
++                // Write malformed data to the server stream to cause the handshake to fail.
++                byte[] payload = [21, 3, 1, 0, 0, 0, 0, 0, 0, 0, 0];
++                await client.WriteAsync(payload);
++
++                await Assert.ThrowsAsync<AuthenticationException>(() => serverSslStream.NegotiateClientCertificateAsync());
++            }
++        }
+     }
+ }
+
+--- a/src/libraries/System.Net.Http/src/Resources/Strings.resx
++++ b/src/libraries/System.Net.Http/src/Resources/Strings.resx
+@@ -420,6 +420,9 @@
+   <data name="net_http_http2_invalidinitialstreamwindowsize" xml:space="preserve">
+     <value>The initial HTTP/2 stream window size must be between {0} and {1}.</value>
+   </data>
++  <data name="net_http_http2_frame_limit_exceeded" xml:space="preserve">
++    <value>The HTTP/2 connection was aborted because the size of the frame queue exceeded an internal limit.</value>
++  </data>
+   <data name="net_MethodNotImplementedException" xml:space="preserve">
+     <value>This method is not implemented by this class.</value>
+   </data>
+--- a/src/libraries/System.Net.Http/src/System/Net/Http/SocketsHttpHandler/Http2Connection.cs
++++ b/src/libraries/System.Net.Http/src/System/Net/Http/SocketsHttpHandler/Http2Connection.cs
+@@ -73,6 +73,10 @@
+         // _shutdown above is true, and requests in flight have been (or are being) failed.
+         private Exception? _abortException;
+ 
++        // Cap number of untransmitted PING and SETTING ACKs and PING requests
++        private const int MaxQueuedFireAndForgetFrames = 1000;
++        private int _queuedFireAndForgetFrames;
++
+         private const int MaxStreamId = int.MaxValue;
+ 
+         // Temporary workaround for request burst handling on connection start.
+@@ -911,7 +915,7 @@
+ 
+                 // Send acknowledgement
+                 // Don't wait for completion, which could happen asynchronously.
+-                LogExceptions(SendSettingsAckAsync());
++                QueueSettingsAck();
+             }
+         }
+ 
+@@ -992,7 +996,7 @@
+             }
+             else
+             {
+-                LogExceptions(SendPingAsync(pingContentLong, isAck: true));
++                QueuePing(pingContentLong, isAck: true);
+             }
+             _incomingBuffer.Discard(frameHeader.PayloadLength);
+         }
+@@ -1272,21 +1276,36 @@
+             }
+         }
+ 
+-        private Task SendSettingsAckAsync() =>
+-            PerformWriteAsync(FrameHeader.Size, this, static (thisRef, writeBuffer) =>
++        private void QueueSettingsAck()
++        {
++            if (!TryIncrementQueuedFireAndForgetFrames())
+             {
++                return;
++            }
++
++            LogExceptions(PerformWriteAsync(FrameHeader.Size, this, static (thisRef, writeBuffer) =>
++            {
+                 if (NetEventSource.Log.IsEnabled()) thisRef.Trace("Started writing.");
+ 
+                 FrameHeader.WriteTo(writeBuffer.Span, 0, FrameType.Settings, FrameFlags.Ack, streamId: 0);
+ 
++                thisRef.DecrementQueuedFireAndForgetFrames();
++
+                 return true;
+-            });
++            }));
++        }
+ 
+         /// <param name="pingContent">The 8-byte ping content to send, read as a big-endian integer.</param>
+         /// <param name="isAck">Determine whether the frame is ping or ping ack.</param>
+-        private Task SendPingAsync(long pingContent, bool isAck = false) =>
+-            PerformWriteAsync(FrameHeader.Size + FrameHeader.PingLength, (thisRef: this, pingContent, isAck), static (state, writeBuffer) =>
++        private void QueuePing(long pingContent, bool isAck = false)
++        {
++            if (!TryIncrementQueuedFireAndForgetFrames())
+             {
++                return;
++            }
++
++            LogExceptions(PerformWriteAsync(FrameHeader.Size + FrameHeader.PingLength, (thisRef: this, pingContent, isAck), static (state, writeBuffer) =>
++            {
+                 if (NetEventSource.Log.IsEnabled()) state.thisRef.Trace($"Started writing. {nameof(pingContent)}={state.pingContent}");
+ 
+                 Debug.Assert(sizeof(long) == FrameHeader.PingLength);
+@@ -1295,8 +1314,11 @@
+                 FrameHeader.WriteTo(span, FrameHeader.PingLength, FrameType.Ping, state.isAck ? FrameFlags.Ack : FrameFlags.None, streamId: 0);
+                 BinaryPrimitives.WriteInt64BigEndian(span.Slice(FrameHeader.Size), state.pingContent);
+ 
++                state.thisRef.DecrementQueuedFireAndForgetFrames();
++
+                 return true;
+-            });
++            }));
++        }
+ 
+         private Task SendRstStreamAsync(int streamId, Http2ProtocolErrorCode errorCode) =>
+             PerformWriteAsync(FrameHeader.Size + FrameHeader.RstStreamLength, (thisRef: this, streamId, errorCode), static (s, writeBuffer) =>
+@@ -1836,6 +1858,28 @@
+             return _streamsInUse == 0 ? base.GetIdleTicks(nowTicks) : 0;
+         }
+ 
++        private bool TryIncrementQueuedFireAndForgetFrames()
++        {
++            if (Interlocked.Increment(ref _queuedFireAndForgetFrames) > MaxQueuedFireAndForgetFrames)
++            {
++                if (NetEventSource.Log.IsEnabled()) this.Trace("Number of untransmitted PING and SETTING frames exceeded limit.");
++
++                // Close connection when there is too much outstanding frames
++                var ex = new HttpIOException(HttpRequestError.Unknown, SR.net_http_http2_frame_limit_exceeded);
++                Abort(ex);
++
++                return false;
++            }
++
++            return true;
++        }
++
++        private void DecrementQueuedFireAndForgetFrames()
++        {
++            int pending = Interlocked.Decrement(ref _queuedFireAndForgetFrames);
++            Debug.Assert(pending >= 0);
++        }
++
+         /// <summary>Abort all streams and cause further processing to fail.</summary>
+         /// <param name="abortException">Exception causing Abort to be called.</param>
+         private void Abort(Exception abortException)
+@@ -2161,7 +2205,7 @@
+                         _keepAlivePingTimeoutTimestamp = now + _keepAlivePingTimeout;
+ 
+                         long pingPayload = Interlocked.Increment(ref _keepAlivePingPayload);
+-                        LogExceptions(SendPingAsync(pingPayload));
++                        QueuePing(pingPayload);
+                         return;
+                     }
+                     break;
+--- a/src/libraries/System.Net.Http/src/System/Net/Http/SocketsHttpHandler/Http2StreamWindowManager.cs
++++ b/src/libraries/System.Net.Http/src/System/Net/Http/SocketsHttpHandler/Http2StreamWindowManager.cs
+@@ -220,7 +220,7 @@
+                     // Send a PING
+                     _pingCounter--;
+                     if (NetEventSource.Log.IsEnabled()) connection.Trace($"[FlowControl] Sending RTT PING with payload {_pingCounter}");
+-                    connection.LogExceptions(connection.SendPingAsync(_pingCounter, isAck: false));
++                    connection.QueuePing(_pingCounter, isAck: false);
+                     _pingSentTimestamp = now;
+                     _state = State.PingSent;
+                 }
+--- a/src/libraries/System.Net.Http/tests/FunctionalTests/SocketsHttpHandlerTest.cs
++++ b/src/libraries/System.Net.Http/tests/FunctionalTests/SocketsHttpHandlerTest.cs
+@@ -2826,6 +2826,176 @@
+             }
+         }
+ 
++        [ConditionalFact(typeof(SocketsHttpHandlerTest_Http2), nameof(SupportsAlpn))]
++        public async Task Http2_SettingInFlightLimitExceeded()
++        {
++            // test that client abort connection when server send too much PING/SETTINGs while not processing ACK replies
++
++            await Http2LoopbackServer.CreateClientAndServerAsync(
++                async uri =>
++                {
++                    using HttpClient client = CreateHttpClient();
++
++                    Exception e = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetAsync(uri));
++                    Assert.True(e.Message.StartsWith(SR.net_http_http2_frame_limit_exceeded), "Bad Exception Message");
++
++                    // test that we can open connection after failure
++                    await client.GetAsync(uri);
++                },
++                async server =>
++                {
++                    server.AllowMultipleConnections = true;
++
++                    await using Http2LoopbackConnection con = await server.AcceptConnectionAsync();
++                    while (true)
++                    {
++                        try
++                        {
++                            await con.WriteFrameAsync(new Frame(0, FrameType.Settings, FrameFlags.None, 0));
++                        }
++                        catch (IOException)
++                        {
++                            break;
++                        }
++                    }
++
++                    // second connection will be more lucky
++                    await server.AcceptConnectionSendResponseAndCloseAsync(HttpStatusCode.OK, "ok");
++                });
++        }
++
++        [ConditionalFact(typeof(SocketsHttpHandlerTest_Http2), nameof(SupportsAlpn))]
++        public async Task Http2_PingInFlightLimitExceeded()
++        {
++            // almost exhaust client queue and test that following asynchronous PING issued by client trips
++
++            BlockedWriteNetworkStream? clientNetStream = null;
++
++            await Http2LoopbackServer.CreateClientAndServerAsync(
++                async uri =>
++                {
++                    using HttpClientHandler handler = CreateHttpClientHandler(allowAllCertificates: true);
++                    SocketsHttpHandler socketsHandler = GetUnderlyingSocketsHttpHandler(handler);
++
++                    socketsHandler.ConnectCallback += async (ctx, ct) =>
++                    {
++                        DnsEndPoint dnsEndPoint = ctx.DnsEndPoint;
++                        IPAddress[] addresses = await Dns.GetHostAddressesAsync(dnsEndPoint.Host, dnsEndPoint.AddressFamily, ct);
++
++                        var s = new Socket(SocketType.Stream, ProtocolType.Tcp);
++                        await s.ConnectAsync(addresses, dnsEndPoint.Port, ct);
++
++                        clientNetStream = new BlockedWriteNetworkStream(s, true);
++                        return clientNetStream;
++                    };
++                    socketsHandler.KeepAlivePingDelay = TimeSpan.FromSeconds(1);
++                    socketsHandler.KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always;
++                    socketsHandler.KeepAlivePingTimeout = TimeSpan.MaxValue;
++
++                    using HttpClient client = CreateHttpClient(handler);
++                    client.DefaultRequestVersion = HttpVersion.Version20;
++                    client.DefaultVersionPolicy = HttpVersionPolicy.RequestVersionExact;
++
++                    Exception e = await Assert.ThrowsAsync<HttpRequestException>(() => client.GetAsync(uri));
++                    Assert.True(e.Message.StartsWith(SR.net_http_http2_frame_limit_exceeded), "Bad Exception Message");
++
++                    // test that we can connect new connection after fail
++                    await client.GetAsync(uri);
++                },
++                async server =>
++                {
++                    server.AllowMultipleConnections = true;
++
++                    await using Http2LoopbackConnection con = await server.AcceptConnectionAsync();
++
++                    // wait for initial frames from client
++                    await con.ReadSettingsAsync();
++                    await con.ReadRequestHeaderAsync();
++                    PingFrame firstPing = await con.ReadPingAsync();
++
++                    long writeCntBeforeSettingsAck = clientNetStream.StartBlocking();
++
++                    // ACK for following SETTINGS will attemp flushing queue on client side and block its processing
++                    await con.WriteFrameAsync(new SettingsFrame());
++
++                    // wait before client attemp to send ACK and channel get blocked.
++                    // Without this wait it may combine SETTINGs ACK and following PING ACKs into
++                    // single buffer which will cause dequeueing them from queue and we fail to
++                    // preload queue to expect 1000 entries as required by test later.
++                    while (clientNetStream.WriteCallCount == writeCntBeforeSettingsAck)
++                    {
++                        await Task.Delay(50);
++                    }
++
++                    // fill the client queue with replies to PING, 1000 exactly fit the queue
++                    for (long i = 0; i < 1000; i++)
++                    {
++                        await con.WriteFrameAsync(new PingFrame(i, FrameFlags.None, 0));
++                    }
++
++                    // now confirm ping we received soon after initiating connection to eneble new heart beat ping
++                    // this should trip and close connection
++                    await con.WriteFrameAsync(new PingFrame(firstPing.Data, FrameFlags.Ack, 0));
++
++                    // test that server/client are operational after failure
++                    await server.AcceptConnectionSendResponseAndCloseAsync();
++                }, new Http2Options()
++                {
++                    UseSsl = false, // SSL introduce buffering which supress effect of blocking
++                    EnableTransparentPingResponse = false // need to observe initial ping
++                });
++        }
++
++        private class BlockedWriteNetworkStream : NetworkStream
++        {
++            private object _lock = new object();
++            private bool _block;
++            private long _writes;
++
++            public long WriteCallCount
++            {
++                get
++                {
++                    lock (_lock)
++                    {
++                        return _writes;
++                    }
++                }
++            }
++
++            public BlockedWriteNetworkStream(Socket socket, bool ownsSocket) : base(socket, ownsSocket) { }
++
++            public long StartBlocking()
++            {
++                lock (_lock)
++                {
++                    _block = true;
++                    return _writes;
++                }
++            }
++
++            public override Task WriteAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken) =>
++                WriteAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
++
++            public override async ValueTask WriteAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellationToken = default)
++            {
++                bool block;
++                lock (_lock)
++                {
++                    _writes++;
++                    block = _block;
++                }
++
++                if (block)
++                {
++                    await Task.Delay(TimeSpan.FromDays(1), cancellationToken);
++                    throw new Exception("Long delay was canceled early");
++                }
++
++                await base.WriteAsync(buffer, cancellationToken);
++            }
++        }
++
+         private async Task VerifySendTasks(IReadOnlyList<Task<HttpResponseMessage>> sendTasks)
+         {
+             await TestHelper.WhenAllCompletedOrAnyFailed(sendTasks.ToArray()).ConfigureAwait(false);
+
+--- a/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/X509Certificates/CertificateData.ManagedDecode.cs
++++ b/src/libraries/System.Security.Cryptography/src/System/Security/Cryptography/X509Certificates/CertificateData.ManagedDecode.cs
+@@ -330,9 +330,11 @@ public string GetNameInfo(X509NameType nameType, bool forIssuer)
+                     }
+                 }
+             }
+-            catch (AsnContentException e)
++            catch (AsnContentException)
++            {
++            }
++            catch (CryptographicException)
+             {
+-                throw new CryptographicException(SR.Cryptography_Der_Invalid_Encoding, e);
+             }
+ 
+             return null;
+--- a/src/libraries/System.Security.Cryptography/tests/X509Certificates/PropsTests.cs
++++ b/src/libraries/System.Security.Cryptography/tests/X509Certificates/PropsTests.cs
+@@ -1,6 +1,7 @@
+ // Licensed to the .NET Foundation under one or more agreements.
+ // The .NET Foundation licenses this file to you under the MIT license.
+ 
++using System.Formats.Asn1;
+ using System.IO;
+ using Test.Cryptography;
+ using Xunit;
+@@ -496,6 +497,251 @@ public static void ComplexGetNameInfo_UrlName_Issuer()
+             TestComplexGetNameInfo("http://uri1.issuer.example.org/", X509NameType.UrlName, true);
+         }
+ 
++        [Theory]
++        [InlineData(null)]
++        [InlineData(true)]
++        [InlineData(false)]
++        [InlineData(5)]
++        [InlineData(new byte[] { 0x30 })]
++        [InlineData("user@domain")]
++        public static void GetNameInfo_InvalidUpnValue(object? value)
++        {
++            string workingUpn = value as string;
++
++            using (ECDsa key = ECDsa.Create(ECCurve.NamedCurves.nistP384))
++            {
++                CertificateRequest req = new CertificateRequest(
++                    "CN=GetNameInfo_InvalidUpnValue",
++                    key,
++                    HashAlgorithmName.SHA384);
++
++                req.CertificateExtensions.Add(BuildSanExtension(value));
++
++                DateTimeOffset now = DateTimeOffset.UtcNow;
++
++                using (X509Certificate2 cert = req.CreateSelfSigned(now, now.AddDays(1)))
++                {
++                    string upn = cert.GetNameInfo(X509NameType.UpnName, forIssuer: false);
++
++                    if (workingUpn is not null)
++                    {
++                        Assert.Equal(workingUpn, upn);
++                    }
++                    else
++                    {
++                        Assert.Empty(upn);
++                    }
++                }
++            }
++
++            static X509Extension BuildSanExtension(object? value)
++            {
++                AsnWriter sanWriter = new AsnWriter(AsnEncodingRules.DER);
++
++                using (sanWriter.PushSequence())
++                {
++                    using (sanWriter.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
++                    {
++                        sanWriter.WriteObjectIdentifier("1.3.6.1.4.1.311.20.2.3");
++
++                        using (sanWriter.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
++                        {
++                            if (value is null)
++                            {
++                                sanWriter.WriteNull();
++                            }
++                            else if (value is bool b)
++                            {
++                                sanWriter.WriteBoolean(b);
++                            }
++                            else if (value is int i)
++                            {
++                                sanWriter.WriteInteger(i);
++                            }
++                            else if (value is byte[] bytes)
++                            {
++                                sanWriter.WriteOctetString(bytes);
++                            }
++                            else if (value is string s)
++                            {
++                                sanWriter.WriteCharacterString(UniversalTagNumber.UTF8String, s);
++                            }
++                        }
++                    }
++                }
++
++                return new X509Extension("2.5.29.17", sanWriter.Encode(), critical: false);
++            }
++        }
++
++        [Theory]
++        [InlineData(0)]
++        [InlineData(1)]
++        [InlineData(2)]
++        [InlineData(3)]
++        [InlineData(4)]
++        public static void GetNameInfo_InvalidUpnEncoding(int mode)
++        {
++            string expectedValue = mode == 0 ? "user@domain" : string.Empty;
++
++            using (ECDsa key = ECDsa.Create(ECCurve.NamedCurves.nistP384))
++            {
++                CertificateRequest req = new CertificateRequest(
++                    "CN=GetNameInfo_UpnName_Test",
++                    key,
++                    HashAlgorithmName.SHA384);
++
++                req.CertificateExtensions.Add(BuildSanExtension(mode));
++
++                DateTimeOffset now = DateTimeOffset.UtcNow;
++
++                using (X509Certificate2 cert = req.CreateSelfSigned(now, now.AddDays(1)))
++                {
++                    string upn = cert.GetNameInfo(X509NameType.UpnName, forIssuer: false);
++                    Assert.Equal(expectedValue, upn);
++                }
++            }
++
++            static X509Extension BuildSanExtension(int mode)
++            {
++                AsnWriter sanWriter = new AsnWriter(AsnEncodingRules.DER);
++
++                using (sanWriter.PushSequence())
++                {
++                    using (sanWriter.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
++                    {
++                        sanWriter.WriteObjectIdentifier("1.3.6.1.4.1.311.20.2.3");
++
++                        using (sanWriter.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
++                        {
++                            switch (mode)
++                            {
++                                case 0:
++                                    // Valid (verifies this method is otherwise encoding correctly)
++                                    sanWriter.WriteCharacterString(
++                                        UniversalTagNumber.UTF8String,
++                                        "user@domain");
++                                    break;
++                                case 1:
++                                    // No value
++                                    break;
++                                case 2:
++                                    // Two strings
++                                    sanWriter.WriteCharacterString(
++                                        UniversalTagNumber.UTF8String,
++                                        "user@domain1");
++
++                                    sanWriter.WriteCharacterString(
++                                        UniversalTagNumber.UTF8String,
++                                        "user@domain2");
++
++                                    break;
++                                case 3:
++                                    // NULL, then a string
++                                    sanWriter.WriteNull();
++
++                                    sanWriter.WriteCharacterString(
++                                        UniversalTagNumber.UTF8String,
++                                        "user@domain");
++
++                                    break;
++                                case 4:
++                                    // A string, then NULL
++                                    sanWriter.WriteCharacterString(
++                                        UniversalTagNumber.UTF8String,
++                                        "user@domain");
++
++                                    sanWriter.WriteNull();
++                                    break;
++                            }
++                        }
++                    }
++                }
++
++                return new X509Extension("2.5.29.17", sanWriter.Encode(), critical: false);
++            }
++        }
++
++        [Theory]
++        [InlineData(false)]
++        [InlineData(true)]
++        public static void GetNameInfo_EmailName_MaybeInvalidSAN(bool invalidOtherName)
++        {
++            using (ECDsa key = ECDsa.Create(ECCurve.NamedCurves.nistP384))
++            {
++                CertificateRequest req = new CertificateRequest(
++                    "CN=Test, E=fallback@subject.example",
++                    key,
++                    HashAlgorithmName.SHA384);
++
++                req.CertificateExtensions.Add(BuildSanExtension(invalidOtherName));
++
++                DateTimeOffset now = DateTimeOffset.UtcNow;
++                X509SignatureGenerator gen = X509SignatureGenerator.CreateForECDsa(key);
++                byte[] serial = new byte[20];
++                RandomNumberGenerator.Fill(serial);
++                serial[0] &= 0x7F;
++
++                using (X509Certificate2 cert = req.Create(req.SubjectName, gen, now, now.AddDays(1), serial))
++                {
++                    string email = cert.GetNameInfo(X509NameType.EmailName, forIssuer: false);
++
++                    if (invalidOtherName)
++                    {
++                        Assert.Equal("fallback@subject.example", email);
++                    }
++                    else
++                    {
++                        Assert.Equal("san@domain.example", email);
++                    }
++                }
++            }
++
++            static X509Extension BuildSanExtension(bool invalidOtherName)
++            {
++                AsnWriter sanWriter = new AsnWriter(AsnEncodingRules.DER);
++
++                using (sanWriter.PushSequence())
++                {
++                    if (invalidOtherName)
++                    {
++                        // Invalid otherName: context-tagged [0] wrapping just a bare
++                        // UTF8String (no OID, no explicit [0] wrapper). This makes
++                        // the overall SAN extension fail to decode.
++                        using (sanWriter.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
++                        {
++                            sanWriter.WriteCharacterString(
++                                UniversalTagNumber.UTF8String,
++                                "bogus");
++                        }
++                    }
++                    else
++                    {
++                        // Valid otherName (UPN) so the SAN is well-formed.
++                        using (sanWriter.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
++                        {
++                            sanWriter.WriteObjectIdentifier("1.3.6.1.4.1.311.20.2.3");
++
++                            using (sanWriter.PushSequence(new Asn1Tag(TagClass.ContextSpecific, 0)))
++                            {
++                                sanWriter.WriteCharacterString(
++                                    UniversalTagNumber.UTF8String,
++                                    "upn@domain.example");
++                            }
++                        }
++                    }
++
++                    // rfc822Name [1] IA5String
++                    sanWriter.WriteCharacterString(
++                        UniversalTagNumber.IA5String,
++                        "san@domain.example",
++                        new Asn1Tag(TagClass.ContextSpecific, 1));
++                }
++
++                return new X509Extension("2.5.29.17", sanWriter.Encode(), critical: false);
++            }
++        }
++
+         private static void TestComplexGetNameInfo(string expected, X509NameType nameType, bool forIssuer)
+         {
+             // ComplexNameInfoCert has the following characteristics:
+--- a/src/native/libs/System.Security.Cryptography.Native/openssl.c
++++ b/src/native/libs/System.Security.Cryptography.Native/openssl.c
+@@ -668,13 +668,11 @@ BIO* CryptoNative_GetX509NameInfo(X509* x509, int32_t nameType, int32_t forIssue
+                                 if (sizeof(szOidUpn) == cchLocalOid &&
+                                     0 == strncmp(localOid, szOidUpn, sizeof(szOidUpn)))
+                                 {
+-                                    // OTHERNAME->ASN1_TYPE->union.field
+-                                    if (!value->value)
++                                    if (value->value && value->value->type == V_ASN1_UTF8STRING)
+                                     {
+-                                        return NULL;
++                                        // OTHERNAME->ASN1_TYPE->union.field
++                                        str = value->value->value.asn1_string;
+                                     }
+-
+-                                    str = value->value->value.asn1_string;
+                                 }
+                             }
+ 
