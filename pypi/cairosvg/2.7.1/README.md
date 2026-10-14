@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-31899
+- CVE-2026-107378
 
 ## How to Apply:
 1. Clone or download the source code for cairosvg
