@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-123768
+- CVE-2026-75650
 
 ## How to Apply:
 1. Clone or download the source code for magento/product-enterprise-edition
