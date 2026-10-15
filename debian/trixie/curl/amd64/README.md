@@ -1,22 +1,19 @@
-# curl : 8.14.1-2+deb13u5.aikido.23
+# curl : 8.14.1-2+deb13u7.aikido.24
 
-This patch is based on curl version 8.14.1-2+deb13u5.aikido.23, which is available at:
-https://sources.debian.org/src/curl/8.14.1-2+deb13u5/
+This patch is based on curl version 8.14.1-2+deb13u7.aikido.24, which is available at:
+https://sources.debian.org/src/curl/8.14.1-2+deb13u7/
 
 ## Affected CVEs:
 - CVE-2025-10966
 - CVE-2025-14017
 - CVE-2025-15079
 - CVE-2026-12064
-- CVE-2026-8286
-- CVE-2026-8927
 - CVE-2026-8932
 - CVE-2026-9079
 - CVE-2026-9080
 - CVE-2026-9545
 - CVE-2026-9547
 - CVE-2026-11856
-- CVE-2026-8924
 - CVE-2026-8926
 - CVE-2026-10536
 - CVE-2026-8458
