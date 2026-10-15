@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2025-52999
 - GHSA-r7wm-3cxj-wff9
+- CVE-2026-68494
 - CVE-2026-89425
 
 ## How to Apply:
