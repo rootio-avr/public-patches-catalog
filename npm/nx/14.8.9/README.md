@@ -4,6 +4,7 @@ This patch is based on nx version 14.8.9, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-104854
 - GHSA-w2vw-w76x-qr89
 
 ## How to Apply:
