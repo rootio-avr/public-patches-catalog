@@ -9,6 +9,7 @@ unknown
 - CVE-2026-89407
 - CVE-2026-89425
 - AIKIDO-2026-665392
+- CVE-2026-68494
 
 ## How to Apply:
 1. Clone or download the source code for com.fasterxml.jackson.core:jackson-core
