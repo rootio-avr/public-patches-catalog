@@ -11,6 +11,7 @@ unknown
 - CVE-2026-33940
 - CVE-2026-33941
 - GHSA-7rx3-28cr-v5wh
+- CVE-2026-106445
 - CVE-2026-106446
 
 ## How to Apply:
