@@ -4,6 +4,7 @@ This patch is based on handlebars version 4.7.9, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-106445
 - CVE-2026-106446
 
 ## How to Apply:
