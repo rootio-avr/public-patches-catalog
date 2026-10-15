@@ -8,6 +8,7 @@ unknown
 - CVE-2026-75650
 - CVE-2026-71362
 - CVE-2026-103849
+- CVE-2026-92909
 
 ## How to Apply:
 1. Clone or download the source code for magento/product-enterprise-edition
