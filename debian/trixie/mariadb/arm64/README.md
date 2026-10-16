@@ -1,18 +1,22 @@
-# mariadb : 1:11.8.6-0+deb13u1.aikido.8
+# mariadb : 1:11.8.6-0+deb13u1.aikido.9
 
-This patch is based on mariadb version 1:11.8.6-0+deb13u1.aikido.8, which is available at:
+This patch is based on mariadb version 1:11.8.6-0+deb13u1.aikido.9, which is available at:
 https://sources.debian.org/src/mariadb/1:11.8.6-0+deb13u1/
 
 ## Affected CVEs:
-- CVE-2026-49261
-- CVE-2026-44172
+- CVE-2026-107815
+- CVE-2026-107818
+- CVE-2026-107821
+- CVE-2026-107823
+- CVE-2026-44168
+- CVE-2026-44169
 - CVE-2026-44170
+- CVE-2026-44171
+- CVE-2026-44172
+- CVE-2026-44173
 - CVE-2026-48163
 - CVE-2026-48165
-- CVE-2026-44168
-- CVE-2026-44171
-- CVE-2026-44169
-- CVE-2026-44173
+- CVE-2026-49261
 
 ## How to Apply:
 1. Obtain the source package: `apt source mariadb`
