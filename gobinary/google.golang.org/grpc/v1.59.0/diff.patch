@@ -1,0 +1,1245 @@
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -46,6 +46,22 @@
+ 	// ALTSMaxConcurrentHandshakes is the maximum number of concurrent ALTS
+ 	// handshakes that can be performed.
+ 	ALTSMaxConcurrentHandshakes = uint64FromEnv("GRPC_ALTS_MAX_CONCURRENT_HANDSHAKES", 100, 1, 100)
++
++	// DisableStrictPathChecking indicates whether strict path checking is
++	// disabled. This feature can be disabled by setting the environment
++	// variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING to "true".
++	//
++	// When strict path checking is enabled, gRPC will reject requests with
++	// paths that do not conform to the gRPC over HTTP/2 specification found at
++	// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md.
++	//
++	// When disabled, gRPC will allow paths that do not contain a leading slash.
++	// Enabling strict path checking is recommended for security reasons, as it
++	// prevents potential path traversal vulnerabilities.
++	//
++	// A future release will remove this environment variable, enabling strict
++	// path checking behavior unconditionally.
++	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+--- a/server.go
++++ b/server.go
+@@ -43,6 +43,7 @@
+ 	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/binarylog"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpcsync"
+ 	"google.golang.org/grpc/internal/grpcutil"
+ 	"google.golang.org/grpc/internal/transport"
+@@ -139,6 +140,8 @@
+ 	channelzID *channelz.Identifier
+ 	czData     *channelzData
+ 
++	strictPathCheckingLogEmitted atomic.Bool
++
+ 	serverWorkerChannel chan func()
+ }
+ 
+@@ -1687,6 +1690,25 @@
+ 	return t.WriteStatus(ss.s, statusOK)
+ }
+ 
++func (s *Server) handleMalformedMethodName(t transport.ServerTransport, stream *transport.Stream, ti *traceInfo) {
++	if ti != nil {
++		ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{stream.Method()}}, true)
++		ti.tr.SetError()
++	}
++	errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
++	if err := t.WriteStatus(stream, status.New(codes.Unimplemented, errDesc)); err != nil {
++		if ti != nil {
++			ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
++			ti.tr.SetError()
++		}
++		channelz.Warningf(logger, s.channelzID, "grpc: Server.handleStream failed to write status: %v", err)
++	}
++	if ti != nil {
++		ti.tr.Finish()
++	}
++}
++
++
+ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.Stream) {
+ 	ctx := stream.Context()
+ 	var ti *traceInfo
+@@ -1706,28 +1728,31 @@
+ 	}
+ 
+ 	sm := stream.Method()
+-	if sm != "" && sm[0] == '/' {
++	if sm == "" {
++		s.handleMalformedMethodName(t, stream, ti)
++		return
++	}
++	if sm[0] != '/' {
++		if envconfig.DisableStrictPathChecking {
++			if old := s.strictPathCheckingLogEmitted.Swap(true); !old {
++				channelz.Warningf(logger, s.channelzID, "grpc: Server.handleStream received malformed method name %q. Allowing it because the environment variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING is set to true, but this option will be removed in a future release.", sm)
++			}
++		} else {
++			if old := s.strictPathCheckingLogEmitted.Swap(true); !old {
++				channelz.Warningf(logger, s.channelzID, "grpc: Server.handleStream rejected malformed method name %q. To temporarily allow such requests, set the environment variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING to true. Note that this is not recommended as it may allow requests to bypass security policies.", sm)
++			}
++			s.handleMalformedMethodName(t, stream, ti)
++			return
++		}
++	} else {
+ 		sm = sm[1:]
+ 	}
+ 	pos := strings.LastIndex(sm, "/")
+ 	if pos == -1 {
+-		if ti != nil {
+-			ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{sm}}, true)
+-			ti.tr.SetError()
+-		}
+-		errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
+-		if err := t.WriteStatus(stream, status.New(codes.Unimplemented, errDesc)); err != nil {
+-			if ti != nil {
+-				ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
+-				ti.tr.SetError()
+-			}
+-			channelz.Warningf(logger, s.channelzID, "grpc: Server.handleStream failed to write status: %v", err)
+-		}
+-		if ti != nil {
+-			ti.tr.Finish()
+-		}
++		s.handleMalformedMethodName(t, stream, ti)
+ 		return
+ 	}
++
+ 	service := sm[:pos]
+ 	method := sm[pos+1:]
+
+ 
+
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -62,6 +62,14 @@ var (
+ 	// A future release will remove this environment variable, enabling strict
+ 	// path checking behavior unconditionally.
+ 	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
++	// EnableReceiveBufferCompaction enables the compaction of data buffers in
++	// the receive buffer to bound the memory overhead of buffering many small
++	// data frames.
++	//
++	// This environment variable serves as an escape hatch to disable the
++	// feature if unforeseen issues arise, and it will be removed in a future
++	// release.
++	EnableReceiveBufferCompaction = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION", true)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+--- a/internal/transport/handler_server.go
++++ b/internal/transport/handler_server.go
+@@ -376,7 +376,7 @@ func (ht *serverHandlerTransport) HandleStreams(startStream func(*Stream)) {
+ 		id:             0, // irrelevant
+ 		requestRead:    func(int) {},
+ 		cancel:         cancel,
+-		buf:            newRecvBuffer(),
++		buf:            newRecvBuffer(nil),
+ 		st:             ht,
+ 		method:         req.URL.Path,
+ 		recvCompress:   req.Header.Get("grpc-encoding"),
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -461,7 +461,7 @@ func (t *http2Client) newStream(ctx context.Context, callHdr *CallHdr) *Stream {
+ 		done:           make(chan struct{}),
+ 		method:         callHdr.Method,
+ 		sendCompress:   callHdr.SendCompress,
+-		buf:            newRecvBuffer(),
++		buf:            newRecvBuffer(t.bufferPool),
+ 		headerChan:     make(chan struct{}),
+ 		contentSubtype: callHdr.ContentSubtype,
+ 		doneFunc:       callHdr.DoneFunc,
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -367,7 +367,7 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
+ 	}
+ 	t.maxStreamID = streamID
+ 
+-	buf := newRecvBuffer()
++	buf := newRecvBuffer(t.bufferPool)
+ 	s := &Stream{
+ 		id:  streamID,
+ 		st:  t,
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -31,10 +31,12 @@ import (
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"unsafe"
+ 
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/keepalive"
+ 	"google.golang.org/grpc/metadata"
+ 	"google.golang.org/grpc/resolver"
+@@ -43,7 +45,26 @@ import (
+ 	"google.golang.org/grpc/tap"
+ )
+ 
+-const logLevel = 2
++const (
++	logLevel = 2
++	// bufferPoolingThreshold is the minimum number of small buffers that must
++	// accumulate in the backlog before compaction coalesces them into a single
++	// buffer. It bounds the memory overhead of buffering many tiny DATA frames.
++	bufferPoolingThreshold = 1 << 10
++	// recvMsgSize estimates the memory overhead of a recvMsg in the backlog. It
++	// accounts for the recvMsg struct itself and the slice header of the
++	// underlying buffer's data.
++	recvMsgSize = int(unsafe.Sizeof(recvMsg{}) + unsafe.Sizeof([]byte{}))
++	// utilizationFactor controls when we consider memory utilization
++	// acceptable. When backlogHeapSize / payloadSize <= utilizationFactor
++	// (meaning at least 50% of the heap memory is actual payload data),
++	// compaction is skipped.
++	utilizationFactor = 2
++	// compactionThreshold is approx 57KB (on 64-bit systems). It allows
++	// accumulating up to 1024 1-byte payloads before triggering compaction,
++	// avoiding frequent copying for small bursts of frames.
++	compactionThreshold = bufferPoolingThreshold * (recvMsgSize + 1)
++)
+ 
+ type bufferPool struct {
+ 	pool sync.Pool
+@@ -87,20 +108,30 @@ type recvBuffer struct {
+ 	c       chan recvMsg
+ 	mu      sync.Mutex
+ 	backlog []recvMsg
+-	err     error
+-}
+-
+-func newRecvBuffer() *recvBuffer {
++	// uncompactedSuffixLen tracks the number of consecutive data messages at
++	// the tail of backlog that have not been compacted.
++	uncompactedSuffixLen int
++	// uncompactedBytes tracks the total payload bytes across the trailing
++	// uncompactedSuffixLen messages.
++	uncompactedBytes int
++	err              error
++	// bufPool, if non-nil, is used to obtain and recycle the *bytes.Buffer
++	// used to hold compacted payloads.
++	bufPool *bufferPool
++}
++
++func newRecvBuffer(pool *bufferPool) *recvBuffer {
+ 	b := &recvBuffer{
+-		c: make(chan recvMsg, 1),
++		c:       make(chan recvMsg, 1),
++		bufPool: pool,
+ 	}
+ 	return b
+ }
+ 
+ func (b *recvBuffer) put(r recvMsg) {
+ 	b.mu.Lock()
++	defer b.mu.Unlock()
+ 	if b.err != nil {
+-		b.mu.Unlock()
+ 		// An error had occurred earlier, don't accept more
+ 		// data or errors.
+ 		return
+@@ -109,13 +140,83 @@ func (b *recvBuffer) put(r recvMsg) {
+ 	if len(b.backlog) == 0 {
+ 		select {
+ 		case b.c <- r:
+-			b.mu.Unlock()
+ 			return
+ 		default:
+ 		}
+ 	}
+ 	b.backlog = append(b.backlog, r)
+-	b.mu.Unlock()
++	b.compactBacklogLocked(r)
++}
++
++// compactBacklogLocked coalesces a trailing run of small data buffers in the
++// backlog into a single buffer, bounding the per-frame memory overhead an
++// attacker can impose by fragmenting a payload into many tiny DATA frames.
++// b.mu must be held.
++func (b *recvBuffer) compactBacklogLocked(r recvMsg) {
++	if !envconfig.EnableReceiveBufferCompaction {
++		return
++	}
++	if r.buffer == nil {
++		b.uncompactedBytes = 0
++		b.uncompactedSuffixLen = 0
++		return
++	}
++
++	b.uncompactedSuffixLen++
++	b.uncompactedBytes += r.buffer.Len()
++	backlogHeapSize := b.uncompactedSuffixLen*recvMsgSize + b.uncompactedBytes
++
++	// If the memory overhead is less than 50% of the heap usage (e.g., because
++	// a large DATA frame arrived), the average message size in the suffix is
++	// large enough that memory bloat is not a concern. Reset suffix tracking.
++	if backlogHeapSize <= utilizationFactor*b.uncompactedBytes {
++		b.uncompactedBytes = 0
++		b.uncompactedSuffixLen = 0
++		return
++	}
++	// Avoid compacting too frequently for short bursts of small frames.
++	// Wait until we have accumulated at least ~1024 small messages (~57 KB).
++	if backlogHeapSize <= compactionThreshold {
++		// Still can accumulate more payloads.
++		return
++	}
++
++	startIdx := len(b.backlog) - b.uncompactedSuffixLen
++	newBuf := b.getCompactionBuffer(b.uncompactedBytes)
++	for i := startIdx; i < len(b.backlog); i++ {
++		m := b.backlog[i]
++		b.backlog[i] = recvMsg{}
++		newBuf.Write(m.buffer.Bytes())
++		b.freeCompactedBuffer(m.buffer)
++	}
++	b.backlog[startIdx] = recvMsg{buffer: newBuf}
++	b.backlog = b.backlog[:startIdx+1]
++	// After compaction, the suffix is replaced with a single message containing
++	// the combined payload. Reset the tracking counters.
++	b.uncompactedBytes = 0
++	b.uncompactedSuffixLen = 0
++}
++
++// getCompactionBuffer returns an empty *bytes.Buffer with room for at least n
++// bytes, reusing one from the pool when available.
++func (b *recvBuffer) getCompactionBuffer(n int) *bytes.Buffer {
++	var buf *bytes.Buffer
++	if b.bufPool != nil {
++		buf = b.bufPool.get()
++	} else {
++		buf = new(bytes.Buffer)
++	}
++	buf.Reset()
++	buf.Grow(n)
++	return buf
++}
++
++// freeCompactedBuffer returns a consumed small buffer to the pool for reuse
++// when a pool is available.
++func (b *recvBuffer) freeCompactedBuffer(buf *bytes.Buffer) {
++	if b.bufPool != nil && buf != nil {
++		b.bufPool.put(buf)
++	}
+ }
+ 
+ func (b *recvBuffer) load() {
+@@ -123,6 +224,13 @@ func (b *recvBuffer) load() {
+ 	if len(b.backlog) > 0 {
+ 		select {
+ 		case b.c <- b.backlog[0]:
++			// backlog[0] is only part of the tracked uncompacted suffix if the
++			// entire backlog currently consists of the suffix. If an earlier
++			// compaction or reset occurred, backlog[0] is already compacted.
++			if envconfig.EnableReceiveBufferCompaction && b.uncompactedSuffixLen == len(b.backlog) {
++				b.uncompactedSuffixLen--
++				b.uncompactedBytes -= b.backlog[0].buffer.Len()
++			}
+ 			b.backlog[0] = recvMsg{}
+ 			b.backlog = b.backlog[1:]
+ 		default:
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -44,6 +44,7 @@ import (
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpctest"
+ 	"google.golang.org/grpc/internal/leakcheck"
+ 	"google.golang.org/grpc/internal/testutils"
+@@ -1742,7 +1743,7 @@ func waitWhileTrue(t *testing.T, condition func() (bool, error)) {
+ // If any error occurs on a call to Stream.Read, future calls
+ // should continue to return that same error.
+ func (s) TestReadGivesSameErrorAfterAnyErrorOccurs(t *testing.T) {
+-	testRecvBuffer := newRecvBuffer()
++	testRecvBuffer := newRecvBuffer(nil)
+ 	s := &Stream{
+ 		ctx:         context.Background(),
+ 		buf:         testRecvBuffer,
+@@ -2643,3 +2644,190 @@ func (s) TestPeerSetInServerContext(t *testing.T) {
+ 	}
+ 	server.mu.Unlock()
+ }
++
++// makeRecvMsg returns a recvMsg wrapping a copy of the given payload, mirroring
++// how the transport copies each incoming DATA frame into a fresh buffer.
++func makeRecvMsg(payload []byte) recvMsg {
++	b := new(bytes.Buffer)
++	b.Write(payload)
++	return recvMsg{buffer: b}
++}
++
++// TestRecvBufferCompaction is a replacement regression test for
++// CVE-2026-84304. The upstream test relies on the internal/mem package and
++// mem.BufferPool, which do not exist in this release; it is re-derived against
++// this version's *bytes.Buffer-based recvBuffer. It verifies that a long run
++// of tiny data frames in the backlog is coalesced into a single buffer once
++// the compaction threshold is crossed, bounding per-frame memory overhead.
++func (s) TestRecvBufferCompaction(t *testing.T) {
++	b := newRecvBuffer(nil)
++
++	// For N messages in the backlog, each of 1 byte:
++	//   uncompactedSuffixLen = N, uncompactedBytes = N
++	//   backlogHeapSize = N*(recvMsgSize+1)
++	// Compaction triggers once backlogHeapSize > compactionThreshold, i.e.
++	// once N > bufferPoolingThreshold. The first put goes to the channel, so
++	// we need bufferPoolingThreshold+2 total puts to place
++	// bufferPoolingThreshold+1 messages into the backlog.
++	numMessages := bufferPoolingThreshold + 2
++	payload := []byte{0x0a}
++
++	for i := 0; i < numMessages-1; i++ {
++		b.put(makeRecvMsg(payload))
++	}
++
++	// No compaction should have occurred yet.
++	if got, want := len(b.backlog), numMessages-2; got != want {
++		t.Fatalf("Got backlog length %d, want %d", got, want)
++	}
++
++	b.put(makeRecvMsg(payload))
++
++	// The trailing suffix should now be compacted into a single message.
++	if got, want := len(b.backlog), 1; got != want {
++		t.Fatalf("Got backlog length %d after compaction, want %d", got, want)
++	}
++	if b.uncompactedSuffixLen != 0 {
++		t.Fatalf("Got uncompactedSuffixLen %d, want 0", b.uncompactedSuffixLen)
++	}
++	if b.uncompactedBytes != 0 {
++		t.Fatalf("Got uncompactedBytes %d, want 0", b.uncompactedBytes)
++	}
++
++	// The first message is uncompacted, sitting in the channel.
++	select {
++	case msg1 := <-b.c:
++		if !bytes.Equal(msg1.buffer.Bytes(), payload) {
++			t.Errorf("Unexpected first message: %v", msg1.buffer.Bytes())
++		}
++	default:
++		t.Fatal("Expected first message to be in the channel")
++	}
++
++	b.load()
++
++	// The compacted message should hold every remaining 1-byte payload.
++	select {
++	case msgCompacted := <-b.c:
++		wantLen := numMessages - 1
++		if msgCompacted.buffer.Len() != wantLen {
++			t.Errorf("Got compacted buffer length %d, want %d", msgCompacted.buffer.Len(), wantLen)
++		}
++		wantPayload := bytes.Repeat(payload, wantLen)
++		if !bytes.Equal(msgCompacted.buffer.Bytes(), wantPayload) {
++			t.Errorf("Compacted payload mismatch")
++		}
++	default:
++		t.Fatal("Expected compacted message to be loaded into the channel")
++	}
++}
++
++// TestRecvBufferErrorResetsCounters verifies that receiving an error message
++// resets the compaction suffix counters, and that load() decrements them.
++func (s) TestRecvBufferErrorResetsCounters(t *testing.T) {
++	b := newRecvBuffer(nil)
++
++	payload := []byte{0x0a}
++	// First goes to the channel, the next two to the backlog.
++	b.put(makeRecvMsg(payload))
++	b.put(makeRecvMsg(payload))
++	b.put(makeRecvMsg(payload))
++
++	if got, want := b.uncompactedSuffixLen, 2; got != want {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", got, want)
++	}
++	if got, want := b.uncompactedBytes, 2; got != want {
++		t.Fatalf("Got uncompactedBytes %d, want %d", got, want)
++	}
++
++	select {
++	case msg1 := <-b.c:
++		if !bytes.Equal(msg1.buffer.Bytes(), payload) {
++			t.Errorf("Unexpected first message: %v", msg1.buffer.Bytes())
++		}
++	default:
++		t.Fatal("Expected first message to be in the channel")
++	}
++	b.load()
++	if got, want := b.uncompactedSuffixLen, 1; got != want {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", got, want)
++	}
++	if got, want := b.uncompactedBytes, 1; got != want {
++		t.Fatalf("Got uncompactedBytes %d, want %d", got, want)
++	}
++
++	// An error message resets both counters.
++	b.put(recvMsg{err: io.EOF})
++
++	if got, want := b.uncompactedSuffixLen, 0; got != want {
++		t.Fatalf("Got uncompactedSuffixLen %d, want %d", got, want)
++	}
++	if got, want := b.uncompactedBytes, 0; got != want {
++		t.Fatalf("Got uncompactedBytes %d, want %d", got, want)
++	}
++}
++
++// TestRecvBufferCompactionSkippedLargeBuffer verifies that a large DATA frame
++// arriving just before the threshold resets suffix tracking (utilization is
++// acceptable), so no compaction copy is performed.
++func (s) TestRecvBufferCompactionSkippedLargeBuffer(t *testing.T) {
++	b := newRecvBuffer(nil)
++
++	// Put bufferPoolingThreshold 1-byte messages into the backlog (one extra
++	// put lands in the channel).
++	numSmallMessages := bufferPoolingThreshold + 1
++	payload := []byte{0x0a}
++
++	for i := 0; i < numSmallMessages; i++ {
++		b.put(makeRecvMsg(payload))
++	}
++
++	if got, want := len(b.backlog), bufferPoolingThreshold; got != want {
++		t.Fatalf("Got backlog length %d, want %d", got, want)
++	}
++
++	// A large buffer whose size makes utilization acceptable resets tracking.
++	threshold := bufferPoolingThreshold*(recvMsgSize-1) + recvMsgSize
++	largePayload := make([]byte, threshold)
++	b.put(makeRecvMsg(largePayload))
++
++	// Compaction should have been skipped: the large message is appended.
++	if got, want := len(b.backlog), bufferPoolingThreshold+1; got != want {
++		t.Fatalf("Got backlog length %d after large buffer (compaction skipped), want %d", got, want)
++	}
++	if b.uncompactedSuffixLen != 0 {
++		t.Fatalf("Got uncompactedSuffixLen %d, want 0", b.uncompactedSuffixLen)
++	}
++	if b.uncompactedBytes != 0 {
++		t.Fatalf("Got uncompactedBytes %d, want 0", b.uncompactedBytes)
++	}
++}
++
++// TestRecvBufferCompactionDisabled verifies that setting the escape-hatch env
++// var disables compaction entirely.
++func (s) TestRecvBufferCompactionDisabled(t *testing.T) {
++	old := envconfig.EnableReceiveBufferCompaction
++	envconfig.EnableReceiveBufferCompaction = false
++	defer func() { envconfig.EnableReceiveBufferCompaction = old }()
++
++	b := newRecvBuffer(nil)
++
++	numMessages := bufferPoolingThreshold + 2
++	payload := []byte{0x0a}
++
++	for i := 0; i < numMessages; i++ {
++		b.put(makeRecvMsg(payload))
++	}
++
++	// With compaction disabled, every message beyond the first stays in the
++	// backlog uncoalesced.
++	if got, want := len(b.backlog), numMessages-1; got != want {
++		t.Fatalf("Got backlog length %d, want %d", got, want)
++	}
++
++	select {
++	case <-b.c:
++	default:
++		t.Fatal("Expected first message to be in the channel, but channel is empty")
++	}
++}
+
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -70,6 +70,17 @@ var (
+ 	// feature if unforeseen issues arise, and it will be removed in a future
+ 	// release.
+ 	EnableReceiveBufferCompaction = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION", true)
++
++	// ControlBufferThrottleLimit is the maximum number of control frames that can
++	// be queued in the control buffer before throttling is applied. The value
++	// must be between 1 and 10,000, and is set to 100 by default.
++	//
++	// This environment variable serves as an escape hatch to increase the
++	// throttling limit if unforeseen issues arise, and it will be removed in a
++	// future release.
++	//
++	// TODO: Remove this env var once v1.83.0 is release.
++	ControlBufferThrottleLimit = uint64FromEnv("GRPC_GO_EXPERIMENTAL_CONTROL_BUFFER_THROTTLE_LIMIT", 100, 1, 10000)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+--- a/internal/transport/controlbuf.go
++++ b/internal/transport/controlbuf.go
+@@ -30,6 +30,7 @@
+ 
+ 	"golang.org/x/net/http2"
+ 	"golang.org/x/net/http2/hpack"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpclog"
+ 	"google.golang.org/grpc/internal/grpcutil"
+ 	"google.golang.org/grpc/status"
+@@ -87,28 +88,34 @@
+ 	return il.head == nil
+ }
+ 
+-// The following defines various control items which could flow through
+-// the control buffer of transport. They represent different aspects of
+-// control tasks, e.g., flow control, settings, streaming resetting, etc.
++// maxQueuedControlBufferItems is the maximum number of frames (other than
++// HEADERS and DATA) that we will buffer before preventing new reads from
++// occurring on the transport.  These are control frames sent in response to
++// client requests, or frames that result in work being scheduled, such as
++// RST_STREAM due to bad headers or settings acks.
++var maxQueuedControlBufferItems = int(envconfig.ControlBufferThrottleLimit)
+ 
+-// maxQueuedTransportResponseFrames is the most queued "transport response"
+-// frames we will buffer before preventing new reads from occurring on the
+-// transport.  These are control frames sent in response to client requests,
+-// such as RST_STREAM due to bad headers or settings acks.
+-const maxQueuedTransportResponseFrames = 50
+-
+ type cbItem interface {
+-	isTransportResponseFrame() bool
++	isThrottled() bool
+ }
+ 
++// throttledItem represents every item in the controlBuffer to which the overall
++// throttling limit applies, other than outgoing HEADERS and DATA frames.
++type throttledItem struct{}
++
++func (throttledItem) isThrottled() bool { return true }
++
++// The following defines various control items which could flow through
++// the control buffer of transport. They represent different aspects of
++// control tasks, e.g., flow control, settings, streaming resetting, etc.
++
+ // registerStream is used to register an incoming stream with loopy writer.
+ type registerStream struct {
++	throttledItem
+ 	streamID uint32
+ 	wq       *writeQuota
+ }
+ 
+-func (*registerStream) isTransportResponseFrame() bool { return false }
+-
+ // headerFrame is also used to register stream on the client-side.
+ type headerFrame struct {
+ 	streamID   uint32
+@@ -121,20 +128,20 @@
+ 	onOrphaned func(error)    // Valid on client-side
+ }
+ 
+-func (h *headerFrame) isTransportResponseFrame() bool {
+-	return h.cleanup != nil && h.cleanup.rst // Results in a RST_STREAM
+-}
++// HEADERS frames are not counted towards the overall control buffer throttling
++// limit.
++func (*headerFrame) isThrottled() bool { return false }
+ 
+ type cleanupStream struct {
++	throttledItem
+ 	streamID uint32
+ 	rst      bool
+ 	rstCode  http2.ErrCode
+ 	onWrite  func()
+ }
+ 
+-func (c *cleanupStream) isTransportResponseFrame() bool { return c.rst } // Results in a RST_STREAM
+-
+ type earlyAbortStream struct {
++	throttledItem
+ 	httpStatus     uint32
+ 	streamID       uint32
+ 	contentSubtype string
+@@ -142,8 +149,6 @@
+ 	rst            bool
+ }
+ 
+-func (*earlyAbortStream) isTransportResponseFrame() bool { return false }
+-
+ type dataFrame struct {
+ 	streamID  uint32
+ 	endStream bool
+@@ -154,71 +159,63 @@
+ 	onEachWrite func()
+ }
+ 
+-func (*dataFrame) isTransportResponseFrame() bool { return false }
++// DATA frames are not counted towards the overall control buffer throttling
++// limit.
++func (*dataFrame) isThrottled() bool { return false }
+ 
+ type incomingWindowUpdate struct {
++	throttledItem
+ 	streamID  uint32
+ 	increment uint32
+ }
+ 
+-func (*incomingWindowUpdate) isTransportResponseFrame() bool { return false }
+-
+ type outgoingWindowUpdate struct {
++	throttledItem
+ 	streamID  uint32
+ 	increment uint32
+ }
+ 
+-func (*outgoingWindowUpdate) isTransportResponseFrame() bool {
+-	return false // window updates are throttled by thresholds
+-}
+-
+ type incomingSettings struct {
++	throttledItem
+ 	ss []http2.Setting
+ }
+ 
+-func (*incomingSettings) isTransportResponseFrame() bool { return true } // Results in a settings ACK
+-
+ type outgoingSettings struct {
++	throttledItem
+ 	ss []http2.Setting
+ }
+ 
+-func (*outgoingSettings) isTransportResponseFrame() bool { return false }
+-
+ type incomingGoAway struct {
++	throttledItem
+ }
+ 
+-func (*incomingGoAway) isTransportResponseFrame() bool { return false }
+-
+ type goAway struct {
++	throttledItem
+ 	code      http2.ErrCode
+ 	debugData []byte
+ 	headsUp   bool
+ 	closeConn error // if set, loopyWriter will exit, resulting in conn closure
+ }
+ 
+-func (*goAway) isTransportResponseFrame() bool { return false }
+-
+ type ping struct {
++	throttledItem
+ 	ack  bool
+ 	data [8]byte
+ }
+ 
+-func (*ping) isTransportResponseFrame() bool { return true }
+-
+ type outFlowControlSizeRequest struct {
++	throttledItem
+ 	resp chan uint32
+ }
+ 
+-func (*outFlowControlSizeRequest) isTransportResponseFrame() bool { return false }
+-
+ // closeConnection is an instruction to tell the loopy writer to flush the
+ // framer and exit, which will cause the transport's connection to be closed
+ // (by the client or server).  The transport itself will close after the reader
+ // encounters the EOF caused by the connection closure.
+-type closeConnection struct{}
++type closeConnection struct {
++	throttledItem
++}
+ 
+-func (closeConnection) isTransportResponseFrame() bool { return false }
+-
+ type outStreamState int
+ 
+ const (
+@@ -302,9 +299,9 @@
+ 	list            *itemList
+ 	err             error
+ 
+-	// transportResponseFrames counts the number of queued items that represent
+-	// the response of an action initiated by the peer.  trfChan is created
+-	// when transportResponseFrames >= maxQueuedTransportResponseFrames and is
++	// transportResponseFrames counts the number of queued items that count
++	// towards the overall control buffer throttling limit.  trfChan is created
++	// when transportResponseFrames >= maxQueuedControlBufferItems and is
+ 	// closed and nilled when transportResponseFrames drops below the
+ 	// threshold.  Both fields are protected by mu.
+ 	transportResponseFrames int
+@@ -354,9 +351,9 @@
+ 		c.consumerWaiting = false
+ 	}
+ 	c.list.enqueue(it)
+-	if it.isTransportResponseFrame() {
++	if it.isThrottled() {
+ 		c.transportResponseFrames++
+-		if c.transportResponseFrames == maxQueuedTransportResponseFrames {
++		if c.transportResponseFrames == maxQueuedControlBufferItems {
+ 			// We are adding the frame that puts us over the threshold; create
+ 			// a throttling channel.
+ 			c.trfChan.Store(make(chan struct{}))
+@@ -396,8 +393,8 @@
+ 		}
+ 		if !c.list.isEmpty() {
+ 			h := c.list.dequeue().(cbItem)
+-			if h.isTransportResponseFrame() {
+-				if c.transportResponseFrames == maxQueuedTransportResponseFrames {
++			if h.isThrottled() {
++				if c.transportResponseFrames == maxQueuedControlBufferItems {
+ 					// We are removing the frame that put us over the
+ 					// threshold; close and clear the throttling channel.
+ 					ch := c.trfChan.Load().(chan struct{})
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -1146,7 +1146,10 @@ func (t *http2Client) handleData(f *http2.DataFrame) {
+ 		}
+ 		if f.Header().Flags.Has(http2.FlagDataPadded) {
+ 			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
+-				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
++				t.controlBuf.put(&outgoingWindowUpdate{
++					streamID:  s.id,
++					increment: w,
++				})
+ 			}
+ 		}
+ 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
+@@ -1770,7 +1773,7 @@ func (t *http2Client) getOutFlowWindow() int64 {
+ 	resp := make(chan uint32, 1)
+ 	timer := time.NewTimer(time.Second)
+ 	defer timer.Stop()
+-	t.controlBuf.put(&outFlowControlSizeRequest{resp})
++	t.controlBuf.put(&outFlowControlSizeRequest{resp: resp})
+ 	select {
+ 	case sz := <-resp:
+ 		return int64(sz)
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -809,7 +809,10 @@ func (t *http2Server) handleData(f *http2.DataFrame) {
+ 		}
+ 		if f.Header().Flags.Has(http2.FlagDataPadded) {
+ 			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
+-				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
++				t.controlBuf.put(&outgoingWindowUpdate{
++					streamID:  s.id,
++					increment: w,
++				})
+ 			}
+ 		}
+ 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
+@@ -1435,7 +1438,7 @@ func (t *http2Server) getOutFlowWindow() int64 {
+ 	resp := make(chan uint32, 1)
+ 	timer := time.NewTimer(time.Second)
+ 	defer timer.Stop()
+-	t.controlBuf.put(&outFlowControlSizeRequest{resp})
++	t.controlBuf.put(&outFlowControlSizeRequest{resp: resp})
+ 	select {
+ 	case sz := <-resp:
+ 		return int64(sz)
+--- a/internal/xds/rbac/matchers.go
++++ b/internal/xds/rbac/matchers.go
+@@ -78,7 +78,7 @@
+ func matchersFromPermissions(permissions []*v3rbacpb.Permission) ([]matcher, error) {
+ 	var matchers []matcher
+ 	for _, permission := range permissions {
+-		switch permission.GetRule().(type) {
++		switch p := permission.GetRule().(type) {
+ 		case *v3rbacpb.Permission_AndRules:
+ 			mList, err := matchersFromPermissions(permission.GetAndRules().Rules)
+ 			if err != nil {
+@@ -120,16 +120,24 @@
+ 			if err != nil {
+ 				return nil, err
+ 			}
++			if len(mList) != 1 {
++				return nil, fmt.Errorf("NotRule must contain exactly one rule")
++			}
+ 			matchers = append(matchers, &notMatcher{matcherToNot: mList[0]})
+ 		case *v3rbacpb.Permission_Metadata:
+-			// Never matches - so no-op if not inverted, always match if
+-			// inverted.
+-			if permission.GetMetadata().GetInvert() { // Test metadata being no-op and also metadata with invert always matching
++			if permission.GetMetadata().GetInvert() {
+ 				matchers = append(matchers, &alwaysMatcher{})
++			} else {
++				matchers = append(matchers, &neverMatcher{})
+ 			}
+ 		case *v3rbacpb.Permission_RequestedServerName:
+-			// Not supported in gRPC RBAC currently - a permission typed as
+-			// requested server name in the initial config will be a no-op.
++			m, err := newRequestedServerNameMatcher(permission.GetRequestedServerName())
++			if err != nil {
++				return nil, err
++			}
++			matchers = append(matchers, m)
++		default:
++			return nil, fmt.Errorf("unsupported permission rule type: %T", p)
+ 		}
+ 	}
+ 	return matchers, nil
+@@ -138,7 +146,7 @@
+ func matchersFromPrincipals(principals []*v3rbacpb.Principal) ([]matcher, error) {
+ 	var matchers []matcher
+ 	for _, principal := range principals {
+-		switch principal.GetIdentifier().(type) {
++		switch p := principal.GetIdentifier().(type) {
+ 		case *v3rbacpb.Principal_AndIds:
+ 			mList, err := matchersFromPrincipals(principal.GetAndIds().Ids)
+ 			if err != nil {
+@@ -178,16 +186,29 @@
+ 				return nil, err
+ 			}
+ 			matchers = append(matchers, m)
++		case *v3rbacpb.Principal_Metadata:
++			if principal.GetMetadata().GetInvert() {
++				matchers = append(matchers, &alwaysMatcher{})
++			} else {
++				matchers = append(matchers, &neverMatcher{})
++			}
+ 		case *v3rbacpb.Principal_NotId:
+ 			mList, err := matchersFromPrincipals([]*v3rbacpb.Principal{{Identifier: principal.GetNotId().Identifier}})
+ 			if err != nil {
+ 				return nil, err
+ 			}
++			if len(mList) != 1 {
++				return nil, fmt.Errorf("NotId must contain exactly one identifier")
++			}
+ 			matchers = append(matchers, &notMatcher{matcherToNot: mList[0]})
+ 		case *v3rbacpb.Principal_SourceIp:
+-			// The source ip principal identifier is deprecated. Thus, a
+-			// principal typed as a source ip in the identifier will be a no-op.
+-			// The config should use DirectRemoteIp instead.
++			// The source ip principal identifier is deprecated, but gRPC RBAC
++			// treats it as equivalent to direct_remote_ip as per A41.
++			m, err := newRemoteIPMatcher(principal.GetSourceIp())
++			if err != nil {
++				return nil, err
++			}
++			matchers = append(matchers, m)
+ 		case *v3rbacpb.Principal_RemoteIp:
+ 			// RBAC in gRPC treats direct_remote_ip and remote_ip as logically
+ 			// equivalent, as per A41.
+@@ -196,9 +217,8 @@
+ 				return nil, err
+ 			}
+ 			matchers = append(matchers, m)
+-		case *v3rbacpb.Principal_Metadata:
+-			// Not supported in gRPC RBAC currently - a principal typed as
+-			// Metadata in the initial config will be a no-op.
++		default:
++			return nil, fmt.Errorf("unsupported principal identifier type: %T", p)
+ 		}
+ 	}
+ 	return matchers, nil
+@@ -248,6 +268,16 @@
+ 	return true
+ }
+ 
++// neverMatcher is a matcher that will never match. This logically represents a
++// permission or principal that is unsupported in gRPC. neverMatcher implements
++// the matcher interface.
++type neverMatcher struct {
++}
++
++func (nm *neverMatcher) match(*rpcData) bool {
++	return false
++}
++
+ // notMatcher is a matcher that nots an underlying matcher. notMatcher
+ // implements the matcher interface.
+ type notMatcher struct {
+@@ -377,6 +407,25 @@
+ 
+ func (pm *portMatcher) match(data *rpcData) bool {
+ 	return data.destinationPort == pm.destinationPort
++}
++
++// requestedServerNameMatcher matches on if the given string matcher matches
++// on "", as per A41-xds-rbac.md. requestedServerNameMatcher implements
++// the matcher interface.
++type requestedServerNameMatcher struct {
++	stringMatcher internalmatcher.StringMatcher
++}
++
++func newRequestedServerNameMatcher(stringMatcherProto *v3matcherpb.StringMatcher) (*requestedServerNameMatcher, error) {
++	stringMatcher, err := internalmatcher.StringMatcherFromProto(stringMatcherProto)
++	if err != nil {
++		return nil, err
++	}
++	return &requestedServerNameMatcher{stringMatcher: stringMatcher}, nil
++}
++
++func (r *requestedServerNameMatcher) match(*rpcData) bool {
++	return r.stringMatcher.Match("")
+ }
+ 
+ // authenticatedMatcher matches on the name of the Principal. If set, the URI
+--- /dev/null
++++ b/internal/transport/controlbuf_ghsa_hrxh_6v49_42gf_test.go
+@@ -0,0 +1,89 @@
++/*
++ *
++ * Copyright 2026 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package transport
++
++import "testing"
++
++// TestGHSA_hrxh_6v49_42gf_ControlBufferItemsThrottled verifies that all control
++// buffer items other than HEADERS and DATA frames now count towards the overall
++// throttling limit. Before the fix only a small subset of "transport response"
++// frames were counted, allowing a peer (e.g. via HTTP/2 Rapid Reset) to force
++// the server to queue an unbounded number of control frames such as
++// RST_STREAM (cleanupStream) and WINDOW_UPDATE without ever being throttled.
++func TestGHSA_hrxh_6v49_42gf_ControlBufferItemsThrottled(t *testing.T) {
++	throttled := []cbItem{
++		&cleanupStream{rst: true},
++		&cleanupStream{rst: false}, // even non-RST cleanups must be throttled now.
++		&earlyAbortStream{},
++		&registerStream{},
++		&incomingWindowUpdate{},
++		&outgoingWindowUpdate{},
++		&incomingSettings{},
++		&outgoingSettings{},
++		&incomingGoAway{},
++		&goAway{},
++		&ping{},
++		&outFlowControlSizeRequest{},
++		closeConnection{},
++	}
++	for _, it := range throttled {
++		if !it.isThrottled() {
++			t.Errorf("item %T isThrottled() = false, want true", it)
++		}
++	}
++
++	// HEADERS and DATA frames must NOT be throttled, otherwise legitimate
++	// streaming traffic would be starved.
++	notThrottled := []cbItem{
++		&headerFrame{},
++		&dataFrame{},
++	}
++	for _, it := range notThrottled {
++		if it.isThrottled() {
++			t.Errorf("item %T isThrottled() = true, want false", it)
++		}
++	}
++}
++
++// TestGHSA_hrxh_6v49_42gf_ControlBufferThrottleTriggers verifies that once the
++// number of queued throttled items reaches maxQueuedControlBufferItems, a
++// throttling channel is created so that throttle() blocks new reads.
++func TestGHSA_hrxh_6v49_42gf_ControlBufferThrottleTriggers(t *testing.T) {
++	done := make(chan struct{})
++	defer close(done)
++	cb := newControlBuffer(done)
++
++	// Before reaching the limit, throttle() must not block.
++	for i := 0; i < maxQueuedControlBufferItems-1; i++ {
++		if err := cb.put(&cleanupStream{rst: true}); err != nil {
++			t.Fatalf("put failed: %v", err)
++		}
++	}
++	if ch, _ := cb.trfChan.Load().(chan struct{}); ch != nil {
++		t.Fatalf("throttling channel created before reaching limit")
++	}
++
++	// The item that reaches the limit must create the throttling channel.
++	if err := cb.put(&cleanupStream{rst: true}); err != nil {
++		t.Fatalf("put failed: %v", err)
++	}
++	if ch, _ := cb.trfChan.Load().(chan struct{}); ch == nil {
++		t.Fatalf("throttling channel not created after reaching limit")
++	}
++}
+--- /dev/null
++++ b/internal/xds/rbac/matchers_ghsa_hrxh_6v49_42gf_test.go
+@@ -0,0 +1,92 @@
++/*
++ *
++ * Copyright 2026 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package rbac
++
++import (
++	"testing"
++
++	v3rbacpb "github.com/envoyproxy/go-control-plane/envoy/config/rbac/v3"
++	v3matcherpb "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
++)
++
++// TestGHSA_hrxh_6v49_42gf_NotRuleGuard verifies that a NotRule permission whose
++// inner rule is unsupported (and therefore produces zero matchers) returns an
++// error instead of panicking on an out-of-range slice index. Before the fix,
++// mList[0] would panic when the inner rule produced no matchers.
++func TestGHSA_hrxh_6v49_42gf_NotRuleGuard(t *testing.T) {
++	// A NotRule wrapping a rule with no oneof value set is unsupported and must
++	// not panic; it must return an error.
++	perms := []*v3rbacpb.Permission{
++		{Rule: &v3rbacpb.Permission_NotRule{NotRule: &v3rbacpb.Permission{}}},
++	}
++	if _, err := matchersFromPermissions(perms); err == nil {
++		t.Fatalf("matchersFromPermissions(NotRule with unsupported inner rule) = nil error, want error")
++	}
++}
++
++// TestGHSA_hrxh_6v49_42gf_NotIdGuard verifies the same protection for a NotId
++// principal wrapping an unsupported identifier.
++func TestGHSA_hrxh_6v49_42gf_NotIdGuard(t *testing.T) {
++	principals := []*v3rbacpb.Principal{
++		{Identifier: &v3rbacpb.Principal_NotId{NotId: &v3rbacpb.Principal{}}},
++	}
++	if _, err := matchersFromPrincipals(principals); err == nil {
++		t.Fatalf("matchersFromPrincipals(NotId with unsupported inner id) = nil error, want error")
++	}
++}
++
++// TestGHSA_hrxh_6v49_42gf_UnsupportedPermissionErrors verifies that a
++// permission with no recognized rule set is rejected with an error rather than
++// being silently treated as a no-op (which the OR semantics turned into an
++// authorization bypass).
++func TestGHSA_hrxh_6v49_42gf_UnsupportedPermissionErrors(t *testing.T) {
++	perms := []*v3rbacpb.Permission{{}}
++	if _, err := matchersFromPermissions(perms); err == nil {
++		t.Fatalf("matchersFromPermissions(unsupported permission) = nil error, want error")
++	}
++}
++
++// TestGHSA_hrxh_6v49_42gf_UnsupportedPrincipalErrors verifies the same for
++// principals.
++func TestGHSA_hrxh_6v49_42gf_UnsupportedPrincipalErrors(t *testing.T) {
++	principals := []*v3rbacpb.Principal{{}}
++	if _, err := matchersFromPrincipals(principals); err == nil {
++		t.Fatalf("matchersFromPrincipals(unsupported principal) = nil error, want error")
++	}
++}
++
++// TestGHSA_hrxh_6v49_42gf_MetadataNeverMatches verifies that a non-inverted
++// Metadata permission is compiled into a matcher that never matches, rather
++// than being dropped (which would leave an empty orMatcher that matches
++// everything and bypass authorization).
++func TestGHSA_hrxh_6v49_42gf_MetadataNeverMatches(t *testing.T) {
++	perms := []*v3rbacpb.Permission{
++		{Rule: &v3rbacpb.Permission_Metadata{Metadata: &v3matcherpb.MetadataMatcher{}}},
++	}
++	matchers, err := matchersFromPermissions(perms)
++	if err != nil {
++		t.Fatalf("matchersFromPermissions(Metadata) unexpected error: %v", err)
++	}
++	if len(matchers) != 1 {
++		t.Fatalf("matchersFromPermissions(Metadata) produced %d matchers, want 1", len(matchers))
++	}
++	if matchers[0].match(&rpcData{}) {
++		t.Fatalf("non-inverted Metadata permission matched, want no match")
++	}
++}
+
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -506,6 +506,19 @@ func (t *http2Server) operateHeaders(frame *http2.MetaHeadersFrame, handle func(
+ 		delete(mdata, "host")
+ 	}
+ 
++	// If :authority is still missing, i.e. no host or :authority header is
++	// present, reject the request as invalid.
++	if len(mdata[":authority"]) == 0 {
++		t.controlBuf.put(&earlyAbortStream{
++			httpStatus:     http.StatusBadRequest,
++			streamID:       streamID,
++			contentSubtype: s.contentSubtype,
++			status:         status.New(codes.Internal, "no host or :authority header present"),
++			rst:            !frame.StreamEnded(),
++		})
++		return nil
++	}
++
+ 	if frame.StreamEnded() {
+ 		// s is just created by the caller. No lock needed.
+ 		s.state = streamReadDone
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -1969,6 +1969,22 @@ func (s) TestHeadersHTTPStatusGRPCStatus(t *testing.T) {
+ 			grpcStatusWant:  "13",
+ 			grpcMessageWant: "both must only have 1 value as per HTTP/2 spec",
+ 		},
++		// If neither :authority nor host header is present on a gRPC request, the
++		// request should be rejected with HTTP Status 400 and gRPC status Internal.
++		{
++			name: "Missing authority and host header grpc",
++			headers: []struct {
++				name   string
++				values []string
++			}{
++				{name: ":method", values: []string{"POST"}},
++				{name: ":path", values: []string{"foo"}},
++				{name: "content-type", values: []string{"application/grpc"}},
++			},
++			httpStatusWant:  "400",
++			grpcStatusWant:  "13",
++			grpcMessageWant: "no host or :authority header present",
++		},
+ 		// If the client sends an HTTP/2 request with a :method header with a
+ 		// value other than POST, as specified in the gRPC over HTTP/2
+ 		// specification, the server should fail the RPC.
+--- a/test/servertester.go
++++ b/test/servertester.go
+@@ -275,6 +275,7 @@ func (st *serverTester) writeHeadersGRPC(streamID uint32, path string, endStream
+ 		BlockFragment: st.encodeHeader(
+ 			":method", "POST",
+ 			":path", path,
++			":authority", "localhost",
+ 			"content-type", "application/grpc",
+ 			"te", "trailers",
+ 		),
+--- a/xds/server.go
++++ b/xds/server.go
+@@ -356,10 +356,14 @@ func routeAndProcess(ctx context.Context) error {
+ 	if !ok {
+ 		return errors.New("missing metadata in incoming context")
+ 	}
+-	// A41 added logic to the core grpc implementation to guarantee that once
+-	// the RPC gets to this point, there will be a single, unambiguous authority
+-	// present in the header map.
++	// A41 added logic to the core grpc implementation to guarantee that once the
++	// RPC gets to this point, there will be a single, unambiguous authority
++	// present in the header map. But add a defensive check to ensure authority
++	// header is present.
+ 	authority := md.Get(":authority")
++	if len(authority) == 0 {
++		return status.Error(codes.Internal, "no :authority header present")
++	}
+ 	vh := xdsresource.FindBestMatchingVirtualHostServer(authority[0], cw.VirtualHosts())
+ 	if vh == nil {
+ 		return status.Error(codes.Unavailable, "the incoming RPC did not match a configured Virtual Host")
+ 	}
