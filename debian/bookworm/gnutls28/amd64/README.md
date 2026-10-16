@@ -1,11 +1,13 @@
-# gnutls28 : 3.7.9-2+deb12u6.root.io.4
+# gnutls28 : 3.7.9-2+deb12u7.aikido.5
 
-This patch is based on gnutls28 version 3.7.9-2+deb12u6.root.io.4, which is available at:
-https://sources.debian.org/src/gnutls28/3.7.9-2+deb12u6/
+This patch is based on gnutls28 version 3.7.9-2+deb12u7.aikido.5, which is available at:
+https://sources.debian.org/src/gnutls28/3.7.9-2+deb12u7/
 
 ## Affected CVEs:
-- CVE-2026-33846
-- CVE-2026-42010
+- CVE-2026-67693
+- CVE-2026-88647
+- CVE-2026-95210
+- CVE-2026-95184
 
 ## How to Apply:
 1. Obtain the source package: `apt source gnutls28`
