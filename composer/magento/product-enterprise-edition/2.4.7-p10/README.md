@@ -9,6 +9,10 @@ unknown
 - CVE-2026-71362
 - CVE-2026-103849
 - CVE-2026-92909
+- AIKIDO-2026-980640
+- AIKIDO-2026-305688
+- AIKIDO-2026-825761
+- AIKIDO-2026-754501
 
 ## How to Apply:
 1. Clone or download the source code for magento/product-enterprise-edition
