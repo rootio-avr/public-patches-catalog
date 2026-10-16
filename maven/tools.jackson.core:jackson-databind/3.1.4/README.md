@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-91776
 - CVE-2026-91777
+- CVE-2026-68497
 
 ## How to Apply:
 1. Clone or download the source code for tools.jackson.core:jackson-databind
