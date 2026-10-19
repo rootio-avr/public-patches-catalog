@@ -1,0 +1,791 @@
+--- a/src/daemon/server/server.js
++++ b/src/daemon/server/server.js
+@@ -353,6 +353,18 @@
+             server.listen((0, socket_utils_1.getFullOsSocketPath)(), async () => {
+                 try {
+                     logger_1.serverLogger.log(`Started listening on: ${(0, socket_utils_1.getFullOsSocketPath)()}`);
++                    // Linux gates connect() on write permission to the socket file, so
++                    // restrict it to the owner. Done after listen because net.Server.listen
++                    // takes no mode and umask is process-global. The socket directory is
++                    // already owner-only (0700), which is the primary control.
++                    if (!socket_utils_1.isWindows) {
++                        try {
++                            (0, fs_1.chmodSync)((0, socket_utils_1.getFullOsSocketPath)(), 0o600);
++                        }
++                        catch {
++                            // Best effort; the private socket directory still applies.
++                        }
++                    }
+                     setInterval(() => {
+                         if ((0, cache_1.getDaemonProcessIdSync)() !== process.pid) {
+                             return (0, shutdown_utils_1.handleServerProcessTermination)({
+--- a/src/daemon/tmp-dir.js
++++ b/src/daemon/tmp-dir.js
+@@ -14,6 +14,7 @@
+ const node_fs_1 = require("node:fs");
+ const path_1 = require("path");
+ const cache_directory_1 = require("../utils/cache-directory");
++const owned_private_dir_1 = require("../utils/owned-private-dir");
+ const crypto_1 = require("crypto");
+ const tmp_1 = require("tmp");
+ const workspace_root_1 = require("../utils/workspace-root");
+@@ -40,31 +41,84 @@
+         return false;
+     }
+ }
+-function socketDirName() {
++function workspaceSocketDirName() {
+     const hasher = (0, crypto_1.createHash)('sha256');
+     hasher.update(workspace_root_1.workspaceRoot.toLowerCase());
+-    const unique = hasher.digest('hex').substring(0, 20);
+-    return (0, path_1.join)(tmp_1.tmpdir, unique);
++    return hasher.digest('hex').substring(0, 20);
+ }
+ /**
+- * We try to create a socket file in a tmp dir, but if it doesn't work because
+- * for instance we don't have permissions, we create it in DAEMON_DIR_FOR_CURRENT_WORKSPACE
++ * The per-user root for sockets: `<tmp>/.nx/<uid>`. The shared `<tmp>/.nx`
++ * container must be root- or user-owned and sticky, and the per-user directory
++ * is owner-only (0700), so no other local user can reach the sockets inside.
++ * Returns `undefined` when such a directory cannot be established.
+  */
++function getUserSocketRoot() {
++    const shared = (0, path_1.join)(tmp_1.tmpdir, '.nx');
++    const sharedVerdict = (0, owned_private_dir_1.ensureSafeSharedRoot)(shared);
++    if (sharedVerdict.status !== 'ok') {
++        return undefined;
++    }
++    // `%TMP%` is already per-account on Windows, so no user segment is needed.
++    const userDir = process.platform === 'win32'
++        ? shared
++        : (0, path_1.join)(shared, (0, owned_private_dir_1.getUserSegment)());
++    const userVerdict = (0, owned_private_dir_1.ensureOwnedPrivateDir)(userDir);
++    return userVerdict.status === 'ok' ? userDir : undefined;
++}
++function ensurePrivateSocketDir(dir) {
++    try {
++        (0, node_fs_1.mkdirSync)((0, path_1.dirname)(dir), { recursive: true });
++    }
++    catch { }
++    const verdict = (0, owned_private_dir_1.ensureOwnedPrivateDir)(dir);
++    return verdict.status === 'ok' ? dir : undefined;
++}
++/**
++ * Sockets are only ever placed in a directory that is a real directory, owned
++ * by the current user and not accessible to anyone else (0700). Any other local
++ * user would otherwise be able to connect to the daemon / plugin worker sockets.
++ *
++ * We try to create the directory in the OS tmp dir (or NX_SOCKET_DIR), but if
++ * that is not possible, we create it in DAEMON_DIR_FOR_CURRENT_WORKSPACE. If no
++ * private directory can be established at all, we refuse to continue rather than
++ * placing a socket in a location other users can reach.
++ */
+ function getSocketDir(alreadyUnique = false) {
++    const configured = process.env.NX_SOCKET_DIR ?? process.env.NX_DAEMON_SOCKET_DIR;
++    if (configured) {
++        const dir = ensurePrivateSocketDir(configured);
++        if (dir) {
++            return dir;
++        }
++    }
++    else {
++        const root = getUserSocketRoot();
++        if (root) {
++            const dir = alreadyUnique
++                ? root
++                : ensurePrivateSocketDir((0, path_1.join)(root, workspaceSocketDirName()));
++            if (dir) {
++                return dir;
++            }
++        }
++    }
+     try {
+-        const dir = process.env.NX_SOCKET_DIR ??
+-            process.env.NX_DAEMON_SOCKET_DIR ??
+-            (alreadyUnique ? tmp_1.tmpdir : socketDirName());
+-        (0, node_fs_1.mkdirSync)(dir, { recursive: true });
+-        return dir;
++        (0, node_fs_1.mkdirSync)(exports.DAEMON_DIR_FOR_CURRENT_WORKSPACE, { recursive: true });
+     }
+-    catch (e) {
+-        return exports.DAEMON_DIR_FOR_CURRENT_WORKSPACE;
++    catch { }
++    const verdict = (0, owned_private_dir_1.ensureOwnedPrivateDir)(exports.DAEMON_DIR_FOR_CURRENT_WORKSPACE);
++    if (verdict.status !== 'ok') {
++        throw new Error(`Nx could not establish a private directory for its sockets: ${(0, owned_private_dir_1.describeRefusal)(verdict.refusal)}. Set NX_SOCKET_DIR to a short directory your user owns.`);
+     }
++    return exports.DAEMON_DIR_FOR_CURRENT_WORKSPACE;
+ }
+ function removeSocketDir() {
+     try {
+-        (0, node_fs_1.rmSync)(getSocketDir(), { recursive: true, force: true });
++        const dir = getSocketDir();
++        // Never recursively delete through a path another user could have planted.
++        if ((0, owned_private_dir_1.isOwnedRealDirectory)(dir)) {
++            (0, node_fs_1.rmSync)(dir, { recursive: true, force: true });
++        }
+     }
+     catch (e) { }
+ }
+--- a/src/project-graph/plugins/isolation/plugin-pool.js
++++ b/src/project-graph/plugins/isolation/plugin-pool.js
+@@ -2,6 +2,7 @@
+ Object.defineProperty(exports, "__esModule", { value: true });
+ exports.loadRemoteNxPlugin = loadRemoteNxPlugin;
+ const child_process_1 = require("child_process");
++const crypto_1 = require("crypto");
+ const path = require("path");
+ const net_1 = require("net");
+ const socket_utils_1 = require("../../../daemon/socket-utils");
+@@ -226,7 +227,11 @@
+             }
+             : {}),
+     };
+-    const ipcPath = (0, socket_utils_1.getPluginOsSocketPath)([process.pid, global.nxPluginWorkerCount++].join('-'));
++    const ipcPath = (0, socket_utils_1.getPluginOsSocketPath)([
++        process.pid,
++        global.nxPluginWorkerCount++,
++        (0, crypto_1.randomBytes)(4).toString('hex'),
++    ].join('-'));
+     const worker = (0, child_process_1.spawn)(process.execPath, [
+         ...(isWorkerTypescript ? ['--require', 'ts-node/register'] : []),
+         workerPath,
+--- a/src/project-graph/plugins/isolation/plugin-worker.js
++++ b/src/project-graph/plugins/isolation/plugin-worker.js
+@@ -156,7 +156,28 @@
+         });
+     });
+ });
+-server.listen(socketPath);
++server.on('error', (err) => {
++    console.error(`The plugin worker failed to listen on ${socketPath}: ${err.message}`);
++    process.exit(1);
++});
++// Remove a stale socket left behind by a worker that was killed uncleanly.
++try {
++    (0, fs_1.unlinkSync)(socketPath);
++}
++catch { }
++server.listen(socketPath, () => {
++    // Linux gates connect() on write permission to the socket file, so restrict
++    // it to the owner. net.Server.listen takes no mode and umask is
++    // process-global. The socket directory is already owner-only (0700).
++    if (process.platform !== 'win32') {
++        try {
++            (0, fs_1.chmodSync)(socketPath, 0o600);
++        }
++        catch {
++            // Best effort; the private socket directory still applies.
++        }
++    }
++});
+ setTimeout(() => {
+     if (!connected) {
+         console.error('The plugin worker is exiting as it was not connected to within 5 seconds.');
+--- /dev/null
++++ b/src/utils/owned-private-dir.js
+@@ -0,0 +1,208 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.describeRefusal = describeRefusal;
++exports.isSafeSharedRoot = isSafeSharedRoot;
++exports.ensureSafeSharedRoot = ensureSafeSharedRoot;
++exports.isOwnedRealDirectory = isOwnedRealDirectory;
++exports.getUserSegment = getUserSegment;
++exports.ensureOwnedPrivateDir = ensureOwnedPrivateDir;
++const node_fs_1 = require("node:fs");
++const node_os_1 = require("node:os");
++const allow = (path) => ({ status: 'ok', path });
++const deny = (refusal) => ({
++    status: 'refused',
++    refusal,
++});
++const asMode = (mode) => (mode & 0o7777).toString(8).padStart(4, '0');
++/** The user-facing sentence for a refusal. */
++function describeRefusal(r) {
++    switch (r.kind) {
++        case 'not-created':
++            return `${r.dir} could not be created${r.code ? ` (${r.code})` : ''}`;
++        case 'not-inspectable':
++            return `${r.dir} could not be inspected${r.code ? ` (${r.code})` : ''}`;
++        case 'not-a-directory':
++            return r.symlink
++                ? `${r.dir} is a symlink, not a real directory`
++                : `${r.dir} exists and is not a directory`;
++        case 'foreign-owner':
++            return `${r.dir} is owned by uid ${r.uid}, not by you`;
++        case 'foreign-shared-container':
++            return `${r.dir} belongs to another user (uid ${r.uid}) rather than to you or to root`;
++        case 'not-tightenable':
++            return `${r.dir} is reachable by other users (mode ${asMode(r.mode)}) and could not be tightened to 0700`;
++        case 'peer-writable-not-sticky':
++            return `${r.dir} is writable by other users but not sticky (mode ${asMode(r.mode)}), so a peer could replace directories inside it`;
++        default:
++            return 'unknown directory refusal';
++    }
++}
++/**
++ * chmod a path only if it is a real directory, never following a symlink at its
++ * final component (`chmodSync` follows them, retargeting the mode change).
++ * `O_NONBLOCK` stops a planted FIFO from blocking `openSync`.
++ */
++function chmodRealDirectory(path, mode) {
++    let fd;
++    try {
++        fd = (0, node_fs_1.openSync)(path, node_fs_1.constants.O_RDONLY | node_fs_1.constants.O_NOFOLLOW | node_fs_1.constants.O_NONBLOCK);
++    }
++    catch {
++        return false;
++    }
++    try {
++        if (!(0, node_fs_1.fstatSync)(fd).isDirectory()) {
++            return false;
++        }
++        (0, node_fs_1.fchmodSync)(fd, mode);
++        return true;
++    }
++    catch {
++        return false;
++    }
++    finally {
++        (0, node_fs_1.closeSync)(fd);
++    }
++}
++const S_ISVTX = 0o1000;
++/**
++ * Whether a shared container is safe to keep an owner-only directory under:
++ * it must be a real directory owned by root or the current user, and if other
++ * users can write to it, it must be sticky.
++ */
++function isSafeSharedRoot(dir) {
++    try {
++        const stats = (0, node_fs_1.lstatSync)(dir);
++        if (!stats.isDirectory()) {
++            return deny({
++                kind: 'not-a-directory',
++                dir,
++                ...(stats.isSymbolicLink() ? { symlink: true } : {}),
++            });
++        }
++        if (process.platform === 'win32') {
++            // The OS temp root is already scoped to the current Windows user.
++            return allow(dir);
++        }
++        if (typeof process.getuid === 'function' &&
++            stats.uid !== process.getuid() &&
++            stats.uid !== 0) {
++            return deny({ kind: 'foreign-shared-container', dir, uid: stats.uid });
++        }
++        return !(stats.mode & 0o022) || !!(stats.mode & S_ISVTX)
++            ? allow(dir)
++            : deny({ kind: 'peer-writable-not-sticky', dir, mode: stats.mode });
++    }
++    catch (e) {
++        return deny({ kind: 'not-inspectable', dir, code: e?.code });
++    }
++}
++/**
++ * Create a shared container as sticky + world-writable if it does not exist
++ * and report whether the resulting path is safe for the current user. A
++ * container that already exists is never modified, only judged.
++ */
++function ensureSafeSharedRoot(dir) {
++    if (process.platform === 'win32') {
++        try {
++            (0, node_fs_1.mkdirSync)(dir, { recursive: true });
++            return allow(dir);
++        }
++        catch (e) {
++            return deny({ kind: 'not-created', dir, code: e?.code });
++        }
++    }
++    try {
++        (0, node_fs_1.mkdirSync)(dir, { mode: 0o1777 });
++        // mkdir is subject to the umask (and macOS drops the sticky bit).
++        chmodRealDirectory(dir, 0o1777);
++    }
++    catch (e) {
++        if (e?.code !== 'EEXIST') {
++            return deny({ kind: 'not-created', dir, code: e?.code });
++        }
++    }
++    return isSafeSharedRoot(dir);
++}
++/**
++ * Whether `dir` is an existing real directory owned by us. Creates nothing and
++ * repairs nothing, for callers that only want to know whether a path is safe to
++ * act on, such as deleting.
++ */
++function isOwnedRealDirectory(dir) {
++    try {
++        const stats = (0, node_fs_1.lstatSync)(dir);
++        if (!stats.isDirectory()) {
++            return false;
++        }
++        return (typeof process.getuid !== 'function' || stats.uid === process.getuid());
++    }
++    catch {
++        return false;
++    }
++}
++/** The path segment separating one user's Nx runtime state from another's. */
++function getUserSegment() {
++    try {
++        if (typeof process.getuid === 'function') {
++            return String(process.getuid());
++        }
++    }
++    catch { }
++    try {
++        const { username } = (0, node_os_1.userInfo)();
++        if (username) {
++            return username;
++        }
++    }
++    catch { }
++    return 'unknown';
++}
++/**
++ * Ensure `dir` exists, is a real directory owned by us, and carries no group or
++ * other bits at all. A looser mode is re-locked to 0700; a directory owned by
++ * someone else, a symlink, or a mode that cannot be tightened is refused.
++ */
++function ensureOwnedPrivateDir(dir) {
++    try {
++        (0, node_fs_1.mkdirSync)(dir, { mode: 0o700 });
++    }
++    catch (e) {
++        if (e?.code !== 'EEXIST') {
++            return deny({ kind: 'not-created', dir, code: e?.code });
++        }
++    }
++    // One verdict for both branches: filesystems that ignore the mode argument
++    // can land a directory requested at 0700 on 0777.
++    try {
++        const stats = (0, node_fs_1.lstatSync)(dir);
++        if (!stats.isDirectory()) {
++            return deny({
++                kind: 'not-a-directory',
++                dir,
++                ...(stats.isSymbolicLink() ? { symlink: true } : {}),
++            });
++        }
++        if (typeof process.getuid !== 'function') {
++            // Windows: the roots there are per-user OS temp dirs, not a shared /tmp.
++            return allow(dir);
++        }
++        if (stats.uid !== process.getuid()) {
++            return deny({ kind: 'foreign-owner', dir, uid: stats.uid });
++        }
++        if (stats.mode & 0o077) {
++            if (!chmodRealDirectory(dir, 0o700)) {
++                return deny({ kind: 'not-tightenable', dir, mode: stats.mode });
++            }
++            // Read the mode back rather than trusting the chmod's return.
++            const after = (0, node_fs_1.lstatSync)(dir);
++            if (after.mode & 0o077) {
++                return deny({ kind: 'not-tightenable', dir, mode: after.mode });
++            }
++        }
++        return allow(dir);
++    }
++    catch (e) {
++        return deny({ kind: 'not-inspectable', dir, code: e?.code });
++    }
++}
+
+--- a/src/project-graph/file-utils.js
++++ b/src/project-graph/file-utils.js
+@@ -13,6 +13,7 @@
+ const configuration_1 = require("../config/configuration");
+ const workspace_root_1 = require("../utils/workspace-root");
+ const fileutils_1 = require("../utils/fileutils");
++const git_revision_1 = require("../utils/git-revision");
+ const json_diff_1 = require("../utils/json-diff");
+ const project_graph_1 = require("./project-graph");
+ const angular_json_1 = require("../adapter/angular-json");
+@@ -78,6 +79,9 @@
+ }
+ exports.TEN_MEGABYTES = 1024 * 10000;
+ function defaultReadFileAtRevision(file, revision) {
++    if (revision) {
++        (0, git_revision_1.assertValidGitRevision)(revision);
++    }
+     try {
+         const fileFullPath = `${workspace_root_1.workspaceRoot}${path_1.sep}${file}`;
+         const gitRepositoryPath = (0, child_process_1.execSync)('git rev-parse --show-toplevel')
+@@ -88,7 +92,7 @@
+             .join('/');
+         return !revision
+             ? (0, fs_1.readFileSync)(file, 'utf-8')
+-            : (0, child_process_1.execSync)(`git show ${revision}:${filePathInGitRepository}`, {
++            : (0, child_process_1.execFileSync)('git', ['show', `${revision}:${filePathInGitRepository}`], {
+                 maxBuffer: exports.TEN_MEGABYTES,
+                 stdio: ['pipe', 'pipe', 'ignore'],
+                 windowsHide: true,
+--- a/src/utils/command-line-utils.js
++++ b/src/utils/command-line-utils.js
+@@ -11,6 +11,7 @@
+ const file_utils_1 = require("../project-graph/file-utils");
+ const output_1 = require("./output");
+ const child_process_1 = require("child_process");
++const git_revision_1 = require("./git-revision");
+ const workspace_root_1 = require("./workspace-root");
+ function createOverrides(__overrides_unparsed__ = []) {
+     let overrides = yargsParser(__overrides_unparsed__, {
+@@ -211,30 +212,27 @@
+     }
+ }
+ function getUncommittedFiles() {
+-    return parseGitOutput(`git diff --name-only --no-renames --relative HEAD .`);
++    return parseGitOutput([
++        'diff',
++        '--name-only',
++        '--no-renames',
++        '--relative',
++        'HEAD',
++        '.',
++    ]);
+ }
+ function getUntrackedFiles() {
+-    return parseGitOutput(`git ls-files --others --exclude-standard`);
++    return parseGitOutput(['ls-files', '--others', '--exclude-standard']);
+ }
+ function getMergeBase(base, head = 'HEAD') {
++    (0, git_revision_1.assertValidGitRevision)(base);
++    (0, git_revision_1.assertValidGitRevision)(head);
+     try {
+-        return (0, child_process_1.execSync)(`git merge-base "${base}" "${head}"`, {
+-            maxBuffer: file_utils_1.TEN_MEGABYTES,
+-            cwd: workspace_root_1.workspaceRoot,
+-            stdio: 'pipe',
+-            windowsHide: true,
+-        })
+-            .toString()
+-            .trim();
++        return runGit(['merge-base', base, head]).toString().trim();
+     }
+     catch {
+         try {
+-            return (0, child_process_1.execSync)(`git merge-base --fork-point "${base}" "${head}"`, {
+-                maxBuffer: file_utils_1.TEN_MEGABYTES,
+-                cwd: workspace_root_1.workspaceRoot,
+-                stdio: 'pipe',
+-                windowsHide: true,
+-            })
++            return runGit(['merge-base', '--fork-point', base, head])
+                 .toString()
+                 .trim();
+         }
+@@ -244,14 +242,27 @@
+     }
+ }
+ function getFilesUsingBaseAndHead(base, head) {
+-    return parseGitOutput(`git diff --name-only --no-renames --relative "${base}" "${head}"`);
++    (0, git_revision_1.assertValidGitRevision)(base);
++    (0, git_revision_1.assertValidGitRevision)(head);
++    return parseGitOutput([
++        'diff',
++        '--name-only',
++        '--no-renames',
++        '--relative',
++        base,
++        head,
++    ]);
+ }
+-function parseGitOutput(command) {
+-    return (0, child_process_1.execSync)(command, {
++function runGit(args) {
++    return (0, child_process_1.execFileSync)('git', args, {
+         maxBuffer: file_utils_1.TEN_MEGABYTES,
+         cwd: workspace_root_1.workspaceRoot,
++        stdio: 'pipe',
+         windowsHide: true,
+-    })
++    });
++}
++function parseGitOutput(args) {
++    return runGit(args)
+         .toString('utf-8')
+         .split('\n')
+         .map((a) => a.trim())
+--- /dev/null
++++ b/src/utils/git-revision.d.ts
+@@ -0,0 +1,12 @@
++/**
++ * Git parses any argument beginning with `-` as an option rather than a
++ * revision, so a flag-shaped revision could smuggle options such as
++ * `--upload-pack` into the git commands Nx runs.
++ */
++export declare function assertValidGitRevision(revision: string): void;
++/**
++ * For refs Nx itself recorded from `git rev-parse` and later read back off
++ * disk, where anything other than a commit sha means the value was tampered
++ * with rather than that the user picked an unusual revision.
++ */
++export declare function assertValidGitSha(sha: string): void;
+--- /dev/null
++++ b/src/utils/git-revision.js
+@@ -0,0 +1,25 @@
++"use strict";
++Object.defineProperty(exports, "__esModule", { value: true });
++exports.assertValidGitRevision = assertValidGitRevision;
++exports.assertValidGitSha = assertValidGitSha;
++/**
++ * Git parses any argument beginning with `-` as an option rather than a
++ * revision, so a flag-shaped revision could smuggle options such as
++ * `--upload-pack` into the git commands Nx runs.
++ */
++function assertValidGitRevision(revision) {
++    if (revision.startsWith('-')) {
++        throw new Error(`Invalid git revision: "${revision}". Git revisions cannot start with "-".`);
++    }
++}
++const COMMIT_SHA = /^[0-9a-f]{7,40}$/i;
++/**
++ * For refs Nx itself recorded from `git rev-parse` and later read back off
++ * disk, where anything other than a commit sha means the value was tampered
++ * with rather than that the user picked an unusual revision.
++ */
++function assertValidGitSha(sha) {
++    if (!COMMIT_SHA.test(sha)) {
++        throw new Error(`Invalid git commit sha: "${sha}". Expected a hexadecimal commit sha.`);
++    }
++}
+--- a/src/utils/git-utils.js
++++ b/src/utils/git-utils.js
+@@ -9,9 +9,9 @@
+ const child_process_1 = require("child_process");
+ const path_1 = require("path");
+ const logger_1 = require("./logger");
+-function execAsync(command, execOptions) {
++function execFileAsync(file, args, execOptions) {
+     return new Promise((res, rej) => {
+-        (0, child_process_1.exec)(command, execOptions, (err, stdout, stderr) => {
++        (0, child_process_1.execFile)(file, args, { ...execOptions, windowsHide: true }, (err, stdout) => {
+             if (err) {
+                 return rej(err);
+             }
+@@ -22,7 +22,14 @@
+ async function cloneFromUpstream(url, destination, { originName, depth } = {
+     originName: 'origin',
+ }) {
+-    await execAsync(`git clone ${url} ${destination} ${depth ? `--depth ${depth}` : ''} --origin ${originName}`, {
++    await execFileAsync('git', [
++        'clone',
++        url,
++        destination,
++        ...(depth ? ['--depth', `${depth}`] : []),
++        '--origin',
++        originName,
++    ], {
+         cwd: (0, path_1.dirname)(destination),
+         maxBuffer: 10 * 1024 * 1024,
+     });
+@@ -34,7 +41,7 @@
+         this.root = this.getGitRootPath(this.directory);
+     }
+     getGitRootPath(cwd) {
+-        return (0, child_process_1.execSync)('git rev-parse --show-toplevel', {
++        return (0, child_process_1.execFileSync)('git', ['rev-parse', '--show-toplevel'], {
+             cwd,
+             windowsHide: true,
+         })
+@@ -42,17 +49,22 @@
+             .trim();
+     }
+     async hasUncommittedChanges() {
+-        const data = await this.execAsync(`git status --porcelain`);
++        const data = await this.execGit(['status', '--porcelain']);
+         return data.trim() !== '';
+     }
+     async addFetchRemote(remoteName, branch) {
+-        return await this.execAsync(`git config --add remote.${remoteName}.fetch "+refs/heads/${branch}:refs/remotes/${remoteName}/${branch}"`);
++        return await this.execGit([
++            'config',
++            '--add',
++            `remote.${remoteName}.fetch`,
++            `+refs/heads/${branch}:refs/remotes/${remoteName}/${branch}`,
++        ]);
+     }
+     async showStat() {
+-        return await this.execAsync(`git show --stat`);
++        return await this.execGit(['show', '--stat']);
+     }
+     async listBranches() {
+-        return (await this.execAsync(`git ls-remote --heads --quiet`))
++        return (await this.execGit(['ls-remote', '--heads', '--quiet']))
+             .trim()
+             .split('\n')
+             .map((s) => s
+@@ -63,45 +75,58 @@
+     async getGitFiles(path) {
+         // Use -z to return file names exactly as they are stored in git, separated by NULL (\x00) character.
+         // This avoids problems with special characters in file names.
+-        return (await this.execAsync(`git ls-files -z ${path}`))
++        return (await this.execGit(['ls-files', '-z', '--', path]))
+             .trim()
+             .split('\x00')
+             .map((s) => s.trim())
+             .filter(Boolean);
+     }
+     async reset(ref) {
+-        return await this.execAsync(`git reset ${ref} --hard`);
++        return await this.execGit(['reset', '--hard', ref]);
+     }
+     async mergeUnrelatedHistories(ref, message) {
+-        return await this.execAsync(`git merge ${ref} -X ours --allow-unrelated-histories -m "${message}"`);
++        return await this.execGit([
++            'merge',
++            ref,
++            '-X',
++            'ours',
++            '--allow-unrelated-histories',
++            '-m',
++            message,
++        ]);
+     }
+     async fetch(remote, ref) {
+-        return await this.execAsync(`git fetch ${remote}${ref ? ` ${ref}` : ''}`);
++        return await this.execGit(['fetch', remote, ...(ref ? [ref] : [])]);
+     }
+     async checkout(branch, opts) {
+-        return await this.execAsync(`git checkout ${opts.new ? '-b ' : ' '}${branch}${opts.base ? ' ' + opts.base : ''}`);
++        return await this.execGit([
++            'checkout',
++            ...(opts.new ? ['-b'] : []),
++            branch,
++            ...(opts.base ? [opts.base] : []),
++        ]);
+     }
+     async move(path, destination) {
+-        return await this.execAsync(`git mv ${this.quotePath(path)} ${this.quotePath(destination)}`);
++        return await this.execGit(['mv', '--', path, destination]);
+     }
+     async push(ref, remoteName) {
+-        return await this.execAsync(`git push -u -f ${remoteName} ${ref}`);
++        return await this.execGit(['push', '-u', '-f', remoteName, ref]);
+     }
+     async commit(message) {
+-        return await this.execAsync(`git commit -am "${message}"`);
++        return await this.execGit(['commit', '-am', message]);
+     }
+     async amendCommit() {
+-        return await this.execAsync(`git commit --amend -a --no-edit`);
++        return await this.execGit(['commit', '--amend', '-a', '--no-edit']);
+     }
+     async deleteGitRemote(name) {
+-        return await this.execAsync(`git remote rm ${name}`);
++        return await this.execGit(['remote', 'rm', name]);
+     }
+     async addGitRemote(name, url) {
+-        return await this.execAsync(`git remote add ${name} ${url}`);
++        return await this.execGit(['remote', 'add', name, url]);
+     }
+     async hasFilterRepoInstalled() {
+         try {
+-            await this.execAsync(`git filter-repo --help`);
++            await this.execGit(['filter-repo', '--help']);
+             return true;
+         }
+         catch {
+@@ -114,35 +139,57 @@
+         // NOTE: filter-repo requires POSIX path to work
+         const sourcePosixPath = source.split(path_1.sep).join(path_1.posix.sep);
+         const destinationPosixPath = destination.split(path_1.sep).join(path_1.posix.sep);
+-        await this.execAsync(`git filter-repo -f ${source !== '' ? `--path ${this.quotePath(sourcePosixPath)}` : ''} ${source !== destination
+-            ? `--path-rename ${this.quotePath(sourcePosixPath, true)}:${this.quotePath(destinationPosixPath, true)}`
+-            : ''}`);
++        const sourcePath = ensureTrailingSlash(sourcePosixPath);
++        const destinationPath = ensureTrailingSlash(destinationPosixPath);
++        await this.execGit([
++            'filter-repo',
++            '-f',
++            ...(source !== '' ? ['--path', sourcePosixPath] : []),
++            ...(source !== destination
++                ? ['--path-rename', `${sourcePath}:${destinationPath}`]
++                : []),
++        ]);
+     }
+     async filterBranch(source, destination, branchName) {
+         // We need non-ASCII file names to not be quoted, or else filter-branch will exclude them.
+-        await this.execAsync(`git config core.quotepath false`);
++        await this.execGit(['config', 'core.quotepath', 'false']);
+         // NOTE: filter-repo requires POSIX path to work
+         const sourcePosixPath = source.split(path_1.sep).join(path_1.posix.sep);
+         const destinationPosixPath = destination.split(path_1.sep).join(path_1.posix.sep);
+         // First, if the source is not a root project, then only include commits relevant to the subdirectory.
+         if (source !== '') {
+-            const indexFilterCommand = this.quoteArg(`node ${(0, path_1.join)(__dirname, 'git-utils.index-filter.js')}`);
+-            await this.execAsync(`git filter-branch -f --index-filter ${indexFilterCommand} --prune-empty -- ${branchName}`, {
++            const indexFilterCommand = `node ${quoteForShell((0, path_1.join)(__dirname, 'git-utils.index-filter.js'))}`;
++            await this.execGit([
++                'filter-branch',
++                '-f',
++                '--index-filter',
++                indexFilterCommand,
++                '--prune-empty',
++                '--',
++                branchName,
++            ], {
+                 NX_IMPORT_SOURCE: sourcePosixPath,
+                 NX_IMPORT_DESTINATION: destinationPosixPath,
+             });
+         }
+         // Then, move files to their new location if necessary.
+         if (source === '' || source !== destination) {
+-            const treeFilterCommand = this.quoteArg(`node ${(0, path_1.join)(__dirname, 'git-utils.tree-filter.js')}`);
+-            await this.execAsync(`git filter-branch -f --tree-filter ${treeFilterCommand} -- ${branchName}`, {
++            const treeFilterCommand = `node ${quoteForShell((0, path_1.join)(__dirname, 'git-utils.tree-filter.js'))}`;
++            await this.execGit([
++                'filter-branch',
++                '-f',
++                '--tree-filter',
++                treeFilterCommand,
++                '--',
++                branchName,
++            ], {
+                 NX_IMPORT_SOURCE: sourcePosixPath,
+                 NX_IMPORT_DESTINATION: destinationPosixPath,
+             });
+         }
+     }
+-    execAsync(command, env) {
+-        return execAsync(command, {
++    execGit(args, env) {
++        return execFileAsync('git', args, {
+             cwd: this.root,
+             maxBuffer: 10 * 1024 * 1024,
+             env: {
+@@ -151,25 +198,14 @@
+             },
+         });
+     }
+-    quotePath(path, ensureTrailingSlash) {
+-        return this.quoteArg(ensureTrailingSlash && path !== '' && !path.endsWith('/')
+-            ? `${path}/`
+-            : path);
+-    }
+-    quoteArg(arg) {
+-        return process.platform === 'win32'
+-            ? // Windows/CMD only understands double-quotes, single-quotes are treated as part of the file name
+-                // Bash and other shells will substitute `$` in file names with a variable value.
+-                `"${arg
+-                    // Need to keep two slashes for Windows or else the path will be invalid.
+-                    // e.g. 'C:\Users\bob\projects\repo' is invalid, but 'C:\\Users\\bob\\projects\\repo' is valid
+-                    .replaceAll('\\', '\\\\')}"`
+-            : // e.g. `git mv "$$file.txt" "libs/a/$$file.txt"` will not work since `$$` is swapped with the PID of the last process.
+-                // Using single-quotes prevents this substitution.
+-                `'${arg}'`;
+-    }
+ }
+ exports.GitRepository = GitRepository;
++function ensureTrailingSlash(path) {
++    return path !== '' && !path.endsWith('/') ? `${path}/` : path;
++}
++function quoteForShell(arg) {
++    return `'${arg.replaceAll("'", "'\"'\"'")}'`;
++}
+ /**
+  * This is currently duplicated in Nx Console. Please let @MaxKless know if you make changes here.
+  */
