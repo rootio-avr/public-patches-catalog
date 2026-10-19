@@ -1,7 +1,7 @@
-# jq : 1.6-2.1+deb12u2.aikido.8
+# jq : 1.6-2.1+deb12u3.aikido.9
 
-This patch is based on jq version 1.6-2.1+deb12u2.aikido.8, which is available at:
-https://sources.debian.org/src/jq/1.6-2.1+deb12u2/
+This patch is based on jq version 1.6-2.1+deb12u3.aikido.9, which is available at:
+https://sources.debian.org/src/jq/1.6-2.1+deb12u3/
 
 ## Affected CVEs:
 - CVE-2024-23337
