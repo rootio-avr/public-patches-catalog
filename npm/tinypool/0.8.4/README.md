@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-938696
 - AIKIDO-2026-396404
+- CVE-2026-104848
+- CVE-2026-104849
 
 ## How to Apply:
 1. Clone or download the source code for tinypool
