@@ -20,6 +20,8 @@ unknown
 - GHSA-wqvq-jvpq-h66f
 - AIKIDO-2026-612508
 - GHSA-v53p-9fqp-m79j
+- CVE-2026-82662
+- GHSA-frj6-5rhh-vwfw
 
 ## How to Apply:
 1. Clone or download the source code for nodemailer
