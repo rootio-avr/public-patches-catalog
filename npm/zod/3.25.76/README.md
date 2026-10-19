@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-10706
 - AIKIDO-2026-10707
+- CVE-2023-54404
 
 ## How to Apply:
 1. Clone or download the source code for zod
