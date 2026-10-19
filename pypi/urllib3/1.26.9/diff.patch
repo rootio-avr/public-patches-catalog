@@ -967,3 +967,412 @@ index 2777e9c..a1b5a3e 100644
              try:
                  retries = retries.increment(method, url, response=response, _pool=self)
              except MaxRetryError:
+
+--- a/CHANGES.rst
++++ b/CHANGES.rst
+@@ -1,6 +1,16 @@
+ Changes
+ =======
+ 
++Unreleased
++----------
++
++* Fixed a denial-of-service issue where a malicious server could cause unbounded memory usage
++  in the streaming chunked-transfer-encoding read path (``HTTPResponse.stream()`` /
++  ``HTTPResponse.read_chunked()``) by sending an unterminated chunk-size line. The chunk-size
++  line and trailing CRLF are now read with a bounded length matching ``http.client._MAXLINE``,
++  raising ``urllib3.exceptions.ProtocolError`` if exceeded (GHSA-vxq7-64xx-v4gw).
++
++
+ 1.26.9 (2022-03-16)
+ -------------------
+ 
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -34,7 +34,14 @@
+ 
+ log = logging.getLogger(__name__)
+ 
++# Maximum length of a chunk-size line (and the trailing CRLF line) when reading a
++# chunked-transfer-encoded response. Matches ``http.client._MAXLINE`` so urllib3's
++# streaming path bounds these reads exactly like the stdlib ``.read()`` path does,
++# preventing a malicious server from forcing unbounded buffering (memory exhaustion)
++# via an unterminated chunk-size line.
++_MAX_CHUNK_LINE_LENGTH = 2**16
+ 
++
+ class DeflateDecoder(object):
+     def __init__(self):
+         self._first_try = True
+@@ -694,7 +701,12 @@
+         # we'll try to read it from socket.
+         if self.chunk_left is not None:
+             return
+-        line = self._fp.fp.readline()
++        line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)
++        if len(line) > _MAX_CHUNK_LINE_LENGTH:
++            self.close()
++            raise ProtocolError(
++                "Response chunk size line exceeded maximum allowed length"
++            )
+         line = line.split(b";", 1)[0]
+         try:
+             self.chunk_left = int(line, 16)
+@@ -784,7 +796,11 @@
+ 
+             # Chunk content ends with \r\n: discard it.
+             while True:
+-                line = self._fp.fp.readline()
++                line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)
++                if len(line) > _MAX_CHUNK_LINE_LENGTH:
++                    raise ProtocolError(
++                        "Response chunk trailer line exceeded maximum allowed length"
++                    )
+                 if not line:
+                     # Some sites may not end with '\r\n'.
+                     break
+--- a/test/test_response.py
++++ b/test/test_response.py
+@@ -24,7 +24,7 @@
+     httplib_IncompleteRead,
+ )
+ from urllib3.packages.six.moves import http_client as httplib
+-from urllib3.response import HTTPResponse, brotli
++from urllib3.response import _MAX_CHUNK_LINE_LENGTH, HTTPResponse, brotli
+ from urllib3.util.response import is_fp_closed
+ from urllib3.util.retry import RequestHistory, Retry
+ 
+@@ -813,6 +813,61 @@
+         assert isinstance(orig_ex, InvalidChunkLength)
+         assert orig_ex.length == six.b(fp.BAD_LENGTH_LINE)
+ 
++    def test_chunk_size_line_too_long(self):
++        # A malicious server can send a chunk-size line with no newline. urllib3's
++        # streaming path must reject it with a bounded read rather than buffering
++        # the whole line (memory exhaustion).
++        stream = [b"foooo"]
++        fp = MockChunkedEncodingLongChunkSizeLine(stream)
++        r = httplib.HTTPResponse(MockSock)
++        r.fp = fp
++        r.chunked = True
++        r.chunk_left = None
++        resp = HTTPResponse(
++            r, preload_content=False, headers={"transfer-encoding": "chunked"}
++        )
++        with pytest.raises(ProtocolError) as ctx:
++            next(resp.read_chunked())
++
++        assert "chunk size line exceeded maximum allowed length" in str(ctx.value)
++
++    @pytest.mark.parametrize(
++        "trailer_length",
++        [
++            _MAX_CHUNK_LINE_LENGTH - 1,
++            _MAX_CHUNK_LINE_LENGTH,
++            _MAX_CHUNK_LINE_LENGTH + 1,
++        ],
++    )
++    @pytest.mark.parametrize("line_ending", [b"\r\n", b""])
++    def test_chunk_trailer_line_length(self, trailer_length, line_ending):
++        # The line limit includes its CRLF, but not the final blank line.
++        trailer = b"X:" + b"x" * (trailer_length - 2 - len(line_ending)) + line_ending
++        fp = BytesIO(b"3\r\nfoo\r\n0\r\n" + trailer + (b"\r\n" if line_ending else b""))
++        r = httplib.HTTPResponse(MockSock, method="GET")
++        r.fp = fp
++        resp = HTTPResponse(
++            r,
++            preload_content=False,
++            headers={"transfer-encoding": "chunked"},
++            original_response=r,
++        )
++        chunks = resp.read_chunked()
++        assert next(chunks) == b"foo"
++
++        if trailer_length > _MAX_CHUNK_LINE_LENGTH:
++            with pytest.raises(ProtocolError) as ctx:
++                next(chunks)
++            assert "chunk trailer line exceeded maximum allowed length" in str(
++                ctx.value
++            )
++        else:
++            assert list(chunks) == []
++
++        assert fp.closed
++        assert r.isclosed()
++        assert resp.closed
++
+     def test_chunked_response_without_crlf_on_end(self):
+         stream = [b"foo", b"bar", b"baz"]
+         fp = MockChunkedEncodingWithoutCRLFOnEnd(stream)
+@@ -1023,8 +1078,20 @@
+                 self.cur_chunk = self.cur_chunk[amt:]
+             return chunk_part
+ 
+-    def readline(self):
+-        return self.pop_current_chunk(till_crlf=True)
++    def readline(self, amt=-1):
++        # Emulate a real file object's readline(size): return bytes up to and
++        # including the first newline, or at most ``amt`` bytes when ``amt >= 0``,
++        # whichever comes first.
++        if len(self.cur_chunk) <= 0:
++            self.cur_chunk = self._pop_new_chunk()
++        line = self.cur_chunk
++        newline_index = line.find(b"\n")
++        if newline_index != -1:
++            line = line[: newline_index + 1]
++        if 0 <= amt < len(line):
++            line = line[:amt]
++        self.cur_chunk = self.cur_chunk[len(line) :]
++        return line
+ 
+     def read(self, amt=-1):
+         return self.pop_current_chunk(amt)
+@@ -1047,6 +1114,14 @@
+ 
+     def _encode_chunk(self, chunk):
+         return "%s%s\r\n" % (self.BAD_LENGTH_LINE, chunk.decode())
++
++
++class MockChunkedEncodingLongChunkSizeLine(MockChunkedEncodingResponse):
++    def _encode_chunk(self, chunk):
++        # A chunk-size line far longer than _MAX_CHUNK_LINE_LENGTH with no
++        # newline, simulating a malicious server that never terminates the
++        # size line (memory-exhaustion attack).
++        return b"f" * (2**16 + 1024)
+ 
+ 
+ class MockChunkedEncodingWithoutCRLFOnEnd(MockChunkedEncodingResponse):
+--- a/test/with_dummyserver/test_socketlevel.py
++++ b/test/with_dummyserver/test_socketlevel.py
+@@ -1779,6 +1779,42 @@
+ 
+             done_event.set()
+ 
++    def test_chunked_size_line_too_long_does_not_buffer(self):
++        # A malicious server can advertise chunked encoding and then send an
++        # unterminated chunk-size line (no newline). The streaming path must
++        # reject it with a bounded read instead of buffering the whole run,
++        # which would exhaust memory.
++        done_event = Event()
++        # Well above the 65536-byte cap, but small enough for a fast test.
++        run_length = 512 * 1024
++
++        def socket_handler(listener):
++            sock = listener.accept()[0]
++
++            buf = b""
++            while not buf.endswith(b"\r\n\r\n"):
++                buf += sock.recv(65536)
++
++            sock.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
++            # A chunk-size line that never terminates with a newline.
++            try:
++                sock.sendall(b"f" * run_length)
++            except (IOError, OSError):
++                pass
++
++            done_event.wait(5)
++            sock.close()
++
++        self._start_server(socket_handler)
++
++        with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
++            r = pool.request("GET", "/", timeout=LONG_TIMEOUT, preload_content=False)
++            with pytest.raises(ProtocolError) as ctx:
++                next(r.stream(65536))
++            assert "chunk size line exceeded maximum allowed length" in str(ctx.value)
++
++            done_event.set()
++
+ 
+ class TestBadContentLength(SocketDummyServerTestCase):
+     def test_enforce_content_length_get(self):
+
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -372,6 +372,16 @@
+ 
+             # Override the host with the one we're requesting data from.
+             hostname = self._tunnel_host
++        elif self._is_forwarding_to_https_proxy():
++            # The peer of this socket is the proxy, not the target server, so
++            # only the proxy's TLS settings apply to this handshake. Target
++            # specific settings (SNI, hostname/fingerprint assertions, client
++            # certificates, cert_reqs) must never influence it and the target
++            # ``ssl_context`` must not be mutated.
++            self.sock = self._connect_tls_proxy(hostname, conn)
++            # The target itself is not verified when forwarding.
++            self.is_verified = False
++            return
+ 
+         server_hostname = hostname
+         if self.server_hostname is not None:
+@@ -471,28 +481,49 @@
+             or self.assert_fingerprint is not None
+         )
+ 
++    def _is_forwarding_to_https_proxy(self):
++        """
++        Whether this connection talks TLS directly to an HTTPS proxy that
++        forwards requests (i.e. there is no CONNECT tunnel to the target).
++        """
++        return (
++            self.proxy is not None
++            and self.proxy_config is not None
++            and not self._is_using_tunnel()
++        )
++
+     def _connect_tls_proxy(self, hostname, conn):
+         """
+-        Establish a TLS connection to the proxy using the provided SSL context.
++        Establish a TLS connection to the proxy using proxy-specific policy.
+         """
+         proxy_config = self.proxy_config
+         ssl_context = proxy_config.ssl_context
+         if ssl_context:
+             # If the user provided a proxy context, we assume CA and client
+-            # certificates have already been set
+-            return ssl_wrap_socket(
++            # certificates have already been set and its certificate policy
++            # (``verify_mode``) is left untouched.
++            sock = ssl_wrap_socket(
+                 sock=conn,
+                 server_hostname=hostname,
+                 ssl_context=ssl_context,
+             )
++            self.proxy_is_verified = ssl_context.verify_mode == ssl.CERT_REQUIRED
++            return sock
+ 
+-        ssl_context = create_proxy_ssl_context(
+-            self.ssl_version,
+-            self.cert_reqs,
+-            self.ca_certs,
+-            self.ca_cert_dir,
+-            self.ca_cert_data,
+-        )
++        if self.ssl_context is not None and self._is_forwarding_to_https_proxy():
++            # Compatibility fallback: without an explicit proxy context an
++            # HTTPS proxy that forwards requests keeps using the pool's
++            # ``ssl_context`` (and its cert policy) for the proxy handshake.
++            ssl_context = self.ssl_context
++            ssl_context.verify_mode = resolve_cert_reqs(self.cert_reqs)
++        else:
++            ssl_context = create_proxy_ssl_context(
++                self.ssl_version,
++                self.cert_reqs,
++                self.ca_certs,
++                self.ca_cert_dir,
++                self.ca_cert_data,
++            )
+ 
+         # If no cert was provided, use only the default options for server
+         # certificate validation
+--- a/test/with_dummyserver/test_proxy_poolmanager.py
++++ b/test/with_dummyserver/test_proxy_poolmanager.py
+@@ -148,6 +148,106 @@
+             r = https.request("GET", "%s/" % self.https_url)
+             assert r.status == 200
+ 
++    def _connect_forwarding_conn(self, target_url, **kw):
++        """Open a connection to the target pool of a forwarding HTTPS proxy
++        and return ``(conn, proxy_manager)``; caller must close ``conn``."""
++        proxy = proxy_from_url(
++            self.https_proxy_url, use_forwarding_for_https=True, **kw
++        )
++        pool = proxy.connection_from_url(target_url)
++        conn = pool._new_conn()
++        try:
++            conn.connect()
++        except Exception:
++            conn.close()
++            proxy.clear()
++            raise
++        return conn, proxy
++
++    @onlyPy3
++    def test_https_proxy_forwarding_uses_proxy_ssl_context(self):
++        proxy_ssl_context = create_urllib3_context(cert_reqs=ssl.CERT_REQUIRED)
++        proxy_ssl_context.load_verify_locations(DEFAULT_CA)
++
++        conn, proxy = self._connect_forwarding_conn(
++            self.https_url,
++            proxy_ssl_context=proxy_ssl_context,
++            cert_reqs=ssl.CERT_NONE,
++            ca_certs=self.bad_ca_path,
++        )
++        try:
++            assert isinstance(conn.sock, ssl.SSLSocket)
++            # The proxy context is used for the proxy handshake ...
++            assert conn.sock.context is proxy_ssl_context
++            # ... and the target's cert policy never leaks into it.
++            assert proxy_ssl_context.verify_mode == ssl.CERT_REQUIRED
++            assert conn.proxy_is_verified is True
++            assert conn.is_verified is False
++        finally:
++            conn.close()
++            proxy.clear()
++
++    @onlyPy3
++    def test_https_proxy_forwarding_proxy_ssl_context_rejects_untrusted_proxy(self):
++        proxy_ssl_context = create_urllib3_context(cert_reqs=ssl.CERT_REQUIRED)
++        proxy_ssl_context.load_verify_locations(self.bad_ca_path)
++
++        # Target settings asking for no verification must not disable the
++        # proxy's certificate verification.
++        with proxy_from_url(
++            self.https_proxy_url,
++            proxy_ssl_context=proxy_ssl_context,
++            cert_reqs=ssl.CERT_NONE,
++            use_forwarding_for_https=True,
++        ) as https:
++            with pytest.raises(MaxRetryError) as e:
++                https.request("GET", "%s/" % self.https_url, retries=0)
++            assert isinstance(e.value.reason, SSLError)
++        assert proxy_ssl_context.verify_mode == ssl.CERT_REQUIRED
++
++    @onlyPy3
++    @pytest.mark.parametrize(
++        "target_tls_kwargs",
++        [
++            {"server_hostname": "example.com"},
++            {"assert_hostname": "example.com"},
++            {"assert_fingerprint": "00" * 32},
++            {"cert_file": "/nonexistent/client-cert.pem"},
++        ],
++    )
++    def test_https_proxy_forwarding_ignores_target_identity_settings(
++        self, target_tls_kwargs
++    ):
++        proxy_ssl_context = create_urllib3_context()
++        proxy_ssl_context.load_verify_locations(DEFAULT_CA)
++
++        conn, proxy = self._connect_forwarding_conn(
++            self.https_url,
++            proxy_ssl_context=proxy_ssl_context,
++            **target_tls_kwargs
++        )
++        try:
++            assert isinstance(conn.sock, ssl.SSLSocket)
++            assert conn.sock.context is proxy_ssl_context
++        finally:
++            conn.close()
++            proxy.clear()
++
++    @onlyPy3
++    def test_https_proxy_forwarding_http_target_pool_ssl_context_fallback(self):
++        ssl_context = create_urllib3_context()
++        ssl_context.load_verify_locations(DEFAULT_CA)
++
++        conn, proxy = self._connect_forwarding_conn(
++            self.http_url, ssl_context=ssl_context
++        )
++        try:
++            assert isinstance(conn.sock, ssl.SSLSocket)
++            assert conn.sock.context is ssl_context
++        finally:
++            conn.close()
++            proxy.clear()
++
+     def test_nagle_proxy(self):
+         """Test that proxy connections do not have TCP_NODELAY turned on"""
+         with ProxyManager(self.proxy_url) as http:
