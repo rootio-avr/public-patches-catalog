@@ -1,0 +1,753 @@
+--- a/dist/esm/server/image-optimizer.js
++++ b/dist/esm/server/image-optimizer.js
+@@ -21,7 +21,11 @@
+ import { InvariantError } from '../shared/lib/invariant-error';
+ import { lookup } from 'dns/promises';
+ import { isIP } from 'net';
+-import { ALL } from 'dns';
++import { ALL, ADDRCONFIG } from 'dns';
++import { Agent as HttpAgent, request as httpRequest } from 'http';
++import { Agent as HttpsAgent, request as httpsRequest } from 'https';
++import { pipeline, Transform } from 'stream';
++import { constants as zlibConstants, createBrotliDecompress, createGunzip, createInflate, createInflateRaw } from 'zlib';
+ const AVIF = 'image/avif';
+ const WEBP = 'image/webp';
+ const PNG = 'image/png';
+@@ -802,25 +806,209 @@
+         308
+     ].includes(statusCode);
+ }
++function upstreamTimedOut(href) {
++    Log.error('upstream image response timed out for', href);
++    return new ImageError(504, '"url" parameter is valid but upstream response timed out');
++}
++const agentOptions = {
++    keepAlive: true,
++    timeout: 7000
++};
++const getHttpAgentName = HttpAgent.prototype.getName;
++const getHttpsAgentName = HttpsAgent.prototype.getName;
++class ImageHttpAgent extends HttpAgent {
++    getName(options = {}) {
++        return `${getHttpAgentName.call(this, options)}:${options.imageLookupKey ?? ''}`;
++    }
++}
++class ImageHttpsAgent extends HttpsAgent {
++    getName(options = {}) {
++        return `${getHttpsAgentName.call(this, options)}:${options.imageLookupKey ?? ''}`;
++    }
++}
++let protectedHttpAgent;
++let protectedHttpsAgent;
++let permissiveHttpAgent;
++let permissiveHttpsAgent;
++function getImageAgent(dangerouslyAllowLocalIP, isHttps) {
++    if (isHttps) {
++        if (dangerouslyAllowLocalIP) {
++            return permissiveHttpsAgent ??= new ImageHttpsAgent(agentOptions);
++        }
++        return protectedHttpsAgent ??= new ImageHttpsAgent(agentOptions);
++    }
++    if (dangerouslyAllowLocalIP) {
++        return permissiveHttpAgent ??= new ImageHttpAgent(agentOptions);
++    }
++    return protectedHttpAgent ??= new ImageHttpAgent(agentOptions);
++}
++const BASE_REQ_HEADERS = {
++    accept: '*/*',
++    'accept-language': '*',
++    'sec-fetch-mode': 'cors',
++    'user-agent': 'node'
++};
++const HTTP_FETCH_HEADERS = {
++    ...BASE_REQ_HEADERS,
++    'accept-encoding': 'gzip, deflate'
++};
++const HTTPS_FETCH_HEADERS = {
++    ...BASE_REQ_HEADERS,
++    'accept-encoding': 'br, gzip, deflate'
++};
++/**
++ * Resolves `hostname` with the DNS options the socket itself would have used,
++ * so the addresses checked below are the exact set the connection can reach.
++ * Mirrors `lookupAndConnect()` in Node's `lib/net.js`.
++ */ function lookupAsSocketWould(hostname) {
++    return lookup(hostname, {
++        all: true,
++        // Node applies ADDRCONFIG whenever no address family is requested,
++        // on every platform except Windows.
++        hints: process.platform === 'win32' ? 0 : ADDRCONFIG
++    });
++}
++/**
++ * Pins the connection to `addresses` instead of letting it resolve `hostname`
++ * a second time. Checking addresses up front only proves where the name
++ * pointed at that moment; the socket runs its own lookup, so a record that
++ * changes in between (DNS rebinding) would otherwise still reach a private IP.
++ *
++ * Every address in the list was checked, so all of them are handed back to
++ * keep Node's happy eyeballs failover between IPv6 and IPv4 intact.
++ */ export function createPinnedLookup(hostname, addresses) {
++    return (lookupHostname, options, callback)=>{
++        if (lookupHostname !== hostname) {
++            callback(new InvariantError(`Image lookup hostname "${lookupHostname}" does not match request hostname "${hostname}"`), []);
++            return;
++        }
++        const family = typeof options.family === 'number' ? options.family : 0;
++        const matched = family ? addresses.filter((address)=>address.family === family) : addresses;
++        if (matched.length === 0) {
++            // Reporting this as an error rather than an empty list is not optional:
++            // Node destructures the first address, so the resulting TypeError is
++            // thrown inside the socket and escapes the request entirely.
++            const err = new Error(`No IPv${family} address available for ${hostname}`);
++            err.code = 'ENODATA';
++            callback(err, []);
++            return;
++        }
++        if (options.all) {
++            callback(null, matched);
++        } else {
++            callback(null, matched[0].address, matched[0].family);
++        }
++    };
++}
++function requestUpstreamImage(url, pinnedLookup, imageLookupKey, dangerouslyAllowLocalIP, signal) {
++    return new Promise((resolve, reject)=>{
++        const isHttps = url.protocol === 'https:';
++        const request = isHttps ? httpsRequest : httpRequest;
++        const options = {
++            agent: getImageAgent(dangerouslyAllowLocalIP, isHttps),
++            headers: isHttps ? HTTPS_FETCH_HEADERS : HTTP_FETCH_HEADERS,
++            imageLookupKey,
++            lookup: pinnedLookup,
++            signal
++        };
++        const req = request(url, options, resolve);
++        req.on('error', reject);
++        req.end();
++    });
++}
++class DeflateDecoder extends Transform {
++    constructor(){
++        super();
++        this.decoder = undefined;
++    }
++    _transform(chunk, encoding, callback) {
++        if (!this.decoder) {
++            if (chunk.length === 0) {
++                callback();
++                return;
++            }
++            const options = {
++                flush: zlibConstants.Z_SYNC_FLUSH,
++                finishFlush: zlibConstants.Z_SYNC_FLUSH
++            };
++            this.decoder = (chunk[0] & 0x0f) === 0x08 ? createInflate(options) : createInflateRaw(options);
++            this.decoder.on('data', (data)=>this.push(data));
++            this.decoder.on('end', ()=>this.push(null));
++            this.decoder.on('error', (err)=>this.destroy(err));
++        }
++        this.decoder.write(chunk, encoding, callback);
++    }
++    _final(callback) {
++        this.decoder?.end();
++        this.decoder = undefined;
++        callback();
++    }
++}
++// Matches the chain limit of native fetch (undici), so an upstream cannot
++// force unbounded decoder allocations with the header alone.
++const MAX_CONTENT_ENCODINGS = 5;
++function decodeResponseBody(res, href) {
++    const contentEncoding = res.headers['content-encoding'];
++    if (!contentEncoding) {
++        return res;
++    }
++    const codings = contentEncoding.toLowerCase().split(',');
++    if (codings.length > MAX_CONTENT_ENCODINGS) {
++        Log.error('upstream image response had too many content encodings for', href);
++        throw new ImageError(400, '"url" parameter is valid but upstream response is invalid');
++    }
++    const decoders = [];
++    for(let i = codings.length - 1; i >= 0; i--){
++        switch(codings[i].trim()){
++            case 'x-gzip':
++            case 'gzip':
++                decoders.push(createGunzip({
++                    flush: zlibConstants.Z_SYNC_FLUSH,
++                    finishFlush: zlibConstants.Z_SYNC_FLUSH
++                }));
++                break;
++            case 'deflate':
++                decoders.push(new DeflateDecoder());
++                break;
++            case 'br':
++                decoders.push(createBrotliDecompress({
++                    flush: zlibConstants.BROTLI_OPERATION_FLUSH,
++                    finishFlush: zlibConstants.BROTLI_OPERATION_FLUSH
++                }));
++                break;
++            default:
++                return res;
++        }
++    }
++    pipeline([
++        res,
++        ...decoders
++    ], ()=>{});
++    return decoders[decoders.length - 1];
++}
+ export async function fetchExternalImage(href, dangerouslyAllowLocalIP, maximumResponseBody, count = 3) {
++    const url = new URL(href);
++    // `URL.hostname` keeps the brackets around an IPv6 literal, the socket does not
++    const hostname = url.hostname.replace(/^\[|\]$/g, '');
++    let pinnedLookup;
++    let imageLookupKey;
+     if (!dangerouslyAllowLocalIP) {
+-        const { hostname } = new URL(href);
+-        let ips = [
+-            hostname
+-        ];
+-        if (!isIP(hostname)) {
+-            const records = await lookup(hostname, {
+-                family: 0,
+-                all: true,
+-                hints: ALL
+-            }).catch((_)=>[
+-                    {
+-                        address: hostname
+-                    }
+-                ]);
+-            ips = records.map((record)=>record.address);
++        const literalFamily = isIP(hostname);
++        let addresses;
++        if (literalFamily > 0) {
++            // A literal address is connected to as-is, without any DNS resolution
++            addresses = [
++                {
++                    address: hostname,
++                    family: literalFamily
++                }
++            ];
++        } else {
++            addresses = await lookupAsSocketWould(hostname);
++            pinnedLookup = createPinnedLookup(hostname, addresses);
+         }
+-        const privateIps = ips.filter((ip)=>isPrivateIp(ip));
++        imageLookupKey = addresses.map((address)=>`${address.family}:${address.address}`).join(',');
++        const privateIps = addresses.map((record)=>record.address).filter((ip)=>isPrivateIp(ip));
+         if (privateIps.length > 0) {
+             Log.error('upstream image', href, 'hostname resolved to private IP', JSON.stringify(privateIps), 'If this is expected and you understand SSRF risk, use images.dangerouslyAllowLocalIP = true to continue.');
+             throw Object.defineProperty(new ImageError(400, '"url" parameter is not allowed'), "__NEXT_ERROR_CODE", {
+@@ -830,24 +1018,31 @@
+             });
+         }
+     }
+-    const res = await fetch(href, {
+-        signal: AbortSignal.timeout(7000),
+-        redirect: 'manual'
+-    }).catch((err)=>err);
+-    if (res instanceof Error) {
+-        const err = res;
+-        if (err.name === 'TimeoutError') {
+-            Log.error('upstream image response timed out for', href);
+-            throw Object.defineProperty(new ImageError(504, '"url" parameter is valid but upstream response timed out'), "__NEXT_ERROR_CODE", {
+-                value: "E394",
+-                enumerable: false,
+-                configurable: true
+-            });
++    // The signal is owned here rather than by `requestUpstreamImage()` because it
++    // has to stay readable while the body streams. Node reports an abort during
++    // the body as a plain `ECONNRESET` on the response, so the signal is the only
++    // way to tell a timeout apart from the upstream resetting the connection.
++    const signal = AbortSignal.timeout(agentOptions.timeout);
++    let res;
++    try {
++        res = await requestUpstreamImage(url, pinnedLookup, imageLookupKey, dangerouslyAllowLocalIP, signal);
++    } catch (err) {
++        if (signal.aborted) {
++            throw upstreamTimedOut(href);
+         }
+         throw err;
+     }
+-    const locationHeader = res.headers.get('Location');
+-    if (isRedirect(res.status) && locationHeader && URL.canParse(locationHeader, href)) {
++    const statusCode = res.statusCode;
++    if (statusCode === undefined) {
++        res.destroy();
++        throw new InvariantError('Expected statusCode on upstream image response');
++    }
++    const locationHeader = res.headers.location;
++    if (isRedirect(statusCode) && locationHeader && URL.canParse(locationHeader, href)) {
++        // Discard the body rather than draining it. A redirect body is never used,
++        // and draining one would download unlimited bytes from the upstream because
++        // `maximumResponseBody` is only enforced on the final response.
++        res.destroy();
+         if (count === 0) {
+             Log.error('upstream image response had too many redirects', href);
+             throw Object.defineProperty(new ImageError(508, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+@@ -859,15 +1054,41 @@
+         const redirect = new URL(locationHeader, href).href;
+         return fetchExternalImage(redirect, dangerouslyAllowLocalIP, maximumResponseBody, count - 1);
+     }
+-    if (!res.ok) {
+-        Log.error('upstream image response failed for', href, res.status);
+-        throw Object.defineProperty(new ImageError(res.status, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
++    if (statusCode < 200 || statusCode > 299) {
++        res.destroy();
++        Log.error('upstream image response failed for', href, statusCode);
++        throw Object.defineProperty(new ImageError(statusCode, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+             value: "E394",
+             enumerable: false,
+             configurable: true
+         });
+     }
+-    if (!res.body) {
++    const chunks = [];
++    let totalSize = 0;
++    try {
++        const body = decodeResponseBody(res, href);
++        // Throwing out of this loop destroys the response, so an oversized or
++        // timed out download stops instead of running to completion.
++        for await (const chunk of body){
++            totalSize += chunk.byteLength;
++            if (totalSize > maximumResponseBody) {
++                Log.error('upstream image response exceeded maximum size for', href, totalSize);
++                throw Object.defineProperty(new ImageError(413, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
++                    value: "E394",
++                    enumerable: false,
++                    configurable: true
++                });
++            }
++            chunks.push(chunk);
++        }
++    } catch (err) {
++        res.destroy();
++        if (signal.aborted) {
++            throw upstreamTimedOut(href);
++        }
++        throw err;
++    }
++    if (totalSize === 0) {
+         Log.error('upstream image response is empty for', href);
+         throw Object.defineProperty(new ImageError(400, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+             value: "E394",
+@@ -875,25 +1096,10 @@
+             configurable: true
+         });
+     }
+-    const chunks = [];
+-    let totalSize = 0;
+-    for await (const c of res.body){
+-        const chunk = Buffer.from(c);
+-        totalSize += chunk.byteLength;
+-        if (totalSize > maximumResponseBody) {
+-            Log.error('upstream image response exceeded maximum size for', href, totalSize);
+-            throw Object.defineProperty(new ImageError(413, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+-                value: "E394",
+-                enumerable: false,
+-                configurable: true
+-            });
+-        }
+-        chunks.push(chunk);
+-    }
+     const buffer = Buffer.concat(chunks);
+-    const contentType = res.headers.get('Content-Type');
+-    const cacheControl = res.headers.get('Cache-Control');
+-    const etag = extractEtag(res.headers.get('ETag'), buffer);
++    const contentType = res.headers['content-type'];
++    const cacheControl = res.headers['cache-control'];
++    const etag = extractEtag(res.headers.etag, buffer);
+     return {
+         buffer,
+         contentType,
+--- a/dist/server/image-optimizer.d.ts
++++ b/dist/server/image-optimizer.d.ts
+@@ -1,4 +1,6 @@
+ import type { IncomingMessage, ServerResponse } from 'http';
++import type { LookupFunction } from 'net';
++import type { LookupAddress } from 'dns';
+ import type { ImageConfigComplete } from '../shared/lib/image-config';
+ import type { NextConfigComplete, NextConfigRuntime } from './config-shared';
+ import type { NextUrlWithParsedQuery } from './request-meta';
+@@ -75,6 +77,7 @@
+     sequentialRead?: boolean | null;
+     timeoutInSeconds?: number;
+ }): Promise<Buffer>;
++export declare function createPinnedLookup(hostname: string, addresses: LookupAddress[]): LookupFunction;
+ export declare function fetchExternalImage(href: string, dangerouslyAllowLocalIP: boolean, maximumResponseBody: number, count?: number): Promise<ImageUpstream>;
+ export declare function fetchInternalImage(href: string, _req: IncomingMessage, _res: ServerResponse, maximumResponseBody: number, handleRequest: (newReq: IncomingMessage, newRes: ServerResponse, newParsedUrl?: NextUrlWithParsedQuery) => Promise<void>): Promise<ImageUpstream>;
+ export declare function imageOptimizer(imageUpstream: ImageUpstream, paramsResult: Pick<ImageParamsResult, 'href' | 'width' | 'quality' | 'mimeType'>, nextConfig: {
+--- a/dist/server/image-optimizer.js
++++ b/dist/server/image-optimizer.js
+@@ -7,6 +7,7 @@
+     ImageOptimizerCache: null,
+     detectContentType: null,
+     extractEtag: null,
++    createPinnedLookup: null,
+     fetchExternalImage: null,
+     fetchInternalImage: null,
+     getHash: null,
+@@ -38,6 +39,9 @@
+     extractEtag: function() {
+         return extractEtag;
+     },
++    createPinnedLookup: function() {
++        return createPinnedLookup;
++    },
+     fetchExternalImage: function() {
+         return fetchExternalImage;
+     },
+@@ -918,25 +922,214 @@
+         308
+     ].includes(statusCode);
+ }
++const { Agent: HttpAgent, request: httpRequest } = require("http");
++const { Agent: HttpsAgent, request: httpsRequest } = require("https");
++const { pipeline, Transform } = require("stream");
++const { constants: zlibConstants, createBrotliDecompress, createGunzip, createInflate, createInflateRaw } = require("zlib");
++const { ADDRCONFIG } = require("dns");
++function upstreamTimedOut(href) {
++    _log.error('upstream image response timed out for', href);
++    return new ImageError(504, '"url" parameter is valid but upstream response timed out');
++}
++const agentOptions = {
++    keepAlive: true,
++    timeout: 7000
++};
++const getHttpAgentName = HttpAgent.prototype.getName;
++const getHttpsAgentName = HttpsAgent.prototype.getName;
++class ImageHttpAgent extends HttpAgent {
++    getName(options = {}) {
++        return `${getHttpAgentName.call(this, options)}:${options.imageLookupKey ?? ''}`;
++    }
++}
++class ImageHttpsAgent extends HttpsAgent {
++    getName(options = {}) {
++        return `${getHttpsAgentName.call(this, options)}:${options.imageLookupKey ?? ''}`;
++    }
++}
++let protectedHttpAgent;
++let protectedHttpsAgent;
++let permissiveHttpAgent;
++let permissiveHttpsAgent;
++function getImageAgent(dangerouslyAllowLocalIP, isHttps) {
++    if (isHttps) {
++        if (dangerouslyAllowLocalIP) {
++            return permissiveHttpsAgent ??= new ImageHttpsAgent(agentOptions);
++        }
++        return protectedHttpsAgent ??= new ImageHttpsAgent(agentOptions);
++    }
++    if (dangerouslyAllowLocalIP) {
++        return permissiveHttpAgent ??= new ImageHttpAgent(agentOptions);
++    }
++    return protectedHttpAgent ??= new ImageHttpAgent(agentOptions);
++}
++const BASE_REQ_HEADERS = {
++    accept: '*/*',
++    'accept-language': '*',
++    'sec-fetch-mode': 'cors',
++    'user-agent': 'node'
++};
++const HTTP_FETCH_HEADERS = {
++    ...BASE_REQ_HEADERS,
++    'accept-encoding': 'gzip, deflate'
++};
++const HTTPS_FETCH_HEADERS = {
++    ...BASE_REQ_HEADERS,
++    'accept-encoding': 'br, gzip, deflate'
++};
++/**
++ * Resolves `hostname` with the DNS options the socket itself would have used,
++ * so the addresses checked below are the exact set the connection can reach.
++ * Mirrors `lookupAndConnect()` in Node's `lib/net.js`.
++ */ function lookupAsSocketWould(hostname) {
++    return (0, _promises.lookup)(hostname, {
++        all: true,
++        // Node applies ADDRCONFIG whenever no address family is requested,
++        // on every platform except Windows.
++        hints: process.platform === 'win32' ? 0 : ADDRCONFIG
++    });
++}
++/**
++ * Pins the connection to `addresses` instead of letting it resolve `hostname`
++ * a second time. Checking addresses up front only proves where the name
++ * pointed at that moment; the socket runs its own lookup, so a record that
++ * changes in between (DNS rebinding) would otherwise still reach a private IP.
++ *
++ * Every address in the list was checked, so all of them are handed back to
++ * keep Node's happy eyeballs failover between IPv6 and IPv4 intact.
++ */ function createPinnedLookup(hostname, addresses) {
++    return (lookupHostname, options, callback)=>{
++        if (lookupHostname !== hostname) {
++            callback(new _invarianterror.InvariantError(`Image lookup hostname "${lookupHostname}" does not match request hostname "${hostname}"`), []);
++            return;
++        }
++        const family = typeof options.family === 'number' ? options.family : 0;
++        const matched = family ? addresses.filter((address)=>address.family === family) : addresses;
++        if (matched.length === 0) {
++            // Reporting this as an error rather than an empty list is not optional:
++            // Node destructures the first address, so the resulting TypeError is
++            // thrown inside the socket and escapes the request entirely.
++            const err = new Error(`No IPv${family} address available for ${hostname}`);
++            err.code = 'ENODATA';
++            callback(err, []);
++            return;
++        }
++        if (options.all) {
++            callback(null, matched);
++        } else {
++            callback(null, matched[0].address, matched[0].family);
++        }
++    };
++}
++function requestUpstreamImage(url, pinnedLookup, imageLookupKey, dangerouslyAllowLocalIP, signal) {
++    return new Promise((resolve, reject)=>{
++        const isHttps = url.protocol === 'https:';
++        const request = isHttps ? httpsRequest : httpRequest;
++        const options = {
++            agent: getImageAgent(dangerouslyAllowLocalIP, isHttps),
++            headers: isHttps ? HTTPS_FETCH_HEADERS : HTTP_FETCH_HEADERS,
++            imageLookupKey,
++            lookup: pinnedLookup,
++            signal
++        };
++        const req = request(url, options, resolve);
++        req.on('error', reject);
++        req.end();
++    });
++}
++class DeflateDecoder extends Transform {
++    constructor(){
++        super();
++        this.decoder = undefined;
++    }
++    _transform(chunk, encoding, callback) {
++        if (!this.decoder) {
++            if (chunk.length === 0) {
++                callback();
++                return;
++            }
++            const options = {
++                flush: zlibConstants.Z_SYNC_FLUSH,
++                finishFlush: zlibConstants.Z_SYNC_FLUSH
++            };
++            this.decoder = (chunk[0] & 0x0f) === 0x08 ? createInflate(options) : createInflateRaw(options);
++            this.decoder.on('data', (data)=>this.push(data));
++            this.decoder.on('end', ()=>this.push(null));
++            this.decoder.on('error', (err)=>this.destroy(err));
++        }
++        this.decoder.write(chunk, encoding, callback);
++    }
++    _final(callback) {
++        this.decoder?.end();
++        this.decoder = undefined;
++        callback();
++    }
++}
++// Matches the chain limit of native fetch (undici), so an upstream cannot
++// force unbounded decoder allocations with the header alone.
++const MAX_CONTENT_ENCODINGS = 5;
++function decodeResponseBody(res, href) {
++    const contentEncoding = res.headers['content-encoding'];
++    if (!contentEncoding) {
++        return res;
++    }
++    const codings = contentEncoding.toLowerCase().split(',');
++    if (codings.length > MAX_CONTENT_ENCODINGS) {
++        _log.error('upstream image response had too many content encodings for', href);
++        throw new ImageError(400, '"url" parameter is valid but upstream response is invalid');
++    }
++    const decoders = [];
++    for(let i = codings.length - 1; i >= 0; i--){
++        switch(codings[i].trim()){
++            case 'x-gzip':
++            case 'gzip':
++                decoders.push(createGunzip({
++                    flush: zlibConstants.Z_SYNC_FLUSH,
++                    finishFlush: zlibConstants.Z_SYNC_FLUSH
++                }));
++                break;
++            case 'deflate':
++                decoders.push(new DeflateDecoder());
++                break;
++            case 'br':
++                decoders.push(createBrotliDecompress({
++                    flush: zlibConstants.BROTLI_OPERATION_FLUSH,
++                    finishFlush: zlibConstants.BROTLI_OPERATION_FLUSH
++                }));
++                break;
++            default:
++                return res;
++        }
++    }
++    pipeline([
++        res,
++        ...decoders
++    ], ()=>{});
++    return decoders[decoders.length - 1];
++}
+ async function fetchExternalImage(href, dangerouslyAllowLocalIP, maximumResponseBody, count = 3) {
++    const url = new URL(href);
++    // `URL.hostname` keeps the brackets around an IPv6 literal, the socket does not
++    const hostname = url.hostname.replace(/^\[|\]$/g, '');
++    let pinnedLookup;
++    let imageLookupKey;
+     if (!dangerouslyAllowLocalIP) {
+-        const { hostname } = new URL(href);
+-        let ips = [
+-            hostname
+-        ];
+-        if (!(0, _net.isIP)(hostname)) {
+-            const records = await (0, _promises.lookup)(hostname, {
+-                family: 0,
+-                all: true,
+-                hints: _dns.ALL
+-            }).catch((_)=>[
+-                    {
+-                        address: hostname
+-                    }
+-                ]);
+-            ips = records.map((record)=>record.address);
++        const literalFamily = (0, _net.isIP)(hostname);
++        let addresses;
++        if (literalFamily > 0) {
++            // A literal address is connected to as-is, without any DNS resolution
++            addresses = [
++                {
++                    address: hostname,
++                    family: literalFamily
++                }
++            ];
++        } else {
++            addresses = await lookupAsSocketWould(hostname);
++            pinnedLookup = createPinnedLookup(hostname, addresses);
+         }
+-        const privateIps = ips.filter((ip)=>(0, _isprivateip.isPrivateIp)(ip));
++        imageLookupKey = addresses.map((address)=>`${address.family}:${address.address}`).join(',');
++        const privateIps = addresses.map((record)=>record.address).filter((ip)=>(0, _isprivateip.isPrivateIp)(ip));
+         if (privateIps.length > 0) {
+             _log.error('upstream image', href, 'hostname resolved to private IP', JSON.stringify(privateIps), 'If this is expected and you understand SSRF risk, use images.dangerouslyAllowLocalIP = true to continue.');
+             throw Object.defineProperty(new ImageError(400, '"url" parameter is not allowed'), "__NEXT_ERROR_CODE", {
+@@ -946,24 +1139,31 @@
+             });
+         }
+     }
+-    const res = await fetch(href, {
+-        signal: AbortSignal.timeout(7000),
+-        redirect: 'manual'
+-    }).catch((err)=>err);
+-    if (res instanceof Error) {
+-        const err = res;
+-        if (err.name === 'TimeoutError') {
+-            _log.error('upstream image response timed out for', href);
+-            throw Object.defineProperty(new ImageError(504, '"url" parameter is valid but upstream response timed out'), "__NEXT_ERROR_CODE", {
+-                value: "E394",
+-                enumerable: false,
+-                configurable: true
+-            });
++    // The signal is owned here rather than by `requestUpstreamImage()` because it
++    // has to stay readable while the body streams. Node reports an abort during
++    // the body as a plain `ECONNRESET` on the response, so the signal is the only
++    // way to tell a timeout apart from the upstream resetting the connection.
++    const signal = AbortSignal.timeout(agentOptions.timeout);
++    let res;
++    try {
++        res = await requestUpstreamImage(url, pinnedLookup, imageLookupKey, dangerouslyAllowLocalIP, signal);
++    } catch (err) {
++        if (signal.aborted) {
++            throw upstreamTimedOut(href);
+         }
+         throw err;
+     }
+-    const locationHeader = res.headers.get('Location');
+-    if (isRedirect(res.status) && locationHeader && URL.canParse(locationHeader, href)) {
++    const statusCode = res.statusCode;
++    if (statusCode === undefined) {
++        res.destroy();
++        throw new _invarianterror.InvariantError('Expected statusCode on upstream image response');
++    }
++    const locationHeader = res.headers.location;
++    if (isRedirect(statusCode) && locationHeader && URL.canParse(locationHeader, href)) {
++        // Discard the body rather than draining it. A redirect body is never used,
++        // and draining one would download unlimited bytes from the upstream because
++        // `maximumResponseBody` is only enforced on the final response.
++        res.destroy();
+         if (count === 0) {
+             _log.error('upstream image response had too many redirects', href);
+             throw Object.defineProperty(new ImageError(508, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+@@ -975,15 +1175,41 @@
+         const redirect = new URL(locationHeader, href).href;
+         return fetchExternalImage(redirect, dangerouslyAllowLocalIP, maximumResponseBody, count - 1);
+     }
+-    if (!res.ok) {
+-        _log.error('upstream image response failed for', href, res.status);
+-        throw Object.defineProperty(new ImageError(res.status, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
++    if (statusCode < 200 || statusCode > 299) {
++        res.destroy();
++        _log.error('upstream image response failed for', href, statusCode);
++        throw Object.defineProperty(new ImageError(statusCode, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+             value: "E394",
+             enumerable: false,
+             configurable: true
+         });
+     }
+-    if (!res.body) {
++    const chunks = [];
++    let totalSize = 0;
++    try {
++        const body = decodeResponseBody(res, href);
++        // Throwing out of this loop destroys the response, so an oversized or
++        // timed out download stops instead of running to completion.
++        for await (const chunk of body){
++            totalSize += chunk.byteLength;
++            if (totalSize > maximumResponseBody) {
++                _log.error('upstream image response exceeded maximum size for', href, totalSize);
++                throw Object.defineProperty(new ImageError(413, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
++                    value: "E394",
++                    enumerable: false,
++                    configurable: true
++                });
++            }
++            chunks.push(chunk);
++        }
++    } catch (err) {
++        res.destroy();
++        if (signal.aborted) {
++            throw upstreamTimedOut(href);
++        }
++        throw err;
++    }
++    if (totalSize === 0) {
+         _log.error('upstream image response is empty for', href);
+         throw Object.defineProperty(new ImageError(400, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+             value: "E394",
+@@ -991,25 +1217,10 @@
+             configurable: true
+         });
+     }
+-    const chunks = [];
+-    let totalSize = 0;
+-    for await (const c of res.body){
+-        const chunk = Buffer.from(c);
+-        totalSize += chunk.byteLength;
+-        if (totalSize > maximumResponseBody) {
+-            _log.error('upstream image response exceeded maximum size for', href, totalSize);
+-            throw Object.defineProperty(new ImageError(413, '"url" parameter is valid but upstream response is invalid'), "__NEXT_ERROR_CODE", {
+-                value: "E394",
+-                enumerable: false,
+-                configurable: true
+-            });
+-        }
+-        chunks.push(chunk);
+-    }
+     const buffer = Buffer.concat(chunks);
+-    const contentType = res.headers.get('Content-Type');
+-    const cacheControl = res.headers.get('Cache-Control');
+-    const etag = extractEtag(res.headers.get('ETag'), buffer);
++    const contentType = res.headers['content-type'];
++    const cacheControl = res.headers['cache-control'];
++    const etag = extractEtag(res.headers.etag, buffer);
+     return {
+         buffer,
+         contentType,
