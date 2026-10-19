@@ -9,6 +9,7 @@ unknown
 - CVE-2026-44240
 - AIKIDO-2026-424618
 - GHSA-6v7q-wjvx-w8wg
+- CVE-2026-102990
 
 ## How to Apply:
 1. Clone or download the source code for basic-ftp
