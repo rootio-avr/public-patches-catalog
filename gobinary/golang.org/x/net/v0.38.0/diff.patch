@@ -31623,3 +31623,1451 @@ index fa45bb9..0000000
 +|               onerror="alert(1)"
 +|               src="1"
 +|             "-->"
+
+--- a/http2/frame.go
++++ b/http2/frame.go
+@@ -1711,7 +1711,8 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
+ 	mh := &MetaHeadersFrame{
+ 		HeadersFrame: hf,
+ 	}
+-	var remainSize = fr.maxHeaderListSize()
++	var headersRemainSize = fr.maxHeaderListSize()
++	var trailersRemainSize = fr.maxHeaderListSize()
+ 	var sawRegular bool
+ 
+ 	var invalid error // pseudo header field errors
+@@ -1743,14 +1744,29 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
+ 			return
+ 		}
+ 
+-		size := hf.Size()
+-		if size > remainSize {
++		var remainSize *uint32
++		var size uint32
++		if hf.Name == "trailer" {
++			remainSize = &trailersRemainSize
++			fieldCount := strings.Count(hf.Value, ",") + 1
++			// Rather than actually constructing hpack.HeaderField for each
++			// trailer field and cumulatively adding its Size, just do the math
++			// manually to avoid unnecessary work. This does make it so
++			// whitespaces after comma are counted against the budget, but that
++			// should be innocuous.
++			size = uint32(len(hf.Value)-fieldCount+1) + uint32(fieldCount)*hpack.HeaderField{}.Size()
++		} else {
++			remainSize = &headersRemainSize
++			size = hf.Size()
++		}
++		if size > *remainSize {
+ 			hdec.SetEmitEnabled(false)
+ 			mh.Truncated = true
+-			remainSize = 0
++			headersRemainSize = 0
++			trailersRemainSize = 0
+ 			return
+ 		}
+-		remainSize -= size
++		*remainSize -= size
+ 
+ 		mh.Fields = append(mh.Fields, hf)
+ 	})
+@@ -1766,10 +1782,10 @@ func (fr *Framer) readMetaFrame(hf *HeadersFrame) (Frame, error) {
+ 		// skip parsing the fragment and close the connection.
+ 		//
+ 		// "Too much" is either any CONTINUATION frame after we've already
+-		// exceeded the max header list size (in which case remainSize is 0),
+-		// or a frame whose encoded size is more than twice the remaining
+-		// header list bytes we're willing to accept.
+-		if int64(len(frag)) > int64(2*remainSize) {
++		// exceeded the max header list size (if so, both budgets are 0), or a
++		// frame whose encoded size is more than twice the remaining header
++		// list bytes we're willing to accept.
++		if int64(len(frag)) > 2*int64(headersRemainSize+trailersRemainSize) {
+ 			if VerboseLogs {
+ 				log.Printf("http2: header list too large")
+ 			}
+--- a/http2/frame_test.go
++++ b/http2/frame_test.go
+@@ -1129,6 +1129,15 @@ func TestMetaFrameHeader(t *testing.T) {
+ 
+ 	oneKBString := strings.Repeat("a", 1<<10)
+ 
++	// A Trailer declaration of 20 fields: ~250 bytes on the wire, but ~900
++	// bytes by our accounting since we add 32 bytes for each entry in
++	// Request.Trailer.
++	var trailerNames []string
++	for i := range 20 {
++		trailerNames = append(trailerNames, fmt.Sprintf("x-trailer-%d", i))
++	}
++	trailerDecl := strings.Join(trailerNames, ",")
++
+ 	tests := [...]struct {
+ 		name              string
+ 		w                 func(*Framer)
+@@ -1266,6 +1275,29 @@ func TestMetaFrameHeader(t *testing.T) {
+ 			want:          streamError(1, ErrCodeProtocol),
+ 			wantErrReason: `invalid header field value for "key"`,
+ 		},
++		13: {
++			name: "trailer_declaration_okay",
++			w: func(f *Framer) {
++				write(f, encodeHeaderRaw(t, ":method", "GET", ":path", "/", "trailer", trailerDecl))
++			},
++			maxHeaderListSize: 1024,
++			want: want(FlagHeadersEndHeaders, 193,
++				":method", "GET",
++				":path", "/",
++				"trailer", trailerDecl,
++			),
++		},
++		14: {
++			name: "trailer_declaration_truncated",
++			w: func(f *Framer) {
++				write(f, encodeHeaderRaw(t, ":method", "GET", ":path", "/", "trailer", trailerDecl))
++			},
++			maxHeaderListSize: 512,
++			want: truncated(want(FlagHeadersEndHeaders, 193,
++				":method", "GET",
++				":path", "/",
++			)),
++		},
+ 	}
+ 	for i, tt := range tests {
+ 		buf := new(bytes.Buffer)
+
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -25,6 +25,7 @@
+ 	"net/http"
+ 	"net/http/httptrace"
+ 	"net/textproto"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 	"sync"
+@@ -2473,20 +2474,45 @@
+ 		return nil, nil
+ 	}
+ 
++	// Delete various headers that might mess up framing for HTTP/1. This is
++	// not a problem for HTTP/2, but someone might use HTTP/2 transport as a
++	// reverse proxy which forwards the response to an HTTP/1 client. Our
++	// HTTP/1 client transport will properly reject improper headers such as
++	// multiple conflicting Content-Length headers, but other implementations
++	// might not.
++	// TODO: just reject such responses? We deleted them for compatibility
++	// since this was done in a security fix (go.dev/issue/81115). However,
++	// rejecting them seems entirely reasonable and relatively safe.
++
++	// Connection-specific header fields must not appear in an HTTP/2 message,
++	// and any message containing them is malformed. RFC 9113, Section 8.2.2.
++	for _, k := range connHeaders {
++		delete(res.Header, k)
++	}
+ 	res.ContentLength = -1
+-	if clens := res.Header["Content-Length"]; len(clens) == 1 {
+-		if cl, err := strconv.ParseUint(clens[0], 10, 63); err == nil {
+-			res.ContentLength = int64(cl)
++	if clens, ok := res.Header["Content-Length"]; ok {
++		// Repeated Content-Length values may be collapsed into one only if
++		// they are identical per RFC 9110 Section 8.6.
++		// No need to trim whitespace, HTTP/2 header values must not have
++		// extraneous whitespace per RFC 9113 Section 8.2.1.
++		// Non-canonical headers are already rejected by our framer at this
++		// point.
++		conflicting := slices.ContainsFunc(clens[1:], func(clen string) bool {
++			return clen != clens[0]
++		})
++		cl, err := strconv.ParseUint(clens[0], 10, 63)
++		if conflicting || err != nil {
++			delete(res.Header, "Content-Length")
+ 		} else {
+-			// TODO: care? unlike http/1, it won't mess up our framing, so it's
+-			// more safe smuggling-wise to ignore.
++			res.Header["Content-Length"] = clens[:1]
++			res.ContentLength = int64(cl)
+ 		}
+-	} else if len(clens) > 1 {
+-		// TODO: care? unlike http/1, it won't mess up our framing, so it's
+-		// more safe smuggling-wise to ignore.
+-	} else if f.StreamEnded() && !cs.isHead {
++	}
++
++	if res.ContentLength < 0 && f.StreamEnded() && !cs.isHead {
+ 		res.ContentLength = 0
+ 	}
++
+ 
+ 	if cs.isHead {
+ 		res.Body = noBody
+--- a/http2/transport_test.go
++++ b/http2/transport_test.go
+@@ -17,6 +17,7 @@
+ 	"io"
+ 	"io/fs"
+ 	"log"
++	"maps"
+ 	"math/rand"
+ 	"net"
+ 	"net/http"
+@@ -27,6 +28,7 @@
+ 	"os"
+ 	"reflect"
+ 	"runtime"
++	"slices"
+ 	"sort"
+ 	"strconv"
+ 	"strings"
+@@ -2116,6 +2118,161 @@
+ 
+ 			if got != tt.wantCL {
+ 				t.Fatalf("Got: %q\nWant: %q", got, tt.wantCL)
++			}
++		})
++	}
++}
++
++// TestTransportResponseContentLength checks that a Content-Length we cannot
++// validate is dropped from the response rather than passed on to the caller,
++// who may be forwarding it to an HTTP/1 endpoint.
++func TestTransportResponseContentLength(t *testing.T) {
++	tests := []struct {
++		name     string
++		clValues []string
++		wantLen  int // -1 means the header is expected to be dropped.
++	}{
++		{
++			name:     "single value",
++			clValues: []string{"3"},
++			wantLen:  3,
++		},
++		{
++			name:     "identical duplicate values",
++			clValues: []string{"3", "3", "3"},
++			wantLen:  3,
++		},
++		{
++			name:     "different duplicate values",
++			clValues: []string{"3", "1", "3"},
++			wantLen:  -1,
++		},
++		{
++			name:     "extraneous whitespace",
++			clValues: []string{" 3"},
++			wantLen:  -1,
++		},
++		{
++			name:     "identical duplicate values with extraneous whitespace",
++			clValues: []string{"3", "3", " 3"},
++			wantLen:  -1,
++		},
++		{
++			name:     "plus sign",
++			clValues: []string{"+3"},
++			wantLen:  -1,
++		},
++		{
++			name:     "non-numeric",
++			clValues: []string{"abc"},
++			wantLen:  -1,
++		},
++		{
++			name:     "empty value",
++			clValues: []string{""},
++			wantLen:  -1,
++		},
++		{
++			name:    "no header",
++			wantLen: -1,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			tc := newTestClientConn(t)
++			tc.greet()
++
++			req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
++			rt := tc.roundTrip(req)
++
++			headers := []string{":status", "200"}
++			for _, val := range tt.clValues {
++				headers = append(headers, "content-length", val)
++			}
++			tc.wantFrameType(FrameHeaders)
++			tc.writeHeaders(HeadersFrameParam{
++				StreamID:      rt.streamID(),
++				EndHeaders:    true,
++				BlockFragment: tc.makeHeaderBlockFragment(headers...),
++			})
++			body := slices.Repeat([]byte("a"), max(tt.wantLen, 1))
++			tc.writeData(rt.streamID(), true, body)
++
++			res := rt.response()
++			rt.wantBody(body)
++
++			if res.ContentLength != int64(tt.wantLen) {
++				t.Errorf("got ContentLength = %d, want %d", res.ContentLength, tt.wantLen)
++			}
++			var wantHeader []string
++			if tt.wantLen >= 0 {
++				wantHeader = []string{strconv.FormatInt(int64(tt.wantLen), 10)}
++			}
++			if got := res.Header["Content-Length"]; !slices.Equal(got, wantHeader) {
++				t.Errorf("got Header[%q] = %q, want %q", "Content-Length", got, wantHeader)
++			}
++		})
++	}
++}
++
++// TestTransportResponseConnHeaders checks that connection-related headers,
++// which are not valid in HTTP/2 and which an HTTP/1 endpoint may use for
++// framing, are dropped from the response.
++func TestTransportResponseConnHeaders(t *testing.T) {
++	tests := []struct {
++		name       string
++		fields     []string
++		wantHeader http.Header
++	}{
++		{
++			name:       "unaffected header",
++			fields:     []string{"content-type", "text/plain"},
++			wantHeader: http.Header{"Content-Type": {"text/plain"}},
++		},
++		{
++			name:   "transfer-encoding",
++			fields: []string{"transfer-encoding", "chunked"},
++		},
++		{
++			name:   "transfer-encoding alongside content-length",
++			fields: []string{"content-length", "-1", "transfer-encoding", "chunked"},
++		},
++		{
++			name:   "connection and keep-alive",
++			fields: []string{"connection", "keep-alive", "keep-alive", "timeout=5"},
++		},
++		{
++			name:   "proxy-connection",
++			fields: []string{"proxy-connection", "keep-alive"},
++		},
++		{
++			name:   "upgrade",
++			fields: []string{"upgrade", "websocket"},
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			tc := newTestClientConn(t)
++			tc.greet()
++
++			req, _ := http.NewRequest("GET", "https://dummy.tld/", nil)
++			rt := tc.roundTrip(req)
++
++			headers := []string{":status", "200"}
++			headers = append(headers, tt.fields...)
++			tc.wantFrameType(FrameHeaders)
++			tc.writeHeaders(HeadersFrameParam{
++				StreamID:      rt.streamID(),
++				EndHeaders:    true,
++				BlockFragment: tc.makeHeaderBlockFragment(headers...),
++			})
++			tc.writeData(rt.streamID(), true, []byte("body"))
++
++			res := rt.response()
++			rt.wantBody([]byte("body"))
++
++			if !maps.EqualFunc(res.Header, tt.wantHeader, slices.Equal) {
++				t.Errorf("got Header = %q, want %q", res.Header, tt.wantHeader)
+ 			}
+ 		})
+ 	}
+
+--- a/http2/server.go
++++ b/http2/server.go
+@@ -676,7 +676,8 @@
+ 	// immutable:
+ 	sc        *serverConn
+ 	id        uint32
+-	body      *pipe       // non-nil if expecting DATA frames
++	body      *pipe // non-nil if expecting DATA frames
++	reqBody   *requestBody
+ 	cw        closeWaiter // closed wait stream transitions to closed state
+ 	ctx       context.Context
+ 	cancelCtx func()
+@@ -1740,10 +1741,6 @@
+ 		}
+ 	}
+ 	if p := st.body; p != nil {
+-		// Return any buffered unread bytes worth of conn-level flow control.
+-		// See golang.org/issue/16481
+-		sc.sendWindowUpdate(nil, p.Len())
+-
+ 		p.CloseWithError(err)
+ 	}
+ 	if e, ok := err.(StreamError); ok {
+@@ -2098,7 +2095,7 @@
+ 	if st.reqTrailer != nil {
+ 		st.trailer = make(http.Header)
+ 	}
+-	st.body = req.Body.(*requestBody).pipe // may be nil
++	st.body = st.reqBody.pipe // may be nil
+ 	st.declBodyBytes = req.ContentLength
+ 
+ 	handler := sc.handler.ServeHTTP
+@@ -2121,7 +2118,7 @@
+ 		st.readDeadline = sc.srv.afterFunc(sc.hs.ReadTimeout, st.onReadTimeout)
+ 	}
+ 
+-	return sc.scheduleHandler(id, rw, req, handler)
++	return sc.scheduleHandler(st, rw, req, handler)
+ }
+ 
+ func (sc *serverConn) upgradeRequest(req *http.Request) {
+@@ -2295,7 +2292,7 @@
+ 		} else {
+ 			req.ContentLength = -1
+ 		}
+-		req.Body.(*requestBody).pipe = &pipe{
++		st.reqBody.pipe = &pipe{
+ 			b: &dataBuffer{expected: req.ContentLength},
+ 		}
+ 	}
+@@ -2315,7 +2312,7 @@
+ 		return nil, nil, sc.countError(res.InvalidReason, streamError(st.id, ErrCodeProtocol))
+ 	}
+ 
+-	body := &requestBody{
++	st.reqBody = &requestBody{
+ 		conn:          sc,
+ 		stream:        st,
+ 		needsContinue: res.NeedsContinue,
+@@ -2331,7 +2328,7 @@
+ 		ProtoMinor: 0,
+ 		TLS:        tlsState,
+ 		Host:       rp.Authority,
+-		Body:       body,
++		Body:       st.reqBody,
+ 		Trailer:    res.Trailer,
+ 	}).WithContext(st.ctx)
+ 	rw := sc.newResponseWriter(st, req)
+@@ -2355,11 +2352,12 @@
+ 	rw       *responseWriter
+ 	req      *http.Request
+ 	handler  func(http.ResponseWriter, *http.Request)
++	body     *pipe
+ }
+ 
+ // scheduleHandler starts a handler goroutine,
+ // or schedules one to start as soon as an existing handler finishes.
+-func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
++func (sc *serverConn) scheduleHandler(st *stream, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
+ 	sc.serveG.check()
+ 	maxHandlers := sc.advMaxStreams
+ 	if sc.curHandlers < maxHandlers {
+@@ -2371,10 +2369,11 @@
+ 		return sc.countError("too_many_early_resets", ConnectionError(ErrCodeEnhanceYourCalm))
+ 	}
+ 	sc.unstartedHandlers = append(sc.unstartedHandlers, unstartedHandler{
+-		streamID: streamID,
++		streamID: st.id,
+ 		rw:       rw,
+ 		req:      req,
+ 		handler:  handler,
++		body:     st.body,
+ 	})
+ 	return nil
+ }
+@@ -2388,6 +2387,10 @@
+ 		u := sc.unstartedHandlers[i]
+ 		if sc.streams[u.streamID] == nil {
+ 			// This stream was reset before its goroutine had a chance to start.
++			if u.body != nil {
++				u.body.BreakWithError(errClosedBody)
++				sc.sendWindowUpdate(nil, u.body.Len())
++			}
+ 			continue
+ 		}
+ 		if sc.curHandlers >= maxHandlers {
+@@ -2410,6 +2413,12 @@
+ 	didPanic := true
+ 	defer func() {
+ 		rw.rws.stream.cancelCtx()
++		if b := rw.rws.stream.reqBody; b != nil {
++			// Closing the body refunds flow control credit for any unconsumed data.
++			// (reqBody is nil for Upgrade: h2c requests, but those do not use flow
++			// control for the request body.)
++			b.Close()
++		}
+ 		if req.MultipartForm != nil {
+ 			req.MultipartForm.RemoveAll()
+ 		}
+@@ -2508,7 +2517,7 @@
+ func (sc *serverConn) noteBodyRead(st *stream, n int) {
+ 	sc.serveG.check()
+ 	sc.sendWindowUpdate(nil, n) // conn-level
+-	if st.state != stateHalfClosedRemote && st.state != stateClosed {
++	if st != nil && st.state != stateHalfClosedRemote && st.state != stateClosed {
+ 		// Don't send this WINDOW_UPDATE if the stream is closed
+ 		// remotely.
+ 		sc.sendWindowUpdate(st, n)
+@@ -2556,6 +2565,9 @@
+ 	b.closeOnce.Do(func() {
+ 		if b.pipe != nil {
+ 			b.pipe.BreakWithError(errClosedBody)
++			if unread := b.pipe.Len(); unread > 0 {
++				b.conn.noteBodyReadFromHandler(nil, unread, errClosedBody)
++			}
+ 		}
+ 	})
+ 	return nil
+--- a/http2/server_test.go
++++ b/http2/server_test.go
+@@ -3649,6 +3649,162 @@
+ 	})
+ }
+ 
++// TestServerResetStreamUnreadBody verifies that flow control for data buffered
++// in a request body is returned exactly once, no matter whether the stream is
++// reset before or after the handler reads the data (or exits without reading it).
++func TestServerResetStreamUnreadBody(t *testing.T) {
++	const size = inflowMinRefresh // enough to trigger flow control return
++
++	// startPost opens stream id with a request body, and sends size bytes of data.
++	startPost := func(st *serverTester, id uint32) {
++		st.writeHeaders(HeadersFrameParam{
++			StreamID:      id,
++			BlockFragment: st.encodeHeader(":method", "POST"),
++			EndHeaders:    true,
++		})
++		st.writeData(id, false, make([]byte, size))
++	}
++
++	t.Run("read_after_reset", func(t *testing.T) {
++		proceed := make(chan struct{})
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			<-proceed
++			io.ReadAll(r.Body)
++		})
++		defer st.Close()
++
++		st.greet()
++		startPost(st, 1)
++		st.writeRSTStream(1, ErrCodeCancel)
++		st.sync()
++
++		// The handler reads the body after the stream has been reset.
++		close(proceed)
++		st.wantWindowUpdate(0, size)
++
++		// Handler exits; no second refund.
++		st.sync()
++		st.wantIdle()
++	})
++
++	t.Run("exit_without_reading", func(t *testing.T) {
++		proceed := make(chan struct{})
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			<-proceed
++		})
++		defer st.Close()
++
++		st.greet()
++		startPost(st, 1)
++		st.writeRSTStream(1, ErrCodeCancel)
++		st.sync()
++
++		// The handler exits without reading the body.
++		// Flow control is returned on exit.
++		close(proceed)
++		st.wantWindowUpdate(0, size)
++		st.sync()
++		st.wantIdle()
++	})
++
++	t.Run("read_after_handler_exit", func(t *testing.T) {
++		proceed := make(chan struct{})
++		bodyc := make(chan io.ReadCloser, 1)
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			bodyc <- r.Body
++			<-proceed
++		})
++		defer st.Close()
++
++		st.greet()
++		startPost(st, 1)
++		st.sync()
++
++		// The handler exits without reading the body.
++		close(proceed)
++
++		// Flow control is returned when the handler exits.
++		st.wantUnorderedFrames(
++			func(f *WindowUpdateFrame) bool {
++				return f.StreamID == 0 && f.Increment == size
++			},
++			func(f *HeadersFrame) bool {
++				return f.StreamID == 1 && f.StreamEnded()
++			},
++			func(f *RSTStreamFrame) bool {
++				return f.StreamID == 1 && f.ErrCode == ErrCodeNo
++			},
++		)
++
++		// Reading the body after the handler exits must not cause a double refund.
++		body := <-bodyc
++		io.ReadAll(body)
++		st.sync()
++		st.wantIdle()
++	})
++
++	t.Run("unstarted_handler", func(t *testing.T) {
++		proceed := make(chan struct{})
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			<-proceed
++		}, func(s *Server) {
++			s.MaxConcurrentStreams = 1
++		})
++		defer st.Close()
++
++		st.greet()
++
++		// Stream 1 uses the single handler slot.
++		st.writeHeaders(HeadersFrameParam{
++			StreamID:      1,
++			BlockFragment: st.encodeHeader(),
++			EndStream:     true,
++			EndHeaders:    true,
++		})
++		st.sync()
++
++		// Reset stream 1 so the client can open another stream without
++		// exceeding the concurrent stream limit.
++		st.writeRSTStream(1, ErrCodeCancel)
++
++		// Stream 3 is queued in unstartedHandlers because the handler for
++		// stream 1 is still executing.
++		startPost(st, 3)
++		st.writeRSTStream(3, ErrCodeCancel)
++		st.sync()
++		st.wantIdle()
++
++		// Stream 1 handler exits. Stream 3 is removed from unstartedHandlers
++		// and its flow control is returned.
++		close(proceed)
++		st.wantWindowUpdate(0, size)
++		st.sync()
++		st.wantIdle()
++	})
++
++	// Same thing as exit_without_reading, but some imaginary middleware
++	// replaced Request.Body first.
++	t.Run("middleware_replaces_body", func(t *testing.T) {
++		proceed := make(chan struct{})
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			// Wrap r.Body like some middleware might.
++			r.Body = http.MaxBytesReader(w, r.Body, 1000)
++			<-proceed
++		})
++		defer st.Close()
++
++		st.greet()
++		startPost(st, 1)
++		st.writeRSTStream(1, ErrCodeCancel)
++		st.sync()
++
++		close(proceed)
++		st.wantWindowUpdate(0, size)
++		st.sync()
++		st.wantIdle()
++	})
++}
++
+ func TestServerIdleTimeout(t *testing.T) {
+ 	if testing.Short() {
+ 		t.Skip("skipping in short mode")
+@@ -4109,9 +4265,21 @@
+ 		}
+ 	}
+ 
++	st.wantHeaders(wantHeader{
++		streamID:  1,
++		endStream: true,
++	})
++
+ 	// Writing data after the stream is reset immediately returns flow control credit.
+ 	st.writeData(1, false, content[windowSize/2:])
+-	st.wantWindowUpdate(0, windowSize/2)
++	st.wantUnorderedFrames(
++		func(f *WindowUpdateFrame) bool {
++			return f.StreamID == 0 && f.Increment == windowSize/2
++		},
++		func(f *RSTStreamFrame) bool {
++			return f.StreamID == 1 && f.ErrCode == ErrCodeStreamClosed
++		},
++	)
+ 
+ 	if err := <-errc; err != nil {
+ 		t.Error(err)
+
+--- a/http2/flow.go
++++ b/http2/flow.go
+@@ -10,6 +10,9 @@
+ // flow control window update.
+ const inflowMinRefresh = 4 << 10
+ 
++// maxFlowWindow is the maximum size of a flow control window.
++const maxFlowWindow = (1 << 31) - 1
++
+ // inflow accounts for an inbound flow control window.
+ // It tracks both the latest window sent to the peer (used for enforcement)
+ // and the accumulated unsent window.
+@@ -74,47 +77,99 @@
+ 	return true
+ }
+ 
+-// outflow is the outbound flow control window's size.
++// connOutflow is connection-level outbound flow control.
++type connOutflow struct {
++	initial int32 // SETTINGS_INITIAL_WINDOW_SIZE, changes with settings updates
++	n       int32 // connection-level flow control window
++	flowErr bool  // set when a flow control error is encountered
++}
++
++func (f *connOutflow) init() {
++	f.initial = initialWindowSize // initial stream window size
++	f.n = initialWindowSize       // current connection window size
++}
++
++func (f *connOutflow) changeInitialWindowSize(size int64) bool {
++	if size > maxFlowWindow {
++		f.flowErr = true
++		return false
++	}
++	f.initial = int32(size)
++	return true
++}
++
++func (f *connOutflow) add(n int32) bool {
++	sum := int64(f.n) + int64(n)
++	if sum > maxFlowWindow {
++		f.flowErr = true
++		return false
++	}
++	f.n += n
++	return true
++}
++
++// outflow is the stream-level outbound flow control window's size.
+ type outflow struct {
+ 	_ incomparable
+ 
+-	// n is the number of DATA bytes we're allowed to send.
+-	// An outflow is kept both on a conn and a per-stream.
+-	n int32
++	// delta is the difference between the stream's flow control window and
++	// the connection's initial window size (conn.initial).
++	//
++	// Another view is that delta is the number of flow control bytes provided to this
++	// stream in WINDOW_UPDATE frames, less the number of bytes sent on the stream.
++	delta int32
+ 
+ 	// conn points to the shared connection-level outflow that is
+-	// shared by all streams on that conn. It is nil for the outflow
+-	// that's on the conn directly.
+-	conn *outflow
++	// shared by all streams on that conn.
++	conn *connOutflow
+ }
+ 
+-func (f *outflow) setConnFlow(cf *outflow) { f.conn = cf }
+-
+-func (f *outflow) available() int32 {
+-	n := f.n
+-	if f.conn != nil && f.conn.n < n {
+-		n = f.conn.n
++func (f *outflow) available() (int32, bool) {
++	if f.conn == nil {
++		return maxFlowWindow, true // only happens in tests
+ 	}
+-	return n
++	if f.conn.flowErr {
++		// Block all sending once any stream observes a flow control error.
++		return 0, false
++	}
++	n := int64(f.conn.initial) + int64(f.delta)
++	if n > maxFlowWindow {
++		f.conn.flowErr = true
++		return 0, false
++	}
++	return min(int32(n), f.conn.n), true
+ }
+ 
+ func (f *outflow) take(n int32) {
+-	if n > f.available() {
++	if f.conn == nil {
++		return // only happens in tests
++	}
++	avail, _ := f.available()
++	if n > avail {
+ 		panic("internal error: took too much")
+ 	}
+-	f.n -= n
+-	if f.conn != nil {
+-		f.conn.n -= n
+-	}
++	f.delta -= n
++	f.conn.n -= n
+ }
+ 
+ // add adds n bytes (positive or negative) to the flow control window.
+ // It returns false if the sum would exceed 2^31-1.
+ func (f *outflow) add(n int32) bool {
+-	sum := f.n + n
+-	if (sum > n) == (f.n > 0) {
+-		f.n = sum
+-		return true
++	if f.conn == nil {
++		return true // only happens in tests
+ 	}
+-	return false
++	avail := int64(f.conn.initial) + int64(f.delta)
++	if avail > maxFlowWindow {
++		// An earlier change to the initial window pushed this stream over the limit.
++		// This is a connection-level flow control error.
++		f.conn.flowErr = true
++		return false
++	}
++	if avail+int64(n) > maxFlowWindow {
++		// This update would push the stream over the limit.
++		// This is a stream-level flow control error.
++		return false
++	}
++	f.delta += n
++	return true
+ }
+--- a/http2/flow_test.go
++++ b/http2/flow_test.go
+@@ -60,43 +60,42 @@
+ 
+ func TestOutFlow(t *testing.T) {
+ 	var st outflow
+-	var conn outflow
++	var conn connOutflow
++	st.conn = &conn
+ 	st.add(3)
+ 	conn.add(2)
+ 
+-	if got, want := st.available(), int32(3); got != want {
+-		t.Errorf("available = %d; want %d", got, want)
++	if got, ok := st.available(); !ok || got != 2 {
++		t.Errorf("available = %d, %v; want 2, true", got, ok)
+ 	}
+-	st.setConnFlow(&conn)
+-	if got, want := st.available(), int32(2); got != want {
+-		t.Errorf("after parent setup, available = %d; want %d", got, want)
+-	}
+ 
+ 	st.take(2)
+-	if got, want := conn.available(), int32(0); got != want {
++	if got, want := conn.n, int32(0); got != want {
+ 		t.Errorf("after taking 2, conn = %d; want %d", got, want)
+ 	}
+-	if got, want := st.available(), int32(0); got != want {
+-		t.Errorf("after taking 2, stream = %d; want %d", got, want)
++	if got, ok := st.available(); !ok || got != 0 {
++		t.Errorf("after taking 2, stream = %d, %v; want 0, true", got, ok)
+ 	}
+ }
+ 
+ func TestOutFlowAdd(t *testing.T) {
+ 	var f outflow
++	f.conn = &connOutflow{}
++	f.conn.add(1<<31 - 1)
+ 	if !f.add(1) {
+ 		t.Fatal("failed to add 1")
+ 	}
+ 	if !f.add(-1) {
+ 		t.Fatal("failed to add -1")
+ 	}
+-	if got, want := f.available(), int32(0); got != want {
+-		t.Fatalf("size = %d; want %d", got, want)
++	if got, ok := f.available(); !ok || got != 0 {
++		t.Fatalf("size = %d, %v; want 0, true", got, ok)
+ 	}
+ 	if !f.add(1<<31 - 1) {
+ 		t.Fatal("failed to add 2^31-1")
+ 	}
+-	if got, want := f.available(), int32(1<<31-1); got != want {
+-		t.Fatalf("size = %d; want %d", got, want)
++	if got, ok := f.available(); !ok || got != 1<<31-1 {
++		t.Fatalf("size = %d, %v; want %d, true", got, ok, 1<<31-1)
+ 	}
+ 	if f.add(1) {
+ 		t.Fatal("adding 1 to max shouldn't be allowed")
+@@ -105,6 +104,8 @@
+ 
+ func TestOutFlowAddOverflow(t *testing.T) {
+ 	var f outflow
++	f.conn = &connOutflow{}
++	f.conn.add(1<<31 - 1)
+ 	if !f.add(0) {
+ 		t.Fatal("failed to add 0")
+ 	}
+@@ -126,14 +127,14 @@
+ 	if !f.add(-3) {
+ 		t.Fatal("failed to add -3")
+ 	}
+-	if got, want := f.available(), int32(-2); got != want {
+-		t.Fatalf("size = %d; want %d", got, want)
++	if got, ok := f.available(); !ok || got != -2 {
++		t.Fatalf("size = %d, %v; want -2, true", got, ok)
+ 	}
+ 	if !f.add(1<<31 - 1) {
+ 		t.Fatal("failed to add 2^31-1")
+ 	}
+-	if got, want := f.available(), int32(1+-3+(1<<31-1)); got != want {
+-		t.Fatalf("size = %d; want %d", got, want)
++	if got, ok := f.available(); !ok || got != 1+-3+(1<<31-1) {
++		t.Fatalf("size = %d, %v; want %d, true", got, ok, 1+-3+(1<<31-1))
+ 	}
+ 
+ }
+--- a/http2/server.go
++++ b/http2/server.go
+@@ -449,7 +449,6 @@
+ 		doneServing:                 make(chan struct{}),
+ 		clientMaxStreams:            math.MaxUint32, // Section 6.5.2: "Initially, there is no limit to this value"
+ 		advMaxStreams:               conf.MaxConcurrentStreams,
+-		initialStreamSendWindowSize: initialWindowSize,
+ 		initialStreamRecvWindowSize: conf.MaxUploadBufferPerStream,
+ 		maxFrameSize:                initialMaxFrameSize,
+ 		pingTimeout:                 conf.PingTimeout,
+@@ -483,7 +482,7 @@
+ 	// These start at the RFC-specified defaults. If there is a higher
+ 	// configured value for inflow, that will be updated when we send a
+ 	// WINDOW_UPDATE shortly after sending SETTINGS.
+-	sc.flow.add(initialWindowSize)
++	sc.flow.init()
+ 	sc.inflow.init(initialWindowSize)
+ 	sc.hpackEncoder = hpack.NewEncoder(&sc.headerWriteBuf)
+ 	sc.hpackEncoder.SetMaxDynamicTableSizeLimit(conf.MaxEncoderHeaderTableSize)
+@@ -599,7 +598,7 @@
+ 	wroteFrameCh     chan frameWriteResult  // from writeFrameAsync -> serve, tickles more frame writes
+ 	bodyReadCh       chan bodyReadMsg       // from handlers -> serve
+ 	serveMsgCh       chan interface{}       // misc messages & code to send to / run on the serve loop
+-	flow             outflow                // conn-wide (not stream-specific) outbound flow control
++	flow             connOutflow            // conn-wide (not stream-specific) outbound flow control
+ 	inflow           inflow                 // conn-wide inbound flow control
+ 	tlsState         *tls.ConnectionState   // shared by all handlers, like net/http
+ 	remoteAddrStr    string
+@@ -623,7 +622,6 @@
+ 	maxPushPromiseID            uint32 // ID of the last push promise (even), or 0 if there have been no pushes
+ 	streams                     map[uint32]*stream
+ 	unstartedHandlers           []unstartedHandler
+-	initialStreamSendWindowSize int32
+ 	initialStreamRecvWindowSize int32
+ 	maxFrameSize                int32
+ 	peerMaxHeaderListSize       uint32            // zero means unknown (default)
+@@ -1429,6 +1427,11 @@
+ 	}
+ 	sc.inFrameScheduleLoop = true
+ 	for !sc.writingFrameAsync {
++		if sc.flow.flowErr && (!sc.inGoAway || sc.goAwayCode == ErrCodeNo) {
++			sc.inGoAway = true
++			sc.needToSendGoAway = true
++			sc.goAwayCode = ErrCodeFlowControl
++		}
+ 		if sc.needToSendGoAway {
+ 			sc.needToSendGoAway = false
+ 			sc.startFrameWrite(FrameWriteRequest{
+@@ -1452,6 +1455,9 @@
+ 				sc.startFrameWrite(wr)
+ 				continue
+ 			}
++			if sc.flow.flowErr {
++				continue
++			}
+ 		}
+ 		if sc.needsFrameFlush {
+ 			sc.startFrameWrite(FrameWriteRequest{write: flushFrameWriter{}})
+@@ -1682,6 +1688,10 @@
+ 			return nil
+ 		}
+ 		if !st.flow.add(int32(f.Increment)) {
++			if st.flow.conn.flowErr {
++				// This is a lazily-detected connection-level flow control error.
++				return sc.countError("bad_flow", ConnectionError(ErrCodeFlowControl))
++			}
+ 			return sc.countError("bad_flow", streamError(f.StreamID, ErrCodeFlowControl))
+ 		}
+ 	default: // connection-level flow control
+@@ -1824,28 +1834,14 @@
+ 
+ func (sc *serverConn) processSettingInitialWindowSize(val uint32) error {
+ 	sc.serveG.check()
+-	// Note: val already validated to be within range by
+-	// processSetting's Valid call.
+-
+-	// "A SETTINGS frame can alter the initial flow control window
+-	// size for all current streams. When the value of
+-	// SETTINGS_INITIAL_WINDOW_SIZE changes, a receiver MUST
+-	// adjust the size of all stream flow control windows that it
+-	// maintains by the difference between the new value and the
+-	// old value."
+-	old := sc.initialStreamSendWindowSize
+-	sc.initialStreamSendWindowSize = int32(val)
+-	growth := int32(val) - old // may be negative
+-	for _, st := range sc.streams {
+-		if !st.flow.add(growth) {
+-			// 6.9.2 Initial Flow Control Window Size
+-			// "An endpoint MUST treat a change to
+-			// SETTINGS_INITIAL_WINDOW_SIZE that causes any flow
+-			// control window to exceed the maximum size as a
+-			// connection error (Section 5.4.1) of type
+-			// FLOW_CONTROL_ERROR."
+-			return sc.countError("setting_win_size", ConnectionError(ErrCodeFlowControl))
+-		}
++	if !sc.flow.changeInitialWindowSize(int64(val)) {
++		// 6.9.2 Initial Flow Control Window Size
++		// "An endpoint MUST treat a change to
++		// SETTINGS_INITIAL_WINDOW_SIZE that causes any flow
++		// control window to exceed the maximum size as a
++		// connection error (Section 5.4.1) of type
++		// FLOW_CONTROL_ERROR."
++		return sc.countError("setting_win_size", ConnectionError(ErrCodeFlowControl))
+ 	}
+ 	return nil
+ }
+@@ -2213,7 +2209,6 @@
+ 	}
+ 	st.cw.Init()
+ 	st.flow.conn = &sc.flow // link to conn-level counter
+-	st.flow.add(sc.initialStreamSendWindowSize)
+ 	st.inflow.init(sc.initialStreamRecvWindowSize)
+ 	if sc.hs.WriteTimeout > 0 {
+ 		st.writeDeadline = sc.srv.afterFunc(sc.hs.WriteTimeout, st.onWriteTimeout)
+--- a/http2/server_test.go
++++ b/http2/server_test.go
+@@ -1347,6 +1347,9 @@
+ 		t.Fatal(err)
+ 	}
+ 	st.wantRSTStream(1, ErrCodeFlowControl)
++	// Connection is still alive, even if the stream has been reset.
++	st.writePing(false, [8]byte{})
++	st.wantFrameType(FramePing)
+ }
+ 
+ // testServerPostUnblock sends a hanging POST with unsent data to handler,
+@@ -4751,5 +4754,94 @@
+ 	st.writePing(true, pf.Data)
+ 
+ 	st.advance(2 * time.Second)
++	st.wantIdle()
++}
++
++// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
++// that causes any flow-control window to exceed the maximum size as
++// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
++// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
++func TestServerSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
++	inHandler := make(chan bool)
++	writeCh := make(chan bool)
++	blockHandler := make(chan bool)
++	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++		w.(http.Flusher).Flush()
++		inHandler <- true
++		<-writeCh
++		w.Write([]byte("hello"))
++		w.(http.Flusher).Flush()
++		<-blockHandler
++	})
++	defer st.Close()
++	defer close(blockHandler)
++	st.greet()
++
++	st.writeHeaders(HeadersFrameParam{
++		StreamID:      1, // clients send odd numbers
++		BlockFragment: st.encodeHeader(":method", "POST"),
++		EndStream:     false, // data coming
++		EndHeaders:    true,
++	})
++	<-inHandler
++	st.wantFrameType(FrameHeaders)
++
++	// Give this stream some additional flow control.
++	const windowIncrease = 1000
++	st.writeWindowUpdate(1, windowIncrease)
++	st.wantIdle()
++
++	// Adjust the initial flow control window. The stream is now over the limit.
++	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
++	const maxInitialWindowSize = maxWindowSize - windowIncrease
++	st.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize + 1})
++	st.wantSettingsAck()
++
++	// We detect this condition lazily. Write something to the stream so we notice.
++	writeCh <- true
++
++	st.wantGoAway(1, ErrCodeFlowControl)
++}
++
++// Counterpart to TestServerSettingsFlowControlUpdateBeyondLimit:
++// A SETTINGS update which doesn't quite put a stream over the flow control limit.
++func TestServerSettingsFlowControlUpdateWithinLimit(t *testing.T) {
++	inHandler := make(chan bool)
++	writeCh := make(chan bool)
++	blockHandler := make(chan bool)
++	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++		w.(http.Flusher).Flush()
++		inHandler <- true
++		<-writeCh
++		w.Write([]byte("hello"))
++		w.(http.Flusher).Flush()
++		<-blockHandler
++	})
++	defer st.Close()
++	defer close(blockHandler)
++	st.greet()
++
++	st.writeHeaders(HeadersFrameParam{
++		StreamID:      1, // clients send odd numbers
++		BlockFragment: st.encodeHeader(":method", "POST"),
++		EndStream:     false, // data coming
++		EndHeaders:    true,
++	})
++	<-inHandler
++	st.wantFrameType(FrameHeaders)
++
++	// Give this stream some additional flow control.
++	const windowIncrease = 1000
++	st.writeWindowUpdate(1, windowIncrease)
++	st.wantIdle()
++
++	// Adjust the initial flow control window. The stream is just within the limit.
++	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
++	const maxInitialWindowSize = maxWindowSize - windowIncrease
++	st.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
++	st.wantSettingsAck()
++
++	writeCh <- true
++	st.wantFrameType(FrameData)
+ 	st.wantIdle()
+ }
+--- a/http2/transport.go
++++ b/http2/transport.go
+@@ -368,11 +368,11 @@
+ 	idleTimeout time.Duration // or 0 for never
+ 	idleTimer   timer
+ 
+-	mu               sync.Mutex // guards following
+-	cond             *sync.Cond // hold mu; broadcast on flow/closed changes
+-	flow             outflow    // our conn-level flow control quota (cs.outflow is per stream)
+-	inflow           inflow     // peer's conn-level flow control
+-	doNotReuse       bool       // whether conn is marked to not be reused for any future requests
++	mu               sync.Mutex  // guards following
++	cond             *sync.Cond  // hold mu; broadcast on flow/closed changes
++	flow             connOutflow // our conn-level flow control quota (cs.outflow is per stream)
++	inflow           inflow      // peer's conn-level flow control
++	doNotReuse       bool        // whether conn is marked to not be reused for any future requests
+ 	closing          bool
+ 	closed           bool
+ 	closedOnIdle     bool                     // true if conn was closed for idleness
+@@ -394,7 +394,6 @@
+ 	maxConcurrentStreams        uint32
+ 	peerMaxHeaderListSize       uint64
+ 	peerMaxHeaderTableSize      uint32
+-	initialWindowSize           uint32
+ 	initialStreamRecvWindowSize int32
+ 	readIdleTimeout             time.Duration
+ 	pingTimeout                 time.Duration
+@@ -826,7 +825,6 @@
+ 		readerDone:                  make(chan struct{}),
+ 		nextStreamID:                1,
+ 		maxFrameSize:                16 << 10, // spec default
+-		initialWindowSize:           65535,    // spec default
+ 		initialStreamRecvWindowSize: conf.MaxUploadBufferPerStream,
+ 		maxConcurrentStreams:        initialMaxConcurrentStreams, // "infinite", per spec. Use a smaller value until we have received server settings.
+ 		peerMaxHeaderListSize:       0xffffffffffffffff,          // "infinite", per spec. Use 2^64-1 instead.
+@@ -852,7 +850,7 @@
+ 	}
+ 
+ 	cc.cond = sync.NewCond(&cc.mu)
+-	cc.flow.add(int32(initialWindowSize))
++	cc.flow.init()
+ 
+ 	// TODO: adjust this writer size to account for frame size +
+ 	// MTU + crypto/tls record padding.
+@@ -1240,6 +1238,33 @@
+ 	return nil
+ }
+ 
++func (cc *ClientConn) goAwayAndClose(code ErrCode) {
++	cc.mu.Lock()
++	closed := cc.closed
++	cc.closing = true
++	cc.closed = true
++	cc.mu.Unlock()
++	if closed {
++		return
++	}
++	if f := cc.fr.countError; f != nil {
++		f(fmt.Sprintf("conn_close_error_%s", code.stringToken()))
++	}
++	done := make(chan struct{})
++	go func() {
++		defer close(done)
++		cc.wmu.Lock()
++		cc.fr.WriteGoAway(0, code, nil)
++		cc.bw.Flush()
++		cc.wmu.Unlock()
++	}()
++	select {
++	case <-done:
++	case <-time.After(250 * time.Millisecond):
++	}
++	cc.closeForError(fmt.Errorf("http2: closing connection with %v", code))
++}
++
+ // closes the client connection immediately. In-flight requests are interrupted.
+ // err is sent to streams.
+ func (cc *ClientConn) closeForError(err error) {
+@@ -1686,7 +1711,9 @@
+ 	}
+ 	if err != nil {
+ 		cs.abortStream(err) // possibly redundant, but harmless
+-		if cs.sentHeaders {
++		if ce, ok := err.(ConnectionError); ok {
++			cc.goAwayAndClose(ErrCode(ce))
++		} else if cs.sentHeaders {
+ 			if se, ok := err.(StreamError); ok {
+ 				if se.Cause != errFromPeer {
+ 					cc.writeStreamReset(cs.ID, se.Code, false, err)
+@@ -2012,8 +2039,12 @@
+ 			return 0, errRequestCanceled
+ 		default:
+ 		}
+-		if a := cs.flow.available(); a > 0 {
+-			take := a
++		avail, ok := cs.flow.available()
++		if !ok {
++			return 0, ConnectionError(ErrCodeFlowControl)
++		}
++		if avail > 0 {
++			take := avail
+ 			if int(take) > maxBytes {
+ 
+ 				take = int32(maxBytes) // can't truncate int; take is int32
+@@ -2074,8 +2105,7 @@
+ 
+ // requires cc.mu be held.
+ func (cc *ClientConn) addStreamLocked(cs *clientStream) {
+-	cs.flow.add(int32(cc.initialWindowSize))
+-	cs.flow.setConnFlow(&cc.flow)
++	cs.flow.conn = &cc.flow
+ 	cs.inflow.init(cc.initialStreamRecvWindowSize)
+ 	cs.ID = cc.nextStreamID
+ 	cc.nextStreamID += 2
+@@ -2790,6 +2820,10 @@
+ func (rl *clientConnReadLoop) streamByID(id uint32, headerOrData bool) *clientStream {
+ 	rl.cc.mu.Lock()
+ 	defer rl.cc.mu.Unlock()
++	return rl.streamByIDLocked(id, headerOrData)
++}
++
++func (rl *clientConnReadLoop) streamByIDLocked(id uint32, headerOrData bool) *clientStream {
+ 	if headerOrData {
+ 		// Work around an unfortunate gRPC behavior.
+ 		// See comment on ClientConn.rstStreamPingsBlocked for details.
+@@ -2870,24 +2904,10 @@
+ 		case SettingMaxHeaderListSize:
+ 			cc.peerMaxHeaderListSize = uint64(s.Val)
+ 		case SettingInitialWindowSize:
+-			// Values above the maximum flow-control
+-			// window size of 2^31-1 MUST be treated as a
+-			// connection error (Section 5.4.1) of type
+-			// FLOW_CONTROL_ERROR.
+-			if s.Val > math.MaxInt32 {
++			if !cc.flow.changeInitialWindowSize(int64(s.Val)) {
+ 				return ConnectionError(ErrCodeFlowControl)
+ 			}
+-
+-			// Adjust flow control of currently-open
+-			// frames by the difference of the old initial
+-			// window size and this one.
+-			delta := int32(s.Val) - int32(cc.initialWindowSize)
+-			for _, cs := range cc.streams {
+-				cs.flow.add(delta)
+-			}
+ 			cc.cond.Broadcast()
+-
+-			cc.initialWindowSize = s.Val
+ 		case SettingHeaderTableSize:
+ 			cc.henc.SetMaxDynamicTableSize(s.Val)
+ 			cc.peerMaxHeaderTableSize = s.Val
+@@ -2929,29 +2949,30 @@
+ 
+ func (rl *clientConnReadLoop) processWindowUpdate(f *WindowUpdateFrame) error {
+ 	cc := rl.cc
+-	cs := rl.streamByID(f.StreamID, notHeaderOrDataFrame)
+-	if f.StreamID != 0 && cs == nil {
+-		return nil
+-	}
+-
+ 	cc.mu.Lock()
+ 	defer cc.mu.Unlock()
+-
+-	fl := &cc.flow
+-	if cs != nil {
+-		fl = &cs.flow
+-	}
+-	if !fl.add(int32(f.Increment)) {
+-		// For stream, the sender sends RST_STREAM with an error code of FLOW_CONTROL_ERROR
+-		if cs != nil {
++	if f.StreamID == 0 {
++		if !cc.flow.add(int32(f.Increment)) {
++			return ConnectionError(ErrCodeFlowControl)
++		}
++	} else {
++		cs := rl.streamByIDLocked(f.StreamID, notHeaderOrDataFrame)
++		if cs == nil {
++			return nil
++		}
++		if !cs.flow.add(int32(f.Increment)) {
++			if cs.flow.conn.flowErr {
++				// This is a lazily-detected connection-level flow control error.
++				return ConnectionError(ErrCodeFlowControl)
++			}
++			// For stream, the sender sends RST_STREAM with
++			// an error code of FLOW_CONTROL_ERROR.
+ 			rl.endStreamError(cs, StreamError{
+ 				StreamID: f.StreamID,
+ 				Code:     ErrCodeFlowControl,
+ 			})
+ 			return nil
+ 		}
+-
+-		return ConnectionError(ErrCodeFlowControl)
+ 	}
+ 	cc.cond.Broadcast()
+ 	return nil
+--- a/http2/transport_test.go
++++ b/http2/transport_test.go
+@@ -917,6 +917,70 @@
+ 	rt.wantBody(nil)
+ }
+ 
++// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
++// that causes any flow-control window to exceed the maximum size as
++// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
++// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
++func TestTransportSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
++	tc := newTestClientConn(t)
++	tc.greet()
++
++	body := tc.newRequestBody()
++	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
++	rt := tc.roundTrip(req)
++	tc.wantFrameType(FrameHeaders)
++
++	// Give this stream some additional flow control.
++	const windowIncrease = 1000
++	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
++	tc.wantIdle()
++
++	// Adjust the initial flow control window. The stream is now over the limit.
++	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
++	const maxInitialWindowSize = maxWindowSize - windowIncrease
++	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize + 1})
++	tc.wantSettingsAck()
++
++	// We detect this condition lazily. Write something to the stream so we notice.
++	body.writeBytes(1)
++	body.closeWithError(io.EOF)
++
++	tc.wantGoAway(0, ErrCodeFlowControl)
++}
++
++// Counterpart to TestTransportSettingsFlowControlUpdateBeyondLimit:
++// A SETTINGS update which doesn't quite put a stream over the flow control limit.
++func TestTransportSettingsFlowControlUpdateWithinLimit(t *testing.T) {
++	tc := newTestClientConn(t)
++	tc.greet()
++
++	body := tc.newRequestBody()
++	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
++	rt := tc.roundTrip(req)
++	tc.wantFrameType(FrameHeaders)
++
++	// Give this stream some additional flow control.
++	const windowIncrease = 1000
++	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
++	tc.wantIdle()
++
++	// Adjust the initial flow control window. The stream is just within the limit.
++	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
++	const maxInitialWindowSize = maxWindowSize - windowIncrease
++	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
++	tc.wantSettingsAck()
++
++	body.writeBytes(1)
++	body.closeWithError(io.EOF)
++	tc.wantData(wantData{
++		streamID:  1,
++		endStream: true,
++		size:      1,
++		multiple:  true,
++	})
++	tc.wantIdle()
++}
++
+ // See golang.org/issue/13444
+ func TestTransportFullDuplex(t *testing.T) {
+ 	ts := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+--- a/http2/writesched.go
++++ b/http2/writesched.go
+@@ -113,10 +113,11 @@
+ 	}
+ 
+ 	// Might need to split after applying limits.
+-	allowed := wr.stream.flow.available()
+-	if n < allowed {
+-		allowed = n
++	avail, ok := wr.stream.flow.available()
++	if !ok {
++		return empty, empty, 0
+ 	}
++	allowed := min(n, avail)
+ 	if wr.stream.sc.maxFrameSize < allowed {
+ 		allowed = wr.stream.sc.maxFrameSize
+ 	}
+--- a/http2/writesched_priority_test.go
++++ b/http2/writesched_priority_test.go
+@@ -436,8 +436,11 @@
+ 	ws.OpenStream(2, OpenStreamOptions{PusherID: 1})
+ 
+ 	sc := &serverConn{maxFrameSize: 16}
++	sc.flow.add(maxFlowWindow)
+ 	st1 := &stream{id: 1, sc: sc}
++	st1.flow.conn = &sc.flow
+ 	st2 := &stream{id: 2, sc: sc}
++	st2.flow.conn = &sc.flow
+ 
+ 	ws.Push(FrameWriteRequest{&writeData{1, make([]byte, 16), false}, st1, nil})
+ 	ws.Push(FrameWriteRequest{&writeData{2, make([]byte, 16), false}, st2, nil})
+--- a/http2/writesched_test.go
++++ b/http2/writesched_test.go
+@@ -76,6 +76,7 @@
+ 		id: 1,
+ 		sc: &serverConn{maxFrameSize: 16},
+ 	}
++	st.flow.conn = &connOutflow{}
+ 	const size = 32
+ 	wr := FrameWriteRequest{&writeData{st.id, make([]byte, size), true}, st, make(chan error)}
+ 	if got, want := wr.DataSize(), size; got != want {
+@@ -113,6 +114,8 @@
+ 		id: 1,
+ 		sc: &serverConn{maxFrameSize: 16},
+ 	}
++	st.flow.conn = &connOutflow{}
++	st.flow.conn.add(maxFlowWindow) // conn-level flow is large
+ 	const size = 32
+ 	wr := FrameWriteRequest{&writeData{st.id, make([]byte, size), true}, st, make(chan error)}
+ 	if got, want := wr.DataSize(), size; got != want {
