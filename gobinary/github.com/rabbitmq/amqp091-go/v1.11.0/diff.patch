@@ -1,0 +1,1099 @@
+--- a/client_test.go
++++ b/client_test.go
+@@ -56,7 +56,7 @@
+ 
+ 	return &server{
+ 		T: t,
+-		r: reader{serverIO},
++		r: reader{r: serverIO},
+ 		w: writer{serverIO},
+ 		S: serverIO,
+ 		C: clientIO,
+--- a/connection.go
++++ b/connection.go
+@@ -124,6 +124,11 @@
+ 	Locales    []string // Server locales
+ 
+ 	closed atomic.Bool // Will be true if the connection is closed, false otherwise.
++
++	// maxFrameSize mirrors Config.FrameSize once negotiated via connection.tune,
++	// letting the reader goroutine reject over-sized frames before allocating
++	// memory for them. 0 means no limit is enforced yet (or none was negotiated).
++	maxFrameSize atomic.Uint32
+ }
+ 
+ type readDeadliner interface {
+@@ -772,7 +777,7 @@
+ // handle on channel 0 (the connection channel).
+ func (c *Connection) reader(r io.Reader) {
+ 	buf := bufio.NewReader(r)
+-	frames := &reader{buf}
++	frames := &reader{r: buf, maxFrameSize: &c.maxFrameSize}
+ 	conn, haveDeadliner := r.(readDeadliner)
+ 
+ 	defer close(c.rpc)
+@@ -1059,10 +1064,12 @@
+ 
+ 	c.m.Unlock()
+ 
+-	// Frame size includes headers and end byte (len(payload)+8), even if
+-	// this is less than FrameMinSize, use what the server sends because the
+-	// alternative is to stop the handshake here.
+-	c.Config.FrameSize = pick(config.FrameSize, int(tune.FrameMax))
++	// Frame size includes headers and end byte (len(payload)+8). Enforce the spec
++	// minimum floor of frameMinSize (4096 bytes) to prevent malicious servers
++	// from forcing extreme fragmentation and CPU overhead. The floor also
++	// guarantees the frame_max check in reader.ReadFrame cannot underflow.
++	c.Config.FrameSize = negotiateFrameSize(config.FrameSize, int(tune.FrameMax))
++	c.maxFrameSize.Store(uint32(c.Config.FrameSize))
+ 
+ 	// Save this off for resetDeadline()
+ 	c.Config.Heartbeat = time.Second * time.Duration(pick(
+@@ -1196,4 +1203,15 @@
+ 		return max(client, server)
+ 	}
+ 	return min(client, server)
++}
++
++// negotiateFrameSize picks the frame size from the client and server values,
++// raising any non-zero result to the AMQP minimum of frameMinSize. A result of
++// 0 means no limit.
++func negotiateFrameSize(client, server int) int {
++	size := pick(client, server)
++	if size > 0 && size < frameMinSize {
++		return frameMinSize
++	}
++	return size
+ }
+--- a/fuzz.go
++++ b/fuzz.go
+@@ -11,7 +11,7 @@
+ import "bytes"
+ 
+ func Fuzz(data []byte) int {
+-	r := reader{bytes.NewReader(data)}
++	r := reader{r: bytes.NewReader(data)}
+ 	frame, err := r.ReadFrame()
+ 	if err != nil {
+ 		if frame != nil {
+--- a/read.go
++++ b/read.go
+@@ -54,6 +54,15 @@
+ 	channel := binary.BigEndian.Uint16(scratch[1:3])
+ 	size := binary.BigEndian.Uint32(scratch[3:7])
+ 
++	// Reject frames larger than the negotiated frame_max before any payload
++	// buffer is allocated. The comparison stays in uint32; it cannot underflow
++	// because a non-zero maxFrameSize is always >= frameMinSize (4096).
++	if r.maxFrameSize != nil {
++		if max := r.maxFrameSize.Load(); max > 0 && size > max-frameHeaderSize {
++			return nil, ErrFrameTooLarge
++		}
++	}
++
+ 	switch typ {
+ 	case frameMethod:
+ 		if frame, err = r.parseMethodFrame(channel, size); err != nil {
+--- a/read_test.go
++++ b/read_test.go
+@@ -7,8 +7,10 @@
+ 
+ import (
+ 	"bytes"
++	"encoding/binary"
+ 	"reflect"
+ 	"strings"
++	"sync/atomic"
+ 	"testing"
+ )
+ 
+@@ -24,13 +26,88 @@
+ // padding bytes before the frame-end octet.
+ func TestParseHeaderFrameConsumesPaddingBytes(t *testing.T) {
+ 	frame := "\x02\x00\x01\x00\x00\x00\x12\x00\x3c\x00\x00\x00\x00\x00\x00\x00\x00\x0a\x54\x00\x00\x00\x00\x00\x00\xce"
+-	r := reader{strings.NewReader(frame)}
++	r := reader{r: strings.NewReader(frame)}
+ 	_, err := r.ReadFrame()
+ 	if err != nil {
+ 		t.Fatalf("expected no error reading header frame, got: %v", err)
+ 	}
+ }
+ 
++// TestReadFrameRejectsOversizedFrame verifies that a frame whose declared
++// size exceeds the negotiated frame_max is rejected before its payload is
++// allocated or read (CVE-2026-79921).
++func TestReadFrameRejectsOversizedFrame(t *testing.T) {
++	const negotiatedMax = 4096 // total frame size, including header and frame-end byte
++
++	header := make([]byte, 7)
++	header[0] = frameBody
++	binary.BigEndian.PutUint16(header[1:3], 1)
++	binary.BigEndian.PutUint32(header[3:7], negotiatedMax) // payload alone exceeds the limit
++
++	var maxFrameSize atomic.Uint32
++	maxFrameSize.Store(negotiatedMax)
++
++	r := reader{r: bytes.NewReader(header), maxFrameSize: &maxFrameSize}
++	frame, err := r.ReadFrame()
++	if err != ErrFrameTooLarge {
++		t.Fatalf("expected ErrFrameTooLarge, got frame=%#v err=%v", frame, err)
++	}
++}
++
++// TestReadFrameAcceptsFrameAtLimit verifies that a frame exactly as large as
++// the negotiated frame_max is accepted, and that no limit is enforced when
++// frame_max is 0 (unlimited).
++func TestReadFrameAcceptsFrameAtLimit(t *testing.T) {
++	const negotiatedMax = 4096
++
++	build := func(payload int) []byte {
++		b := make([]byte, 7, 7+payload+1)
++		b[0] = frameBody
++		binary.BigEndian.PutUint16(b[1:3], 1)
++		binary.BigEndian.PutUint32(b[3:7], uint32(payload))
++		b = append(b, make([]byte, payload)...)
++		return append(b, frameEnd)
++	}
++
++	var maxFrameSize atomic.Uint32
++	maxFrameSize.Store(negotiatedMax)
++
++	r := reader{r: bytes.NewReader(build(negotiatedMax - frameHeaderSize)), maxFrameSize: &maxFrameSize}
++	if _, err := r.ReadFrame(); err != nil {
++		t.Fatalf("expected frame at the limit to be accepted, got: %v", err)
++	}
++
++	r = reader{r: bytes.NewReader(build(negotiatedMax - frameHeaderSize + 1)), maxFrameSize: &maxFrameSize}
++	if _, err := r.ReadFrame(); err != ErrFrameTooLarge {
++		t.Fatalf("expected ErrFrameTooLarge one byte over the limit, got: %v", err)
++	}
++
++	var unlimited atomic.Uint32
++	r = reader{r: bytes.NewReader(build(negotiatedMax * 4)), maxFrameSize: &unlimited}
++	if _, err := r.ReadFrame(); err != nil {
++		t.Fatalf("expected no limit when frame_max is 0, got: %v", err)
++	}
++}
++
++// TestNegotiateFrameSize verifies the AMQP minimum frame size floor.
++func TestNegotiateFrameSize(t *testing.T) {
++	tests := []struct{ client, server, want int }{
++		{0, 0, 0},
++		{0, 131072, 131072},
++		{131072, 0, 131072},
++		{131072, 262144, 131072},
++		{0, 1, frameMinSize},
++		{1, 0, frameMinSize},
++		{512, 131072, frameMinSize},
++		{frameMinSize, frameMinSize, frameMinSize},
++	}
++	for _, tc := range tests {
++		if got := negotiateFrameSize(tc.client, tc.server); got != tc.want {
++			t.Errorf("negotiateFrameSize(%d, %d) = %d, want %d", tc.client, tc.server, got, tc.want)
++		}
++	}
++}
++
+ func TestGoFuzzCrashers(t *testing.T) {
+ 	if testing.Short() {
+ 		t.Skip("excessive allocation")
+@@ -43,7 +120,7 @@
+ 	}
+ 
+ 	for idx, testStr := range testData {
+-		r := reader{strings.NewReader(testStr)}
++		r := reader{r: strings.NewReader(testStr)}
+ 		frame, err := r.ReadFrame()
+ 		if err != nil && frame != nil {
+ 			t.Errorf("%d. frame is not nil: %#v err = %v", idx, frame, err)
+--- a/types.go
++++ b/types.go
+@@ -8,6 +8,7 @@
+ import (
+ 	"fmt"
+ 	"io"
++	"sync/atomic"
+ 	"time"
+ )
+ 
+@@ -67,6 +68,10 @@
+ 	// server, indicating an unsupported protocol or unsupported frame type.
+ 	ErrFrame = &Error{Code: FrameError, Reason: "frame could not be parsed"}
+ 
++	// ErrFrameTooLarge is returned when the server sends a frame whose
++	// declared size exceeds the frame_max negotiated during connection.tune.
++	ErrFrameTooLarge = &Error{Code: FrameError, Reason: "frame size exceeds negotiated frame_max"}
++
+ 	// ErrCommandInvalid is returned when the server sends an unexpected response
+ 	// to this requested message type. This indicates a bug in this client.
+ 	ErrCommandInvalid = &Error{Code: CommandInvalid, Reason: "unexpected command received"}
+@@ -502,6 +507,12 @@
+ 
+ type reader struct {
+ 	r io.Reader
++
++	// maxFrameSize, when non-nil, points at the connection's negotiated
++	// frame_max (total frame length, including header and frame-end byte).
++	// A nil pointer or a stored value of 0 means no limit is enforced,
++	// matching the pre-negotiation and explicitly-unlimited cases.
++	maxFrameSize *atomic.Uint32
+ }
+ 
+ type writer struct {
+
+--- a/channel.go
++++ b/channel.go
+@@ -7,6 +7,7 @@
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"reflect"
+ 	"sync"
+ 	"sync/atomic"
+@@ -703,6 +704,11 @@
+ http://www.rabbitmq.com/blog/2012/04/25/rabbitmq-performance-measurements-part-2/
+ */
+ func (ch *Channel) Qos(prefetchCount, prefetchSize int, global bool) error {
++	// TODO: Change prefetchCount and prefetchSize types from int to uint16 and uint32 respectively.
++	// This will be a breaking change and should be done in a future major release.
++	if err := ch.validateQos(prefetchCount, prefetchSize); err != nil {
++		return err
++	}
+ 	return ch.call(
+ 		&basicQos{
+ 			PrefetchCount: uint16(prefetchCount),
+@@ -711,6 +717,13 @@
+ 		},
+ 		&basicQosOk{},
+ 	)
++}
++
++func (ch *Channel) validateQos(prefetchCount, prefetchSize int) error {
++	if prefetchCount < 0 || prefetchSize < 0 {
++		return fmt.Errorf("amqp: Qos values must be non-negative (got prefetchCount=%d, prefetchSize=%d)", prefetchCount, prefetchSize)
++	}
++	return nil
+ }
+ 
+ /*
+--- /dev/null
++++ b/channel_test.go
+@@ -0,0 +1,22 @@
++package amqp091
++
++import "testing"
++
++func TestQosNegativeReturnsError(t *testing.T) {
++	ch := &Channel{}
++	if err := ch.validateQos(-1, 0); err == nil {
++		t.Fatal("expected error for negative prefetchCount")
++	}
++	if err := ch.validateQos(0, -1); err == nil {
++		t.Fatal("expected error for negative prefetchSize")
++	}
++	if err := ch.validateQos(-1, -1); err == nil {
++		t.Fatal("expected error for negative prefetchCount and prefetchSize")
++	}
++	if err := ch.validateQos(0, 0); err != nil {
++		t.Fatalf("unexpected error for zero values: %v", err)
++	}
++	if err := ch.validateQos(10, 100); err != nil {
++		t.Fatalf("unexpected error for positive values: %v", err)
++	}
++}
+
+--- a/auth.go
++++ b/auth.go
+@@ -23,6 +23,11 @@
+ 	Password string
+ }
+ 
++// String returns a redacted representation of PlainAuth.
++func (auth PlainAuth) String() string {
++	return fmt.Sprintf("PlainAuth{Username: %q, Password: [REDACTED]}", auth.Username)
++}
++
+ // Mechanism returns "PLAIN"
+ func (auth *PlainAuth) Mechanism() string {
+ 	return "PLAIN"
+@@ -37,6 +42,11 @@
+ type AMQPlainAuth struct {
+ 	Username string
+ 	Password string
++}
++
++// String returns a redacted representation of AMQPlainAuth.
++func (auth AMQPlainAuth) String() string {
++	return fmt.Sprintf("AMQPlainAuth{Username: %q, Password: [REDACTED]}", auth.Username)
+ }
+ 
+ // Mechanism returns "AMQPLAIN"
+--- a/auth_test.go
++++ b/auth_test.go
+@@ -1,6 +1,10 @@
+ package amqp091
+ 
+-import "testing"
++import (
++	"fmt"
++	"strings"
++	"testing"
++)
+ 
+ func TestPlainAuth(t *testing.T) {
+ 	auth := &PlainAuth{
+@@ -27,5 +31,21 @@
+ 
+ 	if auth.Response() != "\000*\000*" {
+ 		t.Errorf("Expected \000*\000*, got %s", auth.Response())
++	}
++}
++
++func TestPlainAuthStringRedactsPassword(t *testing.T) {
++	auth := PlainAuth{Username: "admin", Password: "s3cr3t"}
++	s := fmt.Sprintf("%+v", auth)
++	if strings.Contains(s, "s3cr3t") {
++		t.Fatal("PlainAuth default formatting exposes password")
++	}
++}
++
++func TestAMQPlainAuthStringRedactsPassword(t *testing.T) {
++	auth := AMQPlainAuth{Username: "admin", Password: "s3cr3t"}
++	s := fmt.Sprintf("%+v", auth)
++	if strings.Contains(s, "s3cr3t") {
++		t.Fatal("AMQPlainAuth default formatting exposes password")
+ 	}
+ }
+--- a/client_test.go
++++ b/client_test.go
+@@ -29,10 +29,8 @@
+ }
+ 
+ var (
+-	defaultLogin        = "guest"
+-	defaultPassword     = "guest"
+-	defaultPlainAuth    = &PlainAuth{defaultLogin, defaultPassword}
+-	defaultAMQPlainAuth = &AMQPlainAuth{defaultLogin, defaultPassword}
++	defaultLogin    = "guest"
++	defaultPassword = "guest"
+ )
+ 
+ func defaultConfigWithAuth(auth Authentication) Config {
+@@ -44,11 +42,13 @@
+ }
+ 
+ func defaultConfig() Config {
+-	return defaultConfigWithAuth(defaultPlainAuth)
++	// Use new instance of PlainAuth as password is zeroed out after successful open-ok
++	return defaultConfigWithAuth(&PlainAuth{Username: defaultLogin, Password: defaultPassword})
+ }
+ 
+ func amqplainConfig() Config {
+-	return defaultConfigWithAuth(defaultAMQPlainAuth)
++	// Use new instance of AMQPlainAuth as password is zeroed out after successful open-ok
++	return defaultConfigWithAuth(&AMQPlainAuth{Username: defaultLogin, Password: defaultPassword})
+ }
+ 
+ func newServer(t *testing.T, serverIO, clientIO io.ReadWriteCloser) *server {
+--- a/connection.go
++++ b/connection.go
+@@ -1113,6 +1113,15 @@
+ 		_ = deadliner.SetDeadline(time.Time{})
+ 	}
+ 
++	// Zero out credentials after successful open-ok
++	for i := range c.Config.SASL {
++		if pa, ok := c.Config.SASL[i].(*PlainAuth); ok {
++			pa.Password = ""
++		} else if apa, ok := c.Config.SASL[i].(*AMQPlainAuth); ok {
++			apa.Password = ""
++		}
++	}
++
+ 	return nil
+ }
+ 
+--- /dev/null
++++ b/cve_2026_77407_test.go
+@@ -0,0 +1,30 @@
++// Copyright (c) 2021 VMware, Inc. or its affiliates. All Rights Reserved.
++// Copyright (c) 2012-2021, Sean Treadway, SoundCloud Ltd.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package amqp091
++
++import "testing"
++
++func TestConnectionOpenCompleteZerosSASLCredentials(t *testing.T) {
++	pa := &PlainAuth{Username: "user", Password: "secretpassword"}
++	apa := &AMQPlainAuth{Username: "user", Password: "secretpassword"}
++
++	c := &Connection{
++		Config: Config{
++			SASL: []Authentication{pa, apa},
++		},
++	}
++
++	if err := c.openComplete(); err != nil {
++		t.Fatalf("unexpected error from openComplete: %v", err)
++	}
++
++	if pa.Password != "" {
++		t.Errorf("expected PlainAuth password to be zeroed out, got %q", pa.Password)
++	}
++	if apa.Password != "" {
++		t.Errorf("expected AMQPlainAuth password to be zeroed out, got %q", apa.Password)
++	}
++}
+
+--- a/write.go
++++ b/write.go
+@@ -242,6 +242,9 @@
+ 
+ func writeShortstr(w io.Writer, s string) (err error) {
+ 	b := []byte(s)
++	if len(b) > 255 {
++		return fmt.Errorf("amqp: shortstr %q exceeds 255 bytes", s)
++	}
+ 
+ 	length := uint8(len(b))
+ 
+--- /dev/null
++++ b/write_test.go
+@@ -0,0 +1,31 @@
++// Copyright (c) 2026 Broadcom, Inc. All Rights Reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package amqp091
++
++import (
++	"bytes"
++	"strings"
++	"testing"
++)
++
++func TestWriteShortstrTruncationReturnsError(t *testing.T) {
++	longStr := strings.Repeat("a", 256) // 256 bytes > 255 max
++	var buf bytes.Buffer
++	err := writeShortstr(&buf, longStr)
++	if err == nil {
++		t.Fatal("expected error for shortstr > 255 bytes, got nil")
++	}
++}
++
++func TestWriteShortstrExact255Succeeds(t *testing.T) {
++	s := strings.Repeat("a", 255)
++	var buf bytes.Buffer
++	if err := writeShortstr(&buf, s); err != nil {
++		t.Fatalf("unexpected error for 255-byte shortstr: %v", err)
++	}
++	if buf.Len() != 256 { // 1-byte length prefix + 255 bytes
++		t.Fatalf("wrong output length: %d", buf.Len())
++	}
++}
+
+--- a/connection.go
++++ b/connection.go
+@@ -167,6 +167,9 @@
+ // seconds and sets the initial read deadline to 30 seconds.
+ //
+ // DialTLS uses the provided tls.Config when encountering an amqps:// scheme.
++// Note: If you provide a custom tls.Config, you should explicitly set a secure
++// MinVersion (such as tls.VersionTLS12 or tls.VersionTLS13) as the library
++// does not override it.
+ func DialTLS(url string, amqps *tls.Config) (*Connection, error) {
+ 	return DialConfig(url, Config{
+ 		TLSClientConfig: amqps,
+@@ -183,6 +186,9 @@
+ //
+ // DialTLS_ExternalAuth uses the provided tls.Config when encountering an
+ // amqps:// scheme.
++// Note: If you provide a custom tls.Config, you should explicitly set a secure
++// MinVersion (such as tls.VersionTLS12 or tls.VersionTLS13) as the library
++// does not override it.
+ func DialTLS_ExternalAuth(url string, amqps *tls.Config) (*Connection, error) {
+ 	return DialConfig(url, Config{
+ 		TLSClientConfig: amqps,
+@@ -1140,6 +1146,7 @@
+ 		return &tls.Config{
+ 			RootCAs:    certPool,
+ 			ServerName: uri.ServerName,
++			MinVersion: tls.VersionTLS12,
+ 		}, nil
+ 	}
+ 
+@@ -1152,6 +1159,7 @@
+ 		Certificates: []tls.Certificate{certificate},
+ 		RootCAs:      certPool,
+ 		ServerName:   uri.ServerName,
++		MinVersion:   tls.VersionTLS12,
+ 	}, nil
+ }
+ 
+--- /dev/null
++++ b/connection_unit_test.go
+@@ -0,0 +1,82 @@
++// Copyright (c) 2026 Broadcom, Inc. All Rights Reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package amqp091
++
++import (
++	"crypto/tls"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestTLSConfigFromURIEnforcesMinVersion(t *testing.T) {
++	cfg, err := tlsConfigFromURI(URI{
++		ServerName: "localhost",
++	})
++	if err != nil {
++		t.Fatalf("failed to create TLS config from URI: %v", err)
++	}
++
++	if cfg == nil {
++		t.Fatal("expected tls.Config, got nil")
++	}
++
++	if cfg.MinVersion != tls.VersionTLS12 {
++		t.Fatalf("expected MinVersion TLS 1.2 (%d), got %d", tls.VersionTLS12, cfg.MinVersion)
++	}
++}
++
++func TestTLSConfigFromURIWithCACertAndClientCerts(t *testing.T) {
++	tempDir := t.TempDir()
++
++	caPath := filepath.Join(tempDir, "ca.pem")
++	certPath := filepath.Join(tempDir, "client.pem")
++	keyPath := filepath.Join(tempDir, "client-key.pem")
++
++	if err := os.WriteFile(caPath, []byte(caCert), 0600); err != nil {
++		t.Fatalf("failed to write CA cert: %v", err)
++	}
++	defer func() { _ = os.Remove(caPath) }()
++
++	if err := os.WriteFile(certPath, []byte(clientCert), 0600); err != nil {
++		t.Fatalf("failed to write client cert: %v", err)
++	}
++	defer func() { _ = os.Remove(certPath) }()
++
++	if err := os.WriteFile(keyPath, []byte(clientKey), 0600); err != nil {
++		t.Fatalf("failed to write client key: %v", err)
++	}
++	defer func() { _ = os.Remove(keyPath) }()
++
++	cfg, err := tlsConfigFromURI(URI{
++		CACertFile: caPath,
++		CertFile:   certPath,
++		KeyFile:    keyPath,
++		ServerName: "localhost",
++	})
++	if err != nil {
++		t.Fatalf("failed to create TLS config from URI with CA and client certs: %v", err)
++	}
++
++	if cfg == nil {
++		t.Fatal("expected tls.Config, got nil")
++	}
++
++	if cfg.MinVersion != tls.VersionTLS12 {
++		t.Fatalf("expected MinVersion TLS 1.2 (%d), got %d", tls.VersionTLS12, cfg.MinVersion)
++	}
++
++	if len(cfg.Certificates) != 1 {
++		t.Fatalf("expected 1 certificate, got %d", len(cfg.Certificates))
++	}
++
++	if cfg.RootCAs == nil {
++		t.Fatal("expected RootCAs to be set, got nil")
++	}
++
++	if cfg.ServerName != "localhost" {
++		t.Fatalf("expected ServerName localhost, got %q", cfg.ServerName)
++	}
++}
+
+--- a/read.go
++++ b/read.go
+@@ -111,7 +111,7 @@ func readLongstr(r io.Reader) (v string, err error) {
+ 
+ 	// slices can't be longer than max int32 value
+ 	if length > (^uint32(0) >> 1) {
+-		return
++		return "", ErrSyntax
+ 	}
+ 
+ 	bytes := make([]byte, length)
+--- a/read_test.go
++++ b/read_test.go
+@@ -77,6 +77,47 @@ func TestReadFieldUnsignedTypes(t *testing.T) {
+ 	}
+ }
+ 
++func TestReadLongstrOversizeLengthReturnsError(t *testing.T) {
++	testCases := []struct {
++		name    string
++		encoded []byte
++	}{
++		{
++			// 0x80000000 = max_int32 + 1 — first value past the accepted range.
++			name:    "max-int32-plus-one",
++			encoded: []byte{0x80, 0x00, 0x00, 0x00},
++		},
++		{
++			// 0xFFFFFFFF = max uint32 — largest possible declared length.
++			name:    "max-uint32",
++			encoded: []byte{0xFF, 0xFF, 0xFF, 0xFF},
++		},
++	}
++
++	for _, tc := range testCases {
++		t.Run(tc.name, func(t *testing.T) {
++			_, err := readLongstr(bytes.NewReader(tc.encoded))
++			if err == nil {
++				t.Fatal("expected error for oversized longstr length, got nil")
++			}
++		})
++	}
++}
++
++func TestReadTableOversizeOuterBlobReturnsError(t *testing.T) {
++	// Wire layout: [uint32: 0x80000000] [bytes that represent the "table blob"].
++	// The uint32 is the declared size of the table blob, which exceeds max_int32.
++	// These bytes should never be reached as valid frame data after the fix.
++	var buf bytes.Buffer
++	buf.Write([]byte{0x80, 0x00, 0x00, 0x00}) // declared size = max_int32 + 1
++	buf.WriteString("sentinel frame data")    // bytes that must not be misread
++
++	_, err := readTable(&buf)
++	if err == nil {
++		t.Fatal("readTable with oversized outer blob must return error, not silent empty table")
++	}
++}
++
+ func TestWriteFieldUnsignedTypes(t *testing.T) {
+ 	testCases := []struct {
+ 		name     string
+
+--- a/uri.go
++++ b/uri.go
+@@ -229,27 +229,20 @@ func (uri URI) String() string {
+ 	}
+ 
+ 	if uri.CertFile != "" || uri.KeyFile != "" || uri.CACertFile != "" || uri.ServerName != "" {
+-		rawQuery := strings.Builder{}
++		q := url.Values{}
+ 		if uri.CertFile != "" {
+-			rawQuery.WriteString("certfile=")
+-			rawQuery.WriteString(uri.CertFile)
+-			rawQuery.WriteRune('&')
++			q.Set("certfile", uri.CertFile)
+ 		}
+ 		if uri.KeyFile != "" {
+-			rawQuery.WriteString("keyfile=")
+-			rawQuery.WriteString(uri.KeyFile)
+-			rawQuery.WriteRune('&')
++			q.Set("keyfile", uri.KeyFile)
+ 		}
+ 		if uri.CACertFile != "" {
+-			rawQuery.WriteString("cacertfile=")
+-			rawQuery.WriteString(uri.CACertFile)
+-			rawQuery.WriteRune('&')
++			q.Set("cacertfile", uri.CACertFile)
+ 		}
+ 		if uri.ServerName != "" {
+-			rawQuery.WriteString("server_name_indication=")
+-			rawQuery.WriteString(uri.ServerName)
++			q.Set("server_name_indication", uri.ServerName)
+ 		}
+-		authority.RawQuery = rawQuery.String()
++		authority.RawQuery = q.Encode()
+ 	}
+ 
+ 	return authority.String()
+--- a/uri_test.go
++++ b/uri_test.go
+@@ -7,6 +7,7 @@ package amqp091
+ 
+ import (
+ 	"reflect"
++	"strings"
+ 	"testing"
+ 	"time"
+ )
+@@ -425,7 +426,7 @@ func TestURI_ParseUriToString(t *testing.T) {
+ 		{
+ 			name: "TLS with URI parameters",
+ 			uri:  "amqps://some-host.com/foobar?certfile=/foo/%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82/cert.pem&keyfile=/foo/%E4%BD%A0%E5%A5%BD/key.pem&cacertfile=C:%5Ccerts%5Cca.pem&server_name_indication=example.com",
+-			want: "amqps://some-host.com/foobar?certfile=/foo/привет/cert.pem&keyfile=/foo/你好/key.pem&cacertfile=C:\\certs\\ca.pem&server_name_indication=example.com",
++			want: "amqps://some-host.com/foobar?cacertfile=C%3A%5Ccerts%5Cca.pem&certfile=%2Ffoo%2F%D0%BF%D1%80%D0%B8%D0%B2%D0%B5%D1%82%2Fcert.pem&keyfile=%2Ffoo%2F%E4%BD%A0%E5%A5%BD%2Fkey.pem&server_name_indication=example.com",
+ 		},
+ 		{name: "only server name indication", uri: "amqps://foo.bar?server_name_indication=example.com", want: "amqps://foo.bar/?server_name_indication=example.com"},
+ 	}
+@@ -441,3 +442,24 @@ func TestURI_ParseUriToString(t *testing.T) {
+ 		})
+ 	}
+ }
++
++func TestURIStringEncodesSpecialCharsInPaths(t *testing.T) {
++	u := URI{
++		Scheme:     "amqps",
++		Host:       "localhost",
++		Port:       5671,
++		CertFile:   "/tmp/cert=foo&keyfile=/evil",
++		KeyFile:    "/tmp/key.pem",
++		CACertFile: "/tmp/ca.pem",
++	}
++	s := u.String()
++	// Verify the '&' and '=' inside CertFile are percent-encoded
++	if strings.Contains(s, "certfile=/tmp/cert=foo&keyfile=/evil&") {
++		t.Fatal("URI.String() failed to encode special characters in CertFile")
++	}
++	// Round-trip must produce identical URI
++	u2, err := ParseURI(s)
++	if err != nil || u2.CertFile != u.CertFile {
++		t.Fatalf("round-trip failed: %v / %+v", err, u2)
++	}
++}
+
+--- a/read.go
++++ b/read.go
+@@ -10,6 +10,7 @@
+ 	"encoding/binary"
+ 	"errors"
+ 	"io"
++	"math"
+ 	"time"
+ )
+ 
+@@ -90,14 +91,54 @@
+ 	return
+ }
+ 
++// readAllocChunk caps how far readBytes allocates ahead of data confirmed
++// present on the wire, so a fabricated length field cannot force a large
++// allocation on its own.
++const readAllocChunk = 64 * 1024
++
++// maxFieldDepth limits how deeply 'A' and 'F' fields may nest, preventing
++// unbounded recursion from overflowing the goroutine stack.
++const maxFieldDepth = 32
++
++// maxContainerElements limits how many elements/entries a single array or
++// table may hold, preventing amplification of small wire payloads into large
++// heap allocations.
++const maxContainerElements = 8192
++
++// readBytes reads exactly n bytes, growing the buffer in readAllocChunk
++// increments so it never allocates far ahead of confirmed data.
++func readBytes(r io.Reader, n int64) ([]byte, error) {
++	if n < 0 {
++		return nil, ErrSyntax
++	}
++
++	first := n
++	if first > readAllocChunk {
++		first = readAllocChunk
++	}
++	buf := make([]byte, 0, first)
++	for int64(len(buf)) < n {
++		chunk := n - int64(len(buf))
++		if chunk > readAllocChunk {
++			chunk = readAllocChunk
++		}
++		old := len(buf)
++		buf = append(buf, make([]byte, chunk)...)
++		if _, err := io.ReadFull(r, buf[old:]); err != nil {
++			return nil, err
++		}
++	}
++	return buf, nil
++}
++
+ func readShortstr(r io.Reader) (v string, err error) {
+ 	var length uint8
+ 	if err = binary.Read(r, binary.BigEndian, &length); err != nil {
+ 		return
+ 	}
+ 
+-	bytes := make([]byte, length)
+-	if _, err = io.ReadFull(r, bytes); err != nil {
++	bytes, err := readBytes(r, int64(length))
++	if err != nil {
+ 		return
+ 	}
+ 	return string(bytes), nil
+@@ -114,8 +155,8 @@
+ 		return
+ 	}
+ 
+-	bytes := make([]byte, length)
+-	if _, err = io.ReadFull(r, bytes); err != nil {
++	bytes, err := readBytes(r, int64(length))
++	if err != nil {
+ 		return
+ 	}
+ 	return string(bytes), nil
+@@ -159,6 +200,10 @@
+ 'x': []byte
+ */
+ func readField(r io.Reader) (v any, err error) {
++	return readFieldDepth(r, 0)
++}
++
++func readFieldDepth(r io.Reader, depth int) (v any, err error) {
+ 	var typ byte
+ 	if err = binary.Read(r, binary.BigEndian, &typ); err != nil {
+ 		return
+@@ -242,13 +287,13 @@
+ 		return readLongstr(r)
+ 
+ 	case 'A':
+-		return readArray(r)
++		return readArrayDepth(r, depth+1)
+ 
+ 	case 'T':
+ 		return readTimestamp(r)
+ 
+ 	case 'F':
+-		return readTable(r)
++		return readTableDepth(r, depth+1)
+ 
+ 	case 'x':
+ 		var len int32
+@@ -256,11 +301,11 @@
+ 			return nil, err
+ 		}
+ 
+-		value := make([]byte, len)
+-		if _, err = io.ReadFull(r, value); err != nil {
++		value, err := readBytes(r, int64(len))
++		if err != nil {
+ 			return nil, err
+ 		}
+-		return value, err
++		return value, nil
+ 
+ 	case 'V':
+ 		return nil, nil
+@@ -278,6 +323,14 @@
+ held in network byte order.
+ */
+ func readTable(r io.Reader) (table Table, err error) {
++	return readTableDepth(r, 0)
++}
++
++func readTableDepth(r io.Reader, depth int) (table Table, err error) {
++	if depth > maxFieldDepth {
++		return nil, ErrSyntax
++	}
++
+ 	var nested bytes.Buffer
+ 	var str string
+ 
+@@ -297,10 +350,14 @@
+ 			return
+ 		}
+ 
+-		if value, err = readField(&nested); err != nil {
++		if value, err = readFieldDepth(&nested, depth); err != nil {
+ 			return
+ 		}
+ 
++		if len(table) >= maxContainerElements {
++			return nil, ErrSyntax
++		}
++
+ 		table[key] = value
+ 	}
+ 
+@@ -308,24 +365,42 @@
+ }
+ 
+ func readArray(r io.Reader) (arr []any, err error) {
++	return readArrayDepth(r, 0)
++}
++
++func readArrayDepth(r io.Reader, depth int) (arr []any, err error) {
++	if depth > maxFieldDepth {
++		return nil, ErrSyntax
++	}
++
+ 	var size uint32
+ 
+ 	if err = binary.Read(r, binary.BigEndian, &size); err != nil {
+ 		return nil, err
+ 	}
+ 
++	// size is the encoded blob's byte length; reject clearly invalid values.
++	if size > math.MaxInt32 {
++		return nil, ErrSyntax
++	}
++
+ 	var (
+ 		lim   = &io.LimitedReader{R: r, N: int64(size)}
+ 		field any
+ 	)
+ 
+ 	for {
+-		if field, err = readField(lim); err != nil {
++		if field, err = readFieldDepth(lim, depth); err != nil {
+ 			if err == io.EOF {
+ 				break
+ 			}
+ 			return nil, err
+ 		}
++
++		if len(arr) >= maxContainerElements {
++			return nil, ErrSyntax
++		}
++
+ 		arr = append(arr, field)
+ 	}
+ 
+@@ -447,10 +522,9 @@
+ func (r *reader) parseBodyFrame(channel uint16, size uint32) (frame frame, err error) {
+ 	bf := &bodyFrame{
+ 		ChannelId: channel,
+-		Body:      make([]byte, size),
+ 	}
+ 
+-	if _, err = io.ReadFull(r.r, bf.Body); err != nil {
++	if bf.Body, err = readBytes(r.r, int64(size)); err != nil {
+ 		return nil, err
+ 	}
+ 
+@@ -458,8 +532,15 @@
+ }
+ 
+ var errHeartbeatPayload = errors.New("heartbeats should not have a payload")
++var errHeartbeatChannel = errors.New("heartbeats must be sent on channel 0")
+ 
+ func (r *reader) parseHeartbeatFrame(channel uint16, size uint32) (frame frame, err error) {
++	// Per the AMQP 0-9-1 spec, heartbeats are only ever sent on channel 0.
++	// Routing one to another channel's state machine would panic.
++	if channel != 0 {
++		return nil, errHeartbeatChannel
++	}
++
+ 	hf := &heartbeatFrame{
+ 		ChannelId: channel,
+ 	}
+--- /dev/null
++++ b/read_hardening_test.go
+@@ -0,0 +1,109 @@
++// Regression tests for reader hardening (CVE-2026-77410): heartbeat frames on
++// non-zero channels, allocation driven by attacker-declared lengths, and
++// unbounded nesting/size of field arrays and tables.
++
++package amqp091
++
++import (
++	"bytes"
++	"encoding/binary"
++	"strings"
++	"testing"
++)
++
++func be32(n int) []byte {
++	b := make([]byte, 4)
++	binary.BigEndian.PutUint32(b, uint32(n))
++	return b
++}
++
++func TestReadFrameRejectsHeartbeatOnNonZeroChannel(t *testing.T) {
++	r := reader{strings.NewReader("\x08\x00\x01\x00\x00\x00\x00\xce")}
++	f, err := r.ReadFrame()
++	if err == nil {
++		t.Fatalf("expected an error for a heartbeat on channel 1, got frame %#v", f)
++	}
++
++	// A heartbeat on channel 0 remains valid.
++	r = reader{strings.NewReader("\x08\x00\x00\x00\x00\x00\x00\xce")}
++	f, err = r.ReadFrame()
++	if err != nil {
++		t.Fatalf("unexpected error for heartbeat on channel 0: %v", err)
++	}
++	if _, ok := f.(*heartbeatFrame); !ok {
++		t.Fatalf("expected *heartbeatFrame, got %T", f)
++	}
++}
++
++func TestReadFrameBodyDeclaredSizeExceedsData(t *testing.T) {
++	// Body frame on channel 1 declaring a ~4GiB payload but carrying 3 bytes.
++	r := reader{strings.NewReader("\x03\x00\x01\xff\xff\xff\xffabc")}
++	if _, err := r.ReadFrame(); err == nil {
++		t.Fatal("expected an error for a truncated body frame")
++	}
++
++	// A well-formed body frame still parses.
++	r = reader{strings.NewReader("\x03\x00\x01\x00\x00\x00\x03abc\xce")}
++	f, err := r.ReadFrame()
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	bf, ok := f.(*bodyFrame)
++	if !ok || string(bf.Body) != "abc" {
++		t.Fatalf("unexpected frame: %#v", f)
++	}
++}
++
++func TestReadBytes(t *testing.T) {
++	if _, err := readBytes(strings.NewReader("abc"), 1<<30); err == nil {
++		t.Fatal("expected an error when declared length exceeds available data")
++	}
++	if _, err := readBytes(strings.NewReader("abc"), -1); err == nil {
++		t.Fatal("expected an error for a negative length")
++	}
++
++	want := bytes.Repeat([]byte{'x'}, 3*readAllocChunk+5)
++	got, err := readBytes(bytes.NewReader(want), int64(len(want)))
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatal("readBytes returned unexpected data")
++	}
++}
++
++func nestedArray(depth int) []byte {
++	var payload []byte
++	for i := 0; i < depth; i++ {
++		inner := append([]byte{'A'}, be32(len(payload))...)
++		payload = append(inner, payload...)
++	}
++	return append(be32(len(payload)), payload...)
++}
++
++func TestReadArrayRejectsExcessiveNesting(t *testing.T) {
++	if _, err := readArray(bytes.NewReader(nestedArray(maxFieldDepth * 4))); err == nil {
++		t.Fatal("expected an error for deeply nested arrays")
++	}
++	if _, err := readArray(bytes.NewReader(nestedArray(3))); err != nil {
++		t.Fatalf("unexpected error for shallow nesting: %v", err)
++	}
++}
++
++func TestReadArrayRejectsTooManyElements(t *testing.T) {
++	// Each 'V' (void) element is a single wire byte but a full `any` slot.
++	n := maxContainerElements + 1
++	data := append(be32(n), bytes.Repeat([]byte{'V'}, n)...)
++	if _, err := readArray(bytes.NewReader(data)); err == nil {
++		t.Fatal("expected an error for an oversized array")
++	}
++
++	data = append(be32(10), bytes.Repeat([]byte{'V'}, 10)...)
++	arr, err := readArray(bytes.NewReader(data))
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++	if len(arr) != 10 {
++		t.Fatalf("expected 10 elements, got %d", len(arr))
++	}
++}
