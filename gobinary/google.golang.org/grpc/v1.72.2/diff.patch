@@ -1,0 +1,2005 @@
+--- a/server.go
++++ b/server.go
+@@ -42,6 +42,7 @@
+ 	"google.golang.org/grpc/internal"
+ 	"google.golang.org/grpc/internal/binarylog"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpcsync"
+ 	"google.golang.org/grpc/internal/grpcutil"
+ 	istats "google.golang.org/grpc/internal/stats"
+@@ -148,6 +149,8 @@
+ 
+ 	serverWorkerChannel      chan func()
+ 	serverWorkerChannelClose func()
++
++	strictPathCheckingLogEmitted atomic.Bool
+ }
+ 
+ type serverOptions struct {
+@@ -1745,6 +1748,24 @@
+ 	return ss.s.WriteStatus(statusOK)
+ }
+ 
++func (s *Server) handleMalformedMethodName(stream *transport.ServerStream, ti *traceInfo) {
++	if ti != nil {
++		ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{stream.Method()}}, true)
++		ti.tr.SetError()
++	}
++	errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
++	if err := stream.WriteStatus(status.New(codes.Unimplemented, errDesc)); err != nil {
++		if ti != nil {
++			ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
++			ti.tr.SetError()
++		}
++		channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream failed to write status: %v", err)
++	}
++	if ti != nil {
++		ti.tr.Finish()
++	}
++}
++
+ func (s *Server) handleStream(t transport.ServerTransport, stream *transport.ServerStream) {
+ 	ctx := stream.Context()
+ 	ctx = contextWithServer(ctx, s)
+@@ -1765,26 +1786,30 @@
+ 	}
+ 
+ 	sm := stream.Method()
+-	if sm != "" && sm[0] == '/' {
++	if sm == "" {
++		s.handleMalformedMethodName(stream, ti)
++		return
++	}
++	if sm[0] != '/' {
++		// TODO(easwars): Add a link to the CVE in the below log messages once
++		// published.
++		if envconfig.DisableStrictPathChecking {
++			if old := s.strictPathCheckingLogEmitted.Swap(true); !old {
++				channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream received malformed method name %q. Allowing it because the environment variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING is set to true, but this option will be removed in a future release.", sm)
++			}
++		} else {
++			if old := s.strictPathCheckingLogEmitted.Swap(true); !old {
++				channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream rejected malformed method name %q. To temporarily allow such requests, set the environment variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING to true. Note that this is not recommended as it may allow requests to bypass security policies.", sm)
++			}
++			s.handleMalformedMethodName(stream, ti)
++			return
++		}
++	} else {
+ 		sm = sm[1:]
+ 	}
+ 	pos := strings.LastIndex(sm, "/")
+ 	if pos == -1 {
+-		if ti != nil {
+-			ti.tr.LazyLog(&fmtStringer{"Malformed method name %q", []any{sm}}, true)
+-			ti.tr.SetError()
+-		}
+-		errDesc := fmt.Sprintf("malformed method name: %q", stream.Method())
+-		if err := stream.WriteStatus(status.New(codes.Unimplemented, errDesc)); err != nil {
+-			if ti != nil {
+-				ti.tr.LazyLog(&fmtStringer{"%v", []any{err}}, true)
+-				ti.tr.SetError()
+-			}
+-			channelz.Warningf(logger, s.channelz, "grpc: Server.handleStream failed to write status: %v", err)
+-		}
+-		if ti != nil {
+-			ti.tr.Finish()
+-		}
++		s.handleMalformedMethodName(stream, ti)
+ 		return
+ 	}
+ 	service := sm[:pos]
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -69,6 +69,22 @@
+ 	// to gRFC A76. It can be enabled by setting the environment variable
+ 	// "GRPC_EXPERIMENTAL_RING_HASH_SET_REQUEST_HASH_KEY" to "true".
+ 	RingHashSetRequestHashKey = boolFromEnv("GRPC_EXPERIMENTAL_RING_HASH_SET_REQUEST_HASH_KEY", false)
++
++	// DisableStrictPathChecking indicates whether strict path checking is
++	// disabled. This feature can be disabled by setting the environment
++	// variable GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING to "true".
++	//
++	// When strict path checking is enabled, gRPC will reject requests with
++	// paths that do not conform to the gRPC over HTTP/2 specification found at
++	// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md.
++	//
++	// When disabled, gRPC will allow paths that do not contain a leading slash.
++	// Enabling strict path checking is recommended for security reasons, as it
++	// prevents potential path traversal vulnerabilities.
++	//
++	// A future release will remove this environment variable, enabling strict
++	// path checking behavior unconditionally.
++	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+--- /dev/null
++++ b/test/malformed_method_test.go
+@@ -0,0 +1,177 @@
++/*
++ *
++ * Copyright 2026 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++package test
++
++import (
++	"bytes"
++	"context"
++	"net"
++	"testing"
++
++	"golang.org/x/net/http2"
++	"golang.org/x/net/http2/hpack"
++	"google.golang.org/grpc/internal/envconfig"
++	"google.golang.org/grpc/internal/stubserver"
++	"google.golang.org/grpc/internal/testutils"
++
++	testpb "google.golang.org/grpc/interop/grpc_testing"
++)
++
++// TestMalformedMethodPath tests that the server responds with Unimplemented
++// when the method path is malformed. This verifies that the server does not
++// route requests with a malformed method path to the application handler.
++func (s) TestMalformedMethodPath(t *testing.T) {
++	tests := []struct {
++		name       string
++		path       string
++		envVar     bool
++		wantStatus string // string representation of codes.Code
++	}{
++		{
++			name:       "missing_leading_slash_disableStrictPathChecking_false",
++			path:       "grpc.testing.TestService/UnaryCall",
++			wantStatus: "12", // Unimplemented
++		},
++		{
++			name:       "empty_path_disableStrictPathChecking_false",
++			path:       "",
++			wantStatus: "12", // Unimplemented
++		},
++		{
++			name:       "just_slash_disableStrictPathChecking_false",
++			path:       "/",
++			wantStatus: "12", // Unimplemented
++		},
++		{
++			name:       "missing_leading_slash_disableStrictPathChecking_true",
++			path:       "grpc.testing.TestService/UnaryCall",
++			envVar:     true,
++			wantStatus: "0", // OK
++		},
++		{
++			name:       "empty_path_disableStrictPathChecking_true",
++			path:       "",
++			envVar:     true,
++			wantStatus: "12", // Unimplemented
++		},
++		{
++			name:       "just_slash_disableStrictPathChecking_true",
++			path:       "/",
++			envVar:     true,
++			wantStatus: "12", // Unimplemented
++		},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
++			defer cancel()
++
++			testutils.SetEnvConfig(t, &envconfig.DisableStrictPathChecking, tc.envVar)
++
++			ss := &stubserver.StubServer{
++				UnaryCallF: func(context.Context, *testpb.SimpleRequest) (*testpb.SimpleResponse, error) {
++					return &testpb.SimpleResponse{Payload: &testpb.Payload{Body: []byte("pwned")}}, nil
++				},
++			}
++			if err := ss.Start(nil); err != nil {
++				t.Fatalf("Error starting endpoint server: %v", err)
++			}
++			defer ss.Stop()
++
++			// Open a raw TCP connection to the server and speak HTTP/2 directly.
++			tcpConn, err := net.Dial("tcp", ss.Address)
++			if err != nil {
++				t.Fatalf("Failed to dial tcp: %v", err)
++			}
++			defer tcpConn.Close()
++
++			// Write the HTTP/2 connection preface and the initial settings frame.
++			if _, err := tcpConn.Write([]byte("PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n")); err != nil {
++				t.Fatalf("Failed to write preface: %v", err)
++			}
++			framer := http2.NewFramer(tcpConn, tcpConn)
++			if err := framer.WriteSettings(); err != nil {
++				t.Fatalf("Failed to write settings: %v", err)
++			}
++
++			// Encode and write the HEADERS frame.
++			var headerBuf bytes.Buffer
++			enc := hpack.NewEncoder(&headerBuf)
++			writeHeader := func(name, value string) {
++				enc.WriteField(hpack.HeaderField{Name: name, Value: value})
++			}
++			writeHeader(":method", "POST")
++			writeHeader(":scheme", "http")
++			writeHeader(":authority", ss.Address)
++			writeHeader(":path", tc.path)
++			writeHeader("content-type", "application/grpc")
++			writeHeader("te", "trailers")
++			if err := framer.WriteHeaders(http2.HeadersFrameParam{
++				StreamID:      1,
++				BlockFragment: headerBuf.Bytes(),
++				EndStream:     false,
++				EndHeaders:    true,
++			}); err != nil {
++				t.Fatalf("Failed to write headers: %v", err)
++			}
++
++			// Send a small gRPC-encoded data frame (0 length).
++			if err := framer.WriteData(1, true, []byte{0, 0, 0, 0, 0}); err != nil {
++				t.Fatalf("Failed to write data: %v", err)
++			}
++
++			// Read responses and look for grpc-status.
++			gotStatus := ""
++			dec := hpack.NewDecoder(4096, func(f hpack.HeaderField) {
++				if f.Name == "grpc-status" {
++					gotStatus = f.Value
++				}
++			})
++			done := make(chan struct{})
++			go func() {
++				defer close(done)
++				for {
++					frame, err := framer.ReadFrame()
++					if err != nil {
++						return
++					}
++					if headers, ok := frame.(*http2.HeadersFrame); ok {
++						if _, err := dec.Write(headers.HeaderBlockFragment()); err != nil {
++							return
++						}
++						if headers.StreamEnded() {
++							return
++						}
++					}
++				}
++			}()
++
++			select {
++			case <-done:
++			case <-ctx.Done():
++				t.Fatalf("Timed out waiting for response")
++			}
++
++			if gotStatus != tc.wantStatus {
++				t.Errorf("Got grpc-status %v, want %v", gotStatus, tc.wantStatus)
++			}
++		})
++	}
++}
+
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -85,6 +85,14 @@
+ 	// A future release will remove this environment variable, enabling strict
+ 	// path checking behavior unconditionally.
+ 	DisableStrictPathChecking = boolFromEnv("GRPC_GO_EXPERIMENTAL_DISABLE_STRICT_PATH_CHECKING", false)
++
++	// EnableReceiveBufferCompaction enables the compaction of data buffers
++	// to reduce the number of buffers in the receive buffer.
++	//
++	// This environment variable serves as an escape hatch to disable the
++	// feature if unforeseen issues arise, and it will be removed in a future
++	// release.
++	EnableReceiveBufferCompaction = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION", true)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+--- /dev/null
++++ b/internal/mem/buffer_pool.go
+@@ -0,0 +1,35 @@
++/*
++ *
++ * Copyright 2026 gRPC authors.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ *
++ */
++
++// Package mem contains memory related utilities shared between the public mem
++// package and other internal packages.
++package mem
++
++import "google.golang.org/grpc/internal"
++
++var (
++	// BufferPoolingThreshold is the minimum size of a buffer that can be pooled.
++	// This is used to determine whether to pool buffers or allocate them directly.
++	BufferPoolingThreshold = 1 << 10
++)
++
++func init() {
++	internal.SetBufferPoolingThresholdForTesting = func(threshold int) {
++		BufferPoolingThreshold = threshold
++	}
++}
+--- a/internal/transport/handler_server.go
++++ b/internal/transport/handler_server.go
+@@ -413,7 +413,7 @@
+ 			id:             0, // irrelevant
+ 			ctx:            ctx,
+ 			requestRead:    func(int) {},
+-			buf:            newRecvBuffer(),
++			buf:            newRecvBuffer(ht.bufferPool),
+ 			method:         req.URL.Path,
+ 			recvCompress:   req.Header.Get("grpc-encoding"),
+ 			contentSubtype: ht.contentSubtype,
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -487,7 +487,7 @@
+ 		Stream: &Stream{
+ 			method:         callHdr.Method,
+ 			sendCompress:   callHdr.SendCompress,
+-			buf:            newRecvBuffer(),
++			buf:            newRecvBuffer(t.bufferPool),
+ 			contentSubtype: callHdr.ContentSubtype,
+ 		},
+ 		ct:         t,
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -385,7 +385,7 @@
+ 	}
+ 	t.maxStreamID = streamID
+ 
+-	buf := newRecvBuffer()
++	buf := newRecvBuffer(t.bufferPool)
+ 	s := &ServerStream{
+ 		Stream: &Stream{
+ 			id:  streamID,
+--- a/internal/transport/transport.go
++++ b/internal/transport/transport.go
+@@ -30,10 +30,13 @@
+ 	"sync"
+ 	"sync/atomic"
+ 	"time"
++	"unsafe"
+ 
+ 	"google.golang.org/grpc/codes"
+ 	"google.golang.org/grpc/credentials"
+ 	"google.golang.org/grpc/internal/channelz"
++	"google.golang.org/grpc/internal/envconfig"
++	imem "google.golang.org/grpc/internal/mem"
+ 	"google.golang.org/grpc/keepalive"
+ 	"google.golang.org/grpc/mem"
+ 	"google.golang.org/grpc/metadata"
+@@ -43,8 +46,31 @@
+ 	"google.golang.org/grpc/tap"
+ )
+ 
+-const logLevel = 2
++const (
++	logLevel = 2
++	// recvMsgSize estimates the memory overhead of a recvMsg in the backlog.
++	// It accounts for the recvMsg struct itself and the slice header of the
++	// underlying buffer's data.
++	recvMsgSize = int(unsafe.Sizeof(recvMsg{}) + unsafe.Sizeof([]byte{}))
+ 
++	// utilizationFactor controls when we consider memory utilization acceptable.
++	// When backlogHeapSize / payloadSize <= utilizationFactor (meaning at least
++	// 50% of the heap memory is actual payload data), compaction is skipped.
++	utilizationFactor = 2
++)
++
++var (
++	// compactionThreshold is approx 57KB (on 64-bit systems). It allows
++	// accumulating up to 1024 1-byte payloads before triggering compaction.
++	//
++	// Because individual payloads <= 1024 bytes are allocated on the heap
++	// outside mem.BufferPool, waiting for at least 1024 bytes to accumulate
++	// ensures that compaction coalesces those small heap allocations into a
++	// single large buffer from mem.BufferPool, enabling buffer reuse while
++	// avoiding frequent copying for small bursts of frames.
++	compactionThreshold = imem.BufferPoolingThreshold * (recvMsgSize + 1)
++)
++
+ // recvMsg represents the received msg from the transport. All transport
+ // protocol specific info has been removed.
+ type recvMsg struct {
+@@ -65,23 +91,34 @@
+ 	c       chan recvMsg
+ 	mu      sync.Mutex
+ 	backlog []recvMsg
+-	err     error
++	// uncompactedSuffixLen tracks the number of consecutive data messages at
++	// the tail of backlog that have not been compacted.
++	uncompactedSuffixLen int
++	// uncompactedBytes tracks the total payload bytes across the trailing
++	// uncompactedSuffixLen messages.
++	uncompactedBytes int
++	err              error
++	bufPool          mem.BufferPool
+ }
+ 
+-func newRecvBuffer() *recvBuffer {
++func newRecvBuffer(pool mem.BufferPool) *recvBuffer {
++	if pool == nil {
++		pool = mem.DefaultBufferPool()
++	}
+ 	b := &recvBuffer{
+-		c: make(chan recvMsg, 1),
++		c:       make(chan recvMsg, 1),
++		bufPool: pool,
+ 	}
+ 	return b
+ }
+ 
+ func (b *recvBuffer) put(r recvMsg) {
+ 	b.mu.Lock()
++	defer b.mu.Unlock()
+ 	if b.err != nil {
+ 		// drop the buffer on the floor. Since b.err is not nil, any subsequent reads
+ 		// will always return an error, making this buffer inaccessible.
+ 		r.buffer.Free()
+-		b.mu.Unlock()
+ 		// An error had occurred earlier, don't accept more
+ 		// data or errors.
+ 		return
+@@ -90,20 +127,84 @@
+ 	if len(b.backlog) == 0 {
+ 		select {
+ 		case b.c <- r:
+-			b.mu.Unlock()
+ 			return
+ 		default:
+ 		}
+ 	}
+ 	b.backlog = append(b.backlog, r)
+-	b.mu.Unlock()
++	b.compactBacklogLocked(r)
+ }
+ 
++func (b *recvBuffer) compactBacklogLocked(r recvMsg) {
++	if !envconfig.EnableReceiveBufferCompaction {
++		return
++	}
++	if r.buffer == nil {
++		b.uncompactedBytes = 0
++		b.uncompactedSuffixLen = 0
++		return
++	}
++
++	b.uncompactedSuffixLen++
++	b.uncompactedBytes += r.buffer.Len()
++	backlogHeapSize := b.uncompactedSuffixLen*recvMsgSize + b.uncompactedBytes
++
++	// If the memory overhead is less than 50% of the heap usage (e.g., because
++	// a large DATA frame arrived), the average message size in the suffix is
++	// large enough that memory bloat is not a concern. Reset suffix tracking.
++	if backlogHeapSize <= utilizationFactor*b.uncompactedBytes {
++		b.uncompactedBytes = 0
++		b.uncompactedSuffixLen = 0
++		return
++	}
++	// Avoid compacting too frequently for short bursts of small frames.
++	// Wait until we have accumulated at least ~1024 small messages (~57 KB).
++	if backlogHeapSize <= compactionThreshold {
++		// Still can accumulate more payloads.
++		return
++	}
++
++	// Since the memory utilization is less than 50%, the average payload size
++	// of each recvMsg must be less than recvMsgSize (approx 56 bytes).
++	// In the worst case for bytes copied (where the average payload is just
++	// below recvMsgSize), compaction will occur once every:
++	//   compactionThreshold / (recvMsgSize + avg_payload) = ~520 messages,
++	// copying ~29KB of data.
++
++	start := 0
++	newBuf := b.bufPool.Get(b.uncompactedBytes)
++	startIdx := len(b.backlog) - b.uncompactedSuffixLen
++
++	for i := startIdx; i < len(b.backlog); i++ {
++		m := b.backlog[i]
++		b.backlog[i] = recvMsg{}
++		start += copy((*newBuf)[start:], m.buffer.ReadOnlyData())
++		m.buffer.Free()
++	}
++	b.backlog[startIdx] = recvMsg{
++		buffer: mem.NewBuffer(newBuf, b.bufPool),
++	}
++	b.backlog = b.backlog[:startIdx+1]
++	// After compaction, the suffix is replaced with a single message containing
++	// the combined payload. The new utilization is close to 1.0 (overhead of
++	// one recvMsg relative to the large compacted payload), which is well
++	// below the utilization factor of 2.
++	b.uncompactedBytes = 0
++	b.uncompactedSuffixLen = 0
++}
++
+ func (b *recvBuffer) load() {
+ 	b.mu.Lock()
+ 	if len(b.backlog) > 0 {
+ 		select {
+ 		case b.c <- b.backlog[0]:
++			// backlog[0] is only part of the tracked uncompacted suffix if the
++			// entire backlog currently consists of the suffix. If an earlier
++			// compaction or reset occurred, backlog[0] is already compacted.
++			if envconfig.EnableReceiveBufferCompaction && b.uncompactedSuffixLen == len(b.backlog) {
++				b.uncompactedSuffixLen--
++				b.uncompactedBytes -= b.backlog[0].buffer.Len()
++			}
+ 			b.backlog[0] = recvMsg{}
+ 			b.backlog = b.backlog[1:]
+ 		default:
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -1792,7 +1792,7 @@
+ func (s) TestReadGivesSameErrorAfterAnyErrorOccurs(t *testing.T) {
+ 	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
+ 	defer cancel()
+-	testRecvBuffer := newRecvBuffer()
++	testRecvBuffer := newRecvBuffer(mem.DefaultBufferPool())
+ 	s := &Stream{
+ 		ctx:         ctx,
+ 		buf:         testRecvBuffer,
+@@ -2949,7 +2949,7 @@
+ // number of bytes read for flow control is correct.
+ func (s) TestReadMessageHeaderMultipleBuffers(t *testing.T) {
+ 	headerLen := 5
+-	recvBuffer := newRecvBuffer()
++	recvBuffer := newRecvBuffer(mem.DefaultBufferPool())
+ 	recvBuffer.put(recvMsg{buffer: make(mem.SliceBuffer, 3)})
+ 	recvBuffer.put(recvMsg{buffer: make(mem.SliceBuffer, headerLen-3)})
+ 	bytesRead := 0
+@@ -3059,5 +3059,45 @@
+ 
+ 	if got, want := rstTime.Sub(startTime), 10*time.Millisecond; got < want {
+ 		t.Fatalf("RST frame received earlier than expected by duration: %v", want-got)
++	}
++}
++
++// TestRecvBufferCompactsSmallFrames verifies that a large number of tiny data
++// frames queued in the backlog of a recvBuffer are coalesced into a small
++// number of larger buffers, bounding the per-message memory overhead, without
++// altering the order or content of the received data.
++func (s) TestRecvBufferCompactsSmallFrames(t *testing.T) {
++	ctx, cancel := context.WithTimeout(context.Background(), defaultTestTimeout)
++	defer cancel()
++
++	const numMsgs = 20000
++	rb := newRecvBuffer(mem.DefaultBufferPool())
++	want := make([]byte, 0, numMsgs)
++	for i := 0; i < numMsgs; i++ {
++		b := byte(i % 251)
++		want = append(want, b)
++		rb.put(recvMsg{buffer: mem.SliceBuffer{b}})
++	}
++
++	rb.mu.Lock()
++	backlogLen := len(rb.backlog)
++	rb.mu.Unlock()
++	if backlogLen > numMsgs/10 {
++		t.Fatalf("len(recvBuffer.backlog) = %d after %d single byte messages, want at most %d", backlogLen, numMsgs, numMsgs/10)
++	}
++
++	got := make([]byte, 0, numMsgs)
++	for len(got) < numMsgs {
++		select {
++		case m := <-rb.get():
++			got = append(got, m.buffer.ReadOnlyData()...)
++			m.buffer.Free()
++			rb.load()
++		case <-ctx.Done():
++			t.Fatalf("Timed out after reading %d of %d bytes from recvBuffer", len(got), numMsgs)
++		}
++	}
++	if !bytes.Equal(got, want) {
++		t.Fatalf("Data read from recvBuffer does not match the data written to it")
+ 	}
+ }
+--- a/mem/buffer_pool.go
++++ b/mem/buffer_pool.go
+@@ -51,10 +51,6 @@
+ 	internal.SetDefaultBufferPoolForTesting = func(pool BufferPool) {
+ 		defaultBufferPool = pool
+ 	}
+-
+-	internal.SetBufferPoolingThresholdForTesting = func(threshold int) {
+-		bufferPoolingThreshold = threshold
+-	}
+ }
+ 
+ // DefaultBufferPool returns the current default buffer pool. It is a BufferPool
+--- a/mem/buffers.go
++++ b/mem/buffers.go
+@@ -29,6 +29,8 @@
+ 	"fmt"
+ 	"sync"
+ 	"sync/atomic"
++
++	"google.golang.org/grpc/internal/mem"
+ )
+ 
+ // A Buffer represents a reference counted piece of data (in bytes) that can be
+@@ -59,8 +61,6 @@
+ }
+ 
+ var (
+-	bufferPoolingThreshold = 1 << 10
+-
+ 	bufferObjectPool = sync.Pool{New: func() any { return new(buffer) }}
+ 	refObjectPool    = sync.Pool{New: func() any { return new(atomic.Int32) }}
+ )
+@@ -69,7 +69,7 @@
+ // equal to the threshold for buffer pooling. This is used to determine whether
+ // to pool buffers or allocate them directly.
+ func IsBelowBufferPoolingThreshold(size int) bool {
+-	return size <= bufferPoolingThreshold
++	return size <= mem.BufferPoolingThreshold
+ }
+ 
+ type buffer struct {
+
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -527,6 +527,18 @@
+ 		delete(mdata, "host")
+ 	}
+ 
++	// If :authority is still missing, i.e. no host or :authority header is
++	// present, reject the request as invalid.
++	if len(mdata[":authority"]) == 0 {
++		t.controlBuf.put(&earlyAbortStream{
++			httpStatus:     http.StatusBadRequest,
++			streamID:       streamID,
++			contentSubtype: s.contentSubtype,
++			status:         status.New(codes.Internal, "no host or :authority header present"),
++			rst:            !frame.StreamEnded(),
++		})
++		return nil
++	}
+ 	if frame.StreamEnded() {
+ 		// s is just created by the caller. No lock needed.
+ 		s.state = streamReadDone
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -2017,6 +2017,22 @@
+ 			grpcStatusWant:  "13",
+ 			grpcMessageWant: "both must only have 1 value as per HTTP/2 spec",
+ 		},
++		// If neither :authority nor host header is present on a gRPC request, the
++		// request should be rejected with HTTP Status 400 and gRPC status Internal.
++		{
++			name: "Missing authority and host header grpc",
++			headers: []struct {
++				name   string
++				values []string
++			}{
++				{name: ":method", values: []string{"POST"}},
++				{name: ":path", values: []string{"foo"}},
++				{name: "content-type", values: []string{"application/grpc"}},
++			},
++			httpStatusWant:  "400",
++			grpcStatusWant:  "13",
++			grpcMessageWant: "no host or :authority header present",
++		},
+ 		// If the client sends an HTTP/2 request with a :method header with a
+ 		// value other than POST, as specified in the gRPC over HTTP/2
+ 		// specification, the server should fail the RPC.
+--- a/test/end2end_test.go
++++ b/test/end2end_test.go
+@@ -5974,18 +5974,6 @@
+ 			},
+ 			wantAuthority: "localhost",
+ 		},
+-		{
+-			name: "Missing :authority and host",
+-			// Codepath triggered by incoming headers with no :authority and no
+-			// host.
+-			headers: []string{
+-				":method", "POST",
+-				":path", "/grpc.testing.TestService/UnaryCall",
+-				"content-type", "application/grpc",
+-				"te", "trailers",
+-			},
+-			wantAuthority: "",
+-		},
+ 		// "If :authority is present, Host must be discarded." - A41
+ 		{
+ 			name: ":authority and host present",
+@@ -6045,6 +6033,73 @@
+ 				t.Fatalf("gotAuthority: %v, wantAuthority %v", gotAuthority, test.wantAuthority)
+ 			}
+ 		})
++	}
++}
++
++// TestMissingAuthorityAndHostHeader tests that an incoming HTTP/2 request with
++// neither :authority nor host header is rejected with HTTP status 400 and gRPC
++// status Internal.
++func (s) TestMissingAuthorityAndHostHeader(t *testing.T) {
++	lis, err := net.Listen("tcp", "localhost:0")
++	if err != nil {
++		t.Fatalf("Failed to listen: %v", err)
++	}
++	defer lis.Close()
++	s := grpc.NewServer()
++	defer s.Stop()
++	go s.Serve(lis)
++
++	conn, err := net.DialTimeout("tcp", lis.Addr().String(), defaultTestTimeout)
++	if err != nil {
++		t.Fatalf("Failed to dial server: %v", err)
++	}
++	defer conn.Close()
++
++	st := newServerTesterFromConn(t, conn)
++	st.greet()
++
++	st.writeHeaders(http2.HeadersFrameParam{
++		StreamID: 1,
++		BlockFragment: st.encodeHeader(
++			":method", "POST",
++			":path", "/grpc.testing.TestService/UnaryCall",
++			"content-type", "application/grpc",
++			"te", "trailers",
++		),
++		EndStream:  false,
++		EndHeaders: true,
++	})
++
++	for {
++		frame, err := st.readFrame()
++		if err != nil {
++			t.Fatalf("Error reading frame: %v", err)
++		}
++		hf, ok := frame.(*http2.MetaHeadersFrame)
++		if !ok {
++			continue
++		}
++		var httpStatus, grpcStatus, grpcMessage string
++		for _, h := range hf.Fields {
++			switch h.Name {
++			case ":status":
++				httpStatus = h.Value
++			case "grpc-status":
++				grpcStatus = h.Value
++			case "grpc-message":
++				grpcMessage = h.Value
++			}
++		}
++		if httpStatus != "400" {
++			t.Fatalf("Got HTTP status %v, want 400", httpStatus)
++		}
++		if grpcStatus != "13" {
++			t.Fatalf("Got gRPC status %v, want 13 (Internal)", grpcStatus)
++		}
++		if !strings.Contains(grpcMessage, "no host or :authority header present") {
++			t.Fatalf("Got gRPC message %q, want 'no host or :authority header present'", grpcMessage)
++		}
++		return
+ 	}
+ }
+ 
+--- a/test/servertester.go
++++ b/test/servertester.go
+@@ -275,6 +275,7 @@
+ 		BlockFragment: st.encodeHeader(
+ 			":method", "POST",
+ 			":path", path,
++			":authority", "localhost",
+ 			"content-type", "application/grpc",
+ 			"te", "trailers",
+ 		),
+--- a/xds/server.go
++++ b/xds/server.go
+@@ -267,10 +267,14 @@
+ 	if !ok {
+ 		return errors.New("missing metadata in incoming context")
+ 	}
+-	// A41 added logic to the core grpc implementation to guarantee that once
+-	// the RPC gets to this point, there will be a single, unambiguous authority
+-	// present in the header map.
++	// A41 added logic to the core grpc implementation to guarantee that once the
++	// RPC gets to this point, there will be a single, unambiguous authority
++	// present in the header map. But add a defensive check to ensure authority
++	// header is present.
+ 	authority := md.Get(":authority")
++	if len(authority) == 0 {
++		return rc.StatusErrWithNodeID(codes.Internal, "no :authority header present")
++	}
+ 	vh := xdsresource.FindBestMatchingVirtualHostServer(authority[0], rc.VHS)
+ 	if vh == nil {
+ 		return rc.StatusErrWithNodeID(codes.Unavailable, "the incoming RPC did not match a configured Virtual Host")
+
+--- a/internal/envconfig/envconfig.go
++++ b/internal/envconfig/envconfig.go
+@@ -93,6 +93,17 @@
+ 	// feature if unforeseen issues arise, and it will be removed in a future
+ 	// release.
+ 	EnableReceiveBufferCompaction = boolFromEnv("GRPC_GO_EXPERIMENTAL_ENABLE_RECEIVE_BUFFER_COMPACTION", true)
++
++	// ControlBufferThrottleLimit is the maximum number of control frames that can
++	// be queued in the control buffer before throttling is applied. The value
++	// must be between 1 and 10,000, and is set to 100 by default.
++	//
++	// This environment variable serves as an escape hatch to increase the
++	// throttling limit if unforeseen issues arise, and it will be removed in a
++	// future release.
++	//
++	// TODO: Remove this env var once v1.83.0 is release.
++	ControlBufferThrottleLimit = uint64FromEnv("GRPC_GO_EXPERIMENTAL_CONTROL_BUFFER_THROTTLE_LIMIT", 100, 1, 10000)
+ )
+ 
+ func boolFromEnv(envVar string, def bool) bool {
+--- a/internal/transport/controlbuf.go
++++ b/internal/transport/controlbuf.go
+@@ -30,6 +30,7 @@
+ 
+ 	"golang.org/x/net/http2"
+ 	"golang.org/x/net/http2/hpack"
++	"google.golang.org/grpc/internal/envconfig"
+ 	"google.golang.org/grpc/internal/grpclog"
+ 	"google.golang.org/grpc/internal/grpcutil"
+ 	"google.golang.org/grpc/mem"
+@@ -92,50 +93,65 @@
+ // the control buffer of transport. They represent different aspects of
+ // control tasks, e.g., flow control, settings, streaming resetting, etc.
+ 
+-// maxQueuedTransportResponseFrames is the most queued "transport response"
+-// frames we will buffer before preventing new reads from occurring on the
+-// transport.  These are control frames sent in response to client requests,
+-// such as RST_STREAM due to bad headers or settings acks.
+-const maxQueuedTransportResponseFrames = 50
++// maxQueuedControlBufferItems is the maximum number of frames (other than
++// HEADERS and DATA) that we will buffer before preventing new reads from
++// occurring on the transport.  These are control frames sent in response to
++// client requests, or frames that result in work being scheduled, such as
++// RST_STREAM due to bad headers or settings acks.
++var maxQueuedControlBufferItems = int(envconfig.ControlBufferThrottleLimit)
+ 
+ type cbItem interface {
+-	isTransportResponseFrame() bool
++	isThrottled() bool
+ }
+ 
++// throttledItem represents every item in the controlBuffer to which the overall
++// throttling limit applies, other than outgoing HEADERS and DATA frames.
++type throttledItem struct{}
++
++func (throttledItem) isThrottled() bool { return true }
++
++// The following defines various control items which could flow through
++// the control buffer of transport. They represent different aspects of
++// control tasks, e.g., flow control, settings, streaming resetting, etc.
++
+ // registerStream is used to register an incoming stream with loopy writer.
+ type registerStream struct {
++	throttledItem
+ 	streamID uint32
+ 	wq       *writeQuota
+ }
+ 
+-func (*registerStream) isTransportResponseFrame() bool { return false }
+-
+-// headerFrame is also used to register stream on the client-side.
+-type headerFrame struct {
++type clientHeaders struct {
+ 	streamID   uint32
+ 	hf         []hpack.HeaderField
+-	endStream  bool               // Valid on server side.
+-	initStream func(uint32) error // Used only on the client side.
++	initStream func(uint32) error
+ 	onWrite    func()
+-	wq         *writeQuota    // write quota for the stream created.
+-	cleanup    *cleanupStream // Valid on the server side.
+-	onOrphaned func(error)    // Valid on client-side
++	wq         *writeQuota
++	onOrphaned func(error)
+ }
+ 
+-func (h *headerFrame) isTransportResponseFrame() bool {
+-	return h.cleanup != nil && h.cleanup.rst // Results in a RST_STREAM
++func (*clientHeaders) isThrottled() bool { return false }
++
++type serverHeaders struct {
++	streamID  uint32
++	hf        []hpack.HeaderField
++	endStream bool
++	onWrite   func()
++	cleanup   *cleanupStream
+ }
+ 
++func (h *serverHeaders) isThrottled() bool { return false }
++
+ type cleanupStream struct {
++	throttledItem
+ 	streamID uint32
+ 	rst      bool
+ 	rstCode  http2.ErrCode
+ 	onWrite  func()
+ }
+ 
+-func (c *cleanupStream) isTransportResponseFrame() bool { return c.rst } // Results in a RST_STREAM
+-
+ type earlyAbortStream struct {
++	throttledItem
+ 	httpStatus     uint32
+ 	streamID       uint32
+ 	contentSubtype string
+@@ -143,8 +159,6 @@
+ 	rst            bool
+ }
+ 
+-func (*earlyAbortStream) isTransportResponseFrame() bool { return false }
+-
+ type dataFrame struct {
+ 	streamID  uint32
+ 	endStream bool
+@@ -155,71 +169,61 @@
+ 	onEachWrite func()
+ }
+ 
+-func (*dataFrame) isTransportResponseFrame() bool { return false }
++func (*dataFrame) isThrottled() bool { return false }
+ 
+ type incomingWindowUpdate struct {
++	throttledItem
+ 	streamID  uint32
+ 	increment uint32
+ }
+ 
+-func (*incomingWindowUpdate) isTransportResponseFrame() bool { return false }
+-
+ type outgoingWindowUpdate struct {
++	throttledItem
+ 	streamID  uint32
+ 	increment uint32
+ }
+ 
+-func (*outgoingWindowUpdate) isTransportResponseFrame() bool {
+-	return false // window updates are throttled by thresholds
+-}
+-
+ type incomingSettings struct {
++	throttledItem
+ 	ss []http2.Setting
+ }
+ 
+-func (*incomingSettings) isTransportResponseFrame() bool { return true } // Results in a settings ACK
+-
+ type outgoingSettings struct {
++	throttledItem
+ 	ss []http2.Setting
+ }
+ 
+-func (*outgoingSettings) isTransportResponseFrame() bool { return false }
+-
+ type incomingGoAway struct {
++	throttledItem
+ }
+ 
+-func (*incomingGoAway) isTransportResponseFrame() bool { return false }
+-
+ type goAway struct {
++	throttledItem
+ 	code      http2.ErrCode
+ 	debugData []byte
+ 	headsUp   bool
+ 	closeConn error // if set, loopyWriter will exit with this error
+ }
+ 
+-func (*goAway) isTransportResponseFrame() bool { return false }
+-
+ type ping struct {
++	throttledItem
+ 	ack  bool
+ 	data [8]byte
+ }
+ 
+-func (*ping) isTransportResponseFrame() bool { return true }
+-
+ type outFlowControlSizeRequest struct {
++	throttledItem
+ 	resp chan uint32
+ }
+ 
+-func (*outFlowControlSizeRequest) isTransportResponseFrame() bool { return false }
+-
+ // closeConnection is an instruction to tell the loopy writer to flush the
+ // framer and exit, which will cause the transport's connection to be closed
+ // (by the client or server).  The transport itself will close after the reader
+ // encounters the EOF caused by the connection closure.
+-type closeConnection struct{}
++type closeConnection struct {
++	throttledItem
++}
+ 
+-func (closeConnection) isTransportResponseFrame() bool { return false }
+-
+ type outStreamState int
+ 
+ const (
+@@ -295,7 +299,7 @@
+ // control frame not only represents data, messages or headers to be sent out
+ // but can also be used to instruct loopy to update its internal state. It
+ // shouldn't be confused with an HTTP2 frame, although some of the control
+-// frames like dataFrame and headerFrame do go out on wire as HTTP2 frames.
++// frames like dataFrame and serverHeaders do go out on wire as HTTP2 frames.
+ type controlBuffer struct {
+ 	wakeupCh chan struct{}   // Unblocks readers waiting for something to read.
+ 	done     <-chan struct{} // Closed when the transport is done.
+@@ -309,7 +313,7 @@
+ 
+ 	// transportResponseFrames counts the number of queued items that represent
+ 	// the response of an action initiated by the peer.  trfChan is created
+-	// when transportResponseFrames >= maxQueuedTransportResponseFrames and is
++	// when transportResponseFrames >= maxQueuedControlBufferItems and is
+ 	// closed and nilled when transportResponseFrames drops below the
+ 	// threshold.  Both fields are protected by mu.
+ 	transportResponseFrames int
+@@ -371,9 +375,9 @@
+ 		c.consumerWaiting = false
+ 	}
+ 	c.list.enqueue(it)
+-	if it.isTransportResponseFrame() {
++	if it.isThrottled() {
+ 		c.transportResponseFrames++
+-		if c.transportResponseFrames == maxQueuedTransportResponseFrames {
++		if c.transportResponseFrames == maxQueuedControlBufferItems {
+ 			// We are adding the frame that puts us over the threshold; create
+ 			// a throttling channel.
+ 			ch := make(chan struct{})
+@@ -428,8 +432,8 @@
+ 		return nil, nil
+ 	}
+ 	h := c.list.dequeue().(cbItem)
+-	if h.isTransportResponseFrame() {
+-		if c.transportResponseFrames == maxQueuedTransportResponseFrames {
++	if h.isThrottled() {
++		if c.transportResponseFrames == maxQueuedControlBufferItems {
+ 			// We are removing the frame that put us over the
+ 			// threshold; close and clear the throttling channel.
+ 			ch := c.trfChan.Swap(nil)
+@@ -456,10 +460,8 @@
+ 	// is still not aware of these yet.
+ 	for head := c.list.dequeueAll(); head != nil; head = head.next {
+ 		switch v := head.it.(type) {
+-		case *headerFrame:
+-			if v.onOrphaned != nil { // It will be nil on the server-side.
+-				v.onOrphaned(ErrConnClosing)
+-			}
++		case *clientHeaders:
++			v.onOrphaned(ErrConnClosing)
+ 		case *dataFrame:
+ 			_ = v.reader.Close()
+ 		}
+@@ -658,42 +660,38 @@
+ 	l.estdStreams[h.streamID] = str
+ }
+ 
+-func (l *loopyWriter) headerHandler(h *headerFrame) error {
+-	if l.side == serverSide {
+-		str, ok := l.estdStreams[h.streamID]
+-		if !ok {
+-			if l.logger.V(logLevel) {
+-				l.logger.Infof("Unrecognized streamID %d in loopyWriter", h.streamID)
+-			}
+-			return nil
++func (l *loopyWriter) serverHeaderHandler(hdr *serverHeaders) error {
++	str, ok := l.estdStreams[hdr.streamID]
++	if !ok {
++		if l.logger.V(logLevel) {
++			l.logger.Infof("Unrecognized streamID %d in loopyWriter", hdr.streamID)
+ 		}
+-		// Case 1.A: Server is responding back with headers.
+-		if !h.endStream {
+-			return l.writeHeader(h.streamID, h.endStream, h.hf, h.onWrite)
+-		}
+-		// else:  Case 1.B: Server wants to close stream.
++		return nil
++	}
+ 
+-		if str.state != empty { // either active or waiting on stream quota.
+-			// add it str's list of items.
+-			str.itl.enqueue(h)
+-			return nil
+-		}
+-		if err := l.writeHeader(h.streamID, h.endStream, h.hf, h.onWrite); err != nil {
+-			return err
+-		}
+-		return l.cleanupStreamHandler(h.cleanup)
++	// Case 1: Server is responding back with headers.
++	if !hdr.endStream {
++		return l.writeHeader(hdr.streamID, hdr.endStream, hdr.hf, hdr.onWrite)
+ 	}
+-	// Case 2: Client wants to originate stream.
++
++	// Case 2: Server is closing the stream.
++	if str.state != empty { // either active or waiting on stream quota.
++		str.itl.enqueue(hdr)
++		return nil
++	}
++	if err := l.writeHeader(hdr.streamID, hdr.endStream, hdr.hf, hdr.onWrite); err != nil {
++		return err
++	}
++	return l.cleanupStreamHandler(hdr.cleanup)
++}
++
++func (l *loopyWriter) clientHeaderHandler(hdr *clientHeaders) error {
+ 	str := &outStream{
+-		id:    h.streamID,
++		id:    hdr.streamID,
+ 		state: empty,
+ 		itl:   &itemList{},
+-		wq:    h.wq,
++		wq:    hdr.wq,
+ 	}
+-	return l.originateStream(str, h)
+-}
+-
+-func (l *loopyWriter) originateStream(str *outStream, hdr *headerFrame) error {
+ 	// l.draining is set when handling GoAway. In which case, we want to avoid
+ 	// creating new streams.
+ 	if l.draining {
+@@ -704,7 +702,7 @@
+ 	if err := hdr.initStream(str.id); err != nil {
+ 		return err
+ 	}
+-	if err := l.writeHeader(str.id, hdr.endStream, hdr.hf, hdr.onWrite); err != nil {
++	if err := l.writeHeader(str.id, false, hdr.hf, hdr.onWrite); err != nil {
+ 		return err
+ 	}
+ 	l.estdStreams[str.id] = str
+@@ -868,8 +866,10 @@
+ 		return l.incomingSettingsHandler(i)
+ 	case *outgoingSettings:
+ 		return l.outgoingSettingsHandler(i)
+-	case *headerFrame:
+-		return l.headerHandler(i)
++	case *clientHeaders:
++		return l.clientHeaderHandler(i)
++	case *serverHeaders:
++		return l.serverHeaderHandler(i)
+ 	case *registerStream:
+ 		l.registerStreamHandler(i)
+ 	case *cleanupStream:
+@@ -945,7 +945,7 @@
+ 		_ = dataItem.reader.Close()
+ 		if str.itl.isEmpty() {
+ 			str.state = empty
+-		} else if trailer, ok := str.itl.peek().(*headerFrame); ok { // the next item is trailers.
++		} else if trailer, ok := str.itl.peek().(*serverHeaders); ok { // the next item is trailers.
+ 			if err := l.writeHeader(trailer.streamID, trailer.endStream, trailer.hf, trailer.onWrite); err != nil {
+ 				return false, err
+ 			}
+@@ -1019,7 +1019,7 @@
+ 	}
+ 	if str.itl.isEmpty() {
+ 		str.state = empty
+-	} else if trailer, ok := str.itl.peek().(*headerFrame); ok { // The next item is trailers.
++	} else if trailer, ok := str.itl.peek().(*serverHeaders); ok { // The next item is trailers.
+ 		if err := l.writeHeader(trailer.streamID, trailer.endStream, trailer.hf, trailer.onWrite); err != nil {
+ 			return false, err
+ 		}
+--- a/internal/transport/http2_client.go
++++ b/internal/transport/http2_client.go
+@@ -768,9 +768,8 @@
+ 			close(s.headerChan)
+ 		}
+ 	}
+-	hdr := &headerFrame{
+-		hf:        headerFields,
+-		endStream: false,
++	hdr := &clientHeaders{
++		hf: headerFields,
+ 		initStream: func(uint32) error {
+ 			t.mu.Lock()
+ 			// TODO: handle transport closure in loopy instead and remove this
+@@ -1196,7 +1195,7 @@
+ 		}
+ 		if f.Header().Flags.Has(http2.FlagDataPadded) {
+ 			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
+-				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
++				t.controlBuf.put(&outgoingWindowUpdate{streamID: s.id, increment: w})
+ 			}
+ 		}
+ 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
+@@ -1811,7 +1810,7 @@
+ 	resp := make(chan uint32, 1)
+ 	timer := time.NewTimer(time.Second)
+ 	defer timer.Stop()
+-	t.controlBuf.put(&outFlowControlSizeRequest{resp})
++	t.controlBuf.put(&outFlowControlSizeRequest{resp: resp})
+ 	select {
+ 	case sz := <-resp:
+ 		return int64(sz)
+--- a/internal/transport/http2_server.go
++++ b/internal/transport/http2_server.go
+@@ -819,7 +819,7 @@
+ 		}
+ 		if f.Header().Flags.Has(http2.FlagDataPadded) {
+ 			if w := s.fc.onRead(size - uint32(len(f.Data()))); w > 0 {
+-				t.controlBuf.put(&outgoingWindowUpdate{s.id, w})
++				t.controlBuf.put(&outgoingWindowUpdate{streamID: s.id, increment: w})
+ 			}
+ 		}
+ 		// TODO(bradfitz, zhaoq): A copy is required here because there is no
+@@ -963,7 +963,7 @@
+ 	if t.maxSendHeaderListSize == nil {
+ 		return true
+ 	}
+-	hdrFrame := it.(*headerFrame)
++	hdrFrame := it.(*serverHeaders)
+ 	var sz int64
+ 	for _, f := range hdrFrame.hf {
+ 		if sz += int64(f.Size()); sz > int64(*t.maxSendHeaderListSize) {
+@@ -1029,7 +1029,7 @@
+ 		headerFields = append(headerFields, hpack.HeaderField{Name: "grpc-encoding", Value: s.sendCompress})
+ 	}
+ 	headerFields = appendHeaderFieldsFromMD(headerFields, s.header)
+-	hf := &headerFrame{
++	hf := &serverHeaders{
+ 		streamID:  s.id,
+ 		hf:        headerFields,
+ 		endStream: false,
+@@ -1098,7 +1098,7 @@
+ 
+ 	// Attach the trailer metadata.
+ 	headerFields = appendHeaderFieldsFromMD(headerFields, s.trailer)
+-	trailingHeader := &headerFrame{
++	trailingHeader := &serverHeaders{
+ 		streamID:  s.id,
+ 		hf:        headerFields,
+ 		endStream: true,
+@@ -1310,7 +1310,7 @@
+ }
+ 
+ // finishStream closes the stream and puts the trailing headerFrame into controlbuf.
+-func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrCode, hdr *headerFrame, eosReceived bool) {
++func (t *http2Server) finishStream(s *ServerStream, rst bool, rstCode http2.ErrCode, hdr *serverHeaders, eosReceived bool) {
+ 	// In case stream sending and receiving are invoked in separate
+ 	// goroutines (e.g., bi-directional streaming), cancel needs to be
+ 	// called to interrupt the potential blocking on other goroutines.
+@@ -1449,7 +1449,7 @@
+ 	resp := make(chan uint32, 1)
+ 	timer := time.NewTimer(time.Second)
+ 	defer timer.Stop()
+-	t.controlBuf.put(&outFlowControlSizeRequest{resp})
++	t.controlBuf.put(&outFlowControlSizeRequest{resp: resp})
+ 	select {
+ 	case sz := <-resp:
+ 		return int64(sz)
+--- a/internal/transport/transport_test.go
++++ b/internal/transport/transport_test.go
+@@ -223,7 +223,7 @@
+ func (h *testStreamHandler) handleStreamInvalidHeaderField(s *ServerStream) {
+ 	headerFields := []hpack.HeaderField{}
+ 	headerFields = append(headerFields, hpack.HeaderField{Name: "content-type", Value: expectedInvalidHeaderField})
+-	h.t.controlBuf.put(&headerFrame{
++	h.t.controlBuf.put(&serverHeaders{
+ 		streamID:  s.id,
+ 		hf:        headerFields,
+ 		endStream: false,
+@@ -3059,5 +3059,66 @@
+ 
+ 	if got, want := rstTime.Sub(startTime), 10*time.Millisecond; got < want {
+ 		t.Fatalf("RST frame received earlier than expected by duration: %v", want-got)
++	}
++}
++
++func (s) TestControlBuffer_Throttle(t *testing.T) {
++	done := make(chan struct{})
++	defer close(done)
++	cb := newControlBuffer(done)
++
++	// Fill the control buffer up to the limit with throttled items.
++	for i := 0; i < maxQueuedControlBufferItems; i++ {
++		cb.put(&ping{})
++	}
++
++	// The next call to throttle should block.
++	throttleDone := make(chan struct{})
++	go func() {
++		cb.throttle()
++		close(throttleDone)
++	}()
++
++	select {
++	case <-throttleDone:
++		t.Fatal("throttle() did not block when the buffer was full")
++	case <-time.After(defaultTestShortTimeout):
++	}
++
++	// Consume one item from the control buffer.
++	if _, err := cb.get(true); err != nil {
++		t.Fatalf("cb.get(true) failed: %v", err)
++	}
++
++	// Now throttle() should unblock.
++	select {
++	case <-throttleDone:
++	case <-time.After(time.Second):
++		t.Fatal("throttle() did not unblock after an item was consumed")
++	}
++}
++
++func (s) TestControlBuffer_NoThrottleForNonThrottledItems(t *testing.T) {
++	done := make(chan struct{})
++	defer close(done)
++	cb := newControlBuffer(done)
++
++	// Fill the control buffer with many more than limit number of non-throttled
++	// items.
++	for i := 0; i < maxQueuedControlBufferItems+10; i++ {
++		cb.put(&dataFrame{})
++	}
++
++	// throttle() should not block.
++	throttled := make(chan struct{})
++	go func() {
++		cb.throttle()
++		close(throttled)
++	}()
++
++	select {
++	case <-throttled:
++	case <-time.After(defaultTestShortTimeout):
++		t.Fatal("throttle() blocked for non-throttled items")
+ 	}
+ }
+--- a/internal/xds/rbac/matchers.go
++++ b/internal/xds/rbac/matchers.go
+@@ -79,7 +79,7 @@
+ func matchersFromPermissions(permissions []*v3rbacpb.Permission) ([]matcher, error) {
+ 	var matchers []matcher
+ 	for _, permission := range permissions {
+-		switch permission.GetRule().(type) {
++		switch p := permission.GetRule().(type) {
+ 		case *v3rbacpb.Permission_AndRules:
+ 			mList, err := matchersFromPermissions(permission.GetAndRules().Rules)
+ 			if err != nil {
+@@ -121,16 +121,24 @@
+ 			if err != nil {
+ 				return nil, err
+ 			}
++			if len(mList) != 1 {
++				return nil, fmt.Errorf("NotRule must contain exactly one rule")
++			}
+ 			matchers = append(matchers, &notMatcher{matcherToNot: mList[0]})
+ 		case *v3rbacpb.Permission_Metadata:
+-			// Never matches - so no-op if not inverted, always match if
+-			// inverted.
+-			if permission.GetMetadata().GetInvert() { // Test metadata being no-op and also metadata with invert always matching
++			if permission.GetMetadata().GetInvert() {
+ 				matchers = append(matchers, &alwaysMatcher{})
++			} else {
++				matchers = append(matchers, &neverMatcher{})
+ 			}
+ 		case *v3rbacpb.Permission_RequestedServerName:
+-			// Not supported in gRPC RBAC currently - a permission typed as
+-			// requested server name in the initial config will be a no-op.
++			m, err := newRequestedServerNameMatcher(permission.GetRequestedServerName())
++			if err != nil {
++				return nil, err
++			}
++			matchers = append(matchers, m)
++		default:
++			return nil, fmt.Errorf("unsupported permission rule type: %T", p)
+ 		}
+ 	}
+ 	return matchers, nil
+@@ -139,7 +147,7 @@
+ func matchersFromPrincipals(principals []*v3rbacpb.Principal) ([]matcher, error) {
+ 	var matchers []matcher
+ 	for _, principal := range principals {
+-		switch principal.GetIdentifier().(type) {
++		switch p := principal.GetIdentifier().(type) {
+ 		case *v3rbacpb.Principal_AndIds:
+ 			mList, err := matchersFromPrincipals(principal.GetAndIds().Ids)
+ 			if err != nil {
+@@ -179,16 +187,29 @@
+ 				return nil, err
+ 			}
+ 			matchers = append(matchers, m)
++		case *v3rbacpb.Principal_Metadata:
++			if principal.GetMetadata().GetInvert() {
++				matchers = append(matchers, &alwaysMatcher{})
++			} else {
++				matchers = append(matchers, &neverMatcher{})
++			}
+ 		case *v3rbacpb.Principal_NotId:
+ 			mList, err := matchersFromPrincipals([]*v3rbacpb.Principal{{Identifier: principal.GetNotId().Identifier}})
+ 			if err != nil {
+ 				return nil, err
+ 			}
++			if len(mList) != 1 {
++				return nil, fmt.Errorf("NotId must contain exactly one identifier")
++			}
+ 			matchers = append(matchers, &notMatcher{matcherToNot: mList[0]})
+ 		case *v3rbacpb.Principal_SourceIp:
+-			// The source ip principal identifier is deprecated. Thus, a
+-			// principal typed as a source ip in the identifier will be a no-op.
+-			// The config should use DirectRemoteIp instead.
++			// The source ip principal identifier is deprecated, but gRPC RBAC
++			// treats it as equivalent to direct_remote_ip as per A41.
++			m, err := newRemoteIPMatcher(principal.GetSourceIp())
++			if err != nil {
++				return nil, err
++			}
++			matchers = append(matchers, m)
+ 		case *v3rbacpb.Principal_RemoteIp:
+ 			// RBAC in gRPC treats direct_remote_ip and remote_ip as logically
+ 			// equivalent, as per A41.
+@@ -197,9 +218,8 @@
+ 				return nil, err
+ 			}
+ 			matchers = append(matchers, m)
+-		case *v3rbacpb.Principal_Metadata:
+-			// Not supported in gRPC RBAC currently - a principal typed as
+-			// Metadata in the initial config will be a no-op.
++		default:
++			return nil, fmt.Errorf("unsupported principal identifier type: %T", p)
+ 		}
+ 	}
+ 	return matchers, nil
+@@ -249,6 +269,16 @@
+ 	return true
+ }
+ 
++// neverMatcher is a matcher that will never match. This logically represents a
++// permission or principal that is unsupported in gRPC. neverMatcher implements
++// the matcher interface.
++type neverMatcher struct {
++}
++
++func (nm *neverMatcher) match(*rpcData) bool {
++	return false
++}
++
+ // notMatcher is a matcher that nots an underlying matcher. notMatcher
+ // implements the matcher interface.
+ type notMatcher struct {
+@@ -380,6 +410,25 @@
+ 
+ func (pm *portMatcher) match(data *rpcData) bool {
+ 	return data.destinationPort == pm.destinationPort
++}
++
++// requestedServerNameMatcher matches on if the given string matcher matches
++// on "", as per A41-xds-rbac.md. requestedServerNameMatcher implements
++// the matcher interface.
++type requestedServerNameMatcher struct {
++	stringMatcher internalmatcher.StringMatcher
++}
++
++func newRequestedServerNameMatcher(stringMatcherProto *v3matcherpb.StringMatcher) (*requestedServerNameMatcher, error) {
++	stringMatcher, err := internalmatcher.StringMatcherFromProto(stringMatcherProto)
++	if err != nil {
++		return nil, err
++	}
++	return &requestedServerNameMatcher{stringMatcher: stringMatcher}, nil
++}
++
++func (r *requestedServerNameMatcher) match(*rpcData) bool {
++	return r.stringMatcher.Match("")
+ }
+ 
+ // authenticatedMatcher matches on the name of the Principal. If set, the URI
+--- a/internal/xds/rbac/rbac_engine_test.go
++++ b/internal/xds/rbac/rbac_engine_test.go
+@@ -667,6 +667,185 @@
+ 			},
+ 			wantErr: true,
+ 		},
++		{
++			name: "Unsupported_field_in_NotRule",
++			policies: []*v3rbacpb.RBAC{
++				{
++					Action: v3rbacpb.RBAC_ALLOW,
++					Policies: map[string]*v3rbacpb.Policy{
++						"anyone": {
++							Permissions: []*v3rbacpb.Permission{
++								{
++									Rule: &v3rbacpb.Permission_NotRule{
++										NotRule: &v3rbacpb.Permission{
++											Rule: &v3rbacpb.Permission_SourcedMetadata{
++												SourcedMetadata: &v3rbacpb.SourcedMetadata{},
++											},
++										},
++									},
++								},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
++							},
++						},
++					},
++				},
++			},
++			wantErr: true,
++		},
++		{
++			name: "supported_and_unsupported_fields_in_NotRule",
++			policies: []*v3rbacpb.RBAC{
++				{
++					Action: v3rbacpb.RBAC_ALLOW,
++					Policies: map[string]*v3rbacpb.Policy{
++						"anyone": {
++							Permissions: []*v3rbacpb.Permission{
++								{
++									Rule: &v3rbacpb.Permission_NotRule{
++										NotRule: &v3rbacpb.Permission{
++											Rule: &v3rbacpb.Permission_AndRules{
++												AndRules: &v3rbacpb.Permission_Set{
++													Rules: []*v3rbacpb.Permission{
++														{
++															Rule: &v3rbacpb.Permission_UrlPath{
++																UrlPath: &v3matcherpb.PathMatcher{
++																	Rule: &v3matcherpb.PathMatcher_Path{
++																		Path: &v3matcherpb.StringMatcher{
++																			MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: "allowed"},
++																		},
++																	},
++																},
++															},
++														},
++														{
++															Rule: &v3rbacpb.Permission_SourcedMetadata{
++																SourcedMetadata: &v3rbacpb.SourcedMetadata{},
++															},
++														},
++													},
++												},
++											},
++										},
++									},
++								},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
++							},
++						},
++					},
++				},
++			},
++			wantErr: true,
++		},
++		{
++			name: "Unsupported_field_in_NotId",
++			policies: []*v3rbacpb.RBAC{
++				{
++					Action: v3rbacpb.RBAC_ALLOW,
++					Policies: map[string]*v3rbacpb.Policy{
++						"anyone": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Any{Any: true}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{
++									Identifier: &v3rbacpb.Principal_NotId{
++										NotId: &v3rbacpb.Principal{
++											Identifier: &v3rbacpb.Principal_SourcedMetadata{
++												SourcedMetadata: &v3rbacpb.SourcedMetadata{},
++											},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			wantErr: true,
++		},
++		{
++			name: "supported_and_unsupported_fields_in_NotId",
++			policies: []*v3rbacpb.RBAC{
++				{
++					Action: v3rbacpb.RBAC_ALLOW,
++					Policies: map[string]*v3rbacpb.Policy{
++						"anyone": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Any{Any: true}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{
++									Identifier: &v3rbacpb.Principal_NotId{
++										NotId: &v3rbacpb.Principal{
++											Identifier: &v3rbacpb.Principal_AndIds{
++												AndIds: &v3rbacpb.Principal_Set{
++													Ids: []*v3rbacpb.Principal{
++														{
++															Identifier: &v3rbacpb.Principal_DirectRemoteIp{
++																DirectRemoteIp: &v3corepb.CidrRange{
++																	AddressPrefix: "0.0.0.0",
++																	PrefixLen:     &wrapperspb.UInt32Value{Value: uint32(10)},
++																},
++															},
++														},
++														{
++															Identifier: &v3rbacpb.Principal_SourcedMetadata{
++																SourcedMetadata: &v3rbacpb.SourcedMetadata{},
++															},
++														},
++													},
++												},
++											},
++										},
++									},
++								},
++							},
++						},
++					},
++				},
++			},
++			wantErr: true,
++		},
++		{
++			name: "PermissionMetadata",
++			policies: []*v3rbacpb.RBAC{
++				{
++					Action: v3rbacpb.RBAC_ALLOW,
++					Policies: map[string]*v3rbacpb.Policy{
++						"metadata-permission": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Metadata{Metadata: &v3matcherpb.MetadataMatcher{}}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
++							},
++						},
++					},
++				},
++			},
++		},
++		{
++			name: "PrincipalMetadata",
++			policies: []*v3rbacpb.RBAC{
++				{
++					Action: v3rbacpb.RBAC_ALLOW,
++					Policies: map[string]*v3rbacpb.Policy{
++						"metadata-principal": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Any{Any: true}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Metadata{Metadata: &v3matcherpb.MetadataMatcher{}}},
++							},
++						},
++					},
++				},
++			},
++		},
+ 	}
+ 	for _, test := range tests {
+ 		t.Run(test.name, func(t *testing.T) {
+@@ -702,6 +881,180 @@
+ 		rbacQueries []rbacQuery
+ 		policyName  string
+ 	}{
++		{
++			name: "PermissionMetadata",
++			rbacConfigs: []*v3rbacpb.RBAC{
++				{
++					Policies: map[string]*v3rbacpb.Policy{
++						"metadata-permission": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Metadata{Metadata: &v3matcherpb.MetadataMatcher{Invert: false}}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
++							},
++						},
++					},
++				},
++			},
++			rbacQueries: []rbacQuery{
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "0.0.0.0"},
++						},
++					},
++					wantStatusCode: codes.PermissionDenied,
++				},
++			},
++		},
++		{
++			name: "PermissionMetadataInvert",
++			rbacConfigs: []*v3rbacpb.RBAC{
++				{
++					Policies: map[string]*v3rbacpb.Policy{
++						"metadata-permission-invert": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Metadata{Metadata: &v3matcherpb.MetadataMatcher{Invert: true}}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
++							},
++						},
++					},
++				},
++			},
++			rbacQueries: []rbacQuery{
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "0.0.0.0"},
++						},
++					},
++					wantStatusCode: codes.OK,
++				},
++			},
++		},
++		{
++			name: "PrincipalMetadata",
++			rbacConfigs: []*v3rbacpb.RBAC{
++				{
++					Policies: map[string]*v3rbacpb.Policy{
++						"metadata-principal": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Any{Any: true}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Metadata{Metadata: &v3matcherpb.MetadataMatcher{Invert: false}}},
++							},
++						},
++					},
++				},
++			},
++			rbacQueries: []rbacQuery{
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "0.0.0.0"},
++						},
++					},
++					wantStatusCode: codes.PermissionDenied,
++				},
++			},
++		},
++		{
++			name: "PrincipalMetadataInvert",
++			rbacConfigs: []*v3rbacpb.RBAC{
++				{
++					Policies: map[string]*v3rbacpb.Policy{
++						"metadata-principal-invert": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Any{Any: true}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Metadata{Metadata: &v3matcherpb.MetadataMatcher{Invert: true}}},
++							},
++						},
++					},
++				},
++			},
++			rbacQueries: []rbacQuery{
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "0.0.0.0"},
++						},
++					},
++					wantStatusCode: codes.OK,
++				},
++			},
++		},
++		{
++			name: "RequestedServerNameNotMatching",
++			rbacConfigs: []*v3rbacpb.RBAC{
++				{
++					Policies: map[string]*v3rbacpb.Policy{
++						"requested-server-name": {
++							Permissions: []*v3rbacpb.Permission{
++								{
++									Rule: &v3rbacpb.Permission_RequestedServerName{
++										RequestedServerName: &v3matcherpb.StringMatcher{
++											MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: "foo"},
++										},
++									},
++								},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
++							},
++						},
++					},
++				},
++			},
++			rbacQueries: []rbacQuery{
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "0.0.0.0"},
++						},
++					},
++					wantStatusCode: codes.PermissionDenied,
++				},
++			},
++		},
++		{
++			name: "RequestedServerNameMatching",
++			rbacConfigs: []*v3rbacpb.RBAC{
++				{
++					Policies: map[string]*v3rbacpb.Policy{
++						"requested-server-name": {
++							Permissions: []*v3rbacpb.Permission{
++								{
++									Rule: &v3rbacpb.Permission_RequestedServerName{
++										RequestedServerName: &v3matcherpb.StringMatcher{
++											MatchPattern: &v3matcherpb.StringMatcher_Exact{Exact: ""},
++										},
++									},
++								},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
++							},
++						},
++					},
++				},
++			},
++			rbacQueries: []rbacQuery{
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "0.0.0.0"},
++						},
++					},
++					wantStatusCode: codes.OK,
++				},
++			},
++		},
+ 		// SuccessCaseAnyMatch tests a single RBAC Engine instantiated with
+ 		// a config with a policy with any rules for both permissions and
+ 		// principals, meaning that any data about incoming RPC's that the RBAC
+@@ -1002,7 +1355,48 @@
+ 				},
+ 			},
+ 		},
++		// This test tests a RBAC policy configured with a source-ip policy.
++		// This should be logically equivalent to configuring a Engine with a
++		// direct-remote-ip or remote-ip policy, as per A41 - "allow equating
++		// RBAC's direct_remote_ip and remote_ip."
+ 		{
++			name: "SourceIpMatcher",
++			rbacConfigs: []*v3rbacpb.RBAC{
++				{
++					Policies: map[string]*v3rbacpb.Policy{
++						"certain-source-ip": {
++							Permissions: []*v3rbacpb.Permission{
++								{Rule: &v3rbacpb.Permission_Any{Any: true}},
++							},
++							Principals: []*v3rbacpb.Principal{
++								{Identifier: &v3rbacpb.Principal_SourceIp{SourceIp: &v3corepb.CidrRange{AddressPrefix: "0.0.0.0", PrefixLen: &wrapperspb.UInt32Value{Value: uint32(10)}}}},
++							},
++						},
++					},
++				},
++			},
++			rbacQueries: []rbacQuery{
++				// This incoming RPC Call should match with the certain-source-ip policy.
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "0.0.0.0"},
++						},
++					},
++					wantStatusCode: codes.OK,
++				},
++				// This incoming RPC Call shouldn't match with the certain-source-ip policy.
++				{
++					rpcData: &rpcData{
++						peerInfo: &peer.Peer{
++							Addr: &addr{ipAddress: "10.0.0.0:8080"},
++						},
++					},
++					wantStatusCode: codes.PermissionDenied,
++				},
++			},
++		},
++		{
+ 			name: "DestinationIpMatcher",
+ 			rbacConfigs: []*v3rbacpb.RBAC{
+ 				{
+@@ -1154,71 +1548,6 @@
+ 									},
+ 								},
+ 							},
+-						},
+-					},
+-					wantStatusCode: codes.OK,
+-				},
+-			},
+-		},
+-		// This test tests that an RBAC policy configured with a metadata
+-		// matcher as a permission doesn't match with any incoming RPC.
+-		{
+-			name: "metadata-never-matches",
+-			rbacConfigs: []*v3rbacpb.RBAC{
+-				{
+-					Policies: map[string]*v3rbacpb.Policy{
+-						"metadata-never-matches": {
+-							Permissions: []*v3rbacpb.Permission{
+-								{Rule: &v3rbacpb.Permission_Metadata{
+-									Metadata: &v3matcherpb.MetadataMatcher{},
+-								}},
+-							},
+-							Principals: []*v3rbacpb.Principal{
+-								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
+-							},
+-						},
+-					},
+-				},
+-			},
+-			rbacQueries: []rbacQuery{
+-				{
+-					rpcData: &rpcData{
+-						fullMethod: "some method",
+-						peerInfo: &peer.Peer{
+-							Addr: &addr{ipAddress: "0.0.0.0"},
+-						},
+-					},
+-					wantStatusCode: codes.PermissionDenied,
+-				},
+-			},
+-		},
+-		// This test tests that an RBAC policy configured with a metadata
+-		// matcher with invert set to true as a permission always matches with
+-		// any incoming RPC.
+-		{
+-			name: "metadata-invert-always-matches",
+-			rbacConfigs: []*v3rbacpb.RBAC{
+-				{
+-					Policies: map[string]*v3rbacpb.Policy{
+-						"metadata-invert-always-matches": {
+-							Permissions: []*v3rbacpb.Permission{
+-								{Rule: &v3rbacpb.Permission_Metadata{
+-									Metadata: &v3matcherpb.MetadataMatcher{Invert: true},
+-								}},
+-							},
+-							Principals: []*v3rbacpb.Principal{
+-								{Identifier: &v3rbacpb.Principal_Any{Any: true}},
+-							},
+-						},
+-					},
+-				},
+-			},
+-			rbacQueries: []rbacQuery{
+-				{
+-					rpcData: &rpcData{
+-						fullMethod: "some method",
+-						peerInfo: &peer.Peer{
+-							Addr: &addr{ipAddress: "0.0.0.0"},
+ 						},
+ 					},
+ 					wantStatusCode: codes.OK,
