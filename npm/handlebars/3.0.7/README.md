@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-106446
+- CVE-2026-106445
 
 ## How to Apply:
 1. Clone or download the source code for handlebars
