@@ -293,24 +293,354 @@
 
 --- a/src/lib/plugins/block-unsafe-operations-plugin.ts
 +++ b/src/lib/plugins/block-unsafe-operations-plugin.ts
-@@ -3,10 +3,16 @@
- import { GitPluginError } from '../errors/git-plugin-error';
+@@ -110,6 +110,41 @@
+    }
+ }
+ 
++const CONFIG_NON_WRITE_ARGS = new Set([
++   '--get',
++   '--get-all',
++   '--get-regexp',
++   '--get-urlmatch',
++   '--list',
++   '-l',
++   '--unset',
++   '--unset-all',
++   'get',
++   'list',
++   'unset',
++]);
++
++function preventConfigIncludeWrite(args: readonly unknown[]) {
++   const tokens = args.map((arg) => (typeof arg === 'string' ? arg.trim().toLowerCase() : ''));
++
++   // only applies to `git config <key> <value>` style writes, reading or unsetting is harmless
++   if (!tokens.includes('config') || tokens.some((token) => CONFIG_NON_WRITE_ARGS.has(token))) {
++      return;
++   }
++
++   const isUnsafe = tokens.some(
++      (token, index) => index < tokens.length - 1 && /^include(if\..+)?\.path$/.test(token)
++   );
++
++   if (isUnsafe) {
++      throw new GitPluginError(
++         undefined,
++         'unsafe',
++         'Configuring include.path or includeIf.<condition>.path is not permitted without enabling allowUnsafeInclude'
++      );
++   }
++}
++
+ export function blockUnsafeOperationsPlugin({
+    allowUnsafeProtocolOverride = false,
+    allowUnsafePack = false,
+@@ -120,6 +155,8 @@
+    return {
+       type: 'spawn.args',
+       action(args, context) {
++         allowUnsafeInclude || preventConfigIncludeWrite(args);
++
+          args.forEach((current, index) => {
+             const next = index < args.length ? args[index + 1] : '';
+ 
+--- /dev/null
++++ b/test/unit/plugins/plugin.unsafe-include.spec.ts
+@@ -0,0 +1,60 @@
++import { promiseError } from '@kwsites/promise-result';
++import {
++   assertExecutedCommands,
++   assertGitError,
++   closeWithSuccess,
++   newSimpleGit,
++} from '../__fixtures__';
++
++describe('blockUnsafeOperationsPlugin: include configuration', () => {
++   it.each([
++      [['-c', 'include.path=/tmp/evil.gitconfig', 'status']],
++      [['-c', 'Include.Path=/tmp/evil.gitconfig', 'status']],
++      [['-c', 'includeIf.gitdir:/tmp/.path=/tmp/evil.gitconfig', 'status']],
++      [['-c', 'includeif.onbranch:main.path=/tmp/evil.gitconfig', 'status']],
++      [['--config-env=include.path=EVIL', 'status']],
++      [['--config-env', 'includeIf.gitdir:/.path=EVIL', 'status']],
++      [['config', 'include.path', '/tmp/evil.gitconfig']],
++      [['config', '--add', 'includeIf.gitdir:/tmp/.path', '/tmp/evil.gitconfig']],
++      [['config', '--global', 'Include.Path', '/tmp/evil.gitconfig']],
++   ])('blocks %j without the override', async (args) => {
++      const err = await promiseError(newSimpleGit({ unsafe: {} }).raw(args));
++
++      assertGitError(err, 'allowUnsafeInclude');
++   });
++
++   it('blocks include.path supplied through the config helper', async () => {
++      const err = await promiseError(
++         newSimpleGit({ unsafe: {} }).addConfig('include.path', '/tmp/evil.gitconfig')
++      );
++
++      assertGitError(err, 'allowUnsafeInclude');
++   });
++
++   it('allows include configuration with the override', async () => {
++      const git = newSimpleGit({ unsafe: { allowUnsafeInclude: true } });
++      const err = promiseError(git.raw('config', 'include.path', '/tmp/ok.gitconfig'));
++
++      await closeWithSuccess();
++      expect(await err).toBeUndefined();
++      assertExecutedCommands('config', 'include.path', '/tmp/ok.gitconfig');
++   });
++
++   it('allows reading include configuration', async () => {
++      const git = newSimpleGit({ unsafe: {} });
++      const err = promiseError(git.raw('config', '--get', 'include.path'));
++
++      await closeWithSuccess();
++      expect(await err).toBeUndefined();
++      assertExecutedCommands('config', '--get', 'include.path');
++   });
++
++   it('allows unrelated configuration', async () => {
++      const git = newSimpleGit({ unsafe: {} });
++      const err = promiseError(git.raw('config', 'user.name', 'include.path'));
++
++      await closeWithSuccess();
++      expect(await err).toBeUndefined();
++      assertExecutedCommands('config', 'user.name', 'include.path');
++   });
++});
+
+--- a/src/lib/plugins/block-unsafe-operations-plugin.ts
++++ b/src/lib/plugins/block-unsafe-operations-plugin.ts
+@@ -4,15 +4,45 @@
  import type { SimpleGitPluginConfig } from '../types';
+ 
+ function isConfigSwitch(arg: string | unknown) {
+-   return typeof arg === 'string' && arg.trim().toLowerCase() === '-c';
++   if (typeof arg !== 'string') {
++      return false;
++   }
++
++   // `-c` and its long-form equivalent `--config` (eg: `git clone --config key=value`)
++   const switchName = arg.trim().toLowerCase();
++   return switchName === '-c' || switchName === '--config';
+ }
+ 
+-function preventProtocolOverride(arg: string, next: string) {
+-   if (!isConfigSwitch(arg)) {
+-      return;
++/**
++ * Gets the `<key>=<value>` supplied to a configuration switch, whether that is a separate
++ * argument (`-c <key>=<value>`, `--config <key>=<value>`, `--config-env <key>=<ENV>`) or
++ * included in the same argument (`--config=<key>=<value>`, `--config-env=<key>=<ENV>`,
++ * `-c<key>=<value>`).
++ */
++function configSwitchValue(arg: string | unknown, next: string): string | undefined {
++   if (typeof arg !== 'string') {
++      return undefined;
+    }
+ 
+-   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
++   if (isConfigSwitch(arg) || /^\s*--config-env\s*$/i.test(arg)) {
++      return next;
++   }
++
++   if (/^\s*--config(-env)?=/i.test(arg)) {
++      return arg.replace(/^[^=]*=/, '');
++   }
++
++   if (/^\s*-c./.test(arg)) {
++      return arg.replace(/^\s*-c/, '');
++   }
++
++   return undefined;
++}
++
++function preventProtocolOverride(arg: string, next: string) {
++   const value = configSwitchValue(arg, next);
++
++   if (typeof value !== 'string' || !/^\s*protocol(.[a-z]+)?.allow/.test(value)) {
+       return;
+    }
+ 
+@@ -110,6 +140,24 @@
+    }
+ }
+ 
++/**
++ * Configuration supplied as environment variables (`GIT_CONFIG_COUNT`, `GIT_CONFIG_KEY_<n>`
++ * and `GIT_CONFIG_VALUE_<n>`) is equivalent to supplying `-c <key>=<value>` arguments.
++ */
++function envConfigKeys(env: Record<string, string | undefined> | undefined): string[] {
++   const count = parseInt(env?.GIT_CONFIG_COUNT ?? '', 10);
++   const keys: string[] = [];
++
++   for (let i = 0; i < count && i < 1000; i++) {
++      const key = env?.[`GIT_CONFIG_KEY_${i}`];
++      if (typeof key === 'string') {
++         keys.push(key);
++      }
++   }
++
++   return keys;
++}
++
+ export function blockUnsafeOperationsPlugin({
+    allowUnsafeProtocolOverride = false,
+    allowUnsafePack = false,
+@@ -123,11 +171,22 @@
+          args.forEach((current, index) => {
+             const next = index < args.length ? args[index + 1] : '';
+ 
++            // `--config=<key>=<value>` is treated as the equivalent `-c <key>=<value>`
++            const attached = /^\s*--config=/i.test(current);
++            const configArg = attached ? '-c' : current;
++            const configNext = attached ? current.replace(/^[^=]*=/, '') : next;
++
+             allowUnsafeProtocolOverride || preventProtocolOverride(current, next);
+             allowUnsafePack || preventUploadPack(current, context.method);
+-            allowUnsafeInclude || preventConfigInclude(current, next);
++            allowUnsafeInclude || preventConfigInclude(configArg, configNext);
+             allowUnsafeExec || preventRebaseExec(current, context.method);
+-            allowUnsafeCommandBinaries || preventCommandBinaryConfig(current, next);
++            allowUnsafeCommandBinaries || preventCommandBinaryConfig(configArg, configNext);
++         });
++
++         envConfigKeys(context.env).forEach((key) => {
++            allowUnsafeProtocolOverride || preventProtocolOverride('-c', key);
++            allowUnsafeInclude || preventConfigInclude('-c', key);
++            allowUnsafeCommandBinaries || preventCommandBinaryConfig('-c', key);
+          });
+ 
+          return args;
+--- a/src/lib/plugins/simple-git-plugin.ts
++++ b/src/lib/plugins/simple-git-plugin.ts
+@@ -9,7 +9,9 @@
+ export interface SimpleGitPluginTypes {
+    'spawn.args': {
+       data: string[];
+-      context: SimpleGitTaskPluginContext & {};
++      context: SimpleGitTaskPluginContext & {
++         env?: Record<string, string | undefined>;
++      };
+    };
+    'spawn.binary': {
+       data: string;
+--- a/src/lib/runners/git-executor-chain.ts
++++ b/src/lib/runners/git-executor-chain.ts
+@@ -81,11 +81,10 @@
+ 
+    private async attemptRemoteTask<R>(task: RunnableTask<R>, logger: OutputLogger) {
+       const binary = this._plugins.exec('spawn.binary', '', pluginContext(task, task.commands));
+-      const args = this._plugins.exec(
+-         'spawn.args',
+-         [...task.commands],
+-         pluginContext(task, task.commands)
+-      );
++      const args = this._plugins.exec('spawn.args', [...task.commands], {
++         ...pluginContext(task, task.commands),
++         env: { ...this.env },
++      });
+ 
+       const raw = await this.gitResponse(
+          task,
+--- a/test/unit/plugins/plugin.unsafe.spec.ts
++++ b/test/unit/plugins/plugin.unsafe.spec.ts
+@@ -87,3 +87,79 @@
+       assertGitError(err, 'allowUnsafePack');
+    });
+ });
++
++describe('blockUnsafeOperationsPlugin: --config equivalents of -c', () => {
++   it.each([
++      [['clone', '--config', 'protocol.ext.allow=always', 'ext::sh -c touch% /tmp/pwn', 'target']],
++      [['clone', '--config=protocol.ext.allow=always', 'ext::sh -c touch% /tmp/pwn', 'target']],
++      [['clone', '--CONFIG', 'protocol.allow=always', 'ext::sh -c touch% /tmp/pwn', 'target']],
++      [['clone', '-cprotocol.ext.allow=always', 'ext::sh -c touch% /tmp/pwn', 'target']],
++      [['clone', '--config-env=protocol.ext.allow=PWN', 'ext::sh -c touch% /tmp/pwn', 'target']],
++   ])('blocks protocol override %j without the override', async (args) => {
++      const err = await promiseError(newSimpleGit({ unsafe: {} }).raw(args));
++
++      assertGitError(err, 'Configuring protocol.allow is not permitted');
++   });
++
++   it('blocks protocol override using --config in clone', async () => {
++      const git = newSimpleGit({ unsafe: {} });
++      const err = await promiseError(
++         git.clone('ext::sh -c touch% /tmp/pwn', 'target', ['--config', 'protocol.ext.allow=always'])
++      );
++
++      assertGitError(err, 'Configuring protocol.allow is not permitted');
++   });
++
++   it('allows protocol override using --config with the override', async () => {
++      const git = newSimpleGit({ unsafe: { allowUnsafeProtocolOverride: true } });
++      const err = promiseError(git.raw('clone', '--config', 'protocol.ext.allow=always', 'src'));
++
++      await closeWithSuccess();
++      expect(await err).toBeUndefined();
++      assertExecutedCommands('clone', '--config', 'protocol.ext.allow=always', 'src');
++   });
++
++   it('blocks include.path using --config', async () => {
++      const err = await promiseError(
++         newSimpleGit({ unsafe: {} }).raw('clone', '--config=include.path=/tmp/evil', 'src')
++      );
++
++      assertGitError(err, 'allowUnsafeInclude');
++   });
++
++   it('allows unrelated --config values', async () => {
++      const git = newSimpleGit({ unsafe: {} });
++      const err = promiseError(git.raw('clone', '--config', 'user.name=test', 'src'));
++
++      await closeWithSuccess();
++      expect(await err).toBeUndefined();
++      assertExecutedCommands('clone', '--config', 'user.name=test', 'src');
++   });
++});
++
++describe('blockUnsafeOperationsPlugin: configuration set through the environment', () => {
++   it('blocks protocol override set with GIT_CONFIG_COUNT / GIT_CONFIG_KEY_n', async () => {
++      const git = newSimpleGit({ unsafe: {} }).env({
++         GIT_CONFIG_COUNT: '2',
++         GIT_CONFIG_KEY_0: 'user.name',
++         GIT_CONFIG_VALUE_0: 'test',
++         GIT_CONFIG_KEY_1: 'protocol.ext.allow',
++         GIT_CONFIG_VALUE_1: 'always',
++      });
++
++      assertGitError(await promiseError(git.raw('status')), 'Configuring protocol.allow');
++   });
++
++   it('allows unrelated configuration set through the environment', async () => {
++      const git = newSimpleGit({ unsafe: {} }).env({
++         GIT_CONFIG_COUNT: '1',
++         GIT_CONFIG_KEY_0: 'user.name',
++         GIT_CONFIG_VALUE_0: 'test',
++      });
++      const err = promiseError(git.raw('status'));
++
++      await closeWithSuccess();
++      expect(await err).toBeUndefined();
++      assertExecutedCommands('status');
++   });
++});
+
+--- a/src/lib/plugins/block-unsafe-operations-plugin.ts
++++ b/src/lib/plugins/block-unsafe-operations-plugin.ts
+@@ -13,6 +13,12 @@
+    return switchName === '-c' || switchName === '--config';
+ }
  
 +const CLONE_OPTIONS = /^\0*(-|--|--no-)[\0\dlsqvnobucj]+/;
 +
- function isConfigSwitch(arg: string | unknown) {
-    return typeof arg === 'string' && arg.trim().toLowerCase() === '-c';
- }
- 
 +function isCloneSwitch(char: string, arg: string | unknown) {
 +   return Boolean(typeof arg === 'string' && CLONE_OPTIONS.test(arg) && arg.includes(char));
 +}
 +
- function preventProtocolOverride(arg: string, next: string) {
-    if (!isConfigSwitch(arg)) {
-       return;
-@@ -93,7 +99,7 @@
+ /**
+  * Gets the `<key>=<value>` supplied to a configuration switch, whether that is a separate
+  * argument (`-c <key>=<value>`, `--config <key>=<value>`, `--config-env <key>=<ENV>`) or
+@@ -123,7 +129,7 @@
        );
     }
  
@@ -375,22 +705,21 @@
 
 --- a/src/lib/plugins/block-unsafe-operations-plugin.ts
 +++ b/src/lib/plugins/block-unsafe-operations-plugin.ts
-@@ -12,7 +12,7 @@
-       return;
-    }
+@@ -48,7 +48,7 @@
+ function preventProtocolOverride(arg: string, next: string) {
+    const value = configSwitchValue(arg, next);
  
--   if (!/^\s*protocol(.[a-z]+)?.allow/.test(next)) {
-+   if (!/^\s*protocol(.[a-z]+)?.allow/i.test(next)) {
+-   if (typeof value !== 'string' || !/^\s*protocol(.[a-z]+)?.allow/.test(value)) {
++   if (typeof value !== 'string' || !/^\s*protocol(.[a-z]+)?.allow/i.test(value)) {
        return;
     }
  
 --- a/test/unit/plugins/plugin.unsafe.spec.ts
 +++ b/test/unit/plugins/plugin.unsafe.spec.ts
-@@ -7,6 +7,29 @@
- } from '../__fixtures__';
+@@ -8,6 +8,29 @@
  
  describe('blockUnsafeOperationsPlugin', () => {
-+   it.each([
+    it.each([
 +      ['protocol.allow=always'],
 +      ['PROTOCOL.ALLOW=always'],
 +      ['Protocol.Allow=always'],
@@ -413,9 +742,10 @@
 +      assertExecutedCommands(...task);
 +   });
 +
-    it.each([
++   it.each([
        ['clone', '-u touch /tmp/pwn'],
        ['cmd', '--upload-pack=touch /tmp/pwn0'],
+       ['cmd', '--receive-pack=touch /tmp/pwn1'],
 
 --- a/src/lib/plugins/block-unsafe-operations-plugin.ts
 +++ b/src/lib/plugins/block-unsafe-operations-plugin.ts
@@ -709,41 +1039,6 @@ index faf2e35..34b730f 100644
           return args;
        },
     };
-diff --git a/src/lib/plugins/simple-git-plugin.ts b/src/lib/plugins/simple-git-plugin.ts
-index 0573322..77e4fa0 100644
---- a/src/lib/plugins/simple-git-plugin.ts
-+++ b/src/lib/plugins/simple-git-plugin.ts
-@@ -9,7 +9,9 @@ type SimpleGitTaskPluginContext = {
- export interface SimpleGitPluginTypes {
-    'spawn.args': {
-       data: string[];
--      context: SimpleGitTaskPluginContext & {};
-+      context: SimpleGitTaskPluginContext & {
-+         readonly env?: Record<string, string | undefined>;
-+      };
-    };
-    'spawn.binary': {
-       data: string;
-diff --git a/src/lib/runners/git-executor-chain.ts b/src/lib/runners/git-executor-chain.ts
-index 2fceb2e..cc2edf7 100644
---- a/src/lib/runners/git-executor-chain.ts
-+++ b/src/lib/runners/git-executor-chain.ts
-@@ -81,11 +81,10 @@ export class GitExecutorChain implements SimpleGitExecutor {
- 
-    private async attemptRemoteTask<R>(task: RunnableTask<R>, logger: OutputLogger) {
-       const binary = this._plugins.exec('spawn.binary', '', pluginContext(task, task.commands));
--      const args = this._plugins.exec(
--         'spawn.args',
--         [...task.commands],
--         pluginContext(task, task.commands)
--      );
-+      const args = this._plugins.exec('spawn.args', [...task.commands], {
-+         ...pluginContext(task, task.commands),
-+         env: this.env,
-+      });
- 
-       const raw = await this.gitResponse(
-          task,
 diff --git a/src/lib/types/index.ts b/src/lib/types/index.ts
 index af2eb1b..36cf06e 100644
 --- a/src/lib/types/index.ts
