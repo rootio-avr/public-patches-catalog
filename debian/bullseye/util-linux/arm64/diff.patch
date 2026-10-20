@@ -1,3 +1,475 @@
+Description: CVE-2026-53613 - libmount: pin the target to prevent TOCTOU in restricted mount(8)
+ In restricted (non-root, setuid) mount(8) the /etc/fstab target is validated
+ and later re-resolved by mount(2). A local user that owns a writable
+ ancestor of the fstab mountpoint can swap a path component (for example with
+ renameat2(RENAME_EXCHANGE)) between the check and the mount and redirect the
+ mount to a root-owned location.
+ .
+ Add a pinned O_PATH target fd (fd_target) to the libmount context. It is
+ opened via the new ul_open_no_symlinks() helper (openat2() with
+ RESOLVE_NO_SYMLINKS, O_NOFOLLOW fallback) in
+ mnt_context_prepare_target() BEFORE the target is canonicalized (so that a
+ symlink in any component of the user-controlled path makes the mount fail
+ instead of being resolved) and closed on context reset. For restricted
+ mounts mount(2) is then called on /proc/self/fd/<fd_target> instead of the
+ path. After a successful mount the fd is re-opened so that additional
+ propagation/remount calls apply to the mounted filesystem.
+ .
+ The helper defines __NR_openat2 and struct open_how locally: glibc 2.31 does
+ not provide SYS_openat2, so a SYS_openat2 based implementation is silently
+ compiled out on bullseye. If openat2() is unavailable the path is walked
+ component by component with O_NOFOLLOW.
+ .
+ Backport for util-linux 2.36.1: the upstream hook_mount.c/hook_mount_legacy.c
+ and the new mount API do not exist here, so the pinning is done in
+ libmount/src/context_mount.c (do_mount() and do_mount_additional()) by using
+ /proc/self/fd/N as the mount(2) target.
+Origin: backport, https://github.com/util-linux/util-linux/commit/0b010025a0e429bc80355c94db86a843395d49e2
+Author: Karel Zak <kzak@redhat.com>
+Last-Update: 2026-10-16
+
+--- a/include/fileutils.h
++++ b/include/fileutils.h
+@@ -52,6 +52,8 @@ static inline int is_same_inode(const in
+ 	return 1;
+ }
+ 
++extern int ul_open_no_symlinks(const char *path, int flags, mode_t mode);
++
+ extern int dup_fd_cloexec(int oldfd, int lowfd);
+ extern int get_fd_tabsize(void);
+ 
+--- a/lib/fileutils.c
++++ b/lib/fileutils.c
+@@ -10,6 +10,11 @@
+ #include <unistd.h>
+ #include <sys/time.h>
+ #include <sys/resource.h>
++#include <sys/syscall.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stdint.h>
++#include <string.h>
+ 
+ #include "c.h"
+ #include "fileutils.h"
+@@ -246,3 +251,114 @@ char *stripoff_last_component(char *path
+ 	*p = '\0';
+ 	return p + 1;
+ }
++
++/*
++ * Open @path and reject symlinks at any path component (not only the last
++ * one). Uses openat2(RESOLVE_NO_SYMLINKS) if the kernel supports it
++ * (Linux >= 5.6), otherwise the path is walked component by component with
++ * O_NOFOLLOW. The syscall number and the structure are defined locally
++ * because old glibc (< 2.32) does not provide SYS_openat2 and old kernel
++ * headers may not provide <linux/openat2.h>.
++ */
++#ifndef __NR_openat2
++# define __NR_openat2 437
++#endif
++#define UL_RESOLVE_NO_SYMLINKS	0x04
++
++struct ul_open_how {
++	uint64_t flags;
++	uint64_t mode;
++	uint64_t resolve;
++};
++
++static int open_no_symlinks_walk(const char *path, int flags, mode_t mode)
++{
++	char *buf, *p;
++	int dirfd, fd = -1, err = 0;
++
++	if (!path || !*path) {
++		errno = ENOENT;
++		return -1;
++	}
++	buf = strdup(path);
++	if (!buf)
++		return -1;
++
++	dirfd = open(*path == '/' ? "/" : ".", O_PATH | O_DIRECTORY | O_CLOEXEC);
++	if (dirfd < 0) {
++		err = errno;
++		goto done;
++	}
++
++	p = buf;
++	while (*p == '/')
++		p++;
++
++	while (*p) {
++		char *comp = p, *next = strchr(p, '/');
++		int last, nfd;
++
++		if (next) {
++			*next++ = '\0';
++			while (*next == '/')
++				next++;
++		} else
++			next = p + strlen(p);
++		p = next;
++		last = (*p == '\0');
++
++		if (last)
++			nfd = openat(dirfd, comp, flags | O_NOFOLLOW | O_CLOEXEC, mode);
++		else
++			nfd = openat(dirfd, comp,
++				     O_PATH | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
++		if (nfd < 0) {
++			err = errno;
++			goto done;
++		}
++		if (last && (flags & O_PATH)) {
++			struct stat st;
++
++			/* O_PATH|O_NOFOLLOW succeeds on symlinks */
++			if (fstat(nfd, &st) == 0 && S_ISLNK(st.st_mode)) {
++				close(nfd);
++				err = ELOOP;
++				goto done;
++			}
++		}
++		close(dirfd);
++		dirfd = nfd;
++		if (last) {
++			fd = nfd;
++			dirfd = -1;
++		}
++	}
++
++	if (fd < 0)	/* path without any component (e.g. "/") */
++		fd = openat(dirfd, ".", flags | O_NOFOLLOW | O_CLOEXEC, mode);
++	if (fd < 0)
++		err = errno;
++done:
++	if (dirfd >= 0)
++		close(dirfd);
++	free(buf);
++	if (fd < 0)
++		errno = err;
++	return fd;
++}
++
++int ul_open_no_symlinks(const char *path, int flags, mode_t mode)
++{
++	struct ul_open_how how = {
++		.flags = (uint64_t) flags,
++		.mode = (uint64_t) mode,
++		.resolve = UL_RESOLVE_NO_SYMLINKS,
++	};
++	int fd = syscall(__NR_openat2, AT_FDCWD, path, &how, sizeof(how));
++
++	/* only walk manually if the syscall is not available */
++	if (fd >= 0 || (errno != ENOSYS && errno != EPERM))
++		return fd;
++
++	return open_no_symlinks_walk(path, flags, mode);
++}
+--- a/libmount/src/context.c
++++ b/libmount/src/context.c
+@@ -69,6 +69,7 @@ struct libmnt_context *mnt_new_context(v
+ 	cxt->ns_orig.fd = -1;
+ 	cxt->ns_tgt.fd = -1;
+ 	cxt->ns_cur = &cxt->ns_orig;
++	cxt->fd_target = -1;
+ 
+ 	/* if we're really root and aren't running setuid */
+ 	cxt->restricted = (uid_t) 0 == ruid && ruid == euid ? 0 : 1;
+@@ -173,6 +174,7 @@ int mnt_reset_context(struct libmnt_cont
+ 	}
+ 
+ 	mnt_context_reset_status(cxt);
++	mnt_context_close_target_fd(cxt);
+ 
+ 	if (cxt->table_fltrcb)
+ 		mnt_context_set_tabfilter(cxt, NULL, NULL);
+@@ -426,6 +428,74 @@ int mnt_context_is_restricted(struct lib
+ 	return cxt->restricted;
+ }
+ 
++/* The target has to be pinned for restricted (non-root) mount(8) to avoid
++ * TOCTOU races between the target validation and mount(2). */
++int mnt_context_target_fd_required(struct libmnt_context *cxt)
++{
++	return mnt_context_is_restricted(cxt);
++}
++
++int mnt_context_get_target_fd(struct libmnt_context *cxt)
++{
++	assert(cxt);
++
++	if (cxt->fd_target < 0) {
++		const char *target = cxt->fs ? mnt_fs_get_target(cxt->fs) : NULL;
++
++		if (target)
++			cxt->fd_target = ul_open_no_symlinks(target,
++						O_PATH | O_CLOEXEC, 0);
++	}
++	return cxt->fd_target;
++}
++
++void mnt_context_close_target_fd(struct libmnt_context *cxt)
++{
++	assert(cxt);
++
++	if (cxt->fd_target >= 0)
++		close(cxt->fd_target);
++	cxt->fd_target = -1;
++}
++
++/* re-open the target to point to the mounted filesystem root */
++int mnt_context_reopen_target_fd(struct libmnt_context *cxt)
++{
++	assert(cxt);
++
++	if (!mnt_context_target_fd_required(cxt))
++		return 0;
++	mnt_context_close_target_fd(cxt);
++	if (mnt_context_get_target_fd(cxt) < 0)
++		return -errno;
++	return 0;
++}
++
++/*
++ * Returns path that is safe for mount(2). For restricted mount it is
++ * /proc/self/fd/<fd_target>, which refers to the pinned target and cannot be
++ * redirected by modifying path components after the target validation. For
++ * unrestricted mount it returns @target. Returns NULL on error (errno is set).
++ */
++const char *mnt_context_get_pinned_target(struct libmnt_context *cxt,
++			const char *target, char *buf, size_t bufsz)
++{
++	int fd;
++
++	if (!mnt_context_target_fd_required(cxt))
++		return target;
++
++	fd = mnt_context_get_target_fd(cxt);
++	if (fd < 0)
++		return NULL;
++
++	if (snprintf(buf, bufsz, "/proc/self/fd/%d", fd) >= (int) bufsz) {
++		errno = ENAMETOOLONG;
++		return NULL;
++	}
++	return buf;
++}
++
+ /**
+  * mnt_context_force_unrestricted:
+  * @cxt: mount context
+@@ -1963,6 +2033,23 @@ int mnt_context_prepare_target(struct li
+ 			rc = -EPERM;
+ 	}
+ 
++	/*
++	 * Restricted mount: pin the target before it is canonicalized. The
++	 * path is opened with RESOLVE_NO_SYMLINKS, so a symlink in any path
++	 * component (user controlled mountpoint ancestors) makes the mount
++	 * fail instead of being silently resolved, and the pinned object
++	 * cannot be replaced before mount(2).
++	 */
++	if (rc == 0
++	    && cxt->action == MNT_ACT_MOUNT
++	    && mnt_context_target_fd_required(cxt)) {
++		mnt_context_close_target_fd(cxt);
++		if (mnt_context_get_target_fd(cxt) < 0) {
++			rc = -errno;
++			DBG(CXT, ul_debugobj(cxt, "failed to pin target [rc=%d]", rc));
++		}
++	}
++
+ 	/* canonicalize the path */
+ 	if (rc == 0) {
+ 		struct libmnt_cache *cache = mnt_context_get_cache(cxt);
+--- a/libmount/src/context_mount.c
++++ b/libmount/src/context_mount.c
+@@ -724,6 +724,8 @@ static int do_mount_additional(struct li
+ 			       int *syserr)
+ {
+ 	struct list_head *p;
++	char buf[64];
++	const char *tgt;
+ 
+ 	assert(cxt);
+ 	assert(target);
+@@ -731,6 +733,15 @@ static int do_mount_additional(struct li
+ 	if (syserr)
+ 		*syserr = 0;
+ 
++	/* use pinned target for restricted mount (TOCTOU) */
++	tgt = mnt_context_get_pinned_target(cxt, target, buf, sizeof(buf));
++	if (!tgt) {
++		if (syserr)
++			*syserr = -errno;
++		DBG(CXT, ul_debugobj(cxt, "failed to get pinned target"));
++		return -1;
++	}
++
+ 	list_for_each(p, &cxt->addmounts) {
+ 		int rc;
+ 		struct libmnt_addmount *ad =
+@@ -740,7 +751,7 @@ static int do_mount_additional(struct li
+ 				ad->mountflags,
+ 				ad->mountflags & MS_REC ? " (recursive)" : ""));
+ 
+-		rc = mount("none", target, NULL,
++		rc = mount("none", tgt, NULL,
+ 				ad->mountflags | (flags & MS_SILENT), NULL);
+ 		if (rc) {
+ 			if (syserr)
+@@ -789,7 +800,8 @@ static int do_mount(struct libmnt_contex
+ 		if (mnt_context_helper_executed(cxt)
+ 		    && mnt_context_get_helper_status(cxt) == 0
+ 		    && !list_empty(&cxt->addmounts)
+-		    && do_mount_additional(cxt, target, flags, NULL))
++		    && (mnt_context_reopen_target_fd(cxt)
++			|| do_mount_additional(cxt, target, flags, NULL)))
+ 
+ 			return -MNT_ERR_APPLYFLAGS;
+ 		return rc;
+@@ -831,7 +843,17 @@ static int do_mount(struct libmnt_contex
+ 		/*
+ 		 * regular mount
+ 		 */
+-		if (mount(src, target, type, flags, cxt->mountdata)) {
++		char buf[64];
++		const char *tgt = mnt_context_get_pinned_target(cxt,
++						target, buf, sizeof(buf));
++
++		if (!tgt) {
++			cxt->syscall_status = -errno;
++			DBG(CXT, ul_debugobj(cxt, "failed to get pinned target"));
++			return -cxt->syscall_status;
++		}
++
++		if (mount(src, tgt, type, flags, cxt->mountdata)) {
+ 			cxt->syscall_status = -errno;
+ 			DBG(CXT, ul_debugobj(cxt, "mount(2) failed [errno=%d %m]",
+ 							-cxt->syscall_status));
+@@ -844,7 +866,8 @@ static int do_mount(struct libmnt_contex
+ 		 * additional mounts for extra propagation flags
+ 		 */
+ 		if (!list_empty(&cxt->addmounts)
+-		    && do_mount_additional(cxt, target, flags, NULL)) {
++		    && (mnt_context_reopen_target_fd(cxt)
++			|| do_mount_additional(cxt, target, flags, NULL))) {
+ 
+ 			/* TODO: call umount? */
+ 			return -MNT_ERR_APPLYFLAGS;
+--- a/libmount/src/mountP.h
++++ b/libmount/src/mountP.h
+@@ -353,6 +353,8 @@ struct libmnt_context
+ 	struct libmnt_ns	ns_tgt;		/* target namespace */
+ 	struct libmnt_ns	*ns_cur;	/* pointer to current namespace */
+ 
++	int		fd_target;	/* pinned target fd (RESOLVE_NO_SYMLINKS) */
++
+ 	unsigned int	enabled_textdomain : 1;		/* bindtextdomain() called */
+ };
+ 
+@@ -427,6 +429,13 @@ extern int mnt_context_get_mtab_for_targ
+ 
+ extern int mnt_context_prepare_srcpath(struct libmnt_context *cxt);
+ extern int mnt_context_prepare_target(struct libmnt_context *cxt);
++
++extern int mnt_context_target_fd_required(struct libmnt_context *cxt);
++extern int mnt_context_get_target_fd(struct libmnt_context *cxt);
++extern void mnt_context_close_target_fd(struct libmnt_context *cxt);
++extern int mnt_context_reopen_target_fd(struct libmnt_context *cxt);
++extern const char *mnt_context_get_pinned_target(struct libmnt_context *cxt,
++				const char *target, char *buf, size_t bufsz);
+ extern int mnt_context_guess_srcpath_fstype(struct libmnt_context *cxt, char **type);
+ extern int mnt_context_guess_fstype(struct libmnt_context *cxt);
+ extern int mnt_context_prepare_helper(struct libmnt_context *cxt,
+Description: CVE-2026-53615 - Fix integer overflow in libblkid DOS extended partition parsing
+ A uint32_t integer overflow in parse_dos_extended() allows a crafted disk
+ image to register a partition at sector 0 (the MBR) when cur_start + start
+ wraps around. Fix by using 64-bit arithmetic for abs_start calculation,
+ applying extended partition area bounds checks to all EBR data entries (not
+ just index >= 2), and validating EBR link targets stay within the extended
+ area and advance forward.
+Origin: upstream, https://github.com/util-linux/util-linux/commit/e9d544d013267ea86b70ee8ff78abd280e6641af
+Author: Karel Zak <kzak@redhat.com>
+Bug-CVE: CVE-2026-53615
+Last-Update: 2026-07-13
+
+--- a/libblkid/src/partitions/dos.c
++++ b/libblkid/src/partitions/dos.c
+@@ -44,6 +44,7 @@ static int parse_dos_extended(blkid_probe pr, blkid_parttable tab,
+ {
+ 	blkid_partlist ls = blkid_probe_get_partlist(pr);
+ 	uint32_t cur_start = ex_start, cur_size = ex_size;
++	uint64_t ex_end = (uint64_t) ex_start + ex_size;
+ 	unsigned char *data;
+ 	int ct_nodata = 0;	/* count ext.partitions without data partitions */
+ 	int i;
+@@ -86,24 +87,31 @@ static int parse_dos_extended(blkid_probe pr, blkid_parttable tab,
+ 		/* Parse data partition */
+ 		for (p = p0, i = 0; i < 4; i++, p++) {
+ 			uint32_t abs_start;
++			uint64_t abs;
+ 			blkid_partition par;
+ 
+ 			/* the start is relative to the parental ext.partition */
+ 			start = dos_partition_get_start(p) * ssf;
+ 			size = dos_partition_get_size(p) * ssf;
+-			abs_start = cur_start + start;	/* absolute start */
+ 
+ 			if (!size || is_extended(p))
+ 				continue;
++
++			abs = (uint64_t) cur_start + start;
++
++			/* data partition must be within the extended area */
++			if (abs < ex_start || abs + size > ex_end) {
++				DBG(LOWPROBE, ul_debug("#%d: EBR data partition outside "
++						"extended -- ignore", i + 1));
++				continue;
++			}
++			abs_start = (uint32_t) abs;
++
+ 			if (i >= 2) {
+-				/* extra checks to detect real data on
++				/* extra check to detect real data on
+ 				 * 3rd and 4th entries */
+ 				if (start + size > cur_size)
+ 					continue;
+-				if (abs_start < ex_start)
+-					continue;
+-				if (abs_start + size > ex_start + ex_size)
+-					continue;
+ 			}
+ 
+ 			/* Avoid recursive non-empty links, see ct_nodata counter */
+@@ -140,8 +148,22 @@ static int parse_dos_extended(blkid_probe pr, blkid_parttable tab,
+ 		if (i == 4)
+ 			goto leave;
+ 
+-		cur_start = ex_start + start;
+-		cur_size = size;
++		{
++			uint64_t next = (uint64_t) ex_start + start;
++
++			if (next + size > ex_end) {
++				DBG(LOWPROBE, ul_debug("EBR link outside "
++						"extended area -- leave"));
++				goto leave;
++			}
++			if (next <= cur_start) {
++				DBG(LOWPROBE, ul_debug("EBR link does not "
++						"advance -- leave"));
++				goto leave;
++			}
++			cur_start = (uint32_t) next;
++			cur_size = size;
++		}
+ 	}
+ leave:
+ 	return BLKID_PROBE_OK;
 Description: CVE-2026-27456 - Fix TOCTOU race condition in mount(8) loop device setup
  Add O_NOFOLLOW flag and conditional canonicalization for restricted
  (non-root SUID) mounts to prevent TOCTOU race conditions where an
@@ -240,88 +712,3 @@ Last-Update: 2026-06-30
  			if (putpwent(pwd, fp) < 0)
  				goto fail;
  			found = 1;
-Description: CVE-2026-53615 - Fix integer overflow in libblkid DOS extended partition parsing
- A uint32_t integer overflow in parse_dos_extended() allows a crafted disk
- image to register a partition at sector 0 (the MBR) when cur_start + start
- wraps around. Fix by using 64-bit arithmetic for abs_start calculation,
- applying extended partition area bounds checks to all EBR data entries (not
- just index >= 2), and validating EBR link targets stay within the extended
- area and advance forward.
-Origin: upstream, https://github.com/util-linux/util-linux/commit/e9d544d013267ea86b70ee8ff78abd280e6641af
-Author: Karel Zak <kzak@redhat.com>
-Bug-CVE: CVE-2026-53615
-Last-Update: 2026-07-13
-
---- a/libblkid/src/partitions/dos.c
-+++ b/libblkid/src/partitions/dos.c
-@@ -44,6 +44,7 @@ static int parse_dos_extended(blkid_probe pr, blkid_parttable tab,
- {
- 	blkid_partlist ls = blkid_probe_get_partlist(pr);
- 	uint32_t cur_start = ex_start, cur_size = ex_size;
-+	uint64_t ex_end = (uint64_t) ex_start + ex_size;
- 	unsigned char *data;
- 	int ct_nodata = 0;	/* count ext.partitions without data partitions */
- 	int i;
-@@ -86,24 +87,31 @@ static int parse_dos_extended(blkid_probe pr, blkid_parttable tab,
- 		/* Parse data partition */
- 		for (p = p0, i = 0; i < 4; i++, p++) {
- 			uint32_t abs_start;
-+			uint64_t abs;
- 			blkid_partition par;
- 
- 			/* the start is relative to the parental ext.partition */
- 			start = dos_partition_get_start(p) * ssf;
- 			size = dos_partition_get_size(p) * ssf;
--			abs_start = cur_start + start;	/* absolute start */
- 
- 			if (!size || is_extended(p))
- 				continue;
-+
-+			abs = (uint64_t) cur_start + start;
-+
-+			/* data partition must be within the extended area */
-+			if (abs < ex_start || abs + size > ex_end) {
-+				DBG(LOWPROBE, ul_debug("#%d: EBR data partition outside "
-+						"extended -- ignore", i + 1));
-+				continue;
-+			}
-+			abs_start = (uint32_t) abs;
-+
- 			if (i >= 2) {
--				/* extra checks to detect real data on
-+				/* extra check to detect real data on
- 				 * 3rd and 4th entries */
- 				if (start + size > cur_size)
- 					continue;
--				if (abs_start < ex_start)
--					continue;
--				if (abs_start + size > ex_start + ex_size)
--					continue;
- 			}
- 
- 			/* Avoid recursive non-empty links, see ct_nodata counter */
-@@ -140,8 +148,22 @@ static int parse_dos_extended(blkid_probe pr, blkid_parttable tab,
- 		if (i == 4)
- 			goto leave;
- 
--		cur_start = ex_start + start;
--		cur_size = size;
-+		{
-+			uint64_t next = (uint64_t) ex_start + start;
-+
-+			if (next + size > ex_end) {
-+				DBG(LOWPROBE, ul_debug("EBR link outside "
-+						"extended area -- leave"));
-+				goto leave;
-+			}
-+			if (next <= cur_start) {
-+				DBG(LOWPROBE, ul_debug("EBR link does not "
-+						"advance -- leave"));
-+				goto leave;
-+			}
-+			cur_start = (uint32_t) next;
-+			cur_size = size;
-+		}
- 	}
- leave:
- 	return BLKID_PROBE_OK;
