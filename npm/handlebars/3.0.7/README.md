@@ -5,6 +5,11 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-106446
+- GHSA-q2c6-c6pm-g3gh
+- CVE-2019-20920
+- CVE-2021-23369
+- CVE-2019-19919
+- GHSA-2cf5-4w76-r9qv
 - CVE-2021-23383
 - GHSA-g9r4-xpmj-mj65
 - CVE-2026-106445
