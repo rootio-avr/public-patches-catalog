@@ -1,0 +1,531 @@
+--- a/spdy/types.go
++++ b/spdy/types.go
+@@ -63,8 +63,20 @@
+ )
+ 
+ // MaxDataLength is the maximum number of bytes that can be stored in one frame.
++//
++// SPDY frame headers encode the payload length using a 24-bit field,
++// so the maximum representable size for both data and control frames
++// is 2^24-1 bytes.
++//
++// See the SPDY/3 specification, "Frame Format":
++// https://www.chromium.org/spdy/spdy-protocol/spdy-protocol-draft3-1/
+ const MaxDataLength = 1<<24 - 1
+ 
++const (
++	defaultMaxHeaderFieldSize uint32 = 1 << 20
++	defaultMaxHeaderCount     uint32 = 1000
++)
++
+ // headerValueSepator separates multiple header values.
+ const headerValueSeparator = "\x00"
+ 
+@@ -269,6 +281,10 @@
+ 	r                         io.Reader
+ 	headerReader              io.LimitedReader
+ 	headerDecompressor        io.ReadCloser
++
++	maxFrameLength       uint32 // overrides the default frame payload length limit.
++	maxHeaderFieldSize   uint32 // overrides the default per-header name/value length limit.
++	maxHeaderCount       uint32 // overrides the default header count limit.
+ }
+ 
+ // NewFramer allocates a new Framer for a given SPDY connection, represented by
+@@ -276,6 +292,16 @@
+ // from/to the Reader and Writer, so the caller should pass in an appropriately
+ // buffered implementation to optimize performance.
+ func NewFramer(w io.Writer, r io.Reader) (*Framer, error) {
++	return newFramer(w, r)
++}
++
++// NewFramerWithOptions allocates a new Framer for a given SPDY connection and
++// applies frame parsing limits via options.
++func NewFramerWithOptions(w io.Writer, r io.Reader, opts ...FramerOption) (*Framer, error) {
++	return newFramer(w, r, opts...)
++}
++
++func newFramer(w io.Writer, r io.Reader, opts ...FramerOption) (*Framer, error) {
+ 	compressBuf := new(bytes.Buffer)
+ 	compressor, err := zlib.NewWriterLevelDict(compressBuf, zlib.BestCompression, []byte(headerDictionary))
+ 	if err != nil {
+@@ -286,6 +312,11 @@
+ 		headerBuf:        compressBuf,
+ 		headerCompressor: compressor,
+ 		r:                r,
++	}
++	for _, opt := range opts {
++		if opt != nil {
++			opt(framer)
++		}
+ 	}
+ 	return framer, nil
+ }
+--- a/spdy/options.go
++++ b/spdy/options.go
+@@ -0,0 +1,25 @@
++package spdy
++
++// FramerOption allows callers to customize frame parsing limits.
++type FramerOption func(*Framer)
++
++// WithMaxControlFramePayloadSize sets the control-frame payload limit.
++func WithMaxControlFramePayloadSize(size uint32) FramerOption {
++	return func(f *Framer) {
++		f.maxFrameLength = size
++	}
++}
++
++// WithMaxHeaderFieldSize sets the per-header name/value size limit.
++func WithMaxHeaderFieldSize(size uint32) FramerOption {
++	return func(f *Framer) {
++		f.maxHeaderFieldSize = size
++	}
++}
++
++// WithMaxHeaderCount sets the maximum number of headers in a frame.
++func WithMaxHeaderCount(count uint32) FramerOption {
++	return func(f *Framer) {
++		f.maxHeaderCount = count
++	}
++}
+--- a/spdy/read.go
++++ b/spdy/read.go
+@@ -24,6 +24,7 @@
+ 	"compress/zlib"
+ 	"encoding/binary"
+ 	"io"
++	"io/ioutil"
+ 	"net/http"
+ 	"strings"
+ )
+@@ -59,6 +60,11 @@
+ 	if err := binary.Read(f.r, binary.BigEndian, &numSettings); err != nil {
+ 		return err
+ 	}
++	// Each setting is 8 bytes (4-byte id + 4-byte value).
++	// Payload is 4 bytes for numSettings + numSettings*8.
++	if h.length < 4 || numSettings > (h.length-4)/8 {
++		return &Error{InvalidControlFrame, 0}
++	}
+ 	frame.FlagIdValues = make([]SettingsFlagIdValue, numSettings)
+ 	for i := uint32(0); i < numSettings; i++ {
+ 		if err := binary.Read(f.r, binary.BigEndian, &frame.FlagIdValues[i].Id); err != nil {
+@@ -177,8 +183,19 @@
+ 	if err := binary.Read(f.r, binary.BigEndian, &length); err != nil {
+ 		return nil, err
+ 	}
++	maxControlFramePayload := uint32(MaxDataLength)
++	if f.maxFrameLength > 0 {
++		maxControlFramePayload = f.maxFrameLength
++	}
++
+ 	flags := ControlFlags((length & 0xff000000) >> 24)
+ 	length &= 0xffffff
++	if length > maxControlFramePayload {
++		if _, err := io.CopyN(ioutil.Discard, f.r, int64(length)); err != nil {
++			return nil, err
++		}
++		return nil, &Error{InvalidControlFrame, 0}
++	}
+ 	header := ControlFrameHeader{version, frameType, flags, length}
+ 	cframe, err := newControlFrame(frameType)
+ 	if err != nil {
+@@ -190,11 +207,22 @@
+ 	return cframe, nil
+ }
+ 
+-func parseHeaderValueBlock(r io.Reader, streamId StreamId) (http.Header, error) {
++func (f *Framer) parseHeaderValueBlock(r io.Reader, streamId StreamId) (http.Header, error) {
+ 	var numHeaders uint32
+ 	if err := binary.Read(r, binary.BigEndian, &numHeaders); err != nil {
+ 		return nil, err
+ 	}
++	maxHeaders := defaultMaxHeaderCount
++	if f.maxHeaderCount > 0 {
++		maxHeaders = f.maxHeaderCount
++	}
++	if numHeaders > maxHeaders {
++		return nil, &Error{InvalidControlFrame, streamId}
++	}
++	maxFieldSize := defaultMaxHeaderFieldSize
++	if f.maxHeaderFieldSize > 0 {
++		maxFieldSize = f.maxHeaderFieldSize
++	}
+ 	var e error
+ 	h := make(http.Header, int(numHeaders))
+ 	for i := 0; i < int(numHeaders); i++ {
+@@ -202,6 +230,9 @@
+ 		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+ 			return nil, err
+ 		}
++		if length > maxFieldSize {
++			return nil, &Error{InvalidControlFrame, streamId}
++		}
+ 		nameBytes := make([]byte, length)
+ 		if _, err := io.ReadFull(r, nameBytes); err != nil {
+ 			return nil, err
+@@ -217,6 +248,9 @@
+ 		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+ 			return nil, err
+ 		}
++		if length > maxFieldSize {
++			return nil, &Error{InvalidControlFrame, streamId}
++		}
+ 		value := make([]byte, length)
+ 		if _, err := io.ReadFull(r, value); err != nil {
+ 			return nil, err
+@@ -256,7 +290,7 @@
+ 		}
+ 		reader = f.headerDecompressor
+ 	}
+-	frame.Headers, err = parseHeaderValueBlock(reader, frame.StreamId)
++	frame.Headers, err = f.parseHeaderValueBlock(reader, frame.StreamId)
+ 	if !f.headerCompressionDisabled && (err == io.EOF && f.headerReader.N == 0 || f.headerReader.N != 0) {
+ 		err = &Error{WrongCompressedPayloadSize, 0}
+ 	}
+@@ -288,7 +322,7 @@
+ 		}
+ 		reader = f.headerDecompressor
+ 	}
+-	frame.Headers, err = parseHeaderValueBlock(reader, frame.StreamId)
++	frame.Headers, err = f.parseHeaderValueBlock(reader, frame.StreamId)
+ 	if !f.headerCompressionDisabled && (err == io.EOF && f.headerReader.N == 0 || f.headerReader.N != 0) {
+ 		err = &Error{WrongCompressedPayloadSize, 0}
+ 	}
+@@ -320,7 +354,7 @@
+ 		}
+ 		reader = f.headerDecompressor
+ 	}
+-	frame.Headers, err = parseHeaderValueBlock(reader, frame.StreamId)
++	frame.Headers, err = f.parseHeaderValueBlock(reader, frame.StreamId)
+ 	if !f.headerCompressionDisabled && (err == io.EOF && f.headerReader.N == 0 || f.headerReader.N != 0) {
+ 		err = &Error{WrongCompressedPayloadSize, 0}
+ 	}
+--- a/spdy/write.go
++++ b/spdy/write.go
+@@ -23,6 +23,7 @@
+ import (
+ 	"encoding/binary"
+ 	"io"
++	"math"
+ 	"net/http"
+ 	"strings"
+ )
+@@ -63,13 +64,21 @@
+ func (frame *SettingsFrame) write(f *Framer) (err error) {
+ 	frame.CFHeader.version = Version
+ 	frame.CFHeader.frameType = TypeSettings
+-	frame.CFHeader.length = uint32(len(frame.FlagIdValues)*8 + 4)
++	payloadLen := len(frame.FlagIdValues)*8 + 4
++	if payloadLen > MaxDataLength {
++		return &Error{InvalidControlFrame, 0}
++	}
++	frame.CFHeader.length = uint32(payloadLen)
+ 
+ 	// Serialize frame to Writer.
+ 	if err = writeControlFrameHeader(f.w, frame.CFHeader); err != nil {
+ 		return
+ 	}
+-	if err = binary.Write(f.w, binary.BigEndian, uint32(len(frame.FlagIdValues))); err != nil {
++	n := len(frame.FlagIdValues)
++	if uint64(n) > math.MaxUint32 {
++		return &Error{InvalidControlFrame, 0}
++	}
++	if err = binary.Write(f.w, binary.BigEndian, uint32(n)); err != nil {
+ 		return
+ 	}
+ 	for _, flagIdValue := range frame.FlagIdValues {
+@@ -170,29 +179,41 @@
+ 
+ func writeHeaderValueBlock(w io.Writer, h http.Header) (n int, err error) {
+ 	n = 0
+-	if err = binary.Write(w, binary.BigEndian, uint32(len(h))); err != nil {
++	numHeaders := len(h)
++	if numHeaders > math.MaxInt32 {
++		return n, &Error{InvalidControlFrame, 0}
++	}
++	if err = binary.Write(w, binary.BigEndian, uint32(numHeaders)); err != nil {
+ 		return
+ 	}
+-	n += 2
++	n += 4
+ 	for name, values := range h {
+-		if err = binary.Write(w, binary.BigEndian, uint32(len(name))); err != nil {
++		nameLen := len(name)
++		if nameLen > math.MaxInt32 {
++			return n, &Error{InvalidControlFrame, 0}
++		}
++		if err = binary.Write(w, binary.BigEndian, uint32(nameLen)); err != nil {
+ 			return
+ 		}
+-		n += 2
++		n += 4
+ 		name = strings.ToLower(name)
+ 		if _, err = io.WriteString(w, name); err != nil {
+ 			return
+ 		}
+-		n += len(name)
++		n += nameLen
+ 		v := strings.Join(values, headerValueSeparator)
+-		if err = binary.Write(w, binary.BigEndian, uint32(len(v))); err != nil {
++		vLen := len(v)
++		if vLen > math.MaxInt32 {
++			return n, &Error{InvalidControlFrame, 0}
++		}
++		if err = binary.Write(w, binary.BigEndian, uint32(vLen)); err != nil {
+ 			return
+ 		}
+-		n += 2
++		n += 4
+ 		if _, err = io.WriteString(w, v); err != nil {
+ 			return
+ 		}
+-		n += len(v)
++		n += vLen
+ 	}
+ 	return
+ }
+@@ -216,7 +237,11 @@
+ 	// Set ControlFrameHeader.
+ 	frame.CFHeader.version = Version
+ 	frame.CFHeader.frameType = TypeSynStream
+-	frame.CFHeader.length = uint32(len(f.headerBuf.Bytes()) + 10)
++	hLen := len(f.headerBuf.Bytes()) + 10
++	if hLen > MaxDataLength {
++		return &Error{InvalidControlFrame, 0}
++	}
++	frame.CFHeader.length = uint32(hLen)
+ 
+ 	// Serialize frame to Writer.
+ 	if err = writeControlFrameHeader(f.w, frame.CFHeader); err != nil {
+@@ -260,7 +285,11 @@
+ 	// Set ControlFrameHeader.
+ 	frame.CFHeader.version = Version
+ 	frame.CFHeader.frameType = TypeSynReply
+-	frame.CFHeader.length = uint32(len(f.headerBuf.Bytes()) + 4)
++	hLen := len(f.headerBuf.Bytes()) + 4
++	if hLen > MaxDataLength {
++		return &Error{InvalidControlFrame, 0}
++	}
++	frame.CFHeader.length = uint32(hLen)
+ 
+ 	// Serialize frame to Writer.
+ 	if err = writeControlFrameHeader(f.w, frame.CFHeader); err != nil {
+@@ -295,7 +324,11 @@
+ 	// Set ControlFrameHeader.
+ 	frame.CFHeader.version = Version
+ 	frame.CFHeader.frameType = TypeHeaders
+-	frame.CFHeader.length = uint32(len(f.headerBuf.Bytes()) + 4)
++	hLen := len(f.headerBuf.Bytes()) + 4
++	if hLen > MaxDataLength {
++		return &Error{InvalidControlFrame, 0}
++	}
++	frame.CFHeader.length = uint32(hLen)
+ 
+ 	// Serialize frame to Writer.
+ 	if err = writeControlFrameHeader(f.w, frame.CFHeader); err != nil {
+@@ -323,7 +356,11 @@
+ 	if err = binary.Write(f.w, binary.BigEndian, frame.StreamId); err != nil {
+ 		return
+ 	}
+-	flagsAndLength := uint32(frame.Flags)<<24 | uint32(len(frame.Data))
++	dLen := len(frame.Data)
++	if dLen > MaxDataLength {
++		return &Error{InvalidDataFrame, frame.StreamId}
++	}
++	flagsAndLength := uint32(frame.Flags)<<24 | uint32(dLen)
+ 	if err = binary.Write(f.w, binary.BigEndian, flagsAndLength); err != nil {
+ 		return
+ 	}
+--- a/connection.go
++++ b/connection.go
+@@ -224,7 +224,13 @@
+ // NewConnection creates a new spdy connection from an existing
+ // network connection.
+ func NewConnection(conn net.Conn, server bool) (*Connection, error) {
+-	framer, framerErr := spdy.NewFramer(conn, conn)
++	return NewConnectionWithOptions(conn, server)
++}
++
++// NewConnectionWithOptions creates a new spdy connection and applies frame
++// parsing limits via options.
++func NewConnectionWithOptions(conn net.Conn, server bool, opts ...spdy.FramerOption) (*Connection, error) {
++	framer, framerErr := spdy.NewFramerWithOptions(conn, conn, opts...)
+ 	if framerErr != nil {
+ 		return nil, framerErr
+ 	}
+@@ -349,6 +355,9 @@
+ 				debugMessage("frame read error: %s", err)
+ 			} else {
+ 				debugMessage("(%p) EOF received", s)
++			}
++			if spdyErr, ok := err.(*spdy.Error); ok && spdyErr.Err == spdy.InvalidControlFrame {
++				_ = s.conn.Close()
+ 			}
+ 			break
+ 		}
+--- a/spdy/spdy_test.go
++++ b/spdy/spdy_test.go
+@@ -41,7 +41,8 @@
+ 	var headerValueBlockBuf bytes.Buffer
+ 	writeHeaderValueBlock(&headerValueBlockBuf, HeadersFixture)
+ 	const bogusStreamId = 1
+-	newHeaders, err := parseHeaderValueBlock(&headerValueBlockBuf, bogusStreamId)
++	f := &Framer{}
++	newHeaders, err := f.parseHeaderValueBlock(&headerValueBlockBuf, bogusStreamId)
+ 	if err != nil {
+ 		t.Fatal("parseHeaderValueBlock:", err)
+ 	}
+@@ -234,6 +235,87 @@
+ 	}
+ 	if !reflect.DeepEqual(settingsFrame, *parsedSettingsFrame) {
+ 		t.Fatal("got: ", *parsedSettingsFrame, "\nwant: ", settingsFrame)
++	}
++}
++
++func TestReadFrameRejectsOversizedControlFrame(t *testing.T) {
++	buffer := new(bytes.Buffer)
++	framer, err := NewFramer(buffer, buffer)
++	if err != nil {
++		t.Fatal("Failed to create new framer:", err)
++	}
++	framer.maxFrameLength = 1
++
++	// Control frame header (version 3, SETTINGS, length = 2)
++	_, _ = buffer.Write([]byte{
++		0x80, 0x03, // control frame + version
++		0x00, 0x04, // SETTINGS
++		0x00,             // flags
++		0x00, 0x00, 0x02, // length = 2
++		0x00, 0x01, // payload (2 bytes)
++	})
++
++	_, err = framer.ReadFrame()
++	if err == nil {
++		t.Fatal("expected error for oversized control frame")
++	}
++}
++
++func TestReadFrameRejectsSettingsLengthMismatch(t *testing.T) {
++	buffer := new(bytes.Buffer)
++	framer, err := NewFramer(buffer, buffer)
++	if err != nil {
++		t.Fatal("Failed to create new framer:", err)
++	}
++
++	// SETTINGS frame with declared payload length 0, but includes numSettings.
++	_, _ = buffer.Write([]byte{
++		0x80, 0x03, // control frame + version
++		0x00, 0x04, // SETTINGS
++		0x00,             // flags
++		0x00, 0x00, 0x00, // length = 0
++		0x00, 0x00, 0x00, 0x01, // numSettings = 1
++	})
++
++	_, err = framer.ReadFrame()
++	if err == nil {
++		t.Fatal("expected error for SETTINGS length mismatch")
++	}
++}
++
++func TestParseHeaderValueBlockRejectsHeaderCountOverLimit(t *testing.T) {
++	buffer := bytes.NewBuffer([]byte{
++		0x00, 0x00, 0x00, 0x02, // numHeaders = 2
++	})
++
++	f := &Framer{maxHeaderCount: 1}
++	_, err := f.parseHeaderValueBlock(buffer, 1)
++	if err == nil {
++		t.Fatal("expected error for excessive header count")
++	}
++	spdyErr, ok := err.(*Error)
++	if !ok || spdyErr.Err != InvalidControlFrame {
++		t.Fatalf("unexpected error: %v", err)
++	}
++}
++
++func TestParseHeaderValueBlockRejectsHeaderFieldSizeOverLimit(t *testing.T) {
++	buffer := bytes.NewBuffer([]byte{
++		0x00, 0x00, 0x00, 0x01, // numHeaders = 1
++		0x00, 0x00, 0x00, 0x02, // name length = 2
++		0x61, 0x62, // name = "ab"
++		0x00, 0x00, 0x00, 0x01, // value length = 1
++		0x63, // value = "c"
++	})
++
++	f := &Framer{maxHeaderFieldSize: 1}
++	_, err := f.parseHeaderValueBlock(buffer, 1)
++	if err == nil {
++		t.Fatal("expected error for excessive header field size")
++	}
++	spdyErr, ok := err.(*Error)
++	if !ok || spdyErr.Err != InvalidControlFrame {
++		t.Fatalf("unexpected error: %v", err)
+ 	}
+ }
+ 
+--- a/spdy/options_test.go
++++ b/spdy/options_test.go
+@@ -0,0 +1,33 @@
++package spdy
++
++import (
++	"net"
++	"testing"
++)
++
++func TestNewFramerWithOptions(t *testing.T) {
++	serverConn, clientConn := net.Pipe()
++	defer func() {
++		_ = clientConn.Close()
++		_ = serverConn.Close()
++	}()
++
++	framer, err := NewFramerWithOptions(clientConn, clientConn,
++		WithMaxControlFramePayloadSize(1024),
++		WithMaxHeaderFieldSize(128),
++		WithMaxHeaderCount(16),
++	)
++	if err != nil {
++		t.Fatalf("Error creating spdy connection with options: %s", err)
++	}
++
++	if got := framer.maxFrameLength; got != 1024 {
++		t.Fatalf("Unexpected MaxControlFramePayloadSize: %d", got)
++	}
++	if got := framer.maxHeaderFieldSize; got != 128 {
++		t.Fatalf("Unexpected MaxHeaderFieldSize: %d", got)
++	}
++	if got := framer.maxHeaderCount; got != 16 {
++		t.Fatalf("Unexpected MaxHeaderCount: %d", got)
++	}
++}
+--- a/spdy_test.go
++++ b/spdy_test.go
+@@ -174,6 +174,25 @@
+ 	wg.Wait()
+ }
+ 
++func TestNewConnectionWithOptions(t *testing.T) {
++	serverConn, clientConn := net.Pipe()
++	defer func() {
++		_ = clientConn.Close()
++		_ = serverConn.Close()
++	}()
++
++	_, err := NewConnectionWithOptions(
++		clientConn,
++		false,
++		spdy.WithMaxControlFramePayloadSize(1024),
++		spdy.WithMaxHeaderFieldSize(128),
++		spdy.WithMaxHeaderCount(16),
++	)
++	if err != nil {
++		t.Fatalf("Error creating spdy connection with options: %s", err)
++	}
++}
++
+ func TestPing(t *testing.T) {
+ 	var wg sync.WaitGroup
+ 	server, listen, serverErr := runServer(&wg)
