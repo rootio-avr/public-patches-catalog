@@ -12,6 +12,7 @@ unknown
 - CVE-2026-28291
 - CVE-2026-28292
 - CVE-2026-102828
+- CVE-2026-102827
 
 ## How to Apply:
 1. Clone or download the source code for simple-git
