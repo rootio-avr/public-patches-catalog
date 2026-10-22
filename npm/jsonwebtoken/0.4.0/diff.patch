@@ -28,6 +28,184 @@
 
 --- a/index.js
 +++ b/index.js
+@@ -1,5 +1,68 @@
+ var jws = require('jws');
++var crypto = require('crypto');
+ 
++var ALLOWED_ALGORITHMS_FOR_KEYS = {
++  'ec': ['ES256', 'ES384', 'ES512'],
++  'rsa': ['RS256', 'PS256', 'RS384', 'PS384', 'RS512', 'PS512'],
++  'rsa-pss': ['PS256', 'PS384', 'PS512']
++};
++
++var ALLOWED_CURVES = {
++  ES256: 'prime256v1',
++  ES384: 'secp384r1',
++  ES512: 'secp521r1'
++};
++
++// Validates that the type (and, when available, the parameters) of an
++// asymmetric key is compatible with the requested algorithm (CVE-2022-23529
++// / GHSA-8cf7-32gw-wr33). Symmetric algorithms are not affected.
++function validateAsymmetricKey(algorithm, key, isPrivate) {
++  if (!algorithm || !key) return;
++  if (!/^(RS|PS|ES)(256|384|512)$/.test(algorithm)) return;
++  if (typeof key !== 'string' && !Buffer.isBuffer(key)) return;
++
++  var createKey = isPrivate ? crypto.createPrivateKey : crypto.createPublicKey;
++  if (typeof createKey !== 'function') return;
++
++  var keyObject;
++  try {
++    keyObject = createKey(key);
++  } catch (e) {
++    // Not parseable as a PEM key; signing/verifying will fail on its own.
++    return;
++  }
++
++  var keyType = keyObject.asymmetricKeyType;
++  if (!keyType) return;
++
++  var allowedAlgorithms = ALLOWED_ALGORITHMS_FOR_KEYS[keyType];
++  if (!allowedAlgorithms) {
++    throw new Error('Unknown key type "' + keyType + '".');
++  }
++
++  if (allowedAlgorithms.indexOf(algorithm) === -1) {
++    throw new Error('"alg" parameter for "' + keyType + '" key type must be one of: ' + allowedAlgorithms.join(', ') + '.');
++  }
++
++  var details = keyObject.asymmetricKeyDetails;
++  if (!details) return;
++
++  if (keyType === 'ec') {
++    var allowedCurve = ALLOWED_CURVES[algorithm];
++    if (details.namedCurve !== allowedCurve) {
++      throw new Error('"alg" parameter "' + algorithm + '" requires curve "' + allowedCurve + '".');
++    }
++  } else if (keyType === 'rsa-pss' && details.hashAlgorithm !== undefined) {
++    var length = parseInt(algorithm.slice(-3), 10);
++    if (details.hashAlgorithm !== 'sha' + length || details.mgf1HashAlgorithm !== details.hashAlgorithm) {
++      throw new Error('Invalid key for this operation, its RSA-PSS parameters do not meet the requirements of "alg" ' + algorithm + '.');
++    }
++    if (details.saltLength !== undefined && details.saltLength > length >> 3) {
++      throw new Error('Invalid key for this operation, its RSA-PSS parameter saltLength does not meet the requirements of "alg" ' + algorithm + '.');
++    }
++  }
++}
++
+ module.exports.decode = function (jwt) {
+   return jws.decode(jwt).payload;
+ };
+@@ -25,6 +88,10 @@
+   if (options.subject)
+     payload.sub = options.subject;
+ 
++  if (!options.allowInvalidAsymmetricKeyTypes) {
++    validateAsymmetricKey(header.alg, secretOrPrivateKey, true);
++  }
++
+   var signed = jws.sign({header: header, payload: payload, secret: secretOrPrivateKey});
+ 
+   return signed;
+@@ -50,6 +117,14 @@
+   }
+   if (!~options.algorithms.indexOf(decodedToken.header.alg)) {
+     return callback(new Error('invalid algorithm'));
++  }
++
++  if (!options.allowInvalidAsymmetricKeyTypes) {
++    try {
++      validateAsymmetricKey(decodedToken.header.alg, secretOrPublicKey, false);
++    } catch (e) {
++      return callback(e);
++    }
+   }
+ 
+   var valid;
+--- /dev/null
++++ b/test/jwt.keytype.tests.js
+@@ -0,0 +1,77 @@
++var jwt = require('../index');
++var crypto = require('crypto');
++var fs = require('fs');
++var path = require('path');
++
++var expect = require('chai').expect;
++
++// Regression tests for CVE-2022-23529 / GHSA-8cf7-32gw-wr33:
++// the key type must be compatible with the requested algorithm.
++describe('asymmetric key type validation', function() {
++  var rsaPriv = fs.readFileSync(path.join(__dirname, 'priv.pem'));
++  var rsaPub = fs.readFileSync(path.join(__dirname, 'pub.pem'));
++
++  var ec = crypto.generateKeyPairSync('ec', {
++    namedCurve: 'prime256v1',
++    publicKeyEncoding: { type: 'spki', format: 'pem' },
++    privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
++  });
++
++  function b64(obj) {
++    return Buffer.from(JSON.stringify(obj)).toString('base64')
++      .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
++  }
++
++  it('should reject signing with an EC private key and an RSA algorithm', function() {
++    expect(function() {
++      jwt.sign({ foo: 'bar' }, ec.privateKey, { algorithm: 'RS256' });
++    }).to.throw(/"alg" parameter for "ec" key type must be one of: ES256, ES384, ES512/);
++  });
++
++  it('should reject signing with an RSA private key and an EC algorithm', function() {
++    expect(function() {
++      jwt.sign({ foo: 'bar' }, rsaPriv, { algorithm: 'ES256' });
++    }).to.throw(/"alg" parameter for "rsa" key type must be one of/);
++  });
++
++  it('should reject signing with an EC key on the wrong curve', function() {
++    var p384 = crypto.generateKeyPairSync('ec', {
++      namedCurve: 'secp384r1',
++      publicKeyEncoding: { type: 'spki', format: 'pem' },
++      privateKeyEncoding: { type: 'pkcs8', format: 'pem' }
++    });
++    if (!crypto.createPrivateKey(p384.privateKey).asymmetricKeyDetails) return;
++    expect(function() {
++      jwt.sign({ foo: 'bar' }, p384.privateKey, { algorithm: 'ES256' });
++    }).to.throw(/requires curve "prime256v1"/);
++  });
++
++  it('should reject verifying with an RSA public key and an EC algorithm', function(done) {
++    var token = b64({ typ: 'JWT', alg: 'ES256' }) + '.' + b64({ foo: 'bar' }) + '.c2ln';
++    jwt.verify(token, rsaPub, function(err, decoded) {
++      expect(decoded).to.equal(undefined);
++      expect(err).to.be.an.instanceof(Error);
++      expect(err.message).to.match(/"alg" parameter for "rsa" key type must be one of/);
++      done();
++    });
++  });
++
++  it('should reject verifying with an EC public key and an RSA algorithm', function(done) {
++    var token = b64({ typ: 'JWT', alg: 'RS256' }) + '.' + b64({ foo: 'bar' }) + '.c2ln';
++    jwt.verify(token, ec.publicKey, function(err, decoded) {
++      expect(decoded).to.equal(undefined);
++      expect(err).to.be.an.instanceof(Error);
++      expect(err.message).to.match(/"alg" parameter for "ec" key type must be one of/);
++      done();
++    });
++  });
++
++  it('should still accept a matching RSA key pair', function(done) {
++    var token = jwt.sign({ foo: 'bar' }, rsaPriv, { algorithm: 'RS256' });
++    jwt.verify(token, rsaPub, function(err, decoded) {
++      expect(err).to.equal(null);
++      expect(decoded.foo).to.equal('bar');
++      done();
++    });
++  });
++});
+
+--- a/index.js
++++ b/index.js
 @@ -33,6 +33,24 @@ module.exports.verify = function(jwtString, secretOrPublicKey, options, callback
    if ((typeof options === 'function') && !callback) callback = options;
    if (!options) options = {};
