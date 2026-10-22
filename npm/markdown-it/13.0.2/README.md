@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-549894
+- CVE-2026-111759
 
 ## How to Apply:
 1. Clone or download the source code for markdown-it
