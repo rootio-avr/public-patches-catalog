@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-4660
+- CVE-2025-8959
 
 ## How to Apply:
 1. Clone or download the source code for github.com/hashicorp/go-getter
