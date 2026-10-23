@@ -4,16 +4,16 @@ This patch is based on org.springframework:spring version 5.3.14, which is avail
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-11158
 - CVE-2022-22965
 - CVE-2022-22968
 - CVE-2022-22970
 - CVE-2023-20863
 - CVE-2024-22243
-- CVE-2025-41249
-- CVE-2026-41849
-- AIKIDO-2026-11158
 - CVE-2024-22259
 - CVE-2024-22262
+- CVE-2025-41249
+- CVE-2026-41849
 - CVE-2026-41850
 
 ## How to Apply:
