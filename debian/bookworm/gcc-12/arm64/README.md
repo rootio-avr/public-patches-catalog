@@ -1,6 +1,6 @@
-# gcc-12 : 12.2.0-14+deb12u1.aikido.2
+# gcc-12 : 12.2.0-14+deb12u1.aikido.4
 
-This patch is based on gcc-12 version 12.2.0-14+deb12u1.aikido.2, which is available at:
+This patch is based on gcc-12 version 12.2.0-14+deb12u1.aikido.4, which is available at:
 https://sources.debian.org/src/gcc-12/12.2.0-14+deb12u1/
 
 ## Affected CVEs:
