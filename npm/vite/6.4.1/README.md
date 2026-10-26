@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-39363
 - CVE-2026-53571
+- CVE-2026-112942
 
 ## How to Apply:
 1. Clone or download the source code for vite
