@@ -1,0 +1,1075 @@
+Description: CVE-2026-109619 - Avoid state corruption via stale request state in session upload progress
+ Persistent PHP workers (mod_php/FPM) could keep global error, session,
+ object or extension state pointing into freed request memory after a
+ fatal error interrupted the request reset. The session upload progress
+ handler, which runs during request startup before RINIT, then used the
+ dangling pointers (use-after-free).
+ .
+ Targeted backport of the session/startup-state parts of php-src commit
+ 506e87fa7dcdd306975e5b8f8265ee03527aacbf for PHP 8.4.5: reset the session,
+ serialize, URL rewriter, error handler, error list, object store and
+ http_globals state before request data is processed; initialise the
+ session globals at MULTIPART_EVENT_START; ignore request_parse_body();
+ run the upload progress (un)serialization in an "incomplete classes only"
+ mode so no user code (autoload, __wakeup, __unserialize, ...) runs before
+ RINIT; and drop the temporary $_SESSION afterwards. The fallible
+ allocator / delayed OOM infrastructure of the upstream commit
+ (CVE-2026-109618) is intentionally not backported.
+Origin: backport, https://github.com/php/php-src/commit/506e87fa7dcdd306975e5b8f8265ee03527aacbf
+Author: Root.io Patch Bot <patches@root.io>
+Last-Update: 2026-10-25
+---
+--- a/Zend/zend_execute_API.c
++++ b/Zend/zend_execute_API.c
+@@ -419,10 +419,24 @@
+ 		}
+ #endif
+ 	} else {
++		/* may be used by zend_error_zstr_at before init_executor */
++		ZVAL_UNDEF(&EG(user_error_handler));
++		ZVAL_UNDEF(&EG(user_exception_handler));
++		memset(&EG(user_error_handlers_error_reporting), 0, sizeof(EG(user_error_handlers_error_reporting)));
++		memset(&EG(user_error_handlers), 0, sizeof(EG(user_error_handlers)));
++		memset(&EG(user_exception_handlers), 0, sizeof(EG(user_exception_handlers)));
++
+ 		zend_hash_discard(EG(zend_constants), EG(persistent_constants_count));
+ 	}
+ 
+ 	zend_objects_store_free_object_storage(&EG(objects_store), fast_shutdown);
++
++	/* may be used by zend_error_zstr_at before init_executor */
++	EG(record_errors) = false;
++	EG(num_errors) = 0;
++	EG(errors) = NULL;
++	EG(error_handling) = EH_NORMAL;
++	EG(exception) = NULL;
+ }
+ 
+ void shutdown_executor(void) /* {{{ */
+@@ -457,6 +471,8 @@
+ 		 */
+ 		zend_hash_discard(EG(function_table), EG(persistent_functions_count));
+ 		zend_hash_discard(EG(class_table), EG(persistent_classes_count));
++		EG(objects_store).object_buckets = NULL;
++		EG(objects_store).top = 1;
+ 	} else {
+ 		zend_vm_stack_destroy();
+ 
+--- a/ext/session/php_session.h
++++ b/ext/session/php_session.h
+@@ -203,6 +203,8 @@
+ 	bool in_save_handler; /* state if session is in save handler or not */
+ 	bool set_handler;     /* state if session module i setting handler or not */
+ 	zend_string *session_vars; /* serialized original session data */
++
++	bool in_rfc1867_update;    /* php_session_rfc1867_update() is running */
+ } php_ps_globals;
+ 
+ typedef php_ps_globals zend_ps_globals;
+--- a/ext/session/session.c
++++ b/ext/session/session.c
+@@ -108,7 +108,6 @@
+ static inline void php_rinit_session_globals(void) /* {{{ */
+ {
+ 	/* Do NOT init PS(mod_user_names) here! */
+-	/* TODO: These could be moved to MINIT and removed. These should be initialized by php_rshutdown_session_globals() always when execution is finished. */
+ 	PS(id) = NULL;
+ 	PS(session_status) = php_session_none;
+ 	PS(in_save_handler) = 0;
+@@ -118,6 +117,7 @@
+ 	PS(define_sid) = 1;
+ 	PS(session_vars) = NULL;
+ 	PS(module_number) = my_module_number;
++	PS(in_rfc1867_update) = false;
+ 	ZVAL_UNDEF(&PS(http_session_vars));
+ }
+ /* }}} */
+@@ -943,13 +943,35 @@
+ /* ***************
+    * Serializers *
+    *************** */
++
++/* The upload progress handler (php_session_rfc1867_update()) decodes and
++ * re-encodes the session during request startup, before RINIT, when no user
++ * code may run. Objects are then kept as __PHP_Incomplete_Class: no
++ * autoloading, no unserialize_callback_func, no __wakeup() or __unserialize(),
++ * and they are written back unchanged. */
++static void php_session_unserialize_init(php_unserialize_data_t *var_hash)
++{
++	PHP_VAR_UNSERIALIZE_INIT(*var_hash);
++	if (PS(in_rfc1867_update)) {
++		php_var_unserialize_set_incomplete_classes_only(*var_hash, true);
++	}
++}
++
++static void php_session_serialize_init(php_serialize_data_t *var_hash)
++{
++	PHP_VAR_SERIALIZE_INIT(*var_hash);
++	if (PS(in_rfc1867_update)) {
++		php_var_serialize_set_incomplete_classes_only(*var_hash, true);
++	}
++}
++
+ PS_SERIALIZER_ENCODE_FUNC(php_serialize) /* {{{ */
+ {
+ 	smart_str buf = {0};
+ 	php_serialize_data_t var_hash;
+ 
+ 	IF_SESSION_VARS() {
+-		PHP_VAR_SERIALIZE_INIT(var_hash);
++		php_session_serialize_init(&var_hash);
+ 		php_var_serialize(&buf, Z_REFVAL(PS(http_session_vars)), &var_hash);
+ 		PHP_VAR_SERIALIZE_DESTROY(var_hash);
+ 	}
+@@ -966,7 +988,7 @@
+ 	zend_string *var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
+ 
+ 	ZVAL_NULL(&session_vars);
+-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	php_session_unserialize_init(&var_hash);
+ 	result = php_var_unserialize(
+ 		&session_vars, (const unsigned char **)&val, (const unsigned char *)endptr, &var_hash);
+ 	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+@@ -999,7 +1021,7 @@
+ 	php_serialize_data_t var_hash;
+ 	PS_ENCODE_VARS;
+ 
+-	PHP_VAR_SERIALIZE_INIT(var_hash);
++	php_session_serialize_init(&var_hash);
+ 
+ 	PS_ENCODE_LOOP(
+ 			if (ZSTR_LEN(key) > PS_BIN_MAX) continue;
+@@ -1023,7 +1045,7 @@
+ 	php_unserialize_data_t var_hash;
+ 	zval *current, rv;
+ 
+-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	php_session_unserialize_init(&var_hash);
+ 
+ 	for (p = val; p < endptr; ) {
+ 		size_t namelen = ((unsigned char)(*p)) & (~PS_BIN_UNDEF);
+@@ -1065,7 +1087,7 @@
+ 	bool fail = false;
+ 	PS_ENCODE_VARS;
+ 
+-	PHP_VAR_SERIALIZE_INIT(var_hash);
++	php_session_serialize_init(&var_hash);
+ 
+ 	PS_ENCODE_LOOP(
+ 		smart_str_appendl(&buf, ZSTR_VAL(key), ZSTR_LEN(key));
+@@ -1100,7 +1122,7 @@
+ 	php_unserialize_data_t var_hash;
+ 	zval *current, rv;
+ 
+-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	php_session_unserialize_init(&var_hash);
+ 
+ 	p = val;
+ 
+@@ -2959,6 +2981,7 @@
+ 	ps_globals->mod = NULL;
+ 	ps_globals->serializer = NULL;
+ 	ps_globals->mod_data = NULL;
++	ps_globals->in_rfc1867_update = false;
+ 	ps_globals->session_status = php_session_none;
+ 	ps_globals->default_mod = NULL;
+ 	ps_globals->mod_user_implemented = 0;
+@@ -3179,8 +3202,12 @@
+ 		progress->next_update = Z_LVAL_P(progress->post_bytes_processed) + progress->update_step;
+ 	}
+ 
+-	php_session_initialize();
+-	PS(session_status) = php_session_active;
++	/* Runs before RINIT: no user code may be invoked, see php_session_unserialize_init() */
++	PS(in_rfc1867_update) = true;
++	if (php_session_initialize() == FAILURE || PS(session_status) != php_session_active) {
++		PS(in_rfc1867_update) = false;
++		return;
++	}
+ 	IF_SESSION_VARS() {
+ 		zval *sess_var = Z_REFVAL(PS(http_session_vars));
+ 		SEPARATE_ARRAY(sess_var);
+@@ -3190,18 +3217,23 @@
+ 		zend_hash_update(Z_ARRVAL_P(sess_var), progress->key.s, &progress->data);
+ 	}
+ 	php_session_flush(1);
++	PS(in_rfc1867_update) = false;
+ } /* }}} */
+ 
+ static void php_session_rfc1867_cleanup(php_session_rfc1867_progress *progress) /* {{{ */
+ {
+-	php_session_initialize();
+-	PS(session_status) = php_session_active;
++	PS(in_rfc1867_update) = true;
++	if (php_session_initialize() == FAILURE || PS(session_status) != php_session_active) {
++		PS(in_rfc1867_update) = false;
++		return;
++	}
+ 	IF_SESSION_VARS() {
+ 		zval *sess_var = Z_REFVAL(PS(http_session_vars));
+ 		SEPARATE_ARRAY(sess_var);
+ 		zend_hash_del(Z_ARRVAL_P(sess_var), progress->key.s);
+ 	}
+ 	php_session_flush(1);
++	PS(in_rfc1867_update) = false;
+ } /* }}} */
+ 
+ static zend_result php_session_rfc1867_callback(unsigned int event, void *event_data, void **extra) /* {{{ */
+@@ -3215,12 +3247,20 @@
+ 	if (!PS(rfc1867_enabled)) {
+ 		return retval;
+ 	}
++	if (PG(modules_activated)) {
++		/* request_parse_body(). Do not run here as it corrupts the session. */
++		return retval;
++	}
+ 
+ 	progress = PS(rfc1867_progress);
+ 
+ 	switch(event) {
+ 		case MULTIPART_EVENT_START: {
+ 			multipart_event_start *data = (multipart_event_start *) event_data;
++
++			/* This runs before RINIT, so we need to clear these early */
++			php_rinit_session_globals();
++
+ 			progress = ecalloc(1, sizeof(php_session_rfc1867_progress));
+ 			progress->content_length = data->content_length;
+ 			progress->sname_len  = strlen(PS(session_name));
+@@ -3378,6 +3418,11 @@
+ 			efree(progress);
+ 			progress = NULL;
+ 			PS(rfc1867_progress) = NULL;
++
++			/* $_SESSION was populated in incomplete_classes_only mode */
++			zend_string *session_var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
++			zend_delete_global_variable(session_var_name);
++			zend_string_release_ex(session_var_name, 0);
+ 		}
+ 		break;
+ 	}
+--- a/ext/standard/basic_functions.c
++++ b/ext/standard/basic_functions.c
+@@ -501,6 +501,18 @@
+ }
+ /* }}} */
+ 
++/* Called from php_request_startup(), before any request data is processed. */
++PHPAPI void php_basic_early_rinit(void)
++{
++	/* The session upload progress handler (un)serializes the session and
++	 * registers the session id with the URL rewriter from
++	 * php_hash_environment(), before RINIT. */
++	BG(serialize_lock) = 0;
++	memset(&BG(serialize), 0, sizeof(BG(serialize)));
++	memset(&BG(unserialize), 0, sizeof(BG(unserialize)));
++	php_url_scanner_early_rinit();
++}
++
+ PHP_MINFO_FUNCTION(basic) /* {{{ */
+ {
+ 	php_info_print_table_start();
+--- a/ext/standard/basic_functions.h
++++ b/ext/standard/basic_functions.h
+@@ -131,6 +131,7 @@
+ PHPAPI extern bool remove_user_shutdown_function(const char *function_name, size_t function_len);
+ PHPAPI extern bool append_user_shutdown_function(php_shutdown_function_entry *shutdown_function_entry);
+ 
++PHPAPI void php_basic_early_rinit(void);
+ PHPAPI void php_call_shutdown_functions(void);
+ PHPAPI void php_free_shutdown_functions(void);
+ 
+--- a/ext/standard/php_incomplete_class.h
++++ b/ext/standard/php_incomplete_class.h
+@@ -44,6 +44,11 @@
+ 
+ #define INCOMPLETE_CLASS "__PHP_Incomplete_Class"
+ #define MAGIC_MEMBER "__PHP_Incomplete_Class_Name"
++/* Set by php_var_unserialize() in incomplete_classes_only mode: the raw payload
++ * of a C: value, or the case name of an E: value. The serializer writes them
++ * back unchanged. */
++#define MAGIC_MEMBER_SERIALIZED "__PHP_Incomplete_Class_Serialized"
++#define MAGIC_MEMBER_ENUM_CASE "__PHP_Incomplete_Enum_Case"
+ 
+ #ifdef __cplusplus
+ extern "C" {
+--- a/ext/standard/php_var.h
++++ b/ext/standard/php_var.h
+@@ -37,11 +37,13 @@
+ PHPAPI int php_var_unserialize_intern(zval *rval, const unsigned char **p, const unsigned char *max, php_unserialize_data_t *var_hash);
+ 
+ PHPAPI php_serialize_data_t php_var_serialize_init(void);
++PHPAPI void php_var_serialize_set_incomplete_classes_only(php_serialize_data_t d, bool incomplete_classes_only);
+ PHPAPI void php_var_serialize_destroy(php_serialize_data_t d);
+ PHPAPI php_unserialize_data_t php_var_unserialize_init(void);
+ PHPAPI void php_var_unserialize_destroy(php_unserialize_data_t d);
+ PHPAPI HashTable *php_var_unserialize_get_allowed_classes(php_unserialize_data_t d);
+ PHPAPI void php_var_unserialize_set_allowed_classes(php_unserialize_data_t d, HashTable *classes);
++PHPAPI void php_var_unserialize_set_incomplete_classes_only(php_unserialize_data_t d, bool incomplete_classes_only);
+ PHPAPI void php_var_unserialize_set_max_depth(php_unserialize_data_t d, zend_long max_depth);
+ PHPAPI zend_long php_var_unserialize_get_max_depth(php_unserialize_data_t d);
+ PHPAPI void php_var_unserialize_set_cur_depth(php_unserialize_data_t d, zend_long cur_depth);
+--- a/ext/standard/url_scanner_ex.h
++++ b/ext/standard/url_scanner_ex.h
+@@ -22,6 +22,7 @@
+ 
+ PHP_RINIT_FUNCTION(url_scanner_ex);
+ PHP_RSHUTDOWN_FUNCTION(url_scanner_ex);
++void php_url_scanner_early_rinit(void);
+ 
+ PHPAPI char *php_url_scanner_adapt_single_url(const char *url, size_t urllen, const char *name, const char *value, size_t *newlen, bool encode);
+ PHPAPI zend_result php_url_scanner_add_session_var(const char *name, size_t name_len, const char *value, size_t value_len, bool encode);
+--- a/ext/standard/url_scanner_ex.re
++++ b/ext/standard/url_scanner_ex.re
+@@ -683,6 +683,13 @@
+ 	smart_str_free(&ctx->attr_val);
+ }
+ 
++void php_url_scanner_early_rinit(void)
++{
++	/* See php_basic_early_rinit() */
++	php_url_scanner_ex_activate(1);
++	php_url_scanner_ex_activate(0);
++}
++
+ static inline void php_url_scanner_session_handler_impl(char *output, size_t output_len, char **handled_output, size_t *handled_output_len, int mode, bool is_session)
+ {
+ 	size_t len;
+--- a/ext/standard/var.c
++++ b/ext/standard/var.c
+@@ -35,6 +35,9 @@
+ struct php_serialize_data {
+ 	HashTable ht;
+ 	uint32_t n;
++	/* Write back the C: and E: payloads kept by php_var_unserialize() in
++	 * incomplete_classes_only mode, see php_var_serialize_incomplete_raw() */
++	bool incomplete_classes_only;
+ };
+ 
+ #define COMMON (is_ref ? "&" : "")
+@@ -821,6 +824,56 @@
+ }
+ /* }}} */
+ 
++static bool php_var_serialize_incomplete_raw(smart_str *buf, zval *struc)
++{
++	HashTable *props = Z_OBJ_P(struc)->properties;
++	zend_string *class_name;
++	zval *member;
++
++	if (!props) {
++		return false;
++	}
++
++	member = zend_hash_str_find(props, MAGIC_MEMBER_SERIALIZED, sizeof(MAGIC_MEMBER_SERIALIZED) - 1);
++	if (member && Z_TYPE_P(member) == IS_STRING) {
++		class_name = php_lookup_class_name(Z_OBJ_P(struc));
++		if (!class_name) {
++			return false;
++		}
++		smart_str_appendl(buf, "C:", 2);
++		smart_str_append_unsigned(buf, ZSTR_LEN(class_name));
++		smart_str_appendl(buf, ":\"", 2);
++		smart_str_append(buf, class_name);
++		smart_str_appendl(buf, "\":", 2);
++		smart_str_append_unsigned(buf, Z_STRLEN_P(member));
++		smart_str_appendl(buf, ":{", 2);
++		smart_str_append(buf, Z_STR_P(member));
++		smart_str_appendc(buf, '}');
++		zend_string_release_ex(class_name, 0);
++		return true;
++	}
++
++	member = zend_hash_str_find(props, MAGIC_MEMBER_ENUM_CASE, sizeof(MAGIC_MEMBER_ENUM_CASE) - 1);
++	if (member && Z_TYPE_P(member) == IS_STRING) {
++		class_name = php_lookup_class_name(Z_OBJ_P(struc));
++		if (!class_name) {
++			return false;
++		}
++		smart_str_appendl(buf, "E:", 2);
++		smart_str_append_unsigned(buf, ZSTR_LEN(class_name) + strlen(":") + Z_STRLEN_P(member));
++		smart_str_appendl(buf, ":\"", 2);
++		smart_str_append(buf, class_name);
++		smart_str_appendc(buf, ':');
++		smart_str_append(buf, Z_STR_P(member));
++		smart_str_appendl(buf, "\";", 2);
++		zend_string_release_ex(class_name, 0);
++		return true;
++	}
++
++	/* Other incomplete classes are handled using the normal path */
++	return false;
++}
++
+ static HashTable* php_var_serialize_call_sleep(zend_object *obj, zend_function *fn) /* {{{ */
+ {
+ 	zval retval;
+@@ -1114,6 +1167,10 @@
+ 				bool incomplete_class;
+ 				uint32_t count;
+ 
++				if (ce == PHP_IC_ENTRY && var_hash->incomplete_classes_only && php_var_serialize_incomplete_raw(buf, struc)) {
++					return;
++				}
++
+ 				if (ce->ce_flags & ZEND_ACC_NOT_SERIALIZABLE) {
+ 					zend_throw_exception_ex(NULL, 0, "Serialization of '%s' is not allowed",
+ 						ZSTR_VAL(ce->name));
+@@ -1330,6 +1387,7 @@
+ 		d = emalloc(sizeof(struct php_serialize_data));
+ 		zend_hash_init(&d->ht, 16, NULL, ZVAL_PTR_DTOR, 0);
+ 		d->n = 0;
++		d->incomplete_classes_only = false;
+ 		if (!BG(serialize_lock)) {
+ 			BG(serialize).data = d;
+ 			BG(serialize).level = 1;
+@@ -1339,6 +1397,10 @@
+ 		++BG(serialize).level;
+ 	}
+ 	return d;
++}
++
++PHPAPI void php_var_serialize_set_incomplete_classes_only(php_serialize_data_t d, bool incomplete_classes_only) {
++	d->incomplete_classes_only = incomplete_classes_only;
+ }
+ 
+ PHPAPI void php_var_serialize_destroy(php_serialize_data_t d) {
+--- a/ext/standard/var_unserializer.re
++++ b/ext/standard/var_unserializer.re
+@@ -54,6 +54,11 @@
+ 	HashTable        *ref_props;
+ 	zend_long         cur_depth;
+ 	zend_long         max_depth;
++	/* Represent every object as __PHP_Incomplete_Class, without resolving its
++	 * class: no autoloading, no unserialize_callback_func, no __wakeup() or
++	 * __unserialize(). O:, C: and E: values all serialize back to the same
++	 * bytes. */
++	bool              incomplete_classes_only;
+ 	var_entries       entries;
+ };
+ 
+@@ -68,6 +73,7 @@
+ 		d->ref_props = NULL;
+ 		d->cur_depth = 0;
+ 		d->max_depth = BG(unserialize_max_depth);
++		d->incomplete_classes_only = false;
+ 		d->entries.used_slots = 0;
+ 		d->entries.next = NULL;
+ 		if (!BG(serialize_lock)) {
+@@ -99,6 +105,10 @@
+ 	d->allowed_classes = classes;
+ }
+ 
++PHPAPI void php_var_unserialize_set_incomplete_classes_only(php_unserialize_data_t d, bool incomplete_classes_only) {
++	d->incomplete_classes_only = incomplete_classes_only;
++}
++
+ PHPAPI void php_var_unserialize_set_max_depth(php_unserialize_data_t d, zend_long max_depth) {
+ 	d->max_depth = max_depth;
+ }
+@@ -572,6 +582,17 @@
+ }
+ 
+ 
++/* The members that incomplete_classes_only mode writes itself: the class name of
++ * every object, and the payload kept for C: and E: entries. Data that already
++ * carries one of them cannot be told apart from that bookkeeping, so it is
++ * rejected rather than silently overwritten. */
++static zend_always_inline bool is_incomplete_class_reserved_member(const zend_string *name)
++{
++	return zend_string_equals_literal(name, MAGIC_MEMBER)
++		|| zend_string_equals_literal(name, MAGIC_MEMBER_SERIALIZED)
++		|| zend_string_equals_literal(name, MAGIC_MEMBER_ENUM_CASE);
++}
++
+ static zend_always_inline int process_nested_object_data(UNSERIALIZE_PARAMETER, HashTable *ht, zend_long elements, zend_object *obj)
+ {
+ 	if (var_hash) {
+@@ -597,6 +618,13 @@
+ 			goto failure;
+ 		}
+ 
++		if (UNEXPECTED(var_hash && (*var_hash)->incomplete_classes_only)
++		 && Z_TYPE(key) == IS_STRING
++		 && UNEXPECTED(is_incomplete_class_reserved_member(Z_STR(key)))) {
++			zval_ptr_dtor(&key);
++			goto failure;
++		}
++
+ 		if (EXPECTED(Z_TYPE(key) == IS_STRING)) {
+ string_key:
+ 			data = zend_hash_find(ht, Z_STR(key));
+@@ -736,7 +764,7 @@
+ 	return 1;
+ }
+ 
+-static inline int object_custom(UNSERIALIZE_PARAMETER, zend_class_entry *ce)
++static inline int object_custom(UNSERIALIZE_PARAMETER, zend_class_entry *ce, bool keep_payload)
+ {
+ 	zend_long datalen;
+ 
+@@ -770,7 +798,16 @@
+ 		return 0;
+ 	}
+ 
+-	if (ce->unserialize == NULL) {
++	if (keep_payload) {
++		/* The class was not resolved (see php_var_unserialize_set_incomplete_classes_only()):
++		 * keep the payload verbatim, so that the object serializes back to the same bytes. */
++		zval payload;
++
++		ZEND_ASSERT(ce == PHP_IC_ENTRY);
++		ZVAL_STRINGL(&payload, (const char *) *p, datalen);
++		object_init_ex(rval, ce);
++		zend_hash_str_update(Z_OBJPROP_P(rval), MAGIC_MEMBER_SERIALIZED, sizeof(MAGIC_MEMBER_SERIALIZED) - 1, &payload);
++	} else if (ce->unserialize == NULL) {
+ 		zend_error(E_WARNING, "Class %s has no unserializer", ZSTR_VAL(ce->name));
+ 		object_init_ex(rval, ce);
+ 	} else if (ce->unserialize(rval, ce, (const unsigned char*)*p, datalen, (zend_unserialize_data *)var_hash) != SUCCESS) {
+@@ -1187,6 +1224,17 @@
+ 	do {
+ 		zend_string *lc_name;
+ 
++		if ((*var_hash)->incomplete_classes_only) {
++			/* Do not look the class up at all, so that no user code can run. */
++			if (!zend_is_valid_class_name(class_name)) {
++				zend_string_release_ex(class_name, 0);
++				return 0;
++			}
++			incomplete_class = 1;
++			ce = PHP_IC_ENTRY;
++			break;
++		}
++
+ 		if (!(*var_hash)->allowed_classes && ZSTR_HAS_CE_CACHE(class_name)) {
+ 			ce = ZSTR_GET_CE_CACHE(class_name);
+ 			if (ce) {
+@@ -1288,7 +1336,7 @@
+ 	if (custom_object) {
+ 		int ret;
+ 
+-		ret = object_custom(UNSERIALIZE_PASSTHRU, ce);
++		ret = object_custom(UNSERIALIZE_PASSTHRU, ce, (*var_hash)->incomplete_classes_only);
+ 
+ 		if (ret && incomplete_class) {
+ 			php_store_class_name(rval, class_name);
+@@ -1380,6 +1428,22 @@
+ 
+ 	if (!zend_is_valid_class_name(enum_name)) {
+ 		goto fail;
++	}
++
++	if ((*var_hash)->incomplete_classes_only) {
++		/* Do not load the enum: keep the case name, so that the value serializes
++		 * back to the same bytes. */
++		zval case_zv;
++
++		YYCURSOR += 2;
++		*p = YYCURSOR;
++
++		object_init_ex(rval, PHP_IC_ENTRY);
++		php_store_class_name(rval, enum_name);
++		ZVAL_STR(&case_zv, case_name);
++		zend_hash_str_update(Z_OBJPROP_P(rval), MAGIC_MEMBER_ENUM_CASE, sizeof(MAGIC_MEMBER_ENUM_CASE) - 1, &case_zv);
++		zend_string_release_ex(enum_name, 0);
++		return 1;
+ 	}
+ 
+ 	zend_class_entry *ce = zend_lookup_class(enum_name);
+--- a/main/main.c
++++ b/main/main.c
+@@ -1832,6 +1832,7 @@
+ 		PG(in_user_include) = 0;
+ 
+ 		zend_activate();
++		php_basic_early_rinit();
+ 		sapi_activate();
+ 
+ #ifdef ZEND_SIGNALS
+@@ -1943,6 +1944,8 @@
+ 
+ 		for (i=0; i<NUM_TRACK_VARS; i++) {
+ 			zval_ptr_dtor(&PG(http_globals)[i]);
++			/* May be accessed before php_request_startup() */
++			ZVAL_UNDEF(&PG(http_globals)[i]);
+ 		}
+ 	} zend_end_try();
+ 
+@@ -1975,6 +1978,7 @@
+ 	/* 15. Free Willy (here be crashes) */
+ 	zend_arena_destroy(CG(arena));
+ 	zend_interned_strings_deactivate();
++	clear_last_error();
+ 	zend_try {
+ 		shutdown_memory_manager(CG(unclean_shutdown) || !report_memleaks, 0);
+ 	} zend_end_try();
+@@ -1998,6 +2002,9 @@
+ #ifdef HAVE_DTRACE
+ 	DTRACE_REQUEST_SHUTDOWN(SAFE_FILENAME(SG(request_info).path_translated), SAFE_FILENAME(SG(request_info).request_uri), (char *)SAFE_FILENAME(SG(request_info).request_method));
+ #endif /* HAVE_DTRACE */
++
++	/* May be accessed before php_request_startup() */
++	PG(modules_activated) = 0;
+ }
+ /* }}} */
+ 
+new file mode 100644
+--- /dev/null
++++ b/ext/session/tests/rfc1867_incomplete_class_reserved_props.phpt
+@@ -0,0 +1,139 @@
++--TEST--
++session rfc1867: the upload progress update rejects session data whose objects carry the incomplete class bookkeeping property names
++--EXTENSIONS--
++session
++--SKIPIF--
++<?php
++include('skipif.inc');
++if (!getenv('TEST_PHP_CGI_EXECUTABLE')) {
++    die('skip CGI not available');
++}
++?>
++--FILE--
++<?php
++
++$dir = __DIR__ . '/rfc1867_incomplete_class_reserved_props';
++@mkdir($dir);
++$sid = 'rfc1867reservedprops';
++$file = "$dir/sess_$sid";
++$worker = "$dir/worker.php";
++file_put_contents($worker, '<?php');
++
++/* The handler decodes the record with every object kept as
++ * __PHP_Incomplete_Class, which stores the class name of each object and the
++ * payload of C:/E: entries under these three property names. Data that already
++ * carries one of them cannot be told apart from that bookkeeping, so the decode
++ * has to fail rather than let the two meanings be confused. */
++$cases = [
++    'control'          => 'x|O:8:"stdClass":1:{s:1:"a";i:1;}',
++    'Class_Name'       => 'x|O:8:"stdClass":1:{s:27:"__PHP_Incomplete_Class_Name";s:3:"foo";}',
++    'Class_Serialized' => 'x|O:8:"stdClass":1:{s:33:"__PHP_Incomplete_Class_Serialized";s:3:"foo";}',
++    'Enum_Case'        => 'x|O:8:"stdClass":1:{s:26:"__PHP_Incomplete_Enum_Case";s:3:"foo";}',
++    'nested'           => 'x|a:1:{i:0;O:8:"stdClass":1:{s:27:"__PHP_Incomplete_Class_Name";s:3:"foo";}}',
++    'mangled'          => 'x|O:8:"stdClass":1:{s:30:"' . "\0" . 'A' . "\0" . '__PHP_Incomplete_Class_Name";s:3:"foo";}',
++    'corrupt'          => 'x|not-serialized-at-all',
++];
++
++$boundary = '---------------------------20896060251896012921717172737';
++$body = "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"PHPSESSID\"\r\n\r\n$sid\r\n"
++      . "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nkey\r\n"
++      . "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"file1\"; filename=\"file1.txt\"\r\n\r\n1\r\n"
++      . "--$boundary--\r\n";
++
++$ini = [
++    'error_reporting' => 'E_ALL',
++    'html_errors' => '0',
++    'file_uploads' => '1',
++    'upload_max_filesize' => '1024',
++    'session.save_path' => $dir,
++    'session.name' => 'PHPSESSID',
++    'session.use_strict_mode' => '0',
++    'session.use_cookies' => '0',
++    'session.use_only_cookies' => '0',
++    'session.cache_limiter' => '',
++    'session.save_handler' => 'files',
++    'session.serialize_handler' => 'php',
++    'session.upload_progress.enabled' => '1',
++    'session.upload_progress.cleanup' => '0',
++    'session.upload_progress.prefix' => 'upload_progress_',
++    'session.upload_progress.name' => 'PHP_SESSION_UPLOAD_PROGRESS',
++    'session.upload_progress.freq' => '1%',
++    'session.upload_progress.min_freq' => '0.000000001',
++];
++
++/* php-cgi is started with -n, so a shared session module has to be named again. */
++$extension_dir = ini_get('extension_dir');
++foreach (['session.' . PHP_SHLIB_SUFFIX, 'php_session.' . PHP_SHLIB_SUFFIX] as $module) {
++    if ($extension_dir !== false && file_exists("$extension_dir/$module")) {
++        $ini['extension_dir'] = $extension_dir;
++        $ini['extension'] = $module;
++        break;
++    }
++}
++
++$cmd = [getenv('TEST_PHP_CGI_EXECUTABLE'), '-n', '-q'];
++foreach ($ini as $name => $value) {
++    $cmd[] = '-d';
++    $cmd[] = "$name=$value";
++}
++$cmd[] = '-f';
++$cmd[] = $worker;
++
++$env = getenv();
++$env['REDIRECT_STATUS'] = '1';
++$env['REQUEST_METHOD'] = 'POST';
++$env['CONTENT_TYPE'] = "multipart/form-data; boundary=$boundary";
++$env['CONTENT_LENGTH'] = (string) strlen($body);
++$env['SCRIPT_FILENAME'] = $worker;
++$env['PATH_TRANSLATED'] = $worker;
++$env['QUERY_STRING'] = '';
++
++foreach ($cases as $label => $record) {
++    file_put_contents($file, $record);
++
++    $pipes = [];
++    $proc = proc_open(
++        $cmd,
++        [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
++        $pipes,
++        $dir,
++        $env
++    );
++    fwrite($pipes[0], $body);
++    fclose($pipes[0]);
++    $out = stream_get_contents($pipes[1]) . stream_get_contents($pipes[2]);
++    fclose($pipes[1]);
++    fclose($pipes[2]);
++    proc_close($proc);
++
++    /* A refused decode must leave exactly one warning: the handler stops there
++     * instead of writing the progress into the empty session it was left with,
++     * which would add a second warning about the save path. */
++    $kept = file_exists($file) && str_starts_with(file_get_contents($file), $record);
++    printf("%-16s warnings: %d, decode refused: %-5s record kept: %s\n", $label,
++        substr_count($out, 'Warning:'),
++        var_export(str_contains($out, 'Session has been destroyed'), true),
++        var_export($kept, true));
++}
++
++?>
++--CLEAN--
++<?php
++$dir = __DIR__ . '/rfc1867_incomplete_class_reserved_props';
++@unlink("$dir/worker.php");
++foreach (glob("$dir/sess_*") as $f) {
++    unlink($f);
++}
++@rmdir($dir);
++?>
++--EXPECT--
++control          warnings: 0, decode refused: false record kept: true
++Class_Name       warnings: 1, decode refused: true  record kept: false
++Class_Serialized warnings: 1, decode refused: true  record kept: false
++Enum_Case        warnings: 1, decode refused: true  record kept: false
++nested           warnings: 1, decode refused: true  record kept: false
++mangled          warnings: 0, decode refused: false record kept: true
++corrupt          warnings: 1, decode refused: true  record kept: false
+new file mode 100644
+--- /dev/null
++++ b/ext/session/tests/rfc1867_no_user_code.phpt
+@@ -0,0 +1,217 @@
++--TEST--
++session rfc1867: the upload progress update resolves no classes, keeps the session data intact and leaves no $_SESSION behind
++--EXTENSIONS--
++session
++--SKIPIF--
++<?php
++include('skipif.inc');
++if (!getenv('TEST_PHP_CGI_EXECUTABLE')) {
++    die('skip CGI not available');
++}
++?>
++--FILE--
++<?php
++
++$dir = __DIR__ . '/rfc1867_no_user_code';
++@mkdir($dir);
++$sid = 'rfc1867nousercode';
++$file = "$dir/sess_$sid";
++$worker = "$dir/worker.php";
++
++/* A hand-written record, as session_encode() produces it for the `php` handler:
++ * an object with __wakeup(), one with __unserialize(), a Serializable payload
++ * (C:), an enum shared through a back-reference (E: and r:), and a class that
++ * does not exist. Writing it directly leaves the session module untouched until
++ * the upload progress handler runs, as in a real request. */
++$record = 'w|O:1:"W":1:{s:1:"a";i:1;}'
++        . 'u|O:1:"U":1:{s:1:"a";i:2;}'
++        . 'c|C:4:"Cust":7:{payload}'
++        . 'e|a:2:{i:0;E:11:"Suit:Hearts";i:1;r:7;}'
++        . 'm|O:7:"Missing":1:{s:1:"x";i:3;}';
++file_put_contents($file, $record);
++
++/* None of these classes exist while the handler decodes the record: the request
++ * script is not even compiled yet. With the real classes, E:11:"Suit:Hearts"
++ * fails the decode outright, which destroys the session, and C:4:"Cust" loses
++ * its payload. The handler keeps every object as __PHP_Incomplete_Class instead
++ * and writes it back unchanged. */
++file_put_contents($worker, <<<'PHP'
++<?php
++$record = getenv('TEST_SESSION_RECORD');
++$file = getenv('TEST_SESSION_FILE');
++
++spl_autoload_register(function ($class) { echo "autoload($class)\n"; });
++
++enum Suit: string {
++    case Hearts = 'H';
++}
++
++class W {
++    public $a = 1;
++    function __wakeup() {
++        echo "W::__wakeup\n";
++    }
++    function __sleep() {
++        echo "W::__sleep\n"; return ['a'];
++    }
++}
++
++class U {
++    public $a = 2;
++    function __unserialize(array $d) {
++        echo "U::__unserialize\n";
++        $this->a = $d['a'];
++    }
++    function __serialize(): array {
++        echo "U::__serialize\n";
++        return ['a' => $this->a];
++    }
++}
++
++class Cust implements Serializable {
++    public $x = 'payload';
++    function serialize() {
++        return $this->x;
++    }
++    function unserialize($d) {
++        $this->x = $d;
++    }
++}
++
++/* The handler needs a $_SESSION to decode the record into, and registers it in
++ * the global symbol table. This script has not called session_start(), so it
++ * must not be left behind: it would otherwise expose the session data of
++ * whatever id the request body carried. */
++var_dump(array_key_exists('_SESSION', $GLOBALS));
++var_dump(session_status() === PHP_SESSION_NONE);
++
++echo "--- record after the update:\n";
++$after = file_get_contents($file);
++var_dump(substr($after, 0, strlen($record)) === $record);
++var_dump(substr($after, strlen($record), strlen('upload_progress_key|')));
++
++echo "--- session_start():\n";
++session_start();
++var_dump(session_id());
++var_dump($_SESSION['w']->a, $_SESSION['u']->a, $_SESSION['c']->x);
++var_dump($_SESSION['e'][0] === Suit::Hearts, $_SESSION['e'][1] === Suit::Hearts);
++var_dump($_SESSION['m']);
++var_dump(isset($_SESSION['upload_progress_key']['bytes_processed']));
++session_destroy();
++PHP);
++
++$boundary = '---------------------------20896060251896012921717172737';
++$body = "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"PHPSESSID\"\r\n\r\n$sid\r\n"
++      . "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nkey\r\n"
++      . "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"file1\"; filename=\"file1.txt\"\r\n\r\n1\r\n"
++      . "--$boundary--\r\n";
++
++$ini = [
++    'error_reporting' => 'E_ALL&~E_DEPRECATED',
++    'file_uploads' => '1',
++    'upload_max_filesize' => '1024',
++    'session.save_path' => $dir,
++    'session.name' => 'PHPSESSID',
++    'session.use_strict_mode' => '0',
++    'session.use_cookies' => '0',
++    'session.use_only_cookies' => '0',
++    'session.cache_limiter' => '',
++    'session.save_handler' => 'files',
++    'session.serialize_handler' => 'php',
++    'session.upload_progress.enabled' => '1',
++    'session.upload_progress.cleanup' => '0',
++    'session.upload_progress.prefix' => 'upload_progress_',
++    'session.upload_progress.name' => 'PHP_SESSION_UPLOAD_PROGRESS',
++    'session.upload_progress.freq' => '1%',
++    'session.upload_progress.min_freq' => '0.000000001',
++];
++
++/* php-cgi is started with -n, so a shared session module has to be named again. */
++$extension_dir = ini_get('extension_dir');
++foreach (['session.' . PHP_SHLIB_SUFFIX, 'php_session.' . PHP_SHLIB_SUFFIX] as $module) {
++    if ($extension_dir !== false && file_exists("$extension_dir/$module")) {
++        $ini['extension_dir'] = $extension_dir;
++        $ini['extension'] = $module;
++        break;
++    }
++}
++
++$cmd = [getenv('TEST_PHP_CGI_EXECUTABLE'), '-n', '-q'];
++foreach ($ini as $name => $value) {
++    $cmd[] = '-d';
++    $cmd[] = "$name=$value";
++}
++$cmd[] = '-f';
++$cmd[] = $worker;
++
++$env = getenv();
++$env['REDIRECT_STATUS'] = '1';
++$env['REQUEST_METHOD'] = 'POST';
++$env['CONTENT_TYPE'] = "multipart/form-data; boundary=$boundary";
++$env['CONTENT_LENGTH'] = (string) strlen($body);
++$env['SCRIPT_FILENAME'] = $worker;
++$env['PATH_TRANSLATED'] = $worker;
++$env['QUERY_STRING'] = '';
++$env['TEST_SESSION_RECORD'] = $record;
++$env['TEST_SESSION_FILE'] = $file;
++
++$pipes = [];
++$proc = proc_open(
++    $cmd,
++    [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
++    $pipes,
++    $dir,
++    $env
++);
++fwrite($pipes[0], $body);
++fclose($pipes[0]);
++$out = stream_get_contents($pipes[1]);
++$err = stream_get_contents($pipes[2]);
++fclose($pipes[1]);
++fclose($pipes[2]);
++proc_close($proc);
++
++echo $out;
++if ($err !== '') {
++    echo "--- stderr:\n$err";
++}
++
++?>
++--CLEAN--
++<?php
++$dir = __DIR__ . '/rfc1867_no_user_code';
++@unlink("$dir/worker.php");
++foreach (glob("$dir/sess_*") as $f) {
++    unlink($f);
++}
++@rmdir($dir);
++?>
++--EXPECTF--
++X-Powered-By: PHP/%s
++Content-type: text/html; charset=UTF-8
++
++bool(false)
++bool(true)
++--- record after the update:
++bool(true)
++string(20) "upload_progress_key|"
++--- session_start():
++autoload(Missing)
++W::__wakeup
++U::__unserialize
++string(17) "rfc1867nousercode"
++int(1)
++int(2)
++string(7) "payload"
++bool(true)
++bool(true)
++object(__PHP_Incomplete_Class)#%d (2) {
++  ["__PHP_Incomplete_Class_Name"]=>
++  string(7) "Missing"
++  ["x"]=>
++  int(3)
++}
++bool(true)
+--- a/ext/session/tests/rfc1867_sid_invalid.phpt
++++ b/ext/session/tests/rfc1867_sid_invalid.phpt
+@@ -43,7 +43,7 @@
+ var_dump(session_id());
+ var_dump(basename(__FILE__) == $_POST[ini_get("session.upload_progress.name")]);
+ var_dump($_FILES);
+-var_dump($_SESSION["upload_progress_" . basename(__FILE__)]);
++var_dump($_SESSION);
+ session_destroy();
+ ?>
+ --CLEAN--
+@@ -55,13 +55,9 @@
+ 
+ Warning: PHP Request Startup: Failed to read session data: files (path: ) in Unknown on line 0
+ 
+-Warning: PHP Request Startup: Failed to write session data (files). Please verify that the current setting of session.save_path is correct () in Unknown on line 0
+-
+ Warning: PHP Request Startup: Session ID is too long or contains illegal characters. Only the A-Z, a-z, 0-9, "-", and "," characters are allowed in Unknown on line 0
+ 
+ Warning: PHP Request Startup: Failed to read session data: files (path: ) in Unknown on line 0
+-
+-Warning: PHP Request Startup: Failed to write session data (files). Please verify that the current setting of session.save_path is correct () in Unknown on line 0
+ string(%d) ""
+ bool(true)
+ array(2) {
+@@ -96,50 +92,4 @@
+     int(1)
+   }
+ }
+-array(5) {
+-  ["start_time"]=>
+-  int(%d)
+-  ["content_length"]=>
+-  int(469)
+-  ["bytes_processed"]=>
+-  int(469)
+-  ["done"]=>
+-  bool(true)
+-  ["files"]=>
+-  array(2) {
+-    [0]=>
+-    array(7) {
+-      ["field_name"]=>
+-      string(5) "file1"
+-      ["name"]=>
+-      string(9) "file1.txt"
+-      ["tmp_name"]=>
+-      string(%d) "%s"
+-      ["error"]=>
+-      int(0)
+-      ["done"]=>
+-      bool(true)
+-      ["start_time"]=>
+-      int(%d)
+-      ["bytes_processed"]=>
+-      int(1)
+-    }
+-    [1]=>
+-    array(7) {
+-      ["field_name"]=>
+-      string(5) "file2"
+-      ["name"]=>
+-      string(9) "file2.txt"
+-      ["tmp_name"]=>
+-      string(%d) "%s"
+-      ["error"]=>
+-      int(0)
+-      ["done"]=>
+-      bool(true)
+-      ["start_time"]=>
+-      int(%d)
+-      ["bytes_processed"]=>
+-      int(1)
+-    }
+-  }
+-}
++NULL
+new file mode 100644
+--- /dev/null
++++ b/ext/standard/tests/serialize/incomplete_class_raw_payload_markers.phpt
+@@ -0,0 +1,15 @@
++--TEST--
++serialize() keeps O: for incomplete classes whose properties look like raw C:/E: payloads
++--FILE--
++<?php
++enum Suit { case Hearts; }
++
++$raw = 'x:i:0;a:1:{i:0;s:3:"pwn";};m:a:0:{}';
++$untrusted = 'a:2:{i:0;O:11:"ArrayObject":1:{s:33:"__PHP_Incomplete_Class_Serialized";s:' . strlen($raw) . ':"' . $raw . '";}'
++    . 'i:1;O:4:"Suit":1:{s:26:"__PHP_Incomplete_Enum_Case";s:6:"Hearts";}}';
++
++$stored = serialize(unserialize($untrusted, ['allowed_classes' => false]));
++var_dump($stored === $untrusted);
++?>
++--EXPECT--
++bool(true)
