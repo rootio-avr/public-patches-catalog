@@ -1,0 +1,944 @@
+--- a/rest_framework/authtoken/admin.py
++++ b/rest_framework/authtoken/admin.py
+@@ -6,7 +6,7 @@
+ from django.urls import reverse
+ from django.utils.translation import gettext_lazy as _
+ 
+-from rest_framework.authtoken.models import Token, TokenProxy
++from rest_framework.authtoken.models import TokenProxy
+ 
+ User = get_user_model()
+ 
+@@ -44,11 +44,6 @@
+             return queryset.get(user=user)
+         except (queryset.model.DoesNotExist, User.DoesNotExist, ValidationError, ValueError):
+             return None
+-
+-    def delete_model(self, request, obj):
+-        # Map back to actual Token, since delete() uses pk.
+-        token = Token.objects.get(key=obj.key)
+-        return super().delete_model(request, token)
+ 
+ 
+ admin.site.register(TokenProxy, TokenAdmin)
+--- a/rest_framework/authtoken/models.py
++++ b/rest_framework/authtoken/models.py
+@@ -2,7 +2,7 @@
+ import os
+ 
+ from django.conf import settings
+-from django.db import models
++from django.db import models, router
+ from django.utils.translation import gettext_lazy as _
+ 
+ 
+@@ -40,13 +40,56 @@
+         return self.key
+ 
+ 
++class TokenProxyQuerySet(models.QuerySet):
++    """
++    Deletes through the concrete `Token`: the collector deletes by `pk`,
++    which the proxy maps to the user id.
++    """
++    def delete(self):
++        self._not_support_combined_queries('delete')
++        if self.query.is_sliced:
++            raise TypeError("Cannot use 'limit' or 'offset' with delete().")
++        if self.query.distinct or self.query.distinct_fields:
++            raise TypeError("Cannot call delete() after .distinct().")
++        if self._fields is not None:
++            raise TypeError(
++                "Cannot call delete() after .values() or .values_list()"
++            )
++        # Ensure `self.db` resolves with the write routers, like the `QuerySet.delete()`
++        self._for_write = True
++        keys = list(self.values_list('pk', flat=True))
++        return Token.objects.using(self.db).filter(pk__in=keys).delete()
++    delete.alters_data = True
++    delete.queryset_only = True
++
++
+ class TokenProxy(Token):
+     """
+     Proxy mapping pk to user pk for use in admin.
+     """
++    objects = TokenProxyQuerySet.as_manager()
++
+     @property
+     def pk(self):
+         return self.user_id
++
++    def delete(self, using=None, keep_parents=False):
++        """
++        Deletes through the concrete `Token`. The inherited delete matches
++        the `key` column against `pk` -- a user id here -- and silently
++        deletes nothing.
++        """
++        if self.key is None:
++            raise ValueError(
++                "%s object can't be deleted because its %s attribute is set "
++                "to None." % (self._meta.object_name, self._meta.pk.attname)
++            )
++        # Resolve `using` in same order as in the base `Model.delete()`
++        using = using or router.db_for_write(self.__class__, instance=self)
++        deleted = type(self).objects.using(using).filter(key=self.key).delete()
++        # `Model.delete()` clears the pk of the in-memory instance
++        self.key = None
++        return deleted
+ 
+     class Meta:
+         proxy = 'rest_framework.authtoken' in settings.INSTALLED_APPS
+--- a/tests/authentication/test_authentication.py
++++ b/tests/authentication/test_authentication.py
+@@ -14,7 +14,7 @@
+     BaseAuthentication, BasicAuthentication, RemoteUserAuthentication,
+     SessionAuthentication, TokenAuthentication
+ )
+-from rest_framework.authtoken.models import Token
++from rest_framework.authtoken.models import Token, TokenProxy
+ from rest_framework.authtoken.views import obtain_auth_token
+ from rest_framework.response import Response
+ from rest_framework.test import APIClient, APIRequestFactory
+@@ -407,6 +407,24 @@
+         self.token.delete()
+         token = self.model.objects.create(user=self.user)
+         assert bool(token.key)
++
++    def test_deleting_the_proxy_revokes_the_token(self):
++        """
++        A token deleted through TokenProxy no longer authenticates requests.
++        """
++        auth = self.header_prefix + self.key
++        response = self.csrf_client.post(
++            self.path, {'example': 'example'}, HTTP_AUTHORIZATION=auth
++        )
++        assert response.status_code == status.HTTP_200_OK
++
++        deleted, _ = TokenProxy.objects.get(user=self.user).delete()
++        assert deleted == 1
++
++        response = self.csrf_client.post(
++            self.path, {'example': 'example'}, HTTP_AUTHORIZATION=auth
++        )
++        assert response.status_code == status.HTTP_401_UNAUTHORIZED
+ 
+     def test_generate_key_returns_string(self):
+         """Ensure generate_key returns a string"""
+--- a/tests/test_authtoken.py
++++ b/tests/test_authtoken.py
+@@ -2,19 +2,38 @@
+ from io import StringIO
+ 
+ import pytest
++from django.apps import apps
+ from django.contrib.admin import site
+ from django.contrib.auth.models import User
+ from django.core.management import CommandError, call_command
+-from django.test import TestCase, modify_settings
++from django.db import connection, models
++from django.db.models.signals import post_delete
++from django.db.utils import ConnectionDoesNotExist
++from django.test import TestCase, modify_settings, override_settings
+ 
+ from rest_framework.authtoken.admin import TokenAdmin
+ from rest_framework.authtoken.management.commands.drf_create_token import \
+     Command as AuthTokenCommand
+-from rest_framework.authtoken.models import Token
++from rest_framework.authtoken.models import Token, TokenProxy
+ from rest_framework.authtoken.serializers import AuthTokenSerializer
+ from rest_framework.exceptions import ValidationError
+ 
+ 
++def make_token_holder_model():
++    """
++    Build a model with a cascading FK to Token: any such relation pushes
++    the deletion collector off the fast path, onto the one that deletes
++    by `pk`.
++    """
++    class TokenHolder(models.Model):
++        token = models.ForeignKey(Token, on_delete=models.CASCADE)
++
++        class Meta:
++            app_label = 'authtoken'
++
++    return TokenHolder
++
++
+ class AuthTokenTests(TestCase):
+ 
+     def setUp(self):
+@@ -47,6 +66,189 @@
+         self.user.set_password(data['password'])
+         self.user.save()
+         assert AuthTokenSerializer(data=data).is_valid()
++
++    def test_token_proxy_delete_deletes_the_token(self):
++        deleted = TokenProxy.objects.get(user=self.user).delete()
++
++        assert deleted == (1, {'authtoken.Token': 1})
++        assert not Token.objects.filter(key='test token').exists()
++
++    def test_token_proxy_delete_deletes_the_token_with_a_receiver_connected(self):
++        fired = []
++
++        def receiver(**kwargs):
++            fired.append(kwargs['sender'])
++
++        # The row is deleted as the concrete `Token`, so a receiver
++        # connected to the proxy does not fire.
++        post_delete.connect(receiver, sender=TokenProxy)
++        self.addCleanup(post_delete.disconnect, receiver, sender=TokenProxy)
++
++        TokenProxy.objects.get(user=self.user).delete()
++
++        assert not Token.objects.exists()
++        assert fired == []
++
++    def test_token_proxy_delete_sends_signals_for_the_concrete_token(self):
++        deleted = []
++
++        def receiver(instance, **kwargs):
++            # Copy the values out: the delete clears `instance.key` afterwards.
++            deleted.append((instance.key, instance.user_id, instance.created))
++
++        post_delete.connect(receiver, sender=Token)
++        self.addCleanup(post_delete.disconnect, receiver, sender=Token)
++
++        TokenProxy.objects.get(user=self.user).delete()
++
++        assert deleted == [('test token', self.user.pk, self.token.created)]
++
++    def test_token_proxy_queryset_delete_deletes_the_token(self):
++        deleted = TokenProxy.objects.all().delete()
++
++        assert deleted == (1, {'authtoken.Token': 1})
++        assert not Token.objects.exists()
++
++    def test_token_proxy_queryset_delete_leaves_other_tokens_alone(self):
++        other_user = User.objects.create_user(username='other_user')
++        other_token = Token.objects.create(key='other token', user=other_user)
++
++        TokenProxy.objects.filter(user=self.user).delete()
++
++        assert list(Token.objects.all()) == [other_token]
++
++    def test_token_proxy_queryset_delete_follows_a_filter_across_a_join(self):
++        other_user = User.objects.create_user(username='other_user')
++        other_token = Token.objects.create(key='other token', user=other_user)
++
++        TokenProxy.objects.filter(user__username='test_user').delete()
++
++        assert list(Token.objects.all()) == [other_token]
++
++    def test_token_proxy_delete_leaves_other_tokens_alone(self):
++        other_user = User.objects.create_user(username='other_user')
++        other_token = Token.objects.create(key='other token', user=other_user)
++
++        TokenProxy.objects.get(user=self.user).delete()
++
++        assert list(Token.objects.all()) == [other_token]
++
++    def test_token_proxy_delete_deletes_a_deferred_token(self):
++        proxy = TokenProxy.objects.defer('created').get(user=self.user)
++
++        deleted, _ = proxy.delete()
++
++        assert deleted == 1
++        assert not Token.objects.exists()
++
++    def test_token_proxy_delete_clears_the_key_and_refuses_a_second_delete(self):
++        proxy = TokenProxy.objects.get(user=self.user)
++        proxy.delete()
++
++        assert proxy.key is None
++        with pytest.raises(ValueError):
++            proxy.delete()
++
++    def test_model_admin_delete_model_deletes_the_token(self):
++        token_admin = TokenAdmin(TokenProxy, self.site)
++        proxy = TokenProxy.objects.get(user=self.user)
++
++        token_admin.delete_model(object(), proxy)
++
++        assert not Token.objects.exists()
++
++
++class TokenProxyCascadeTests(TestCase):
++
++    @classmethod
++    def setUpClass(cls):
++        # SQLite cannot run the schema editor inside the per-test transaction.
++        cls.token_holder_model = make_token_holder_model()
++        with connection.schema_editor() as editor:
++            editor.create_model(cls.token_holder_model)
++        super().setUpClass()
++
++    @classmethod
++    def tearDownClass(cls):
++        super().tearDownClass()
++        with connection.schema_editor() as editor:
++            editor.delete_model(cls.token_holder_model)
++        del apps.all_models['authtoken']['tokenholder']
++        apps.clear_cache()
++
++    def setUp(self):
++        self.user = User.objects.create_user(username='test_user')
++        self.token = Token.objects.create(key='test token', user=self.user)
++        self.token_holder_model.objects.create(token=self.token)
++
++    def test_token_proxy_delete_deletes_the_token_and_its_dependents(self):
++        deleted, per_model = TokenProxy.objects.get(user=self.user).delete()
++
++        assert deleted == 2
++        assert per_model == {'authtoken.Token': 1, 'authtoken.TokenHolder': 1}
++        assert not Token.objects.exists()
++        assert not self.token_holder_model.objects.exists()
++
++    def test_token_proxy_queryset_delete_deletes_the_token_and_its_dependents(self):
++        # The dependent row stops the fast delete; the token used to survive.
++        deleted, per_model = TokenProxy.objects.all().delete()
++
++        assert deleted == 2
++        assert per_model == {'authtoken.Token': 1, 'authtoken.TokenHolder': 1}
++        assert not Token.objects.exists()
++        assert not self.token_holder_model.objects.exists()
++
++
++class UnreachableWriteRouter:
++    def db_for_write(self, model, **hints):
++        return 'nonexistent'
++
++
++class TokenProxyRoutingTests(TestCase):
++    databases = {'default', 'secondary'}
++
++    def setUp(self):
++        self.user = User.objects.create_user(username='test_user')
++        self.token = Token.objects.create(key='test token', user=self.user)
++        secondary_user = User.objects.db_manager('secondary').create_user(
++            username='secondary_user'
++        )
++        self.secondary_token = Token.objects.using('secondary').create(
++            key='secondary token', user=secondary_user
++        )
++
++    def test_delete_uses_the_database_the_token_was_read_from(self):
++        proxy = TokenProxy.objects.using('secondary').get(key='secondary token')
++
++        proxy.delete()
++
++        assert not Token.objects.using('secondary').exists()
++        assert Token.objects.filter(key='test token').exists()
++
++    def test_queryset_delete_uses_the_database_it_was_read_from(self):
++        deleted, _ = TokenProxy.objects.using('secondary').delete()
++
++        assert deleted == 1
++        assert not Token.objects.using('secondary').exists()
++        assert Token.objects.filter(key='test token').exists()
++
++    @override_settings(DATABASE_ROUTERS=[UnreachableWriteRouter()])
++    def test_delete_asks_the_router_which_database_writes_go_to(self):
++        # The router decides writes, as it does for `Model.delete()`; reads
++        # are unrouted, so the token is still found on `default`.
++        proxy = TokenProxy.objects.get(key='test token')
++
++        with pytest.raises(ConnectionDoesNotExist):
++            proxy.delete()
++
++        assert Token.objects.filter(key='test token').exists()
++
++    @override_settings(DATABASE_ROUTERS=[UnreachableWriteRouter()])
++    def test_queryset_delete_asks_the_router_which_database_writes_go_to(self):
++        with pytest.raises(ConnectionDoesNotExist):
++            TokenProxy.objects.filter(key='test token').delete()
++
++        assert Token.objects.filter(key='test token').exists()
+ 
+ 
+ class AuthTokenCommandTests(TestCase):
+
+--- a/rest_framework/parsers.py
++++ b/rest_framework/parsers.py
+@@ -23,6 +23,28 @@
+ from rest_framework.utils import json
+ 
+ 
++def get_encoding(parser_context):
++    """
++    Return the charset to decode the request body with: the one named in the
++    request's `Content-Type` header, or `settings.DEFAULT_CHARSET`.
++
++    Django accepts any charset that `codecs.lookup()` resolves, which includes
++    bytes-to-bytes codecs such as `bz2_codec`. Decoding through one of those
++    decompresses the body after `DATA_UPLOAD_MAX_MEMORY_SIZE` has already been
++    checked against the compressed size, so a tiny request can expand without
++    bound. Only text encodings are accepted here.
++    """
++    encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++    try:
++        # Unlike `codecs.getreader()`, `str.encode()` rejects non-text codecs.
++        ''.encode(encoding)
++    except (LookupError, UnicodeError):
++        raise ParseError(
++            'Unsupported charset "%s" in request Content-Type header.' % encoding
++        )
++    return encoding
++
++
+ class DataAndFiles:
+     def __init__(self, data, files):
+         self.data = data
+@@ -58,7 +80,7 @@
+         Parses the incoming bytestream as JSON and returns the resulting data.
+         """
+         parser_context = parser_context or {}
+-        encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++        encoding = get_encoding(parser_context)
+ 
+         try:
+             decoded_stream = codecs.getreader(encoding)(stream)
+@@ -80,7 +102,7 @@
+         and returns the resulting QueryDict.
+         """
+         parser_context = parser_context or {}
+-        encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++        encoding = get_encoding(parser_context)
+         return QueryDict(stream.read(), encoding=encoding)
+ 
+ 
+@@ -100,7 +122,7 @@
+         """
+         parser_context = parser_context or {}
+         request = parser_context['request']
+-        encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++        encoding = get_encoding(parser_context)
+         meta = request.META.copy()
+         meta['CONTENT_TYPE'] = media_type
+         upload_handlers = request.upload_handlers
+--- a/tests/test_parsers.py
++++ b/tests/test_parsers.py
+@@ -1,17 +1,19 @@
++import bz2
+ import io
+ import math
+ 
+ import pytest
+ from django import forms
++from django.conf import settings
+ from django.core.files.uploadhandler import (
+     MemoryFileUploadHandler, TemporaryFileUploadHandler
+ )
+ from django.http.request import RawPostDataException
+-from django.test import TestCase
++from django.test import TestCase, override_settings
+ 
+ from rest_framework.exceptions import ParseError
+ from rest_framework.parsers import (
+-    FileUploadParser, FormParser, JSONParser, MultiPartParser
++    FileUploadParser, FormParser, JSONParser, MultiPartParser, get_encoding
+ )
+ from rest_framework.request import Request
+ from rest_framework.test import APIRequestFactory
+@@ -140,6 +142,113 @@
+         assert parser.parse(self.bytes('Infinity')) == float('inf')
+         assert parser.parse(self.bytes('-Infinity')) == float('-inf')
+         assert math.isnan(parser.parse(self.bytes('NaN')))
++
++
++class TestGetEncoding(TestCase):
++    def test_defaults_to_default_charset(self):
++        assert get_encoding({}) == settings.DEFAULT_CHARSET
++
++    def test_accepts_text_encodings(self):
++        for encoding in ['utf-8', 'UTF8', 'ascii', 'latin-1', 'utf-16', 'utf-32']:
++            with self.subTest(encoding=encoding):
++                assert get_encoding({'encoding': encoding}) == encoding
++
++    def test_rejects_non_text_encodings(self):
++        # Short aliases, as a `charset=` parameter would carry them.
++        # `undefined` is a text codec in name only: it fails on every input.
++        for encoding in ['bz2', 'zlib', 'base64', 'hex', 'rot13', 'undefined',
++                         'not-a-real-encoding']:
++            with self.subTest(encoding=encoding):
++                with pytest.raises(ParseError):
++                    get_encoding({'encoding': encoding})
++
++
++class TestRequestCharset(TestCase):
++    unsupported_message = 'Unsupported charset "%s" in request Content-Type header.'
++
++    # Codecs that transform bytes rather than decode text. `zip` is an alias
++    # of `zlib_codec`, so this also checks the codec is resolved rather than
++    # the name matched.
++    byte_transforms = (
++        'base64_codec', 'bz2_codec', 'hex_codec', 'quopri_codec', 'rot_13',
++        'uu_codec', 'zlib_codec', 'zip',
++    )
++
++    def test_json_parser_honours_a_text_charset(self):
++        # utf-16 is not the default and its bytes are not valid utf-8, so this
++        # only passes if the charset the client named was the one used.
++        stream = io.BytesIO('{"field1": "ÀĥƦ"}'.encode('utf-16'))
++        data = JSONParser().parse(stream, parser_context={'encoding': 'utf-16'})
++
++        assert data == {'field1': 'ÀĥƦ'}
++
++    def test_form_parser_honours_a_text_charset(self):
++        stream = io.BytesIO('field1=À&field2=x'.encode('iso-8859-1'))
++        data = FormParser().parse(stream, parser_context={'encoding': 'iso-8859-1'})
++
++        assert data['field1'] == 'À'
++
++    def test_json_parser_rejects_a_byte_transform_charset(self):
++        for charset in self.byte_transforms:
++            with self.subTest(charset=charset):
++                with pytest.raises(ParseError) as excinfo:
++                    JSONParser().parse(
++                        io.BytesIO(b'{}'), parser_context={'encoding': charset}
++                    )
++                assert str(excinfo.value) == self.unsupported_message % charset
++
++    def test_form_parser_rejects_a_byte_transform_charset(self):
++        for charset in self.byte_transforms:
++            with self.subTest(charset=charset):
++                with pytest.raises(ParseError) as excinfo:
++                    FormParser().parse(
++                        io.BytesIO(b'field1=x'), parser_context={'encoding': charset}
++                    )
++                assert str(excinfo.value) == self.unsupported_message % charset
++
++    def test_multipart_parser_rejects_a_byte_transform_charset(self):
++        request = APIRequestFactory().post('/', {'field1': 'x'})
++        for charset in self.byte_transforms:
++            with self.subTest(charset=charset):
++                with pytest.raises(ParseError) as excinfo:
++                    MultiPartParser().parse(
++                        io.BytesIO(request.body),
++                        request.content_type,
++                        parser_context={'request': request, 'encoding': charset}
++                    )
++                assert str(excinfo.value) == self.unsupported_message % charset
++
++    def test_unresolvable_charset_is_rejected(self):
++        # Django drops charsets `codecs.lookup()` cannot resolve, so this only
++        # happens with a hand-built `parser_context`. Still not a server error.
++        with pytest.raises(ParseError) as excinfo:
++            JSONParser().parse(
++                io.BytesIO(b'{}'), parser_context={'encoding': 'no-such-charset'}
++            )
++
++        assert str(excinfo.value) == self.unsupported_message % 'no-such-charset'
++
++    @override_settings(DATA_UPLOAD_MAX_MEMORY_SIZE=1024)
++    def test_request_data_with_compression_charset_raises_error(self):
++        # Django checks the limit against the compressed body.
++        # The parser must not decompress it afterwards.
++        expanded = b'{"qwerty": "' + b'u' * (64 * 1024) + b'"}'
++        compressed = bz2.compress(expanded)
++        assert len(compressed) < 1024 < len(expanded)
++
++        django_request = APIRequestFactory().post(
++            '/',
++            compressed,
++            content_type='application/json; charset=bz2_codec'
++        )
++        # Guard against the test client re-encoding the payload.
++        assert django_request.body == compressed
++
++        request = Request(django_request)
++        request.parsers = (JSONParser(),)
++
++        with pytest.raises(ParseError):
++            request.data
+ 
+ 
+ class TestPOSTAccessed(TestCase):
+
+--- a/rest_framework/negotiation.py
++++ b/rest_framework/negotiation.py
+@@ -7,7 +7,7 @@
+ from rest_framework import exceptions
+ from rest_framework.settings import api_settings
+ from rest_framework.utils.mediatypes import (
+-    _MediaType, media_type_matches, order_by_precedence
++    _MediaType, media_type_matches, order_parsed_by_precedence
+ )
+ 
+ 
+@@ -22,13 +22,21 @@
+ class DefaultContentNegotiation(BaseContentNegotiation):
+     settings = api_settings
+ 
++    max_accept_header_length = 8192
++    max_accept_tokens = 64
++    max_media_type_length = 256
++
+     def select_parser(self, request, parsers):
+         """
+         Given a list of parsers and a media type, return the appropriate
+         parser to handle the incoming request.
+         """
++        content_type = request.content_type
++        if content_type and len(content_type) > self.max_media_type_length:
++            # Refuse rather than parse. Returning None results in a 415.
++            return None
+         for parser in parsers:
+-            if media_type_matches(parser.media_type, request.content_type):
++            if media_type_matches(parser.media_type, content_type):
+                 return parser
+         return None
+ 
+@@ -44,20 +52,25 @@
+         if format:
+             renderers = self.filter_renderers(renderers, format)
+ 
+-        accepts = self.get_accept_list(request)
++        accepts = self._get_parsed_accept_list(request)
+ 
++        # Parse each renderer's (constant) media type once, not once per token.
++        renderer_media_types = [
++            (renderer, _MediaType(renderer.media_type)) for renderer in renderers
++        ]
++
+         # Check the acceptable media types against each renderer,
+         # attempting more specific media types first
+         # NB. The inner loop here isn't as bad as it first looks :)
+         #     Worst case is we're looping over len(accept_list) * len(self.renderers)
+-        for media_type_set in order_by_precedence(accepts):
+-            for renderer in renderers:
+-                for media_type in media_type_set:
+-                    if media_type_matches(renderer.media_type, media_type):
++        for media_type_set in order_parsed_by_precedence(accepts):
++            for renderer, renderer_media_type in renderer_media_types:
++                for media_type_wrapper in media_type_set:
++                    if renderer_media_type.match(media_type_wrapper):
++                        media_type = media_type_wrapper.orig
+                         # Return the most specific media type as accepted.
+-                        media_type_wrapper = _MediaType(media_type)
+                         if (
+-                            _MediaType(renderer.media_type).precedence >
++                            renderer_media_type.precedence >
+                             media_type_wrapper.precedence
+                         ):
+                             # Eg client requests '*/*'
+@@ -94,4 +107,34 @@
+         type strings.
+         """
+         header = request.META.get('HTTP_ACCEPT', '*/*')
+-        return [token.strip() for token in header.split(',')]
++        if len(header) > self.max_accept_header_length:
++            # Truncate at a separator, so a truncated tail cannot be read as a
++            # valid media type. split() then only ever runs on a bounded prefix.
++            cut = header.rfind(',', 0, self.max_accept_header_length)
++            header = header[:cut + 1] if cut != -1 else ''
++        tokens = []
++        for token in header.split(','):
++            token = token.strip()
++            if not token or len(token) > self.max_media_type_length:
++                # Skip (don't break): an over-long leading token should not
++                # discard the usable media types that follow it.
++                continue
++            tokens.append(token)
++            if len(tokens) >= self.max_accept_tokens:
++                break
++        return tokens
++
++    def _get_parsed_accept_list(self, request):
++        """
++        Parse the Accept tokens into ``_MediaType`` objects exactly once per
++        request, reusing them for the forced 406 re-negotiation instead of
++        re-parsing (and without a process-global cache of client input).
++        """
++        parsed = getattr(request, '_parsed_accept_list', None)
++        if parsed is None:
++            parsed = [_MediaType(token) for token in self.get_accept_list(request)]
++            try:
++                request._parsed_accept_list = parsed
++            except Exception:
++                pass
++        return parsed
+--- a/rest_framework/request.py
++++ b/rest_framework/request.py
+@@ -21,11 +21,15 @@
+ from rest_framework import exceptions
+ from rest_framework.settings import api_settings
+ 
++MAX_MEDIA_TYPE_LENGTH = 256
+ 
++
+ def is_form_media_type(media_type):
+     """
+     Return True if the media type is a valid form media type.
+     """
++    if media_type is None or len(media_type) > MAX_MEDIA_TYPE_LENGTH:
++        return False
+     base_media_type, params = parse_header_parameters(media_type)
+     return (base_media_type == 'application/x-www-form-urlencoded' or
+             base_media_type == 'multipart/form-data')
+--- a/rest_framework/utils/mediatypes.py
++++ b/rest_framework/utils/mediatypes.py
+@@ -24,28 +24,48 @@
+     return lhs.match(rhs)
+ 
+ 
+-def order_by_precedence(media_type_lst):
++def order_parsed_by_precedence(media_types):
+     """
+-    Returns a list of sets of media type strings, ordered by precedence.
+-    Precedence is determined by how specific a media type is:
++    Given an iterable of parsed ``_MediaType``, return a list of sets,
++    ordered by precedence. Precedence is determined by how specific a media type is:
+ 
+     3. 'type/subtype; param=val'
+     2. 'type/subtype'
+     1. 'type/*'
+     0. '*/*'
++
++    ``_MediaType`` is hashable by its original string, preserving the set-based dedup.
+     """
+     ret = [set(), set(), set(), set()]
+-    for media_type in media_type_lst:
+-        precedence = _MediaType(media_type).precedence
+-        ret[3 - precedence].add(media_type)
+-    return [media_types for media_types in ret if media_types]
++    for media_type in media_types:
++        ret[3 - media_type.precedence].add(media_type)
++    return [bucket for bucket in ret if bucket]
+ 
+ 
++def order_by_precedence(media_type_lst):
++    """
++    Same as `order_parsed_by_precedence`, but takes unparsed media type strings.
++    """
++    media_types_gen = (_MediaType(mt) for mt in media_type_lst)
++    return order_parsed_by_precedence(media_types_gen)
++
++
+ class _MediaType:
+     def __init__(self, media_type_str):
+         self.orig = '' if (media_type_str is None) else media_type_str
+-        self.full_type, self.params = parse_header_parameters(self.orig)
++        try:
++            self.full_type, self.params = parse_header_parameters(self.orig)
++        except ValueError:
++            # Django raises ValueError above MAX_HEADER_LENGTH; degrade to a
++            # media type that matches nothing rather than surfacing a 500.
++            self.full_type, self.params = '', {}
+         self.main_type, sep, self.sub_type = self.full_type.partition('/')
++
++    def __eq__(self, other):
++        return isinstance(other, _MediaType) and self.orig == other.orig
++
++    def __hash__(self):
++        return hash(self.orig)
+ 
+     def match(self, other):
+         """Return true if this MediaType satisfies the given MediaType."""
+--- a/tests/test_negotiation.py
++++ b/tests/test_negotiation.py
+@@ -1,14 +1,20 @@
++from unittest import mock
++
+ import pytest
+ from django.http import Http404
+ from django.test import TestCase
+ 
++from rest_framework import exceptions
+ from rest_framework.negotiation import (
+     BaseContentNegotiation, DefaultContentNegotiation
+ )
+ from rest_framework.renderers import BaseRenderer
+ from rest_framework.request import Request
+ from rest_framework.test import APIRequestFactory
+-from rest_framework.utils.mediatypes import _MediaType
++from rest_framework.utils import mediatypes
++from rest_framework.utils.mediatypes import (
++    _MediaType, order_parsed_by_precedence
++)
+ 
+ factory = APIRequestFactory()
+ 
+@@ -83,6 +89,90 @@
+         renderers = [MockRenderer()]
+         with pytest.raises(Http404):
+             self.negotiator.filter_renderers(renderers, format='json')
++
++    def test_accept_header_length_limit(self):
++        prefix = 'text/plain,'
++        limit = self.negotiator.max_accept_header_length
++        header = prefix + ' ' * (limit - len(prefix) - len('application/json')) + 'application/json'
++        request = Request(factory.get('/', HTTP_ACCEPT=header))
++        assert self.negotiator.get_accept_list(request) == ['text/plain', 'application/json']
++
++        request = Request(factory.get('/', HTTP_ACCEPT=header + 'x'))
++        assert self.negotiator.get_accept_list(request) == ['text/plain']
++
++    def test_accept_header_without_separator(self):
++        header = 'x' * (self.negotiator.max_accept_header_length + 1)
++        request = Request(factory.get('/', HTTP_ACCEPT=header))
++        assert self.negotiator.get_accept_list(request) == []
++        with pytest.raises(exceptions.NotAcceptable):
++            self.select_renderer(request)
++
++    def test_accept_token_length_limit(self):
++        prefix = 'application/json; padding='
++        token = prefix + 'x' * (self.negotiator.max_media_type_length - len(prefix))
++        request = Request(factory.get('/', HTTP_ACCEPT=token))
++        accepted_renderer, accepted_media_type = self.select_renderer(request)
++        assert accepted_renderer is self.renderers[0]
++        assert accepted_media_type == token
++
++        request = Request(factory.get('/', HTTP_ACCEPT=token + 'x, text/html'))
++        assert self.negotiator.get_accept_list(request) == ['text/html']
++        accepted_renderer, accepted_media_type = self.select_renderer(request)
++        assert accepted_renderer is self.renderers[1]
++        assert accepted_media_type == 'text/html'
++
++    def test_accept_token_count_limit(self):
++        tokens = ['text/x%d' % i for i in range(self.negotiator.max_accept_tokens - 1)]
++        request = Request(factory.get('/', HTTP_ACCEPT=', '.join(tokens + ['application/json'])))
++        accepted_renderer, accepted_media_type = self.select_renderer(request)
++        assert accepted_renderer is self.renderers[0]
++        assert accepted_media_type == 'application/json'
++
++        request = Request(factory.get('/', HTTP_ACCEPT=', '.join(tokens + ['text/plain', 'application/json'])))
++        with pytest.raises(exceptions.NotAcceptable):
++            self.select_renderer(request)
++
++    def test_media_type_parse_error(self):
++        with mock.patch.object(
++            mediatypes, 'parse_header_parameters', side_effect=ValueError
++        ) as parse:
++            media_type = _MediaType('application/json')
++        parse.assert_called_once_with('application/json')
++        assert media_type.full_type == ''
++        assert media_type.params == {}
++
++    def test_media_type_equality(self):
++        one = _MediaType('application/json')
++        same = _MediaType('application/json')
++        assert one == same
++        assert hash(one) == hash(same)
++        assert one != _MediaType('text/html')
++        assert one != _MediaType('application/json; indent=4')
++
++    def test_parsed_media_type_precedence(self):
++        wildcard = _MediaType('*/*')
++        subtype = _MediaType('application/*')
++        json = _MediaType('application/json')
++        parameterized = _MediaType('application/json; indent=4')
++        buckets = order_parsed_by_precedence([
++            wildcard, json, subtype, parameterized, _MediaType('application/json'),
++        ])
++        assert buckets == [{parameterized}, {json}, {subtype}, {wildcard}]
++
++    def test_accept_tokens_cached_on_request(self):
++        token = 'application/json; indent=8'
++        request = Request(factory.get('/', HTTP_ACCEPT=token))
++        with mock.patch.object(
++            mediatypes, 'parse_header_parameters',
++            wraps=mediatypes.parse_header_parameters
++        ) as parse:
++            for _ in range(2):
++                self.select_renderer(request)
++            assert parse.call_args_list.count(mock.call(token)) == 1
++
++            request = Request(factory.get('/', HTTP_ACCEPT=token))
++            self.select_renderer(request)
++            assert parse.call_args_list.count(mock.call(token)) == 2
+ 
+ 
+ class BaseContentNegotiationTests(TestCase):
+--- a/tests/test_request.py
++++ b/tests/test_request.py
+@@ -4,6 +4,7 @@
+ import copy
+ import os.path
+ import tempfile
++from unittest import mock
+ 
+ import pytest
+ from django.contrib.auth import authenticate, login, logout
+@@ -17,10 +18,16 @@
+ 
+ from rest_framework import status
+ from rest_framework.authentication import SessionAuthentication
+-from rest_framework.parsers import BaseParser, FormParser, MultiPartParser
+-from rest_framework.request import Request, WrappedAttributeError
++from rest_framework.negotiation import DefaultContentNegotiation
++from rest_framework.parsers import (
++    BaseParser, FormParser, JSONParser, MultiPartParser
++)
++from rest_framework.request import (
++    Request, WrappedAttributeError, is_form_media_type
++)
+ from rest_framework.response import Response
+ from rest_framework.test import APIClient, APIRequestFactory
++from rest_framework.utils import mediatypes
+ from rest_framework.views import APIView
+ 
+ factory = APIRequestFactory()
+@@ -143,6 +150,27 @@
+ 
+         with self.assertRaisesMessage(WrappedAttributeError, expected_message):
+             request.data
++
++    def test_content_type_length_limit(self):
++        negotiator = DefaultContentNegotiation()
++        parser = JSONParser()
++        prefix = 'application/json; padding='
++        content_type = prefix + 'x' * (negotiator.max_media_type_length - len(prefix))
++        request = Request(factory.post('/', data=b'', content_type=content_type))
++        assert negotiator.select_parser(request, [parser]) is parser
++
++        request = Request(factory.post('/', data=b'', content_type=content_type + 'x'))
++        with mock.patch.object(mediatypes, 'parse_header_parameters') as parse:
++            assert negotiator.select_parser(request, [parser]) is None
++        parse.assert_not_called()
++
++    def test_form_content_type_length_limit(self):
++        prefix = 'multipart/form-data; boundary='
++        content_type = prefix + 'x' * (256 - len(prefix))
++        assert is_form_media_type(content_type) is True
++        with mock.patch('rest_framework.request.parse_header_parameters') as parse:
++            assert is_form_media_type(content_type + 'x') is False
++        parse.assert_not_called()
+ 
+ 
+ class MockView(APIView):
+--- a/tests/test_views.py
++++ b/tests/test_views.py
+@@ -1,5 +1,6 @@
+ import copy
+ import unittest
++from unittest import mock
+ 
+ from django import VERSION as DJANGO_VERSION
+ from django.test import TestCase
+@@ -9,6 +10,7 @@
+ from rest_framework.response import Response
+ from rest_framework.settings import APISettings, api_settings
+ from rest_framework.test import APIRequestFactory
++from rest_framework.utils import mediatypes
+ from rest_framework.views import APIView
+ 
+ factory = APIRequestFactory()
+@@ -82,6 +84,16 @@
+         }
+         assert response.status_code == status.HTTP_400_BAD_REQUEST
+         assert sanitise_json_error(response.data) == expected
++
++    def test_accept_tokens_cached_for_error_response(self):
++        token = 'text/plain; version=1'
++        with mock.patch.object(
++            mediatypes, 'parse_header_parameters',
++            wraps=mediatypes.parse_header_parameters
++        ) as parse:
++            response = self.view(factory.get('/', HTTP_ACCEPT=token))
++        assert response.status_code == status.HTTP_406_NOT_ACCEPTABLE
++        assert parse.call_args_list.count(mock.call(token)) == 1
+ 
+ 
+ class FunctionBasedViewIntegrationTests(TestCase):
