@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2022-23491
 - CVE-2023-37920
+- GHSA-6q48-6c7w-9gw2
 
 ## How to Apply:
 1. Clone or download the source code for certifi
