@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-54399
+- CVE-2026-54428
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.httpcomponents.core5:httpcore5
