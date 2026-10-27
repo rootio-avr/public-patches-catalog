@@ -4,6 +4,7 @@ This patch is based on undici version 8.10.2, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2026-846025
 - AIKIDO-2026-393834
 - AIKIDO-2026-159850
 
