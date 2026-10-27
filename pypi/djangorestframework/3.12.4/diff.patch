@@ -7,3 +7,342 @@
 -        header = mark_safe('<br> ' + ', <br>'.join(header.split(',')))
 +        header = mark_safe('<br> ' + ', <br>'.join(escape(header).split(',')))
      return header
+
+--- a/rest_framework/authtoken/admin.py
++++ b/rest_framework/authtoken/admin.py
+@@ -5,7 +5,7 @@
+ from django.core.exceptions import ValidationError
+ from django.urls import reverse
+ 
+-from rest_framework.authtoken.models import Token, TokenProxy
++from rest_framework.authtoken.models import TokenProxy
+ 
+ User = get_user_model()
+ 
+@@ -41,11 +41,6 @@
+             return queryset.get(user=user)
+         except (queryset.model.DoesNotExist, User.DoesNotExist, ValidationError, ValueError):
+             return None
+-
+-    def delete_model(self, request, obj):
+-        # Map back to actual Token, since delete() uses pk.
+-        token = Token.objects.get(key=obj.key)
+-        return super().delete_model(request, token)
+ 
+ 
+ admin.site.register(TokenProxy, TokenAdmin)
+--- a/rest_framework/authtoken/models.py
++++ b/rest_framework/authtoken/models.py
+@@ -2,7 +2,7 @@
+ import os
+ 
+ from django.conf import settings
+-from django.db import models
++from django.db import models, router
+ from django.utils.translation import gettext_lazy as _
+ 
+ 
+@@ -40,13 +40,63 @@
+         return self.key
+ 
+ 
++class TokenProxyQuerySet(models.QuerySet):
++    """
++    Deletes through the concrete `Token`: the collector deletes by `pk`,
++    which the proxy maps to the user id.
++    """
++    def delete(self):
++        # Mirror the checks done by `QuerySet.delete()`, in a way that works
++        # across all supported Django versions.
++        not_support_combined = getattr(self, '_not_support_combined_queries', None)
++        if not_support_combined is not None:
++            not_support_combined('delete')
++        is_sliced = getattr(self.query, 'is_sliced', None)
++        if is_sliced is None:
++            is_sliced = not self.query.can_filter()
++        if is_sliced:
++            raise TypeError("Cannot use 'limit' or 'offset' with delete().")
++        if self.query.distinct or self.query.distinct_fields:
++            raise TypeError("Cannot call delete() after .distinct().")
++        if self._fields is not None:
++            raise TypeError(
++                "Cannot call delete() after .values() or .values_list()"
++            )
++        # Ensure `self.db` resolves with the write routers, like `QuerySet.delete()`
++        self._for_write = True
++        keys = list(self.values_list('pk', flat=True))
++        return Token.objects.using(self.db).filter(pk__in=keys).delete()
++    delete.alters_data = True
++    delete.queryset_only = True
++
++
+ class TokenProxy(Token):
+     """
+     Proxy mapping pk to user pk for use in admin.
+     """
++    objects = TokenProxyQuerySet.as_manager()
++
+     @property
+     def pk(self):
+         return self.user_id
++
++    def delete(self, using=None, keep_parents=False):
++        """
++        Deletes through the concrete `Token`. The inherited delete matches
++        the `key` column against `pk` -- a user id here -- and silently
++        deletes nothing.
++        """
++        if self.key is None:
++            raise ValueError(
++                "%s object can't be deleted because its %s attribute is set "
++                "to None." % (self._meta.object_name, self._meta.pk.attname)
++            )
++        # Resolve `using` in same order as in the base `Model.delete()`
++        using = using or router.db_for_write(self.__class__, instance=self)
++        deleted = type(self).objects.using(using).filter(key=self.key).delete()
++        # `Model.delete()` clears the pk of the in-memory instance
++        self.key = None
++        return deleted
+ 
+     class Meta:
+         proxy = 'rest_framework.authtoken' in settings.INSTALLED_APPS
+
+--- a/rest_framework/parsers.py
++++ b/rest_framework/parsers.py
+@@ -22,6 +22,28 @@
+ from rest_framework.utils import json
+ 
+ 
++def get_encoding(parser_context):
++    """
++    Return the charset to decode the request body with: the one named in the
++    request's `Content-Type` header, or `settings.DEFAULT_CHARSET`.
++
++    Django accepts any charset that `codecs.lookup()` resolves, which includes
++    bytes-to-bytes codecs such as `bz2_codec`. Decoding through one of those
++    decompresses the body after `DATA_UPLOAD_MAX_MEMORY_SIZE` has already been
++    checked against the compressed size, so a tiny request can expand without
++    bound. Only text encodings are accepted here.
++    """
++    encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++    try:
++        # Unlike `codecs.getreader()`, `str.encode()` rejects non-text codecs.
++        ''.encode(encoding)
++    except (LookupError, UnicodeError):
++        raise ParseError(
++            'Unsupported charset "%s" in request Content-Type header.' % encoding
++        )
++    return encoding
++
++
+ class DataAndFiles:
+     def __init__(self, data, files):
+         self.data = data
+@@ -57,7 +79,7 @@
+         Parses the incoming bytestream as JSON and returns the resulting data.
+         """
+         parser_context = parser_context or {}
+-        encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++        encoding = get_encoding(parser_context)
+ 
+         try:
+             decoded_stream = codecs.getreader(encoding)(stream)
+@@ -79,7 +101,7 @@
+         and returns the resulting QueryDict.
+         """
+         parser_context = parser_context or {}
+-        encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++        encoding = get_encoding(parser_context)
+         return QueryDict(stream.read(), encoding=encoding)
+ 
+ 
+@@ -99,7 +121,7 @@
+         """
+         parser_context = parser_context or {}
+         request = parser_context['request']
+-        encoding = parser_context.get('encoding', settings.DEFAULT_CHARSET)
++        encoding = get_encoding(parser_context)
+         meta = request.META.copy()
+         meta['CONTENT_TYPE'] = media_type
+         upload_handlers = request.upload_handlers
+
+--- a/rest_framework/negotiation.py
++++ b/rest_framework/negotiation.py
+@@ -7,7 +7,7 @@
+ from rest_framework import HTTP_HEADER_ENCODING, exceptions
+ from rest_framework.settings import api_settings
+ from rest_framework.utils.mediatypes import (
+-    _MediaType, media_type_matches, order_by_precedence
++    _MediaType, media_type_matches, order_parsed_by_precedence
+ )
+ 
+ 
+@@ -22,13 +22,21 @@
+ class DefaultContentNegotiation(BaseContentNegotiation):
+     settings = api_settings
+ 
++    max_accept_header_length = 8192
++    max_accept_tokens = 64
++    max_media_type_length = 256
++
+     def select_parser(self, request, parsers):
+         """
+         Given a list of parsers and a media type, return the appropriate
+         parser to handle the incoming request.
+         """
++        content_type = request.content_type
++        if content_type and len(content_type) > self.max_media_type_length:
++            # Refuse rather than parse. Returning None results in a 415.
++            return None
+         for parser in parsers:
+-            if media_type_matches(parser.media_type, request.content_type):
++            if media_type_matches(parser.media_type, content_type):
+                 return parser
+         return None
+ 
+@@ -44,20 +52,25 @@
+         if format:
+             renderers = self.filter_renderers(renderers, format)
+ 
+-        accepts = self.get_accept_list(request)
++        accepts = self._get_parsed_accept_list(request)
+ 
++        # Parse each renderer's (constant) media type once, not once per token.
++        renderer_media_types = [
++            (renderer, _MediaType(renderer.media_type)) for renderer in renderers
++        ]
++
+         # Check the acceptable media types against each renderer,
+         # attempting more specific media types first
+         # NB. The inner loop here isn't as bad as it first looks :)
+         #     Worst case is we're looping over len(accept_list) * len(self.renderers)
+-        for media_type_set in order_by_precedence(accepts):
+-            for renderer in renderers:
+-                for media_type in media_type_set:
+-                    if media_type_matches(renderer.media_type, media_type):
++        for media_type_set in order_parsed_by_precedence(accepts):
++            for renderer, renderer_media_type in renderer_media_types:
++                for media_type_wrapper in media_type_set:
++                    if renderer_media_type.match(media_type_wrapper):
++                        media_type = media_type_wrapper.orig
+                         # Return the most specific media type as accepted.
+-                        media_type_wrapper = _MediaType(media_type)
+                         if (
+-                            _MediaType(renderer.media_type).precedence >
++                            renderer_media_type.precedence >
+                             media_type_wrapper.precedence
+                         ):
+                             # Eg client requests '*/*'
+@@ -92,4 +105,34 @@
+         type strings.
+         """
+         header = request.META.get('HTTP_ACCEPT', '*/*')
+-        return [token.strip() for token in header.split(',')]
++        if len(header) > self.max_accept_header_length:
++            # Truncate at a separator, so a truncated tail cannot be read as a
++            # valid media type. split() then only ever runs on a bounded prefix.
++            cut = header.rfind(',', 0, self.max_accept_header_length)
++            header = header[:cut + 1] if cut != -1 else ''
++        tokens = []
++        for token in header.split(','):
++            token = token.strip()
++            if not token or len(token) > self.max_media_type_length:
++                # Skip (don't break): an over-long leading token should not
++                # discard the usable media types that follow it.
++                continue
++            tokens.append(token)
++            if len(tokens) >= self.max_accept_tokens:
++                break
++        return tokens
++
++    def _get_parsed_accept_list(self, request):
++        """
++        Parse the Accept tokens into ``_MediaType`` objects exactly once per
++        request, reusing them for the forced 406 re-negotiation instead of
++        re-parsing (and without a process-global cache of client input).
++        """
++        parsed = getattr(request, '_parsed_accept_list', None)
++        if parsed is None:
++            parsed = [_MediaType(token) for token in self.get_accept_list(request)]
++            try:
++                request._parsed_accept_list = parsed
++            except Exception:
++                pass
++        return parsed
+--- a/rest_framework/request.py
++++ b/rest_framework/request.py
+@@ -21,11 +21,15 @@
+ from rest_framework import HTTP_HEADER_ENCODING, exceptions
+ from rest_framework.settings import api_settings
+ 
++MAX_MEDIA_TYPE_LENGTH = 256
+ 
++
+ def is_form_media_type(media_type):
+     """
+     Return True if the media type is a valid form media type.
+     """
++    if media_type is None or len(media_type) > MAX_MEDIA_TYPE_LENGTH:
++        return False
+     base_media_type, params = parse_header(media_type.encode(HTTP_HEADER_ENCODING))
+     return (base_media_type == 'application/x-www-form-urlencoded' or
+             base_media_type == 'multipart/form-data')
+--- a/rest_framework/utils/mediatypes.py
++++ b/rest_framework/utils/mediatypes.py
+@@ -26,28 +26,48 @@
+     return lhs.match(rhs)
+ 
+ 
+-def order_by_precedence(media_type_lst):
++def order_parsed_by_precedence(media_types):
+     """
+-    Returns a list of sets of media type strings, ordered by precedence.
+-    Precedence is determined by how specific a media type is:
++    Given an iterable of parsed ``_MediaType``, return a list of sets,
++    ordered by precedence. Precedence is determined by how specific a media type is:
+ 
+     3. 'type/subtype; param=val'
+     2. 'type/subtype'
+     1. 'type/*'
+     0. '*/*'
++
++    ``_MediaType`` is hashable by its original string, preserving the set-based dedup.
+     """
+     ret = [set(), set(), set(), set()]
+-    for media_type in media_type_lst:
+-        precedence = _MediaType(media_type).precedence
+-        ret[3 - precedence].add(media_type)
+-    return [media_types for media_types in ret if media_types]
++    for media_type in media_types:
++        ret[3 - media_type.precedence].add(media_type)
++    return [bucket for bucket in ret if bucket]
+ 
+ 
++def order_by_precedence(media_type_lst):
++    """
++    Same as `order_parsed_by_precedence`, but takes unparsed media type strings.
++    """
++    media_types_gen = (_MediaType(mt) for mt in media_type_lst)
++    return order_parsed_by_precedence(media_types_gen)
++
++
+ class _MediaType:
+     def __init__(self, media_type_str):
+         self.orig = '' if (media_type_str is None) else media_type_str
+-        self.full_type, self.params = parse_header(self.orig.encode(HTTP_HEADER_ENCODING))
++        try:
++            self.full_type, self.params = parse_header(self.orig.encode(HTTP_HEADER_ENCODING))
++        except ValueError:
++            # Degrade to a media type that matches nothing rather than
++            # surfacing a 500.
++            self.full_type, self.params = '', {}
+         self.main_type, sep, self.sub_type = self.full_type.partition('/')
++
++    def __eq__(self, other):
++        return isinstance(other, _MediaType) and self.orig == other.orig
++
++    def __hash__(self):
++        return hash(self.orig)
+ 
+     def match(self, other):
+         """Return true if this MediaType satisfies the given MediaType."""

@@ -5,6 +5,9 @@ unknown
 
 ## Affected CVEs:
 - CVE-2024-21520
+- CVE-2026-114137
+- CVE-2026-114136
+- CVE-2026-114138
 
 ## How to Apply:
 1. Clone or download the source code for djangorestframework
