@@ -4,6 +4,7 @@ This patch is based on org.springframework:spring version 5.3.20, which is avail
 unknown
 
 ## Affected CVEs:
+- CVE-2016-1000027
 - CVE-2023-20860
 - CVE-2023-20861
 - CVE-2023-20863
