@@ -1,3 +1,1000 @@
+--- a/lib/dispatcher/client-h1.js
++++ b/lib/dispatcher/client-h1.js
+@@ -17,6 +17,7 @@
+   InformationalError,
+   BodyTimeoutError,
+   HTTPParserError,
++  WebAssemblyNotSupportedError,
+   ResponseExceededMaxSizeError
+ } = require('../core/errors.js')
+ const {
+@@ -51,10 +52,15 @@
+   kOnError,
+   kResume,
+   kHTTPContext,
+-  kClosed
++  kClosed,
++  kUseMilo
+ } = require('../core/symbols.js')
+ 
+ const constants = require('../llhttp/constants.js')
++// Node.js core bundles only llhttp; experimental Milo remains available in npm builds.
++const { H1Parser, getMiloEnabled } = typeof esbuildDetection === 'undefined'
++  ? require('./parser-h1.js')
++  : {}
+ const EMPTY_BUF = Buffer.alloc(0)
+ const FastBuffer = Buffer[Symbol.species]
+ const removeAllListeners = util.removeAllListeners
+@@ -66,12 +72,23 @@
+ let extractBody
+ 
+ function lazyllhttp () {
++  // Check only when HTTP/1 needs the parser, so other APIs remain usable without WASM.
++  if (typeof WebAssembly === 'undefined') {
++    throw new WebAssemblyNotSupportedError()
++  }
++
+   const llhttpWasmData = process.env.JEST_WORKER_ID ? require('../llhttp/llhttp-wasm.js') : undefined
+ 
+   let mod
+ 
+-  // We disable wasm SIMD on ppc64 as it seems to be broken on Power 9 architectures.
+-  let useWasmSIMD = process.arch !== 'ppc64'
++  // We disable wasm SIMD on older versions of Node.js on ppc64 that are broken on Power >=9 architectures.
++  let useWasmSIMD = true
++  if (process.arch === 'ppc64') {
++    const [major, minor] = process.versions.node.split('.').map(n => parseInt(n, 10))
++    if (major < 24 || (major === 24 && minor < 12)) {
++      useWasmSIMD = false
++    }
++  }
+   // The Env Variable UNDICI_NO_WASM_SIMD allows explicitly overriding the default behavior
+   if (process.env.UNDICI_NO_WASM_SIMD === '1') {
+     useWasmSIMD = false
+@@ -82,8 +99,7 @@
+   if (useWasmSIMD) {
+     try {
+       mod = new WebAssembly.Module(require('../llhttp/llhttp_simd-wasm.js'))
+-    } catch {
+-    }
++    } catch {}
+   }
+ 
+   if (!mod) {
+@@ -120,7 +136,7 @@
+        * @param {number} p
+        * @returns {number}
+        */
+-      wasm_on_message_begin: (p) => {
++      wasm_on_message_begin: p => {
+         assert(currentParser.ptr === p)
+         return currentParser.onMessageBegin()
+       },
+@@ -172,11 +188,10 @@
+        * @param {number} p
+        * @returns {number}
+        */
+-      wasm_on_message_complete: (p) => {
++      wasm_on_message_complete: p => {
+         assert(currentParser.ptr === p)
+         return currentParser.onMessageComplete()
+       }
+-
+     }
+   })
+ }
+@@ -209,10 +224,10 @@
+ 
+ class Parser {
+   /**
+-     * @param {import('./client.js')} client
+-     * @param {import('net').Socket} socket
+-     * @param {*} llhttp
+-     */
++   * @param {import('./client.js')} client
++   * @param {import('net').Socket} socket
++   * @param {*} llhttp
++   */
+   constructor (client, socket, { exports }) {
+     this.llhttp = exports
+     this.ptr = this.llhttp.llhttp_alloc(constants.TYPE.RESPONSE)
+@@ -239,7 +254,8 @@
+ 
+     this.keepAlive = ''
+     this.contentLength = -1
+-    this.connectionKeepAlive = false
++    this.hasTransferEncoding = false
++    this.connection = ''
+     this.maxResponseSize = client[kMaxResponseSize]
+   }
+ 
+@@ -247,10 +263,7 @@
+     // If the existing timer and the new timer are of different timer type
+     // (fast or native) or have different delay, we need to clear the existing
+     // timer and set a new one.
+-    if (
+-      delay !== this.timeoutValue ||
+-      (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)
+-    ) {
++    if (delay !== this.timeoutValue || (type & USE_FAST_TIMER) ^ (this.timeoutType & USE_FAST_TIMER)) {
+       // If a timeout is already set, clear it with clearTimeout of the fast
+       // timer implementation, as it can clear fast and native timers.
+       if (this.timeout) {
+@@ -435,9 +448,7 @@
+     if (ptr) {
+       const len = new Uint8Array(llhttp.memory.buffer, ptr).indexOf(0)
+       message =
+-        'Response does not match the HTTP/1.1 protocol (' +
+-        Buffer.from(llhttp.memory.buffer, ptr, len).toString() +
+-        ')'
++        'Response does not match the HTTP/1.1 protocol (' + Buffer.from(llhttp.memory.buffer, ptr, len).toString() + ')'
+     }
+ 
+     return new HTTPParserError(message, constants.ERROR[ret], data)
+@@ -515,6 +526,7 @@
+    */
+   onHeaderValue (buf) {
+     let len = this.headers.length
++    const isContinuation = (len & 1) === 0
+ 
+     if ((len & 1) === 1) {
+       this.headers.push(buf)
+@@ -527,19 +539,19 @@
+     if (key.length === 10) {
+       const headerName = util.bufferToLowerCasedHeaderName(key)
+       if (headerName === 'keep-alive') {
+-        this.keepAlive += buf.toString()
++        this.keepAlive += (isContinuation || this.keepAlive.length === 0 ? '' : ',') + buf.toString()
+       } else if (headerName === 'connection') {
+-        this.connectionKeepAlive =
+-          this.headers[len - 1].length === 10 &&
+-          util.bufferToLowerCasedHeaderName(this.headers[len - 1]) === 'keep-alive'
++        this.connection += (isContinuation || this.connection.length === 0 ? '' : ',') + buf.toString()
+       }
+     } else if (key.length === 14 && util.bufferToLowerCasedHeaderName(key) === 'content-length') {
+       if (this.contentLength === -1) {
+         this.contentLength = 0
+       }
+       for (let i = 0; i < buf.length; i++) {
+-        this.contentLength = (this.contentLength * 10) + (buf[i] - 0x30)
++        this.contentLength = this.contentLength * 10 + (buf[i] - 0x30)
+       }
++    } else if (key.length === 17 && util.bufferToLowerCasedHeaderName(key) === 'transfer-encoding') {
++      this.hasTransferEncoding = true
+     }
+ 
+     this.trackHeader(buf.length)
+@@ -561,7 +573,7 @@
+    * @param {Buffer} head
+    */
+   onUpgrade (head) {
+-    const { upgrade, client, socket, headers, statusCode } = this
++    const { upgrade, client, socket, headers, statusCode, statusText } = this
+ 
+     assert(upgrade)
+     assert(client[kSocket] === socket)
+@@ -596,8 +608,9 @@
+     client.emit('disconnect', client[kUrl], [client], new InformationalError('upgrade'))
+ 
+     try {
+-      request.onRequestUpgrade(statusCode, headers, socket)
++      request.onRequestUpgrade(statusCode, headers, socket, statusText)
+     } catch (err) {
++      util.errorRequest(client, request, err)
+       util.destroy(socket, err)
+     }
+ 
+@@ -645,16 +658,27 @@
+     assert(this.timeoutType === TIMEOUT_HEADERS)
+ 
+     this.statusCode = statusCode
+-    this.shouldKeepAlive = (
++    this.shouldKeepAlive =
+       shouldKeepAlive ||
+       // Override llhttp value which does not allow keepAlive for HEAD.
+-      (request.method === 'HEAD' && !socket[kReset] && this.connectionKeepAlive)
+-    )
++      (request.method === 'HEAD' && !socket[kReset] &&
++        /(?:^|,)[\t ]*keep-alive[\t ]*(?:,|$)/i.test(this.connection) &&
++        !/(?:^|,)[\t ]*close[\t ]*(?:,|$)/i.test(this.connection))
+ 
++    // Responses to HEAD and 204/304 responses never carry content
++    if (request.method === 'HEAD' || statusCode === 204 || statusCode === 304) {
++      // A non-zero Content-Length or Transfer-Encoding on a 204/304 means the
++      // server may also have sent content inappropriately, which would then be
++      // parsed as the next response on this connection. Accept it, but do not
++      // reuse the connection. HEAD requests are fine tho.
++      if (request.method !== 'HEAD' && (this.contentLength > 0 || this.hasTransferEncoding)) {
++        this.shouldKeepAlive = false
++      }
++      this.contentLength = -1
++    }
++
+     if (this.statusCode >= 200) {
+-      const bodyTimeout = request.bodyTimeout != null
+-        ? request.bodyTimeout
+-        : client[kBodyTimeout]
++      const bodyTimeout = request.bodyTimeout != null ? request.bodyTimeout : client[kBodyTimeout]
+       this.setTimeout(bodyTimeout, TIMEOUT_BODY)
+     } else if (this.timeout) {
+       if (this.timeout.refresh) {
+@@ -682,10 +706,7 @@
+       const keepAliveTimeout = this.keepAlive ? util.parseKeepAliveTimeout(this.keepAlive) : null
+ 
+       if (keepAliveTimeout != null) {
+-        const timeout = Math.min(
+-          keepAliveTimeout - client[kKeepAliveTimeoutThreshold],
+-          client[kKeepAliveMaxTimeout]
+-        )
++        const timeout = Math.min(keepAliveTimeout - client[kKeepAliveTimeoutThreshold], client[kKeepAliveMaxTimeout])
+         if (timeout <= 0) {
+           socket[kReset] = true
+         } else {
+@@ -782,8 +803,9 @@
+     this.statusText = ''
+     this.bytesRead = 0
+     this.contentLength = -1
++    this.hasTransferEncoding = false
+     this.keepAlive = ''
+-    this.connectionKeepAlive = false
++    this.connection = ''
+ 
+     this.headers = []
+     this.headersSize = 0
+@@ -792,7 +814,7 @@
+       return 0
+     }
+ 
+-    if (request.method !== 'HEAD' && contentLength !== -1 && bytesRead !== contentLength) {
++    if (contentLength !== -1 && bytesRead !== contentLength) {
+       util.destroy(socket, new ResponseContentLengthMismatchError())
+       return -1
+     }
+@@ -880,7 +902,9 @@
+   socket[kIdleSocketValidation] = 0
+   socket[kIdleSocketValidationTimeout] = null
+   socket[kSocketUsed] = false
+-  socket[kParser] = new Parser(client, socket, llhttpInstance)
++  socket[kParser] = typeof esbuildDetection === 'undefined' && (client[kUseMilo] ?? getMiloEnabled())
++    ? new H1Parser(client, socket)
++    : new Parser(client, socket, llhttpInstance)
+ 
+   util.addListener(socket, 'error', onHttpSocketError)
+   util.addListener(socket, 'readable', onHttpSocketReadable)
+@@ -941,8 +965,11 @@
+           return true
+         }
+ 
+-        if (client[kRunning] > 0 && util.bodyLength(request.body) !== 0 &&
+-          (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))) {
++        if (
++          client[kRunning] > 0 &&
++          util.bodyLength(request.body) !== 0 &&
++          (util.isStream(request.body) || util.isAsyncIterable(request.body) || util.isFormDataLike(request.body))
++        ) {
+           // Request with stream or iterator body can error while other requests
+           // are inflight and indirectly error those as well.
+           // Ensure this doesn't happen by waiting for inflight
+@@ -961,8 +988,6 @@
+ }
+ 
+ function onHttpSocketError (err) {
+-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
+-
+   const parser = this[kParser]
+ 
+   // On Mac OS, we get an ECONNRESET even if there is a full body to be forwarded
+@@ -1130,9 +1155,7 @@
+     } else if (client[kRunning] > 0 && socket[kParser].statusCode < 200) {
+       if (socket[kParser].timeoutType !== TIMEOUT_HEADERS) {
+         const request = client[kQueue][client[kRunningIdx]]
+-        const headersTimeout = request.headersTimeout != null
+-          ? request.headersTimeout
+-          : client[kHeadersTimeout]
++        const headersTimeout = request.headersTimeout != null ? request.headersTimeout : client[kHeadersTimeout]
+         socket[kParser].setTimeout(headersTimeout, TIMEOUT_HEADERS)
+       }
+     }
+@@ -1189,14 +1212,13 @@
+   // servers and corrupt connection state. Do not
+   // re-use the connection for further requests.
+ 
+-  const expectsPayload = (
++  const expectsPayload =
+     method === 'PUT' ||
+     method === 'POST' ||
+     method === 'PATCH' ||
+     method === 'QUERY' ||
+     method === 'PROPFIND' ||
+     method === 'PROPPATCH'
+-  )
+ 
+   if (util.isFormDataLike(body)) {
+     if (!extractBody) {
+@@ -1245,7 +1267,12 @@
+ 
+   // https://github.com/nodejs/undici/issues/2046
+   // A user agent may send a Content-Length header with 0 value, this should be allowed.
+-  if (shouldSendContentLength(method) && contentLength > 0 && request.contentLength !== null && request.contentLength !== contentLength) {
++  if (
++    shouldSendContentLength(method) &&
++    contentLength > 0 &&
++    request.contentLength !== null &&
++    request.contentLength !== contentLength
++  ) {
+     if (client[kStrictContentLength]) {
+       util.errorRequest(client, request, new RequestContentLengthMismatchError())
+       return false
+@@ -1261,7 +1288,7 @@
+    * @param {Error} [err]
+    * @returns {void}
+    */
+-  const abort = (err) => {
++  const abort = err => {
+     if (request.aborted || request.completed) {
+       return
+     }
+@@ -1446,14 +1473,9 @@
+ 
+     assert(socket.destroyed || (socket[kWriting] && client[kRunning] <= 1))
+ 
+-    socket
+-      .off('drain', onDrain)
+-      .off('error', onFinished)
++    socket.off('drain', onDrain).off('error', onFinished)
+ 
+-    body
+-      .removeListener('data', onData)
+-      .removeListener('end', onFinished)
+-      .removeListener('close', onClose)
++    body.removeListener('data', onData).removeListener('end', onFinished).removeListener('close', onClose)
+ 
+     if (!err) {
+       try {
+@@ -1472,19 +1494,13 @@
+     }
+   }
+ 
+-  body
+-    .on('data', onData)
+-    .on('end', onFinished)
+-    .on('error', onFinished)
+-    .on('close', onClose)
++  body.on('data', onData).on('end', onFinished).on('error', onFinished).on('close', onClose)
+ 
+   if (body.resume) {
+     body.resume()
+   }
+ 
+-  socket
+-    .on('drain', onDrain)
+-    .on('error', onFinished)
++  socket.on('drain', onDrain).on('error', onFinished)
+ 
+   if (body.errorEmitted ?? body.errored) {
+     setImmediate(onFinished, body.errored)
+@@ -1605,19 +1621,18 @@
+     }
+   }
+ 
+-  const waitForDrain = () => new Promise((resolve, reject) => {
+-    assert(callback === null)
++  const waitForDrain = () =>
++    new Promise((resolve, reject) => {
++      assert(callback === null)
+ 
+-    if (socket[kError]) {
+-      reject(socket[kError])
+-    } else {
+-      callback = resolve
+-    }
+-  })
++      if (socket[kError]) {
++        reject(socket[kError])
++      } else {
++        callback = resolve
++      }
++    })
+ 
+-  socket
+-    .on('close', onDrain)
+-    .on('drain', onDrain)
++  socket.on('close', onDrain).on('drain', onDrain)
+ 
+   const writer = new AsyncWriter({ abort, socket, request, contentLength, client, expectsPayload, header })
+   try {
+@@ -1636,9 +1651,7 @@
+   } catch (err) {
+     writer.destroy(err)
+   } finally {
+-    socket
+-      .off('close', onDrain)
+-      .off('drain', onDrain)
++    socket.off('close', onDrain).off('drain', onDrain)
+   }
+ }
+ 
+@@ -1663,11 +1676,28 @@
+     this.expectsPayload = expectsPayload
+     this.header = header
+     this.abort = abort
++    this.lengthMismatch = false
+ 
+     socket[kWriting] = true
+   }
+ 
+   /**
++   * The body doesn't match the declared content-length and strictContentLength
++   * is off. Warn once, and mark the socket so it isn't reused: on the wire this
++   * request's body no longer ends where the server expects, so anything sent
++   * after it on the same connection would be misread.
++   * @returns {void}
++   */
++  onLengthMismatch () {
++    this.socket[kReset] = true
++
++    if (!this.lengthMismatch) {
++      this.lengthMismatch = true
++      process.emitWarning(new RequestContentLengthMismatchError())
++    }
++  }
++
++  /**
+    * @param {string|Uint8Array} chunk
+    * @returns
+    */
+@@ -1682,7 +1712,7 @@
+       return false
+     }
+ 
+-    const len = chunk instanceof Uint8Array ? chunk.byteLength : Buffer.byteLength(chunk)
++    let len = chunk instanceof Uint8Array ? chunk.byteLength : Buffer.byteLength(chunk)
+     if (!len) {
+       return true
+     }
+@@ -1693,7 +1723,17 @@
+         throw new RequestContentLengthMismatchError()
+       }
+ 
+-      process.emitWarning(new RequestContentLengthMismatchError())
++      this.onLengthMismatch()
++
++      // Never write past the declared content-length. The server treats any
++      // extra bytes as the start of the next request, so a body could inject
++      // a request of its own (request smuggling).
++      const remaining = contentLength - bytesWritten
++      if (remaining === 0) {
++        return true
++      }
++      chunk = (typeof chunk === 'string' ? Buffer.from(chunk) : chunk).subarray(0, remaining)
++      len = remaining
+     }
+ 
+     socket.cork()
+@@ -1768,9 +1808,12 @@
+     if (contentLength !== null && bytesWritten !== contentLength) {
+       if (client[kStrictContentLength]) {
+         throw new RequestContentLengthMismatchError()
+-      } else {
+-        process.emitWarning(new RequestContentLengthMismatchError())
+       }
++
++      // The body is shorter than declared, so the server is still waiting for
++      // the rest. Don't let the next request's bytes on this connection be
++      // read as the missing part of this body.
++      this.onLengthMismatch()
+     }
+ 
+     if (socket[kParser].timeout && socket[kParser].timeoutType === TIMEOUT_HEADERS) {
+--- a/lib/dispatcher/client-h2.js
++++ b/lib/dispatcher/client-h2.js
+@@ -5,6 +5,7 @@
+ const util = require('../core/util.js')
+ const {
+   RequestContentLengthMismatchError,
++  ResponseContentLengthMismatchError,
+   RequestAbortedError,
+   SocketError,
+   InformationalError,
+@@ -193,6 +194,11 @@
+   return body == null || util.isBuffer(body) || util.isBlobLike(body)
+ }
+ 
++function hasResponseStarted (request) {
++  const state = request[kRequestStream]?.[kRequestStreamState]
++  return state?.responseReceived === true
++}
++
+ // Count a GOAWAY refusal against the request's replay budget. A peer that
+ // refuses every connection must eventually surface an error to the caller
+ // rather than being retried forever. Kept separate from canReplayRequest so
+@@ -406,7 +412,8 @@
+   const session = client[kHTTP2Session]
+ 
+   if (socket?.destroyed === false) {
+-    if (client[kSize] === 0 || client[kMaxConcurrentStreams] === 0) {
++    // After an upgrade the queue is empty but its stream is still in use, so never unref while a stream is open.
++    if (session[kOpenStreams] === 0 && client[kSize] === 0) {
+       unrefH2Session(session)
+     } else {
+       refH2Session(session)
+@@ -541,8 +548,14 @@
+ }
+ 
+ function onHttp2RemoteSettings (settings) {
+-  // Fallbacks are a safe bet, remote setting will always override
+-  this[kClient][kMaxConcurrentStreams] = settings.maxConcurrentStreams ?? this[kClient][kMaxConcurrentStreams]
++  const client = this[kClient]
++
++  // The configured maxConcurrentStreams (default 100) is the client's own
++  // ceiling. The server's SETTINGS_MAX_CONCURRENT_STREAMS can lower it, but
++  // must not raise it: a default Node.js server advertises 2^32-1.
++  const localMaxConcurrentStreams = client[kHTTP2Options].maxConcurrentStreams
++  const remoteMaxConcurrentStreams = settings.maxConcurrentStreams ?? client[kMaxConcurrentStreams] ?? localMaxConcurrentStreams
++  client[kMaxConcurrentStreams] = Math.min(remoteMaxConcurrentStreams, localMaxConcurrentStreams)
+   /**
+    * From RFC-8441
+    * A sender MUST NOT send a SETTINGS_ENABLE_CONNECT_PROTOCOL parameter
+@@ -587,8 +600,6 @@
+ }
+ 
+ function onHttp2SessionError (err) {
+-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
+-
+   this[kSocket][kError] = err
+ 
+   if (this[kReceivedGoAway]) {
+@@ -640,9 +651,12 @@
+     const request = client[kQueue][i]
+ 
+     if (request != null) {
++      // Read before detaching, which drops the stream state.
++      const responseStarted = hasResponseStarted(request)
++
+       streamsToClose.push(detachRequestStreamForClose(request))
+ 
+-      if (canReplayRequest(request) && registerGoAwayRefusal(request)) {
++      if (!responseStarted && canReplayRequest(request) && registerGoAwayRefusal(request)) {
+         retriableRequests.push(request)
+       } else {
+         util.errorRequest(client, request, err)
+@@ -666,6 +680,10 @@
+     client[kHTTP2Session] = null
+   }
+ 
++  if (this[kOpenStreams] === 0) {
++    unrefH2Session(this)
++  }
++
+   clearHttp2IdleTimeout(this)
+   clearNoStreamsTimeout(this)
+ 
+@@ -747,8 +765,6 @@
+ }
+ 
+ function onHttp2SocketError (err) {
+-  assert(err.code !== 'ERR_TLS_CERT_ALTNAME_INVALID')
+-
+   this[kError] = err
+ 
+   if (this[kHTTP2Session]?.[kReceivedGoAway]) {
+@@ -770,10 +786,12 @@
+ 
+ function closeStreamSession (stream) {
+   const session = stream[kHTTP2Session]
++  const client = session[kClient]
+ 
+   stream[kHTTP2Session] = null
+   session[kOpenStreams] -= 1
+-  if (session[kOpenStreams] === 0) {
++  // A session that received GOAWAY does not need to stay ref'd for queued requests.
++  if (session[kOpenStreams] === 0 && (client[kSize] === 0 || session[kReceivedGoAway])) {
+     unrefH2Session(session)
+     setHttp2IdleTimeout(session)
+   }
+@@ -832,25 +850,27 @@
+   for (let n = 0; n < reqHeaders.length; n += 2) {
+     const key = reqHeaders[n + 0]
+     const val = reqHeaders[n + 1]
+-    const current = headers[key]
++    // Reading headers[key] directly resolves `__proto__` through the prototype
++    // chain instead of reporting the header as absent.
++    const current = Object.hasOwn(headers, key) ? headers[key] : undefined
+ 
+     if (key === 'cookie') {
+       if (current != null) {
+-        headers[key] = Array.isArray(current) ? (current.push(val), current) : [current, val]
++        util.setHeader(headers, key, Array.isArray(current) ? (current.push(val), current) : [current, val])
+       } else {
+-        headers[key] = val
++        util.setHeader(headers, key, val)
+       }
+ 
+       continue
+     }
+ 
+     if (typeof val === 'string') {
+-      headers[key] = current ? `${current}, ${val}` : val
++      util.setHeader(headers, key, current ? `${current}, ${val}` : val)
+       continue
+     }
+ 
+     for (let i = 0; i < val.length; i++) {
+-      headers[key] = headers[key] ? `${headers[key]}, ${val[i]}` : val[i]
++      util.setHeader(headers, key, Object.hasOwn(headers, key) ? `${headers[key]}, ${val[i]}` : val[i])
+     }
+   }
+ 
+@@ -931,9 +951,14 @@
+   const statusCode = headers[HTTP2_HEADER_STATUS]
+   delete headers[HTTP2_HEADER_STATUS]
+ 
+-  request.onRequestUpgrade(statusCode, headers, stream)
++  try {
++    request.onRequestUpgrade(statusCode, headers, stream)
++  } catch (err) {
++    state.abort(err)
++    return
++  }
+ 
+-  if (request.aborted || request.completed) {
++  if (request.aborted) {
+     return
+   }
+ 
+@@ -1033,6 +1058,7 @@
+     headersTimeout,
+     bodyTimeout,
+     requestFinalized: false,
++    responseContentLength: null,
+     responseReceived: false,
+     bodySent: false,
+     pendingEnd: false,
+@@ -1328,12 +1354,17 @@
+     return
+   }
+ 
+-  const { request, maxResponseSize } = state
++  const { request, maxResponseSize, responseContentLength } = state
+ 
+   if (request.aborted || request.completed) {
+     return
+   }
+ 
++  if (responseContentLength != null && state.bytesRead + chunk.length > responseContentLength) {
++    state.abort(new ResponseContentLengthMismatchError())
++    return
++  }
++
+   if (maxResponseSize > -1 && state.bytesRead + chunk.length > maxResponseSize) {
+     // Unlike HTTP/1.1, which destroys the socket because it cannot abandon one
+     // response without losing framing, resetting the offending stream leaves
+@@ -1345,10 +1376,34 @@
+   state.bytesRead += chunk.length
+ 
+   if (request.onResponseData(chunk) === false) {
+-    stream.pause()
++    pauseResponseStream(stream, state)
+   }
+ }
+ 
++// The body timeout measures how long the peer takes to send data. While the
++// consumer applies backpressure the peer can't send (it's out of flow-control
++// window), and Http2Stream's timer, which counts stream activity, would fire.
++// Stop it while paused and start a fresh one on resume, like HTTP/1.1, which
++// ignores the body timeout while its parser is paused.
++function pauseResponseStream (stream, state) {
++  stream.pause()
++  if (state.bodyTimeout) {
++    stream.setTimeout(0)
++  }
++}
++
++// Passed to the handler as its resume callback, bound to the stream.
++function resumeResponseStream () {
++  const stream = this
++  const state = stream[kRequestStreamState]
++
++  if (state != null && state.bodyTimeout && stream.isPaused()) {
++    stream.setTimeout(state.bodyTimeout)
++  }
++
++  stream.resume()
++}
++
+ function onInterimResponse (headers) {
+   const stream = this
+   const state = stream[kRequestStreamState]
+@@ -1392,11 +1447,20 @@
+     stream.end()
+   }
+ 
+-  const statusCode = headers[HTTP2_HEADER_STATUS]
++  const statusCode = Number(headers[HTTP2_HEADER_STATUS])
+   delete headers[HTTP2_HEADER_STATUS]
+   request.onResponseStarted()
+   state.responseReceived = true
+ 
++  // A Content-Length in HEAD and 304 responses describes the selected
++  // representation rather than DATA on this stream. Successful CONNECT uses
++  // the upgrade path above; all other final responses use Content-Length as
++  // their DATA payload length.
++  if (request.method !== 'HEAD' && statusCode !== 304) {
++    const contentLength = headers[HTTP2_HEADER_CONTENT_LENGTH]
++    state.responseContentLength = contentLength == null ? null : Number(contentLength)
++  }
++
+   if (state.headersTimeout || state.bodyTimeout) {
+     stream.setTimeout(state.bodyTimeout)
+   }
+@@ -1414,8 +1478,8 @@
+     return
+   }
+ 
+-  if (request.onResponseStart(Number(statusCode), headers, stream.resume.bind(stream), '') === false) {
+-    stream.pause()
++  if (request.onResponseStart(statusCode, headers, resumeResponseStream.bind(stream), '') === false) {
++    pauseResponseStream(stream, state)
+   }
+ 
+   stream.on('data', onData)
+@@ -1437,6 +1501,11 @@
+   // trailers on the state by now, so completing here still delivers them.
+   if (state.responseReceived) {
+     if (!request.aborted && !request.completed) {
++      if (state.responseContentLength != null && state.bytesRead !== state.responseContentLength) {
++        state.abort(new ResponseContentLengthMismatchError())
++        return
++      }
++
+       state.pendingEnd = true
+ 
+       // Complete on 'end': a blocked event loop can keep the stream's 'close'
+@@ -1492,6 +1561,13 @@
+   }
+ 
+   stream.off('error', onError)
++
++  // Node's HTTP/2 implementation can turn an incomplete Content-Length body
++  // into a protocol stream error instead of emitting 'end'. Prefer the
++  // content-length mismatch error when the received byte count proves it.
++  if (state.responseContentLength != null && state.bytesRead !== state.responseContentLength) {
++    err = new ResponseContentLengthMismatchError()
++  }
+ 
+   if (typeof stream.rstCode === 'number' && stream.rstCode !== NGHTTP2_NO_ERROR) {
+     err.http2ErrorCode = stream.rstCode
+--- /dev/null
++++ b/test/fixtures/tls-renegotiation/ca.pem
+@@ -0,0 +1,21 @@
++-----BEGIN CERTIFICATE-----
++MIIDfTCCAmUCFGyh4yEEw4HfhGlYjPpIP9TBqqq7MA0GCSqGSIb3DQEBCwUAMHox
++CzAJBgNVBAYTAlVTMQswCQYDVQQIDAJDQTELMAkGA1UEBwwCU0YxDzANBgNVBAoM
++BkpveWVudDEQMA4GA1UECwwHTm9kZS5qczEMMAoGA1UEAwwDY2EyMSAwHgYJKoZI
++hvcNAQkBFhFyeUB0aW55Y2xvdWRzLm9yZzAgFw0yNDA4MjcyMjU4NDRaGA8yMjk4
++MDYxMTIyNTg0NFowejELMAkGA1UEBhMCVVMxCzAJBgNVBAgMAkNBMQswCQYDVQQH
++DAJTRjEPMA0GA1UECgwGSm95ZW50MRAwDgYDVQQLDAdOb2RlLmpzMQwwCgYDVQQD
++DANjYTIxIDAeBgkqhkiG9w0BCQEWEXJ5QHRpbnljbG91ZHMub3JnMIIBIjANBgkq
++hkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoq6k9bq0BgvZDesrfPPzYyA2PbxTA3hI
++ziKAmglvuF1lbHVdG/7jOZV7JQpdViCRpcoO6uz1BmGnvd3UDS6Q/y/mkjE96E/y
++O3h8gcn+CBzniKIYhB9QtrrVHDy5e/tOJGhGifLtver3iLf5kgiJPy4cGAD663oT
++Vlzvo4U6E2j3vJw4l18pi9gpL7shU8QJka0/0F8BbhoaQK1ZqvD4p9bOMRDztfhZ
++Gb5qJ+664bx80dck9a5UoLCid8tQIlOCnr9IrAwTPNpnk/xCC7nsbE0+CkMsI3+U
++g+3gO0zApWy6DzSawYh6VVijFe6Q0N12duspxdpgt7Kk+8ejrAAOjwIDAQABMA0G
++CSqGSIb3DQEBCwUAA4IBAQCSsx31ivZnnpAJqsF8yncin8kAvgy8YG1itguKO9sG
++KQ5AIWpSRjhZjJ0JRMj2hxhoob2vZ68QbP8iEufByBJ7G1CkyHvBODaMSdydXWga
++wBSKFpsiPt+Gj6rzb5yn0MuH577tWzVLi4C1KW8sFx9rtjDUHTqwf3i7/iuTA5Yo
++yruWRmIXqFoIs3lnKC1f8CYmcZMT2hox8imQI8hIMjalB30WGrDudoqd67rDGWn7
++IKC12pRdgaADILx0vhdniieUwTq85r/6BaKFCJsZIaRd3aAoo3bl4qBA5Bt0uoCB
++x6pEPQeypvU8qBmKKD+XQdY0Pf9Vh9Wq6g/iiw79IsY0
++-----END CERTIFICATE-----
+--- /dev/null
++++ b/test/fixtures/tls-renegotiation/matching-cert.pem
+@@ -0,0 +1,20 @@
++-----BEGIN CERTIFICATE-----
++MIIDVTCCAj2gAwIBAgICIykwDQYJKoZIhvcNAQELBQAwejELMAkGA1UEBhMCVVMx
++CzAJBgNVBAgMAkNBMQswCQYDVQQHDAJTRjEPMA0GA1UECgwGSm95ZW50MRAwDgYD
++VQQLDAdOb2RlLmpzMQwwCgYDVQQDDANjYTIxIDAeBgkqhkiG9w0BCQEWEXJ5QHRp
++bnljbG91ZHMub3JnMB4XDTI2MDkwNjA5NTQyNloXDTM2MDkwMzA5NTQyNlowFDES
++MBAGA1UEAwwJbG9jYWxob3N0MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKC
++AQEAzB0VfVEOH9YbUzJ6AGDY+pyYxJ3fAqY7pDFJikR2/aiuEEnyil+x28wO+Trp
++R+oGAwivImEdZ/WLOeYALZpPiENjIq6oW43sQPMc5Yfu1rkTn45dH9S+Bi+yrmm0
++0oBRRtncyg6dCW4Rs2clLTCopJBa7VqmeKHx9SKqtNCMj92Wec30DVpDAPYkw/L8
++ZgPpuPHemwVwGOs+JKb9a5nGlwWD+v1w1bebKUQwzDZNR7ZbBrP3YZ9foBsX8Q0B
++L0NlLDPtTNXBofPC/r1NdOWyR28C8YDiPoUK+lu5MU1zTdhgZR+eE7tamJpL2Wmm
++PtQwBQ4jQosAihhlg4Jhqtl43QIDAQABo0swSTAMBgNVHRMBAf8EAjAAMA4GA1Ud
++DwEB/wQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcDATAUBgNVHREEDTALgglsb2Nh
++bGhvc3QwDQYJKoZIhvcNAQELBQADggEBAAcFtVPnVyxthSRl+Jb0Ay+CJcSG4PEi
++f6SIBdLfIzvwegtNvTRE9KybKkJBqUkq7D6ia0apLsNFXL9TskE9u3K70A4FLfoo
++5tBQELZQ1yV+YSlW6J0Zq1sqMbHu0UqyDVV8y/pN2MGhsr+cxFVqwWE6TMl2ewHK
++kIUonS5mLSFt/coH62biMTB0f8KuKIo2JDzuN/L/sWHrsf3WMzxtc3ePDuUXBABr
++2UaMII/wyQKSW3BJ2alracpsffo6Za0HvhSy5RjjrkV6e2/JezqC2TLkXPczSt64
++4rFHshRBjpi8ceOiFygELxs8EL9D/1Fhsydv4aOErh3+0nGe2iaDlT8=
++-----END CERTIFICATE-----
+--- /dev/null
++++ b/test/fixtures/tls-renegotiation/matching-key.pem
+@@ -0,0 +1,27 @@
++-----BEGIN RSA PRIVATE KEY-----
++MIIEogIBAAKCAQEAzB0VfVEOH9YbUzJ6AGDY+pyYxJ3fAqY7pDFJikR2/aiuEEny
++il+x28wO+TrpR+oGAwivImEdZ/WLOeYALZpPiENjIq6oW43sQPMc5Yfu1rkTn45d
++H9S+Bi+yrmm00oBRRtncyg6dCW4Rs2clLTCopJBa7VqmeKHx9SKqtNCMj92Wec30
++DVpDAPYkw/L8ZgPpuPHemwVwGOs+JKb9a5nGlwWD+v1w1bebKUQwzDZNR7ZbBrP3
++YZ9foBsX8Q0BL0NlLDPtTNXBofPC/r1NdOWyR28C8YDiPoUK+lu5MU1zTdhgZR+e
++E7tamJpL2WmmPtQwBQ4jQosAihhlg4Jhqtl43QIDAQABAoIBAF+KLYje69GTEm86
++7UhIDMghjJBbpQtEbB5Kw7VonpnU3sTZGCIU8NeFCG04WgFDVVUON4vMEUub73NG
++aUbvN9L8V+bgAgX4xGESarA1lGIFd13z8Tr5BYk3wldJO05cqa6UQ3iAppjHYJms
++6gXhBM8ikq0PBWTpyKuJcoX4KBMeO1IQ7DIVqNnttwDG0thiPdEwCH31L9m/wKm7
++upt9vF0hKmmK+QfMyXwyl0XuilB60+VMsomqFy/yvWyLt5MqLYnsDR9zRfPJPgzm
++OcH6VZ/ce70r1eCxcrGp2/JasUDAFhR8VN+w1nyPzT6dZjJsbO1xCpjOCM+Mkfxh
++copO7TECgYEA52TA3Tl0Z+UN6SxfL6wYn6zCV/1eK7VCN59dtssGUa4he2sY2QVb
++im6Kfu49V9/+loiR+8k2ZfLY5B0K2Jq5/jfpkOHHVPDmLeE64XUW0asxpXwRA+L5
++Eh5rjJDk9TiKdFVoqVQwUK6fGhL3vjMjIGD9QCdBk/3JzalkBHgNt9cCgYEA4dGv
++mmQfUFBLTNzcgcrNBw5wq/xxG5s+QJ/0WfYhBv6+HcUXRwqx2BtUa7qbUov10eku
++Xlm3C/PghIy67BHNMYKdSamCWHhyAtI7kJ3d+A8WLc9ejTyswevSr3INmVOuvLje
++xLZqcMhyjOKyW9AeJ/XMyg4pqkGwSXcU3APzLmsCgYB9dgWUbWiORIWMXgCmSnt3
++aCZfqwL6U+c5XXFkgSRF+VIyJtlsIhmGL3VsaSRdlxfk6tusV2blVA0BcjXFR+98
++xTgg1CpOBefoDGzufZwHxvi+L0zSfKhriI7rwkxCIYwAk6aR2RHxTRz6+DnXqMZs
++8emedSp7YWmf1y5hte5KNQKBgEPRV22EmCrkkli5E7gfEcgGvCvKmqVx0BZUc2v5
++ER4qryn9oOoC+jouqwHXfwIhamfqIbTQOLrsOQdVxGVVS0yNL3OJ5s1vDr5uKNlb
++r+fpj/2eA4VjLXbnvdRW6mKb0SR4WN628eyBJnXNN0d/jy7tEN21tymcpLbLfoY8
++4XGVAoGAQ1rJDHnB7L3k59QwvANJkcTmLRPeHs3Gyb2Nlt4JJURg9R0+wvsK6P21
++mIpv4h5EJ7D4zWFrDqu/1tR0v6jridSRgLkD4yqVsGeODG5ARdwMlLeYgO/eyDMW
++TrqYyBhz+eiC8oB27m9VnSimyWjpK+qfC6OaoODussiSyVXeyHs=
++-----END RSA PRIVATE KEY-----
+--- /dev/null
++++ b/test/fixtures/tls-renegotiation/wrong-cert.pem
+@@ -0,0 +1,21 @@
++-----BEGIN CERTIFICATE-----
++MIIDXTCCAkWgAwIBAgICIyowDQYJKoZIhvcNAQELBQAwejELMAkGA1UEBhMCVVMx
++CzAJBgNVBAgMAkNBMQswCQYDVQQHDAJTRjEPMA0GA1UECgwGSm95ZW50MRAwDgYD
++VQQLDAdOb2RlLmpzMQwwCgYDVQQDDANjYTIxIDAeBgkqhkiG9w0BCQEWEXJ5QHRp
++bnljbG91ZHMub3JnMB4XDTI2MDkwNjA5NTYwM1oXDTM2MDkwMzA5NTYwM1owGDEW
++MBQGA1UEAwwNd3JvbmcuZXhhbXBsZTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCC
++AQoCggEBAPZaF/m0KtqNUofqdr35zbw7P5bwnsbiilgrLfy2Wcj4XessLlKLNJcb
++NADeweHGOeAKtDlBH6F+6DwcUt6yLk3VMFnLMM/SYNj51BAL3pCbRUu/L++zkQKp
++3oBMnkM6SdYvjGGfxG566eptj7ddVK70KZElaH83q62W8UgQSEZtqYmp3LWj7qJy
++97clddZGW94uWA/bNCfoNwOdT31Ajgdrpj58w4HgAJfexcPxPtG0LtAuexI/OgMR
++H0hJ24/ZfmSpAzLl0E2SlZaGPhHP+sI9ptPwARLFjfYeqkNKW+KAdecxQaYAnkc1
++rkXy9ra/epxsGI0IjN3QMxJL0pgxd08CAwEAAaNPME0wDAYDVR0TAQH/BAIwADAO
++BgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwGAYDVR0RBBEwD4IN
++d3JvbmcuZXhhbXBsZTANBgkqhkiG9w0BAQsFAAOCAQEAbXw6xVEvtG2jx0wf1Lto
++eMUBoKcsNOQgK/LcxHXppo0xfk+MLSTUeXQ95fF3L+FKtAIK1IWNjARQAI3H9q1p
++f4W+WLCB17ly6n7210V7AJnH6d960PorRTLlxu6P8tZ1UNvvjT2br102DlmgEgH2
++Bf6NycnM/yKmIWnxHcQ3prqQ2816p64HfsgTmucsK+PgZw5h5V0x4UOE+p8qf5fi
++JelO54iEtNWPZiRqhoiIGkejG9Yab2r1QQ8bu7/itxUox2Yzo6+UlKjTY0gr/bsK
++DExzcooWkDuZ2BqstWj3PW2K665rMpoBh0q7bznYgOglybetYtL3sOZn6SBC9/JU
++Xg==
++-----END CERTIFICATE-----
+--- /dev/null
++++ b/test/fixtures/tls-renegotiation/wrong-key.pem
+@@ -0,0 +1,27 @@
++-----BEGIN RSA PRIVATE KEY-----
++MIIEpAIBAAKCAQEA9loX+bQq2o1Sh+p2vfnNvDs/lvCexuKKWCst/LZZyPhd6ywu
++Uos0lxs0AN7B4cY54Aq0OUEfoX7oPBxS3rIuTdUwWcswz9Jg2PnUEAvekJtFS78v
++77ORAqnegEyeQzpJ1i+MYZ/Ebnrp6m2Pt11UrvQpkSVofzerrZbxSBBIRm2pianc
++taPuonL3tyV11kZb3i5YD9s0J+g3A51PfUCOB2umPnzDgeAAl97Fw/E+0bQu0C57
++Ej86AxEfSEnbj9l+ZKkDMuXQTZKVloY+Ec/6wj2m0/ABEsWN9h6qQ0pb4oB15zFB
++pgCeRzWuRfL2tr96nGwYjQiM3dAzEkvSmDF3TwIDAQABAoIBAE05cMqV79kS9Awn
++M5HZ/ORErmpig2NVIIkDACd4Ai09rjNKZjr56EJ2BJdBPQXJXdsdf+FyyLeXULWH
++K3Mj59/+NGnxiBudlz5tEkz1a49pHQ/hnuVFJO/w0A7n9bSdUQgTX646pxj67tjN
++/387gpBVebJGR7uZd/eymXA9qmpo2IiQtc8xgAq0nLDp2bWIaJteNHJ4J3gQIlNB
++U4nbCFMfVL9rs94NOldZC7uv1kHdY1Uao1j0Z+w6Duf69HBAyZ/pQbN68aL57lQY
++oG3okYzgC91luOElA4dwtBvZL+C8rmdYAKUz2nboeXW8bzbc6oPyLUpBthsTt5eb
++evInbAECgYEA/XAJNLtQDcLhZgvPy92iuE0lceXHEu2Xk2pQaW9WiWHJfG3wrr29
++vHOy8C5hZ7nYDmaJe33yHJI/2xfKM9K7iKMBmQR6WziXE2pIzB3BIMW6Ef/uaUDo
++OofYJIFYBJ9yIg6DCLb5gya/oeAOQ6+S5sreQf9ZbLvjnr2FGMtRchcCgYEA+Ne3
++zdxUfG9C7B4YH5yALErE6fGygrhtBUBVMBVPEzl5yocrvbdcLiceoxU35AgQTHGl
++F6i9jXuPIkUcaP6lnNNc0+RLGDK+rqiQh2eVoxcC39NjaK5m1ncx176XR2My0v+t
++uV4GUAbnfUSGIgo2h3JLCAsayNhuVy5CG7lOf4kCgYEA3SS/w7WWuwtL5uFzpq50
++6GDYxbP8q7WKR+XC2N2AI0yipeLA25lRUHmcsBuofvwZXSd327wgYXH0Kldt5x6A
++6U9je4P+yE5u9VAOyZ1FAjXGkSJDhLBQc5JJtkDu7sm6q6ECEb6nphtPqA58I++2
++PZDTs77+5vRkQAWbd/Eh1m0CgYA70FZtFD32nyPd76nqx0qD2wEUHrXC+CO0dG9F
++nImiXFlrFiyscIumyF5z4uDJXirUxShi1Hujq4SPPz+B+VvDo4aXpDNswJ3XC8uZ
++0ItGZXyaYoxtmCY9/O6tJjHkxfJsh2qxuOkZiV9RXAxF2GCdFBr29vxcNLHpIMRh
++N5ynyQKBgQCmpJWN+449X6nqJbDsSTx503gtgK0SOIEqifUL5jXanoWWT7xXYaEO
++CWSiL8QWWr8QjcsHKpAUHmBKVwvwOHr81nxl7q2PdPLI+7VQwgVXNosu6cM52Op5
++LkvUDKaKPP55ek6vMNxepY5TggKmOI2mfqPvGgXqzZFctamS9gJPIw==
++-----END RSA PRIVATE KEY-----
+--- /dev/null
++++ b/test/tls-renegotiation.js
+@@ -0,0 +1,96 @@
++'use strict'
++
++const assert = require('node:assert/strict')
++const { constants } = require('node:crypto')
++const { once } = require('node:events')
++const { readFileSync } = require('node:fs')
++const { join } = require('node:path')
++const { createServer, TLSSocket } = require('node:tls')
++const { test } = require('node:test')
++
++const { Client } = require('..')
++
++const fixtures = join(__dirname, 'fixtures', 'tls-renegotiation')
++const matching = {
++  key: readFileSync(join(fixtures, 'matching-key.pem')),
++  cert: readFileSync(join(fixtures, 'matching-cert.pem'))
++}
++const wrongHost = {
++  key: readFileSync(join(fixtures, 'wrong-key.pem')),
++  cert: readFileSync(join(fixtures, 'wrong-cert.pem'))
++}
++const ca = readFileSync(join(fixtures, 'ca.pem'))
++
++// @see https://github.com/nodejs/undici/security/advisories/GHSA-qrxm-fqhp-jwvm
++for (const protocol of ['http/1.1', 'h2']) {
++  test(`TLS certificate errors after ${protocol} connection establishment reject the request`, {
++    skip: typeof TLSSocket.prototype.setKeyCert !== 'function' && 'TLSSocket.prototype.setKeyCert is not available'
++  }, async (t) => {
++    let startRenegotiation
++    const renegotiationStarted = new Promise((resolve) => {
++      startRenegotiation = resolve
++    })
++    const sockets = new Set()
++    const server = createServer({
++      ...matching,
++      minVersion: 'TLSv1.2',
++      maxVersion: 'TLSv1.2',
++      secureOptions: constants.SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION,
++      ALPNProtocols: [protocol]
++    }, (socket) => {
++      sockets.add(socket)
++      socket.on('close', () => sockets.delete(socket))
++      socket.on('error', () => {})
++      socket.once('data', () => {
++        setTimeout(() => {
++          socket.setKeyCert(wrongHost)
++          startRenegotiation(socket.renegotiate({
++            requestCert: false,
++            rejectUnauthorized: false
++          }, () => {}))
++        }, 50)
++      })
++    })
++
++    server.listen(0, '127.0.0.1')
++    await once(server, 'listening')
++
++    const client = new Client(`https://localhost:${server.address().port}`, {
++      allowH2: protocol === 'h2',
++      connect: {
++        ca,
++        minVersion: 'TLSv1.2',
++        maxVersion: 'TLSv1.2',
++        lookup (hostname, options, callback) {
++          if (options.all === true) {
++            callback(null, [{ address: '127.0.0.1', family: 4 }])
++          } else {
++            callback(null, '127.0.0.1', 4)
++          }
++        }
++      }
++    })
++
++    t.after(async () => {
++      await client.destroy()
++      for (const socket of sockets) {
++        socket.destroy()
++      }
++      await new Promise((resolve) => server.close(resolve))
++    })
++
++    const rejected = assert.rejects(
++      client.request({ path: '/', method: 'GET' }),
++      { code: 'ERR_TLS_CERT_ALTNAME_INVALID' }
++    )
++
++    assert.equal(await renegotiationStarted, true)
++    await rejected
++
++    // The errored connection must not be reused to serve a later request.
++    await assert.rejects(
++      client.request({ path: '/', method: 'GET' }),
++      { code: 'ERR_TLS_CERT_ALTNAME_INVALID' }
++    )
++  })
++}
+
 --- a/lib/web/fetch/index.js
 +++ b/lib/web/fetch/index.js
 @@ -2280,8 +2280,6 @@ async function httpNetworkFetch (
