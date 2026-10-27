@@ -1,7 +1,7 @@
-# php7.4 : 7.4.33-1+deb11u5.aikido.1
+# php7.4 : 7.4.33-1+deb11u12.aikido.2
 
-This patch is based on php7.4 version 7.4.33-1+deb11u5.aikido.1, which is available at:
-https://sources.debian.org/src/php7.4/7.4.33-1+deb11u5/
+This patch is based on php7.4 version 7.4.33-1+deb11u12.aikido.2, which is available at:
+https://sources.debian.org/src/php7.4/7.4.33-1+deb11u12/
 
 ## Affected CVEs:
 - CVE-2026-109618
