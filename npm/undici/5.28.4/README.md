@@ -9,6 +9,8 @@ unknown
 - CVE-2026-2229
 - AIKIDO-2026-393834
 - AIKIDO-2026-846025
+- CVE-2026-109383
+- CVE-2026-87018
 
 ## How to Apply:
 1. Clone or download the source code for undici
