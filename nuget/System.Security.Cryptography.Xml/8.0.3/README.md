@@ -9,6 +9,10 @@ unknown
 - CVE-2026-47304
 - CVE-2026-50525
 - CVE-2026-50527
+- CVE-2026-96222
+- CVE-2026-96960
+- CVE-2026-96959
+- CVE-2026-96958
 
 ## How to Apply:
 1. Clone or download the source code for System.Security.Cryptography.Xml
