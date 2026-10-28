@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-104852
+- CVE-2026-114604
 
 ## How to Apply:
 1. Clone or download the source code for @graphql-tools/utils
