@@ -22,6 +22,7 @@ unknown
 - CVE-2026-56854
 - CVE-2026-56855
 - CVE-2026-78662
+- CVE-2026-39828
 
 ## How to Apply:
 1. Clone or download the source code for golang.org/x/crypto
