@@ -769,3 +769,362 @@ index ca1fb01..6e08c39 100644
      }
  
      /* Execute a hook if present */
+
+--- a/src/purify.ts
++++ b/src/purify.ts
+@@ -25,12 +25,19 @@
+   lookupGetter,
+   create,
+   objectHasOwnProperty,
++  unapply,
+ } from './utils.js';
+ 
+ export type { Config } from './config';
+ 
+ declare const VERSION: string;
+ 
++/* Cached Set accessors, so page-level tampering with Set.prototype cannot
++ * steer the IN_PLACE bookkeeping below. */
++const setCreate = (): Set<unknown> => new Set();
++const setAdd = unapply(Set.prototype.add);
++const setHas = unapply(Set.prototype.has);
++
+ // https://developer.mozilla.org/en-US/docs/Web/API/Node/nodeType
+ const NODE_TYPE = {
+   element: 1,
+@@ -156,6 +163,10 @@
+ 
+   const cloneNode = lookupGetter(ElementPrototype, 'cloneNode');
+   const remove = lookupGetter(ElementPrototype, 'remove');
++  const removeAttributeNode = lookupGetter(
++    ElementPrototype,
++    'removeAttributeNode'
++  );
+   const getNextSibling = lookupGetter(ElementPrototype, 'nextSibling');
+   const getChildNodes = lookupGetter(ElementPrototype, 'childNodes');
+   const getParentNode = lookupGetter(ElementPrototype, 'parentNode');
+@@ -1558,12 +1569,155 @@
+     }
+   };
+ 
++  /**
++   * Reads a node's type through the cached getter, so an own property on the
++   * node cannot steer the walk.
++   *
++   * @param node a DOM node
++   */
++  const _readNodeType = function (node: Node): number {
++    return getNodeType ? getNodeType(node) : (node as any).nodeType;
++  };
++
++  /**
++   * Removes every attribute the configuration does not allow from an element
++   * that was discarded from an IN_PLACE tree. The exact Attr node is removed,
++   * as name-based removal lowercases the name for HTML elements and would
++   * miss case-preserved names from imported XHTML.
++   *
++   * @param element the element to strip
++   */
++  const _stripDisallowedAttributes = function (element: Element): void {
++    const attributes = getAttributes(element);
++    if (!attributes) {
++      return;
++    }
++
++    for (let i = attributes.length - 1; i >= 0; --i) {
++      const attribute = attributes[i];
++      const name = attribute && attribute.name;
++      if (typeof name !== 'string' || ALLOWED_ATTR[transformCaseFunc(name)]) {
++        continue;
++      }
++
++      try {
++        removeAttributeNode(element, attribute);
++      } catch (_) {
++        try {
++          element.removeAttribute(name);
++        } catch (_) {}
++      }
++    }
++  };
++
++  /**
++   * Iterative depth-first walk over `root` and everything below it, reading
++   * through the cached getters so clobbering cannot hide children. With
++   * `intoShadow`, open shadow roots are walked as well. Template content is
++   * inert and never entered.
++   *
++   * @param root where to start
++   * @param visit called for every node
++   * @param intoShadow whether to enter open shadow roots
++   */
++  const _walkTree = function (
++    root: Node,
++    visit: (node: Node) => void,
++    intoShadow = false
++  ): void {
++    const stack: Node[] = [root];
++
++    while (stack.length > 0) {
++      const node = arrayPop(stack);
++      visit(node);
++
++      if (intoShadow && _readNodeType(node) === NODE_TYPE.element) {
++        const shadowRoot = getShadowRoot(node);
++        if (_isDocumentFragment(shadowRoot)) {
++          arrayPush(stack, shadowRoot);
++        }
++      }
++
++      const childNodes = getChildNodes(node);
++      if (childNodes) {
++        for (let i = childNodes.length - 1; i >= 0; --i) {
++          arrayPush(stack, childNodes[i]);
++        }
++      }
++    }
++  };
++
++  /**
++   * Strips disallowed attributes from every element of a discarded subtree,
++   * so a handler that is already queued (a loading image) cannot fire.
++   *
++   * @param root the root of a removed subtree
++   */
++  const _neutralizeSubtree = function (root: Node): void {
++    _walkTree(root, (node) => {
++      if (_readNodeType(node) === NODE_TYPE.element) {
++        _stripDisallowedAttributes(node as Element);
++      }
++    });
++  };
++
++  /**
++   * All nodes under `root`, root first, including open shadow roots.
++   *
++   * @param root the in-place root
++   * @return the nodes
++   */
++  const _collectLiveNodes = function (root: Node): Node[] {
++    const nodes: Node[] = [];
++    _walkTree(
++      root,
++      (node) => {
++        arrayPush(nodes, node);
++      },
++      true
++    );
++    return nodes;
++  };
++
++  /**
++   * Neutralizes everything that left the in-place tree during the call: what
++   * DOMPurify removed, and what hooks or custom elements detached (a parent,
++   * an ancestor or a sibling the walk had not reached yet), whatever removed
++   * or moved it. Without this, a handler such as onerror on a detached
++   * subtree stays armed after sanitize() returns.
++   *
++   * @param root the in-place root
++   * @param before the root's nodes, collected before any hook could run
++   */
++  const _neutralizeDiscarded = function (root: Node, before: Node[]): void {
++    arrayForEach(DOMPurify.removed, (entry) => {
++      if (entry.element) {
++        _neutralizeSubtree(entry.element as Node);
++      }
++    });
++
++    const reachable = setCreate();
++    arrayForEach(_collectLiveNodes(root), (node: Node) => {
++      setAdd(reachable, node);
++    });
++    arrayForEach(before, (node: Node) => {
++      if (
++        _readNodeType(node) === NODE_TYPE.element &&
++        !setHas(reachable, node)
++      ) {
++        _stripDisallowedAttributes(node as Element);
++      }
++    });
++  };
++
+   // eslint-disable-next-line complexity
+   DOMPurify.sanitize = function (dirty, cfg = {}) {
+     let body = null;
+     let importedNode = null;
+     let currentNode = null;
+     let returnNode = null;
++    /* IN_PLACE: the caller's nodes before any hook can run */
++    let inPlaceNodes: Node[] = [];
+     /* Make sure we have a string to sanitize.
+       DO NOT return early, as this will return the wrong type if
+       the user has requested a DOM object rather than a string */
+@@ -1650,8 +1804,17 @@
+         );
+       }
+ 
++      /* Remember every node that is part of the tree now, so whatever a hook
++         detaches during the call can be neutralized afterwards. */
++      inPlaceNodes = _collectLiveNodes(dirty as Node);
++
+       /* Sanitize attached shadow roots before the main iterator runs. */
+-      _sanitizeAttachedShadowRoots(dirty as Node);
++      try {
++        _sanitizeAttachedShadowRoots(dirty as Node);
++      } catch (error) {
++        _neutralizeDiscarded(dirty as Node, inPlaceNodes);
++        throw error;
++      }
+     } else if (_isNode(dirty)) {
+       /* If dirty is a DOM element, append to an empty document to avoid
+          elements being stripped by the parser */
+@@ -1703,22 +1866,35 @@
+     /* Get node iterator */
+     const nodeIterator = _createNodeIterator(IN_PLACE ? dirty : body);
+ 
+-    /* Now start iterating over the created document */
+-    while ((currentNode = nodeIterator.nextNode())) {
+-      /* Sanitize tags and elements */
+-      _sanitizeElements(currentNode);
++    /* Now start iterating over the created document. If anything throws on
++       the IN_PLACE path, what hooks already detached is neutralized before
++       the error propagates. */
++    try {
++      while ((currentNode = nodeIterator.nextNode())) {
++        /* Sanitize tags and elements */
++        _sanitizeElements(currentNode);
+ 
+-      /* Check attributes next */
+-      _sanitizeAttributes(currentNode);
++        /* Check attributes next */
++        _sanitizeAttributes(currentNode);
+ 
+-      /* Shadow DOM detected, sanitize it */
+-      if (_isDocumentFragment(currentNode.content)) {
+-        _sanitizeShadowDOM(currentNode.content);
++        /* Shadow DOM detected, sanitize it */
++        if (_isDocumentFragment(currentNode.content)) {
++          _sanitizeShadowDOM(currentNode.content);
++        }
+       }
++    } catch (error) {
++      if (IN_PLACE) {
++        _neutralizeDiscarded(dirty as Node, inPlaceNodes);
++      }
++
++      throw error;
+     }
+ 
+-    /* If we sanitized `dirty` in-place, return it. */
++    /* If we sanitized `dirty` in-place, return it. A hook may have removed
++       a parent, an ancestor or a later sibling of the node being visited; that
++       subtree is never walked, so strip its disallowed attributes here. */
+     if (IN_PLACE) {
++      _neutralizeDiscarded(dirty as Node, inPlaceNodes);
+       return dirty;
+     }
+ 
+--- /dev/null
++++ b/test/ghsa-mrv2-3pqr-j5jr.test.js
+@@ -0,0 +1,101 @@
++/* jshint node: true, esnext: true */
++'use strict';
++
++const assert = require('node:assert');
++const { JSDOM } = require('jsdom');
++const createDOMPurify = require('../dist/purify.cjs');
++
++const { window } = new JSDOM('');
++const DOMPurify = createDOMPurify(window);
++
++let failures = 0;
++function check(name, fn) {
++  try {
++    fn();
++    console.log('ok - ' + name);
++  } catch (err) {
++    failures++;
++    console.log('not ok - ' + name);
++    console.log(String(err && err.stack ? err.stack : err));
++  }
++}
++
++function build(html) {
++  const root = window.document.createElement('div');
++  root.innerHTML = html;
++  return root;
++}
++
++check('IN_PLACE: hook removing a parent leaves no armed handler (GHSA-mrv2-3pqr-j5jr)', function () {
++  const root = build(
++    '<div id="p"><i id="first"></i><img id="victim" src="x" onerror="alert(1)"></div>'
++  );
++  const victim = root.querySelector('#victim');
++  DOMPurify.addHook('beforeSanitizeElements', function (node) {
++    if (node.id === 'first') {
++      node.parentNode.remove();
++    }
++  });
++  try {
++    DOMPurify.sanitize(root, { IN_PLACE: true });
++  } finally {
++    DOMPurify.removeHook('beforeSanitizeElements');
++  }
++  assert.ok(!victim.isConnected || !root.contains(victim), 'victim detached');
++  assert.strictEqual(
++    victim.getAttribute('onerror'),
++    null,
++    'onerror must be stripped from the subtree a hook detached'
++  );
++});
++
++check('IN_PLACE: hook removing an unvisited later sibling leaves no armed handler', function () {
++  const root = build(
++    '<p id="a"></p><div id="later"><img id="victim" src="x" onerror="alert(1)"></div>'
++  );
++  const victim = root.querySelector('#victim');
++  DOMPurify.addHook('uponSanitizeElement', function (node) {
++    if (node.id === 'a') {
++      root.querySelector('#later').remove();
++    }
++  });
++  try {
++    DOMPurify.sanitize(root, { IN_PLACE: true });
++  } finally {
++    DOMPurify.removeHook('uponSanitizeElement');
++  }
++  assert.strictEqual(victim.getAttribute('onerror'), null);
++});
++
++check('IN_PLACE: a throwing hook still neutralizes what it detached', function () {
++  const root = build(
++    '<p id="a"></p><div id="later"><img id="victim" src="x" onerror="alert(1)"></div>'
++  );
++  const victim = root.querySelector('#victim');
++  DOMPurify.addHook('beforeSanitizeElements', function (node) {
++    if (node.id === 'a') {
++      root.querySelector('#later').remove();
++      throw new Error('hook failure');
++    }
++  });
++  try {
++    assert.throws(function () {
++      DOMPurify.sanitize(root, { IN_PLACE: true });
++    }, /hook failure/);
++  } finally {
++    DOMPurify.removeHook('beforeSanitizeElements');
++  }
++  assert.strictEqual(victim.getAttribute('onerror'), null);
++});
++
++check('IN_PLACE: ordinary sanitization is unchanged', function () {
++  const root = build('<b onclick="x()">ok</b><img src="x" onerror="x()">');
++  DOMPurify.sanitize(root, { IN_PLACE: true });
++  assert.strictEqual(root.innerHTML, '<b>ok</b><img src="x">');
++});
++
++if (failures > 0) {
++  console.error('\n' + failures + ' GHSA-mrv2-3pqr-j5jr regression check(s) failed');
++  process.exit(1);
++}
++console.log('\nAll GHSA-mrv2-3pqr-j5jr regression checks passed');
