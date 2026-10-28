@@ -1,3 +1,250 @@
+--- /dev/null
++++ b/docs/changelog/3417.bugfix.rst
+@@ -0,0 +1,5 @@
++Preserve spaces, quotes, and backslashes in interpreter paths when pip console scripts need a POSIX shell launcher.
++Paths containing tabs also use the shell launcher so the kernel does not split the interpreter name.
++
++Apply the same launcher quoting after pip seeding and refresh the installed file records. Later independent pip installs
++or upgrades can overwrite these launchers; recreate affected environments after upgrading virtualenv.
+--- a/src/virtualenv/seed/embed/pip_invoke.py
++++ b/src/virtualenv/seed/embed/pip_invoke.py
+@@ -1,17 +1,25 @@
+ from __future__ import annotations
+ 
++import csv
++import hashlib
++import io
+ import logging
++import os
++from base64 import urlsafe_b64encode
+ from contextlib import contextmanager
++from importlib.metadata import distributions
++from pathlib import Path
++from stat import S_IMODE
+ from subprocess import Popen
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Final
+ 
+ from virtualenv.seed.embed.base_embed import BaseEmbed
++from virtualenv.seed.embed.via_app_data.pip_install.base import shell_shebang
+ from virtualenv.seed.wheels import Version, get_wheel, pip_wheel_env_run
+ from virtualenv.util.subprocess import LogCmd
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Generator
+-    from pathlib import Path
+ 
+     from virtualenv.config.cli.parser import VirtualEnvOptions
+     from virtualenv.create.creator import Creator
+@@ -30,6 +38,42 @@
+         with self.get_pip_install_cmd(creator.exe, for_py_version) as cmd:
+             env = pip_wheel_env_run(self.extra_search_dir, self.app_data, self.env)
+             self._execute(cmd, env)
++        if os.name == "posix":
++            self._rewrite_launchers(creator)
++
++    def _rewrite_launchers(self, creator: Creator) -> None:
++        selected: Final = self.distribution_to_versions()
++        exe: Final = str(creator.exe).encode("utf-8")
++        for distribution in distributions(path=sorted({str(creator.purelib), str(creator.platlib)})):
++            if distribution.metadata["Name"].lower().replace("-", "_") not in selected:
++                continue
++            rows: Final = list(csv.reader(io.StringIO(distribution.read_text("RECORD") or "")))
++            changed = False
++            for row in rows:
++                path: Final = Path(os.path.abspath(str(distribution.locate_file(row[0]))))
++                if path.parent != creator.script_dir or not path.is_file():
++                    continue
++                content = path.read_bytes()
++                if content.startswith(b"#!/bin/sh\n'''exec' "):
++                    body = content.split(b"\n", 3)[3]
++                elif content.startswith(b"#!" + exe + b"\n") and len(exe.split()) > 1:
++                    body = content.split(b"\n", 1)[1]
++                else:
++                    continue
++                content = shell_shebang(str(creator.exe)) + body
++                mode: Final = S_IMODE(path.stat().st_mode) & 0o755
++                path.unlink()
++                with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "wb") as stream:
++                    stream.write(content)
++                row[1:] = [
++                    "sha256=" + urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode("ascii"),
++                    str(len(content)),
++                ]
++                changed = True
++            if changed:
++                record: Final = next(row[0] for row in rows if row[0].endswith(".dist-info/RECORD"))
++                with Path(str(distribution.locate_file(record))).open("w", encoding="utf-8", newline="") as stream:
++                    csv.writer(stream).writerows(rows)
+ 
+     @staticmethod
+     def _execute(cmd: list[str], env: dict[str, str]) -> Popen[bytes]:
+--- a/src/virtualenv/seed/embed/via_app_data/pip_install/base.py
++++ b/src/virtualenv/seed/embed/via_app_data/pip_install/base.py
+@@ -5,13 +5,14 @@
+ import os
+ import posixpath
+ import re
++import shlex
+ import zipfile
+ from abc import ABC, abstractmethod
+ from configparser import ConfigParser
+ from itertools import chain
+ from pathlib import Path
+ from tempfile import mkdtemp
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Final
+ 
+ from distlib.scripts import ScriptMaker, enquote_executable
+ 
+@@ -229,7 +230,14 @@
+         self.version_info = version_info.major, version_info.minor  # ty: ignore[unresolved-attribute]
+         self.variants = {"", "X", "X.Y"}
+         self._name = name
++        self._raw_executable = str(executable)
+ 
++    def _build_shebang(self, executable: bytes, post_interp: bytes) -> bytes:
++        shebang: Final = super()._build_shebang(executable, post_interp)
++        if os.name != "posix" or len(shebang.split()) == 1:
++            return shebang
++        return shell_shebang(self._raw_executable, post_interp)
++
+     def _write_script(
+         self, names: set[str], shebang: bytes, script_bytes: bytes, filenames: list[str], ext: str
+     ) -> None:
+@@ -237,6 +245,13 @@
+         super()._write_script(names, shebang, script_bytes, filenames, ext)
+ 
+ 
++def shell_shebang(executable: str, post_interp: bytes = b"") -> bytes:
++    # The exec line is read by both sh and Python; double-quoted backslashes survive both readers.
++    quoted: Final = shlex.quote(executable).replace("\\", "'\"\\\\\"'")
++    return b"#!/bin/sh\n'''exec' " + quoted.encode("utf-8") + post_interp + b' "$0" "$@"\n' + b"' '''\n"
++
++
+ __all__ = [
+     "PipInstall",
++    "shell_shebang",
+ ]
+--- a/tests/unit/seed/embed/test_bootstrap_link_via_app_data.py
++++ b/tests/unit/seed/embed/test_bootstrap_link_via_app_data.py
+@@ -1,13 +1,16 @@
+ from __future__ import annotations
+ 
+ import contextlib
++import csv
++import hashlib
+ import os
+ import sys
+ import zipfile
++from base64 import urlsafe_b64encode
+ from stat import S_IWGRP, S_IWOTH, S_IWUSR
+-from subprocess import Popen, check_call
++from subprocess import Popen, check_call, run
+ from threading import Thread
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Final
+ 
+ import pytest
+ from python_discovery import PythonInfo
+@@ -25,6 +28,70 @@
+     from pytest_mock import MockerFixture
+ 
+ 
++@pytest.mark.parametrize(
++    "name",
++    [
++        pytest.param("plain", id="plain"),
++        pytest.param("two words", id="space"),
++        pytest.param("owner's env", id="apostrophe"),
++        pytest.param("$(echo a) `echo b`", id="command-substitution"),
++        pytest.param("a" * 120, id="long", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX shebang limit")),
++        pytest.param("env \\path", id="backslash", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX filename")),
++        pytest.param("env\tname", id="tab", marks=pytest.mark.skipif(os.name == "nt", reason="POSIX filename")),
++    ],
++)
++@pytest.mark.parametrize(
++    "via_python",
++    [
++        pytest.param(False, id="launcher"),
++        pytest.param(
++            True, id="python", marks=pytest.mark.skipif(os.name == "nt", reason="Windows launcher is an executable")
++        ),
++    ],
++)
++@pytest.mark.parametrize("seeder", [pytest.param("app-data", id="app-data"), pytest.param("pip", id="pip")])
++def test_console_script_preserves_interpreter_path(
++    tmp_path: Path, current_fastest: str, name: str, via_python: bool, seeder: str
++) -> None:
++    destination: Final = os.path.join(str(tmp_path), name, "env")
++    run(
++        [
++            sys.executable,
++            "-m",
++            "virtualenv",
++            destination,
++            "--seeder",
++            seeder,
++            "--creator",
++            current_fastest,
++            "--activators",
++            "",
++            "--no-periodic-update",
++            "--pip",
++            "embed",
++        ],
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        timeout=60,
++        check=True,
++    )
++    scripts: Final = os.path.join(destination, "Scripts" if os.name == "nt" else "bin")
++    result: Final = run(
++        [
++            *([os.path.join(scripts, "python")] if via_python else []),
++            os.path.join(scripts, "pip.exe" if os.name == "nt" else "pip"),
++            "--version",
++        ],
++        capture_output=True,
++        text=True,
++        encoding="utf-8",
++        timeout=30,
++        check=True,
++    )
++    assert os.path.normcase(destination) in os.path.normcase(result.stdout)
++
++
+ @pytest.mark.slow
+ @pytest.mark.parametrize("copies", [False, True] if fs_supports_symlink() else [True])
+ def test_seed_link_via_app_data(tmp_path, coverage_env, current_fastest, copies) -> None:
+@@ -299,3 +366,25 @@
+ 
+     with zipfile.ZipFile(str(archive)) as zip_ref, pytest.raises(RuntimeError, match="absolute path"):
+         _safe_extract_zip(zip_ref, target)
++
++
++@pytest.mark.skipif(os.name != "posix", reason="POSIX shell launchers")
++@pytest.mark.parametrize(
++    ("name", "via_shell"),
++    [
++        pytest.param("plain", False, id="plain"),
++        pytest.param("two words", True, id="space"),
++        pytest.param("env\tname", True, id="tab"),
++    ],
++)
++def test_pip_launcher_record_matches_contents(tmp_path: Path, name: str, via_shell: bool) -> None:
++    session: Final = cli_run([str(tmp_path / name), "--seeder", "pip", "--pip", "embed", "--no-periodic-update"])
++    record: Final = next(session.creator.purelib.glob("pip-*.dist-info/RECORD"))
++    with record.open(encoding="utf-8", newline="") as stream:
++        row: Final = next(row for row in csv.reader(stream) if row[0].endswith("/bin/pip"))
++    content: Final = (session.creator.script_dir / "pip").read_bytes()
++    assert content.startswith(b"#!/bin/sh\n") is via_shell
++    assert row[1:] == [
++        "sha256=" + urlsafe_b64encode(hashlib.sha256(content).digest()).rstrip(b"=").decode("ascii"),
++        str(len(content)),
++    ]
+
 --- a/src/virtualenv/activation/bash/activate.sh
 +++ b/src/virtualenv/activation/bash/activate.sh
 @@ -131,9 +131,11 @@
@@ -53,3 +300,137 @@
  
  
  @pytest.mark.skipif(IS_WIN or shutil.which("dash") is None, reason="needs dash as a POSIX shell")
+
+--- a/src/virtualenv/activation/bash/activate.sh
++++ b/src/virtualenv/activation/bash/activate.sh
+@@ -128,15 +128,24 @@
+ if [ -z "${VIRTUAL_ENV_DISABLE_PROMPT-}" ] ; then
+     _OLD_VIRTUAL_PS1="${PS1-}"
+     _VIRTUAL_PROMPT="${VIRTUAL_ENV_PROMPT}"
+-    # bash re-expands backslashes, dollar signs and backticks in PS1 on every redraw; the guard keeps the
+-    # bash-only substitution away from POSIX shells such as dash, which reject it with "Bad substitution"
++    # bash, and zsh under PROMPT_SUBST, re-expand backslashes, dollar signs and backticks in PS1 on every redraw;
++    # zsh gets the escaping even without the option, since a user can set it after activation. The guards keep
++    # the substitution away from POSIX shells such as dash, which reject it with "Bad substitution"
+     if [ -n "${BASH_VERSION-}" ]; then
+         # bash first decodes its backslash prompt escapes, turning \\ into \ and \$ into $ (or # for root), and only
+         # then expands the result, so each character needs escaping for both passes
+         _VIRTUAL_PROMPT="${_VIRTUAL_PROMPT//\\/\\\\\\\\}"
+         _VIRTUAL_PROMPT="${_VIRTUAL_PROMPT//\$/\\\\\$}"
+         _VIRTUAL_PROMPT="${_VIRTUAL_PROMPT//\`/\\\\\`}"
++    elif [ -n "${ZSH_VERSION-}" ]; then
++        _VIRTUAL_PROMPT="${_VIRTUAL_PROMPT//\\/\\\\}"
++        _VIRTUAL_PROMPT="${_VIRTUAL_PROMPT//\$/\\\$}"
++        _VIRTUAL_PROMPT="${_VIRTUAL_PROMPT//\`/\\\`}"
+     fi
++    # zsh expands % sequences in PS1 as prompt escapes
++    if [ -n "${ZSH_VERSION-}" ]; then
++        _VIRTUAL_PROMPT="${_VIRTUAL_PROMPT//\%/%%}"
++    fi
+     PS1="(${_VIRTUAL_PROMPT}) ${PS1-}"
+     unset _VIRTUAL_PROMPT
+ fi
+--- a/tests/unit/activation/test_bash.py
++++ b/tests/unit/activation/test_bash.py
+@@ -227,16 +227,21 @@
+     assert result.stdout.splitlines() == ["None", "None"]
+ 
+ 
+-@pytest.fixture
+-def bash_prompt_after_activate(tmp_path: Path, current_fastest: str) -> Callable[[str | None, str], tuple[Path, str]]:
+-    version = subprocess.run(
+-        ["bash", "-c", 'printf "%s" "$((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))"'],
+-        capture_output=True,
+-        text=True,
+-        check=True,
+-    ).stdout
+-    if int(version) < 404:
+-        pytest.skip("${PS1@P} needs bash 4.4 or later")
++@pytest.fixture(params=["bash", "zsh"])
++def prompt_after_activate(
++    request: pytest.FixtureRequest, tmp_path: Path, current_fastest: str
++) -> Callable[[str | None, str], tuple[Path, str]]:
++    if shutil.which(shell := request.param) is None:
++        pytest.skip(f"{shell} is not installed")
++    if shell == "bash":
++        version = subprocess.run(
++            ["bash", "-c", 'printf "%s" "$((BASH_VERSINFO[0] * 100 + BASH_VERSINFO[1]))"'],
++            capture_output=True,
++            text=True,
++            check=True,
++        ).stdout
++        if int(version) < 404:
++            pytest.skip("${PS1@P} needs bash 4.4 or later")
+ 
+     def build(prompt: str | None, env_name: str) -> tuple[Path, str]:
+         dest = tmp_path / env_name
+@@ -252,13 +257,17 @@
+         if prompt is not None:
+             args += ["--prompt", prompt]
+         cli_run(args)
+-        activate = dest / "bin" / "activate"
+         work_dir = tmp_path / "workdir"
+         work_dir.mkdir(exist_ok=True)
+         # the path is passed as $1 so the outer shell cannot expand a payload dir name while locating the script;
+-        # ${PS1@P} then forces bash to render the prompt exactly as it does before each interactive command
++        # ${PS1@P} renders the prompt exactly as bash does before each interactive command, and in zsh (e) applies
++        # what PROMPT_SUBST does at each draw before (%) expands the prompt escapes
++        render = {
++            "bash": ["bash", "--norc", "--noprofile", "-c", 'source "$1"; printf "%s" "${PS1@P}"'],
++            "zsh": ["zsh", "-f", "-c", 'setopt prompt_subst; source "$1"; print -rn -- "${(%)${(e)PS1}}"'],
++        }[shell]
+         result = subprocess.run(
+-            ["bash", "--norc", "--noprofile", "-c", 'source "$1"; printf "%s" "${PS1@P}"', "bash", str(activate)],
++            [*render, shell, str(dest / "bin" / "activate")],
+             capture_output=True,
+             text=True,
+             cwd=str(work_dir),
+@@ -276,30 +285,22 @@
+     [
+         pytest.param("x$(touch PWNED)y", "env", id="prompt-command-substitution"),
+         pytest.param("x`touch PWNED`y", "env", id="prompt-backticks"),
++        pytest.param("x${$(touch PWNED)}y", "env", id="prompt-parameter-expansion"),
+         pytest.param("x\\$(touch PWNED)y", "env", id="prompt-backslash-command-substitution"),
+         pytest.param("x\\`touch PWNED`y", "env", id="prompt-backslash-backticks"),
+         pytest.param(None, "x$(touch PWNED)y", id="dirname-command-substitution"),
+         pytest.param(None, "A__VIRTUAL_NAME__B/x'$(touch PWNED)'y", id="placeholder-in-parent-dir"),
+     ],
+ )
+-def test_bash_prompt_does_not_run_commands(
+-    bash_prompt_after_activate: Callable[[str | None, str], tuple[Path, str]], prompt: str | None, env_name: str
++def test_prompt_does_not_run_commands(
++    prompt_after_activate: Callable[[str | None, str], tuple[Path, str]], prompt: str | None, env_name: str
+ ) -> None:
+-    work_dir, _ = bash_prompt_after_activate(prompt, env_name)
++    work_dir, _ = prompt_after_activate(prompt, env_name)
+ 
+     assert not (work_dir / "PWNED").exists()
+ 
+ 
+ @pytest.mark.skipif(IS_WIN, reason="Github Actions ships with WSL bash")
+-def test_bash_prompt_keeps_plain_name_visible(
+-    bash_prompt_after_activate: Callable[[str | None, str], tuple[Path, str]],
+-) -> None:
+-    _, rendered = bash_prompt_after_activate("myenv", "env")
+-
+-    assert rendered.startswith("(myenv) ")
+-
+-
+-@pytest.mark.skipif(IS_WIN, reason="Github Actions ships with WSL bash")
+ @pytest.mark.parametrize(
+     "prompt",
+     [
+@@ -311,10 +312,10 @@
+         pytest.param("e\\", id="trailing-backslash"),
+     ],
+ )
+-def test_bash_prompt_renders_name_literally(
+-    bash_prompt_after_activate: Callable[[str | None, str], tuple[Path, str]], prompt: str
++def test_prompt_renders_name_literally(
++    prompt_after_activate: Callable[[str | None, str], tuple[Path, str]], prompt: str
+ ) -> None:
+-    _, rendered = bash_prompt_after_activate(prompt, "env")
++    _, rendered = prompt_after_activate(prompt, "env")
+ 
+     assert rendered.startswith(f"({prompt}) ")
+ 
