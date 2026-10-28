@@ -4,6 +4,7 @@ This patch is based on golang.org/x/crypto version v0.27.0, which is available a
 unknown
 
 ## Affected CVEs:
+- CVE-2026-39834
 - CVE-2024-45337
 - CVE-2025-22869
 - CVE-2025-47913

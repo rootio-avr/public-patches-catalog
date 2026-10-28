@@ -1,3 +1,183 @@
+diff --git a/ssh/channel.go b/ssh/channel.go
+--- a/ssh/channel.go
++++ b/ssh/channel.go
+@@ -131,11 +131,17 @@ func (r RejectionReason) String() string {
+ 	return fmt.Sprintf("unknown reason %d", int(r))
+ }
+ 
+-func min(a uint32, b int) uint32 {
+-	if a < uint32(b) {
+-		return a
++// minPayloadSize returns min(limit, length) clamped to a uint32. It is used
++// to compute the size of the next channel data packet from the remaining
++// payload. The comparison is done in int64 because length is an int — on
++// 64-bit systems len(data) can exceed 2^32, and a direct uint32(length)
++// cast would silently truncate to 0 at every multiple of 2^32, causing
++// WriteExtended's loop to spin without making progress.
++func minPayloadSize(limit uint32, length int) uint32 {
++	if int64(length) > int64(limit) {
++		return limit
+ 	}
+-	return uint32(b)
++	return uint32(length)
+ }
+ 
+ type channelDirection uint8
+@@ -251,7 +257,7 @@ func (ch *channel) WriteExtended(data []byte, extendedCode uint32) (n int, err e
+ 	ch.writeMu.Unlock()
+ 
+ 	for len(data) > 0 {
+-		space := min(ch.maxRemotePayload, len(data))
++		space := minPayloadSize(ch.maxRemotePayload, len(data))
+ 		if space, err = ch.remoteWin.reserve(space); err != nil {
+ 			return n, err
+ 		}
+diff --git a/ssh/channel_test.go b/ssh/channel_test.go
+new file mode 100644
+--- /dev/null
++++ b/ssh/channel_test.go
+@@ -0,0 +1,140 @@
++// Copyright 2025 The Go Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style
++// license that can be found in the LICENSE file.
++
++package ssh
++
++import (
++	"math/bits"
++	"testing"
++	"time"
++	"unsafe"
++)
++
++func TestMinPayloadSize(t *testing.T) {
++	// 4 GiB (2^32). Declared as a var (not a const) so that int(bigPayload)
++	// is a runtime conversion: a constant conversion would fail to compile
++	// on 32-bit platforms with "constant 4294967296 overflows int". On
++	// 32-bit the value truncates to 0 at runtime, but the is64Bit cases
++	// that reference it are skipped by the runtime check below.
++	var bigPayload int64 = 1 << 32
++
++	tests := []struct {
++		name       string
++		maxPayload uint32
++		dataLen    int
++		want       uint32
++		is64Bit    bool // Flag to run only on 64-bit architectures
++	}{
++		{
++			name:       "Normal Case - Data fits in payload",
++			maxPayload: 32768,
++			dataLen:    1000,
++			want:       1000,
++		},
++		{
++			name:       "Normal Case - Data larger than payload",
++			maxPayload: 32768,
++			dataLen:    50000,
++			want:       32768,
++		},
++		{
++			name:       "Boundary Case - Data zero",
++			maxPayload: 32768,
++			dataLen:    0,
++			want:       0,
++		},
++		{
++			name:       "Overflow Case - Data is exactly 4GB (1<<32)",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload),
++			want:       32768,
++			is64Bit:    true,
++		},
++		{
++			name:       "Overflow Case - Data is 4GB + small amount",
++			maxPayload: 32768,
++			dataLen:    int(bigPayload + 100),
++			want:       32768,
++			is64Bit:    true,
++		},
++	}
++
++	is64Bit := bits.UintSize == 64
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			if tt.is64Bit && !is64Bit {
++				t.Skip("Skipping test requiring 64-bit int")
++			}
++			got := minPayloadSize(tt.maxPayload, tt.dataLen)
++			if got != tt.want {
++				t.Errorf("minPayloadSize(%d, %d) = %d; want %d", tt.maxPayload, tt.dataLen, got, tt.want)
++			}
++		})
++	}
++}
++
++// TestWriteExtendedNoInfiniteLoopOnLargeWrite is an end-to-end regression
++// test for the integer-overflow bug in WriteExtended. Before the fix, a
++// write whose len(data) was a multiple of 2^32 caused minPayloadSize to
++// return 0; WriteExtended then spun forever, reserving 0 bytes per
++// iteration and never advancing the data slice.
++//
++// We exercise the real WriteExtended path with a slice whose declared
++// length is exactly 2^32. Allocating 4 GiB is unnecessary: each iteration
++// only reads up to maxRemotePayload bytes from the head of the slice, and
++// the loop blocks in remoteWin.reserve() once the channel window is
++// exhausted — before the slice base advances past the underlying buffer.
++//
++// With the fix, the loop blocks in reserve(); we detect that via
++// waitWriterBlocked(), then close the window to let WriteExtended return.
++// With the bug, the loop never blocks and the test times out.
++//
++//go:nocheckptr
++func TestWriteExtendedNoInfiniteLoopOnLargeWrite(t *testing.T) {
++	if bits.UintSize < 64 {
++		t.Skip("test requires 64-bit int to construct a slice with len >= 2^32")
++	}
++
++	reader, writer, mux := channelPair(t)
++	defer reader.Close()
++	defer writer.Close()
++	defer mux.Close()
++
++	// Sized to hold the full pre-update remote window so that no iteration
++	// reads past the backing buffer before reserve() blocks.
++	backing := make([]byte, channelWindowSize)
++	var bigLen int64 = 1 << 32
++	bigSlice := unsafe.Slice(&backing[0], int(bigLen))
++
++	done := make(chan int, 1)
++	go func() {
++		n, _ := writer.Write(bigSlice)
++		done <- n
++	}()
++
++	blocked := make(chan struct{})
++	go func() {
++		writer.remoteWin.waitWriterBlocked()
++		close(blocked)
++	}()
++
++	select {
++	case <-blocked:
++		// Good — the loop made progress and is now blocked in reserve().
++		// Close the window to let WriteExtended return.
++		writer.remoteWin.close()
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not block in reserve within 2s — minPayloadSize likely returned 0 (integer overflow regression)")
++	}
++
++	select {
++	case n := <-done:
++		if n == 0 {
++			t.Fatalf("WriteExtended returned n=0; expected progress")
++		}
++	case <-time.After(2 * time.Second):
++		t.Fatal("WriteExtended did not return after closing the window")
++	}
++}
+
 --- a/ssh/server.go
 +++ b/ssh/server.go
 @@ -149,7 +149,7 @@ func (s *ServerConfig) AddHostKey(key Signer) {
@@ -748,18 +928,22 @@
  	"reflect"
  	"strings"
  	"testing"
-@@ -205,6 +206,20 @@
+@@ -205,6 +206,24 @@
  	}
  }
  
 +func TestParseRSAModulusTooLarge(t *testing.T) {
-+	rsa16384 := "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAIAQC0vyqtnpzMZ8Th6gv1t3+7dDVd2X+7MwjqKe08/wrKZaIuCAHX7jglC8FdHfiOcPhLHAreSJLZGXiSzCTUExbp9Zdt7tHluKMQxZCnbk02V89ggc4KpptQqfcmjMNgrEPF4PGJBe3eSYu9m7A1ptm0buWxaKtA17O1c2q2CVNYmuajSUAfi8+AZcdyRAX8eqga3u77DEj4O+CCuNA908NYv9Pc7SbaCwCgX3FXh7MvlaYcruTk529psNk1SK6uwBNak3CLRrXUBo5yTO7cCO0gmlvd8SwtY5mPaDLLCJa+Ed2t9OCt8HCPrdkH3aiQBTP3k/Iofy3NRv+/1lenJP1qWB2rnyagoj+osrLc6m8PRd7GBje7KdO6nyY1D+q1MvX4zV1qNQfD+38N6PixVX1MGKw72sD+oLCDjHKS24BHfnfaE7f8n+Alp2mxnSz9tYqsN3JXrbbwblzH8YFOz9MMKkTY5lQNQFoKdTHoPVXBqcMlGQGgC/kkH9TH110MDE3L+Z0i9kG53QLcHNVC0cJzo6X77PQF1WoS33Ssf1s21kUB6fe/5G2L2Tuy635ingtnQMUazwJMli+y/3U7QqqcuJzITbLw/zozRzbqFRE4HHOyGkJSptraH4/3cjmYro8JL20A7EUDiXxmn+z+eoxaBWaEP2Rs5LH0ocrwYmBmSUIrPy4e5ESlRRVuv+prNUB1pYGnFZUI9HRRFxRFg+SxXZZp4mq8jzroRLZFAqKY1/eDgsCGoV1HG3QW1t0jGNkv8BL/Zpz7Hhmt0lRr7rVN+PJaTQx8NNUJZ/l7nMXp/+7aTbkyI8PiNyemko0+joDrkBWdcK0vi8Du6k3oQRBUsJ0aM0iPxMWQq/oYyHqpf6revycYTUdOGeckGWXuXLNRIZQ/PsKuw/teqDaBkkMKaQH2oXWMsacL6WDu5VYUQidOtaTgHX8AKVHF/vobTQfw7HgPKlyRN41dAX+YIjRABYoqU7M2MYPuoPYbqzTz7iLZyFP8FCJ3dRQBTWSeer/s+Ih6Ev1EsznVmAw9SKb5q8QCSYk5mMugUTDVETOQo10CGAF6094/PcJRXgag/uWs4k+13c+/HaeNzrHQyqzWnf9bFFHIvs7Wqov9k+nWv/TwSGplkyBk4bHfhEZNbl+b6T8sZXsv8mTT+INzKT4DCVZ5a/G+NQ6Xo26Aa6Se5DOdzdXOLZ7yIhOi+olip8AOXIIFLb7Vee1+q7Ri6ScUJEKxdEvec5EceXEtWs0U4AnuHgiH0ewJSX9yUp8T4ImCzu00JhTMOH2nXU3PJuGgZgrDifNWXGpFruIBjHWRKpESpy+9HPGoNoxSO/hzSfuM5LKvwX+I96cMK5OC+fKsBh59cMpU4YnqFNh59ZP/kaMDxAXgrVku5s9oB3Rgc7t1rfm6dqycBiwn4QnYJpk7M+gzAbrF/nty8y84ajNdhINXgMgvv3JLC5YTqznBPm3koHSOEF8f4xtCZtzjNN6jNjX8gEvxoRpC9Z+X15c8XBSFyDMBoi0FMDor619XJKgTxNiOYmeH/DLhKEb8MIaug8IFu34FKbG81IsWD+zwA1A5xqXEVlgsfEOcML+Oe2rulkpwQBWnsmY+f/Z80004Mytreo/ME2TDuPJPOi15D0j0CbwG7xzE8qrn0EomBE9mrwH3uuH7df3lzx1HiLAmh2s4MO5R64AoWeAPQW9lWZPzp+2dNgk+0qWpoEsMN+r91yWxUZHgeoC+GJKs13LItH32sGInyUrquMYQjEh44fAEFrMREcS4A7l+875GUmWC6i2MSLyvtAzuPS2IV0t9GU0ooH8cfG5JUeDnsJcVanJTR+XuXPetM+cDyGFTGri3lsCndE9maLgs9iDHtJxzKUBUUakaIPLsXtZD51cS4jhSbbHuzgC21BRtnBhCE2phVYbz4Tj0t90wBmemBaP2eVwv9p4s/JJAHEELvV7k+Gro4FozOoC2WBdqdTPDFB00la08O6ADBdjd2el2pRA7HCTG6v3qwA6RQJfm4UHOXaFYhhiNngxHB4VHZMvpd+YMEqNmtYOb4lzWwI13iHU0Rh0Sj4IaY9EwEy/KjR5dc2DjWGj11SFFCP1uG24fccF+LhtdMNDItI1mBxfaeRelYlsCZwtbbVLnuVQ5izuTzXa48x7CBaHnD3i09BZCuQITLX4d7KkD6CLWWTHrc5onLFJKxRF/p5AEFoqtN3vP9CsLXSYNKxFV5UbxAY5TnAoLFCCo0WbgvtAV77jWSbru9Oq/7ORN9smog4zNuYBZE1uXjxM2xszDduOym7+CxwpJMc7XPknt2XwiANaf2QANMMMH6lmnjTH1RVR7oH4+ts4xVcsdiO/QOlMp+Th9/KIMYyUevR18vHbs+88uxzIG28/58xLZTs6rZc71g9mGw9Q21ugL2sfTc7e0VDMnAmdg+92s2RXQMvkmx+oRc+IsFqgOZzjYcTmnJxZaXsoIsydDVcTalgmhK6/dD0grPLaGgaeXMEw2hN8p8seAHrGRW8+6WBD63NBYaAG0/zwuGOCHUo/BeG9bz39Hsz9Yvs5KvJiLhmM5K+8RlnxIY329REqdFZVyuXyy0NpDueFQelnd0j47Quc7GJGX3QycJiKpLolMtDnpnjgYOvdfycM+JEMZGwpLsBBE8R6vJ3RVczT6DdMtpVQ4l7kOzsPSYlp4qAv5fiqUboyv5eP7G7MOD/qSUwBnMS1p9Vm4Wr8B9w=="
-+	_, _, _, _, err := ParseAuthorizedKey([]byte(rsa16384))
-+
++	// Drive parseRSA directly: v0.27.0 ParseAuthorizedKey swallows per-line
++	// parse errors as "ssh: no key found", which would hide this check.
++	N := new(big.Int).Lsh(big.NewInt(1), 16384)
++	E := big.NewInt(65537)
++	rawKey := struct {
++		E, N *big.Int
++	}{E: E, N: N}
++	_, _, err := parseRSA(Marshal(&rawKey))
 +	if err == nil {
-+		t.Fatal("ParseAuthorizedKey accepted a 16384-bit modulus; expected it to be rejected")
++		t.Fatal("parseRSA accepted a 16384-bit modulus; expected it to be rejected")
 +	}
-+
 +	expectedError := "rsa modulus too large"
 +	if !strings.Contains(err.Error(), expectedError) {
 +		t.Errorf("unexpected error message: got %q, want substring %q", err.Error(), expectedError)
@@ -769,7 +953,7 @@
  func TestParseECPrivateKey(t *testing.T) {
  	key := testPrivateKeys["ecdsa"]
  
-@@ -327,6 +342,72 @@
+@@ -327,6 +346,72 @@
  	}
  	if !reflect.DeepEqual(actPub, pub) {
  		t.Errorf("got %v, expected %v", actPub, pub)
