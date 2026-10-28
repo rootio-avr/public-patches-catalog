@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - GHSA-vcvr-r3jv-pc5j
 - CVE-2026-94483
+- GHSA-673q-mjm6-r5xr
 - CVE-2026-94482
 - GHSA-2464-fhr4-w9xw
 
