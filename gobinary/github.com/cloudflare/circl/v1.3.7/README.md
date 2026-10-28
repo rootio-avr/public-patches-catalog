@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-1229
+- CVE-2025-8556
 
 ## How to Apply:
 1. Clone or download the source code for github.com/cloudflare/circl
