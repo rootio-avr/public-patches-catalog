@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-32274
+- CVE-2026-114134
 
 ## How to Apply:
 1. Clone or download the source code for black
