@@ -1,0 +1,288 @@
+--- a/src/graphql/language/parser.py
++++ b/src/graphql/language/parser.py
+@@ -1177,14 +1177,32 @@
+         return nodes
+ 
+     def advance_lexer(self) -> None:
++        """Advance the lexer.
++
++        Counts every token that is consumed toward ``max_tokens``, including the
++        comment tokens that the lexer skips over between the previously focused token
++        and the new one. Comments are read and allocated as ``Token`` objects (and
++        chained into the token list) but are not returned by the lexer, so counting
++        only the returned tokens would let a comment-padded document bypass
++        ``max_tokens`` while still allocating one token per comment.
++        """
+         max_tokens = self._max_tokens
+-        token = self._lexer.advance()
++        lexer = self._lexer
++        token = lexer.advance()
+ 
+-        if max_tokens is not None and token.kind != TokenKind.EOF:
+-            self._token_counter += 1
++        if max_tokens is not None:
++            # Count the comment tokens that were skipped since the previously focused
++            # token. They are the nodes strictly between ``last_token`` and ``token``
++            # in the token linked-list (the lexer only ever skips comments).
++            skipped = lexer.last_token.next
++            while skipped is not None and skipped is not token:
++                self._token_counter += 1
++                skipped = skipped.next
++            if token.kind != TokenKind.EOF:
++                self._token_counter += 1
+             if self._token_counter > max_tokens:
+                 raise GraphQLSyntaxError(
+-                    self._lexer.source,
++                    lexer.source,
+                     token.start,
+                     f"Document contains more than {max_tokens} tokens."
+                     " Parsing aborted.",
+--- a/tests/language/test_parser.py
++++ b/tests/language/test_parser.py
+@@ -108,6 +108,30 @@
+         ):
+             assert parse('{ foo(bar: "baz") }', max_tokens=7)
+ 
++    def counts_comment_tokens_towards_the_maximum():
++        # Comment tokens are read and allocated by the lexer but skipped over; they
++        # must still count towards max_tokens, otherwise a comment-padded document
++        # bypasses the limit (memory-exhaustion DoS).
++        parse("{ # c\n foo }", max_tokens=4)
++        with raises(
++            GraphQLSyntaxError,
++            match="Syntax Error:"
++            r" Document contains more than 3 tokens\. Parsing aborted\.",
++        ):
++            parse("{ # c\n foo }", max_tokens=3)
++
++        # Neither leading nor trailing comment padding can bypass the limit.
++        with raises(
++            GraphQLSyntaxError,
++            match=r"Document contains more than 5 tokens\. Parsing aborted\.",
++        ):
++            parse("# c\n" * 1000 + "{ a }", max_tokens=5)
++        with raises(
++            GraphQLSyntaxError,
++            match=r"Document contains more than 5 tokens\. Parsing aborted\.",
++        ):
++            parse("{ a }" + "\n# c" * 1000, max_tokens=5)
++
+     def parses_variable_inline_values():
+         parse("{ field(complex: { a: { b: [ $var ] } }) }")
+ 
+
+--- a/src/graphql/validation/rules/overlapping_fields_can_be_merged.py
++++ b/src/graphql/validation/rules/overlapping_fields_can_be_merged.py
+@@ -32,9 +32,29 @@
+ 
+ MYPY = False
+ 
+-__all__ = ["OverlappingFieldsCanBeMergedRule"]
++__all__ = ["MAX_FIELD_COMPARISONS", "OverlappingFieldsCanBeMergedRule"]
+ 
++# The maximum number of pairwise field comparisons performed while validating a
++# single document with the OverlappingFieldsCanBeMerged rule. The rule compares
++# every pair of fields that share a response name and recurses into their
++# sub-selections, which is O(n^2) in the number of such fields (and worse when
++# inline fragments repeat the same response name at multiple nesting levels). A
++# crafted query can therefore drive validation into minutes of CPU on a single
++# request. Once this many comparisons have been made, validation is aborted with a
++# GraphQLError instead of running to completion. The default is high enough that any
++# realistic query stays far below it; it can be raised or lowered by assigning to
++# ``graphql.validation.rules.overlapping_fields_can_be_merged.MAX_FIELD_COMPARISONS``.
++MAX_FIELD_COMPARISONS = 250_000
+ 
++
++class ComparisonBudgetExceededError(Exception):
++    """Internal signal that the field-comparison budget has been exhausted.
++
++    Raised deep inside the recursive conflict search and caught by the rule to abort
++    validation. Never surfaces to callers of ``validate``.
++    """
++
++
+ def reason_message(reason: "ConflictReasonMessage") -> str:
+     if isinstance(reason, list):
+         return " and ".join(
+@@ -66,14 +86,32 @@
+         # times, so this improves the performance of this validator.
+         self.cached_fields_and_fragment_names: Dict = {}
+ 
++        # Set once the comparison budget is exhausted. Further selection sets are then
++        # skipped, since validation has already been aborted with an error.
++        self._budget_exceeded = False
++
+     def enter_selection_set(self, selection_set: SelectionSetNode, *_args: Any) -> None:
+-        conflicts = find_conflicts_within_selection_set(
+-            self.context,
+-            self.cached_fields_and_fragment_names,
+-            self.compared_fragment_pairs,
+-            self.context.get_parent_type(),
+-            selection_set,
+-        )
++        if self._budget_exceeded:
++            return
++        try:
++            conflicts = find_conflicts_within_selection_set(
++                self.context,
++                self.cached_fields_and_fragment_names,
++                self.compared_fragment_pairs,
++                self.context.get_parent_type(),
++                selection_set,
++            )
++        except ComparisonBudgetExceededError:
++            self._budget_exceeded = True
++            self.report_error(
++                GraphQLError(
++                    "Query is too complex to validate for overlapping fields:"
++                    f" exceeded {MAX_FIELD_COMPARISONS} field comparisons."
++                    " Validation was aborted.",
++                    selection_set,
++                )
++            )
++            return
+         for (reason_name, reason), fields1, fields2 in conflicts:
+             reason_msg = reason_message(reason)
+             self.report_error(
+@@ -520,6 +558,12 @@
+     Determines if there is a conflict between two particular fields, including comparing
+     their sub-fields.
+     """
++    # Charge this comparison against the document-wide budget and abort validation once
++    # it is exhausted, guarding against quadratic-blowup denial of service.
++    compared_fragment_pairs.comparisons += 1
++    if compared_fragment_pairs.comparisons > MAX_FIELD_COMPARISONS:
++        raise ComparisonBudgetExceededError
++
+     parent_type1, node1, def1 = field1
+     parent_type2, node2, def2 = field2
+ 
+@@ -749,14 +793,19 @@
+     """Pair set
+ 
+     A way to keep track of pairs of things when the ordering of the pair doesn't matter.
++
++    Also carries a running count of the pairwise field comparisons performed with
++    this set, used to enforce the OverlappingFieldsCanBeMerged comparison budget.
+     """
+ 
+-    __slots__ = ("_data",)
++    __slots__ = ("_data", "comparisons")
+ 
+     _data: Dict[str, Dict[str, bool]]
++    comparisons: int
+ 
+     def __init__(self) -> None:
+         self._data = {}
++        self.comparisons = 0
+ 
+     def has(self, a: str, b: str, are_mutually_exclusive: bool) -> bool:
+         key1, key2 = (a, b) if a < b else (b, a)
+--- a/tests/validation/test_overlapping_fields_can_be_merged.py
++++ b/tests/validation/test_overlapping_fields_can_be_merged.py
+@@ -1,7 +1,11 @@
++from contextlib import contextmanager
+ from functools import partial
+ 
+ from graphql.utilities import build_schema
+ from graphql.validation import OverlappingFieldsCanBeMergedRule
++from graphql.validation.rules import (
++    overlapping_fields_can_be_merged as overlapping_module,
++)
+ 
+ from .harness import assert_validation_errors
+ 
+@@ -9,7 +13,33 @@
+ 
+ assert_valid = partial(assert_errors, errors=[])
+ 
++budget_schema = build_schema(
++    """
++    type Query {
++      field: Node
++      other: Node
++    }
+ 
++    type Node {
++      f: Node
++      x: String
++    }
++    """
++)
++
++
++@contextmanager
++def budget_of(limit):
++    # Temporarily lower the module-level comparison budget so the budget tests can
++    # trigger the guard with small, fast queries.
++    saved = overlapping_module.MAX_FIELD_COMPARISONS
++    overlapping_module.MAX_FIELD_COMPARISONS = limit
++    try:
++        yield
++    finally:
++        overlapping_module.MAX_FIELD_COMPARISONS = saved
++
++
+ def describe_validate_overlapping_fields_can_be_merged():
+     def unique_fields():
+         assert_valid(
+@@ -1176,3 +1206,59 @@
+                 }
+             ],
+         )
++
++    def describe_comparison_budget():
++        def aborts_validation_when_the_comparison_budget_is_exceeded():
++            # Repeated inline fragments select the same response name, forcing O(n^2)
++            # pairwise comparisons. Once the budget is exhausted the rule aborts with
++            # a single error instead of running the comparison to completion. The
++            # trailing `other` selection set is visited after the abort and must be
++            # skipped, so exactly one error is reported for the whole document.
++            query = (
++                "{ field { " + " ".join(["... on Node { x }"] * 10) + " } other { x } }"
++            )
++            with budget_of(5):
++                assert_errors(
++                    query,
++                    [
++                        {
++                            "message": "Query is too complex to validate for"
++                            " overlapping fields: exceeded 5 field comparisons."
++                            " Validation was aborted."
++                        }
++                    ],
++                    schema=budget_schema,
++                )
++
++        def deduplication_alone_would_not_bound_this_query():
++            # Each `f` selection shares the response name `f` but wraps a distinct
++            # sub-selection (`a0: x`, `a1: x`, ...), so none conflicts with another
++            # (differing aliases merge cleanly), yet validation is O(n^2).
++            query = (
++                "{ field { "
++                + " ".join(f"... on Node {{ f {{ a{i}: x }} }}" for i in range(20))
++                + " } }"
++            )
++            with budget_of(1_000_000):
++                assert_valid(query, schema=budget_schema)
++            with budget_of(10):
++                assert_errors(
++                    query,
++                    [
++                        {
++                            "message": "Query is too complex to validate for"
++                            " overlapping fields: exceeded 10 field comparisons."
++                            " Validation was aborted."
++                        }
++                    ],
++                    schema=budget_schema,
++                )
++
++        def does_not_abort_queries_that_stay_within_the_budget():
++            # A valid overlapping query well under the budget validates normally, with
++            # no spurious abort error.
++            with budget_of(50):
++                assert_valid(
++                    "{ field { ... on Node { x } ... on Node { x } } }",
++                    schema=budget_schema,
++                )
