@@ -22,6 +22,7 @@ unknown
 - GHSA-cjmm-f4jc-qw8r
 - GHSA-cmwh-pvxp-8882
 - GHSA-h8r8-wccr-v5f2
+- GHSA-mrv2-3pqr-j5jr
 
 ## How to Apply:
 1. Clone or download the source code for dompurify
