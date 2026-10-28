@@ -1,0 +1,1804 @@
+--- a/cmd/operator/main.go
++++ b/cmd/operator/main.go
+@@ -94,6 +94,8 @@
+ 	var httpMaxIdleConns int
+ 	var httpMaxIdleConnsPerHost int
+ 	var httpIdleConnTimeout time.Duration
++	var serviceAccountTokenMode string
++	var vaultKubernetesAuthTokenFile string
+ 	pflag.BoolVar(&enablePrometheusMetrics, "enable-prometheus-metrics", true, "Enable the prometheus metric of keda-operator.")
+ 	pflag.BoolVar(&enableOpenTelemetryMetrics, "enable-opentelemetry-metrics", false, "Enable the opentelemetry metric of keda-operator.")
+ 	pflag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the prometheus metric endpoint binds to.")
+@@ -123,6 +125,8 @@
+ 	pflag.IntVar(&httpMaxIdleConns, "http-max-idle-conns", 0, "Maximum number of idle HTTP connections across all hosts. Zero means no limit.")
+ 	pflag.IntVar(&httpMaxIdleConnsPerHost, "http-max-idle-conns-per-host", 1000, "Maximum number of idle HTTP connections to keep per host.")
+ 	pflag.DurationVar(&httpIdleConnTimeout, "http-idle-conn-timeout", 90*time.Second, "Maximum time an idle HTTP connection remains in the pool. Must be greater than zero.")
++	pflag.StringVar(&serviceAccountTokenMode, "service-account-token-mode", "enforce-audience", "Service account token mode for Vault file tokens and all boundServiceAccountToken minting: enforce-audience (default) or legacy (explicit insecure bypass). Legacy may expose Kubernetes API credentials and logs warnings at startup and on use.")
++	pflag.StringVar(&vaultKubernetesAuthTokenFile, "vault-kubernetes-auth-token-file", resolver.DefaultVaultKubernetesAuthTokenFile, "Dedicated projected token for the operator's Vault Kubernetes login. The kubelet mints and rotates this token; KEDA needs no TokenRequest permission for this path.")
+ 	opts := zap.Options{}
+ 	opts.BindFlags(flag.CommandLine)
+ 
+@@ -179,11 +183,14 @@
+ 		os.Exit(1)
+ 	}
+ 
+-	resolver.SetConfig(&resolver.Config{
+-		FilePathAuthRootPath: filePathAuthRootPath,
+-	})
+-
+ 	cfg := ctrl.GetConfigOrDie()
++	resolverConfig := &resolver.Config{
++		FilePathAuthRootPath:         filePathAuthRootPath,
++		ServiceAccountTokenMode:      serviceAccountTokenMode,
++		VaultKubernetesAuthTokenFile: vaultKubernetesAuthTokenFile,
++	}
++	configureAuthenticationPolicyOrDie(resolverConfig)
++
+ 	cfg.QPS = adapterClientRequestQPS
+ 	cfg.Burst = adapterClientRequestBurst
+ 	cfg.DisableCompression = disableCompression
+@@ -385,5 +392,25 @@
+ 	if err := mgr.Start(ctx); err != nil {
+ 		setupLog.Error(err, "problem running manager")
+ 		os.Exit(1)
++	}
++}
++
++func configureAuthenticationPolicyOrDie(config *resolver.Config) {
++	if err := config.LoadServiceAccountTokenAudiences(os.Getenv(resolver.ServiceAccountTokenAudiencesEnvVar)); err != nil {
++		setupLog.Error(err, "invalid service account token policy")
++		os.Exit(1)
++	}
++	if err := config.LoadOutboundFilter(os.Getenv(resolver.OutboundFilterEnvVar)); err != nil {
++		setupLog.Error(err, "invalid authentication policy")
++		os.Exit(1)
++	}
++	resolver.SetConfig(config)
++	if config.IsLegacyServiceAccountTokenMode() {
++		setupLog.Info("Warning: legacy service account token mode explicitly disables audience enforcement for Vault and boundServiceAccountToken authentication; Kubernetes API credentials may be sent to tenant-controlled destinations. Configure approved audiences and restore --service-account-token-mode=enforce-audience. Each legacy Vault login and token mint logs a warning")
++	}
++	if config.IsWarnOutboundPolicy() {
++		setupLog.Info("Warning: outbound filter mode warn allows tenant-selected Vault addresses outside the allowlist and logs a warning for each violation. Configure KEDA_OUTBOUND_FILTER.hashiCorpVault with mode enforce and trusted allowedEndpoints to restrict destinations")
++	} else if config.OutboundEndpointPolicy == "off" {
++		setupLog.Info("Outbound filter mode off allows tenant-selected Vault addresses without destination restrictions; allowedEndpoints is ignored. Configure KEDA_OUTBOUND_FILTER.hashiCorpVault with mode enforce and trusted allowedEndpoints to restrict destinations")
+ 	}
+ }
+--- a/config/e2e/kustomization.yaml
++++ b/config/e2e/kustomization.yaml
+@@ -21,3 +21,9 @@
+     kind: Deployment
+     name: keda-operator
+     version: v1
++- path: vault/patch_operator.yml
++  target:
++    group: apps
++    kind: Deployment
++    name: keda-operator
++    version: v1
+--- /dev/null
++++ b/config/e2e/vault/patch_operator.yml
+@@ -0,0 +1,34 @@
++# Keep the audience in sync with the HashiCorp Vault e2e roles.
++- op: add
++  path: /spec/template/spec/containers/0/args/-
++  value: --service-account-token-mode=enforce-audience
++- op: add
++  path: /spec/template/spec/containers/0/args/-
++  value: --vault-kubernetes-auth-token-file=/var/run/secrets/keda-vault/token
++- op: add
++  path: /spec/template/spec/containers/0/env/-
++  value:
++    name: KEDA_SERVICE_ACCOUNT_TOKEN_AUDIENCES
++    value: |
++      - serviceAccountName: default
++        namespace: hashicorp-vault-test-ns
++        audience: keda-vault-e2e
++      - serviceAccountName: trigger-auth-bound-service-account-token-test-sa
++        namespace: trigger-auth-bound-service-account-token-test-ns
++        audience: keda-metrics-e2e
++- op: add
++  path: /spec/template/spec/volumes/-
++  value:
++    name: keda-vault-token
++    projected:
++      sources:
++      - serviceAccountToken:
++          audience: keda-vault-e2e
++          expirationSeconds: 3600
++          path: token
++- op: add
++  path: /spec/template/spec/containers/0/volumeMounts/-
++  value:
++    name: keda-vault-token
++    mountPath: /var/run/secrets/keda-vault
++    readOnly: true
+--- a/pkg/scaling/resolver/hashicorpvault_handler.go
++++ b/pkg/scaling/resolver/hashicorpvault_handler.go
+@@ -20,6 +20,7 @@
+ 	"context"
+ 	"errors"
+ 	"fmt"
++	"net/url"
+ 	"strings"
+ 
+ 	"github.com/go-logr/logr"
+@@ -30,7 +31,9 @@
+ )
+ 
+ const (
+-	serviceAccountTokenFile = "/var/run/secrets/kubernetes.io/serviceaccount/token"
++	// serviceAccountTokenFile is the operator's Kubernetes API token path, used only for the legacy Vault authentication fallback. Remove when legacy mode is retired.
++	serviceAccountTokenFile             = "/var/run/secrets/kubernetes.io/serviceaccount/token"
++	DefaultVaultKubernetesAuthTokenFile = "/var/run/secrets/keda-vault/token"
+ )
+ 
+ // HashicorpVaultHandler is a specification of HashiCorp Vault
+@@ -53,6 +56,10 @@
+ 
+ // Initialize the Vault client
+ func (vh *HashicorpVaultHandler) Initialize(logger logr.Logger) error {
++	if err := vh.validateAddress(logger); err != nil {
++		return err
++	}
++
+ 	config := vaultapi.DefaultConfig()
+ 	client, err := vaultapi.NewClient(config)
+ 	if err != nil {
+@@ -68,7 +75,7 @@
+ 		client.SetNamespace(vh.vault.Namespace)
+ 	}
+ 
+-	token, err := vh.token(client)
++	token, err := vh.token(client, logger)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -94,10 +101,8 @@
+ }
+ 
+ // token Extract a vault token from the Authentication method
+-func (vh *HashicorpVaultHandler) token(client *vaultapi.Client) (string, error) {
++func (vh *HashicorpVaultHandler) token(client *vaultapi.Client, logger logr.Logger) (string, error) {
+ 	var token string
+-	var jwt []byte
+-	var err error
+ 
+ 	switch vh.vault.Authentication {
+ 	case kedav1alpha1.VaultAuthenticationToken:
+@@ -105,7 +110,7 @@
+ 		switch {
+ 		case len(client.Token()) > 0:
+ 			break
+-		case len(vh.vault.Credential.Token) > 0:
++		case vh.vault.Credential != nil && len(vh.vault.Credential.Token) > 0:
+ 			token = vh.vault.Credential.Token
+ 		default:
+ 			return token, errors.New("could not get Vault token")
+@@ -119,32 +124,22 @@
+ 			return token, errors.New("k8s role not in config")
+ 		}
+ 
+-		if vh.vault.Credential == nil {
+-			defaultCred := kedav1alpha1.Credential{
+-				ServiceAccount: serviceAccountTokenFile,
+-			}
+-			vh.vault.Credential = &defaultCred
++		jwt, err := vh.kubernetesToken(context.Background())
++		if err != nil {
++			return token, err
+ 		}
+-
+-		if vh.vault.Credential.ServiceAccountName == "" && vh.vault.Credential.ServiceAccount == "" {
+-			return token, errors.New("k8s SA file not in config or serviceAccountName not supplied")
++		if globalConfig.IsLegacyServiceAccountTokenMode() {
++			logger.Info("Warning: Vault Kubernetes authentication is using a legacy service account token; a leaked token may grant Kubernetes API access. Configure approved audiences and --service-account-token-mode=enforce-audience", "vaultOrigin", vh.origin())
+ 		}
+ 
+-		if vh.vault.Credential.ServiceAccountName != "" {
+-			jwt = []byte(GenerateBoundServiceAccountToken(context.Background(), vh.vault.Credential.ServiceAccountName, vh.namespace, vh.acs))
+-		} else if len(vh.vault.Credential.ServiceAccount) != 0 {
+-			// Get the JWT from POD
+-			jwt, err = readKubernetesServiceAccountProjectedToken(vh.vault.Credential.ServiceAccount)
+-			if err != nil {
+-				return token, err
+-			}
+-		}
+-
+ 		data := map[string]interface{}{"jwt": string(jwt), "role": vh.vault.Role}
+ 		secret, err := client.Logical().Write(fmt.Sprintf("auth/%s/login", vh.vault.Mount), data)
+ 		if err != nil {
+ 			return token, err
+ 		}
++		if secret == nil || secret.Auth == nil || secret.Auth.ClientToken == "" {
++			return token, errors.New("vault Kubernetes login returned no client token")
++		}
+ 		token = secret.Auth.ClientToken
+ 
+ 	default:
+@@ -152,6 +147,95 @@
+ 	}
+ 
+ 	return token, nil
++}
++
++// kubernetesToken mints a named-SA token or reads a token file on each login.
++func (vh *HashicorpVaultHandler) kubernetesToken(ctx context.Context) ([]byte, error) {
++	legacy := globalConfig.IsLegacyServiceAccountTokenMode()
++	path := globalConfig.VaultKubernetesAuthTokenFile
++	if legacy {
++		path = serviceAccountTokenFile
++	}
++	if credential := vh.vault.Credential; credential != nil {
++		if credential.ServiceAccountName != "" {
++			token, err := GenerateBoundServiceAccountToken(ctx, credential.ServiceAccountName, vh.namespace, vh.acs)
++			return []byte(token), err
++		}
++		path = credential.ServiceAccount
++	}
++
++	var allowed []string
++	if !legacy {
++		allowed = globalConfig.serviceAccountTokenAllowedAudiences()
++		if len(allowed) == 0 {
++			return nil, fmt.Errorf("no approved service account token audiences; configure %s", ServiceAccountTokenAudiencesEnvVar)
++		}
++	}
++	if path == "" {
++		return nil, errors.New("k8s SA file not in config or serviceAccountName not supplied")
++	}
++	token, err := readKubernetesServiceAccountProjectedToken(path)
++	if err != nil {
++		return nil, err
++	}
++	if legacy {
++		return token, nil
++	}
++	if err := validateK8sSATokenAudiences(token, allowed); err != nil {
++		return nil, err
++	}
++	return token, nil
++}
++
++// validateAddress checks the Vault destination before accessing credentials.
++func (vh *HashicorpVaultHandler) validateAddress(logger logr.Logger) error {
++	policy := globalConfig.OutboundEndpointPolicy
++	switch policy {
++	case "", outboundPolicyOff:
++		return nil
++	case outboundPolicyWarn, outboundPolicyEnforce:
++	default:
++		return fmt.Errorf("unsupported %s.hashiCorpVault.mode %q", OutboundFilterEnvVar, policy)
++	}
++	allowed := globalConfig.AllowedOutboundEndpoints
++	for _, endpoint := range allowed {
++		if vaultAddressesEqual(endpoint, vh.vault.Address) {
++			return nil
++		}
++	}
++	if policy == outboundPolicyWarn {
++		logger.Info("Warning: Vault endpoint is outside the allowlist; credentials may be sent to an untrusted destination. Configure KEDA_OUTBOUND_FILTER.hashiCorpVault with mode enforce and trusted allowedEndpoints", "vaultOrigin", vh.origin())
++		return nil
++	}
++	if len(allowed) == 0 {
++		return errors.New("no outbound endpoint allowlist is configured in enforce mode (KEDA_OUTBOUND_FILTER.hashiCorpVault.allowedEndpoints)")
++	}
++	return fmt.Errorf("vault endpoint %q is not in the configured allowlist (KEDA_OUTBOUND_FILTER.hashiCorpVault.allowedEndpoints)", vh.origin())
++}
++
++func (vh *HashicorpVaultHandler) origin() string {
++	address, err := url.Parse(vh.vault.Address)
++	if err != nil {
++		return "<invalid endpoint>"
++	}
++	return (&url.URL{Scheme: address.Scheme, Host: address.Host}).String()
++}
++
++// vaultAddressesEqual compares two Vault addresses by scheme+host+port, ignoring path and trailing
++// slashes, to avoid trivial allowlist bypasses via string prefixing.
++func vaultAddressesEqual(a, b string) bool {
++	ua, erra := url.Parse(strings.TrimSpace(a))
++	ub, errb := url.Parse(strings.TrimSpace(b))
++	if erra != nil || errb != nil {
++		return false
++	}
++	if ua.User != nil || ub.User != nil || ua.Hostname() == "" || ub.Hostname() == "" {
++		return false
++	}
++	if ua.Scheme != "http" && ua.Scheme != "https" || ub.Scheme != "http" && ub.Scheme != "https" {
++		return false
++	}
++	return strings.EqualFold(ua.Scheme, ub.Scheme) && strings.EqualFold(ua.Host, ub.Host)
+ }
+ 
+ // renewToken takes charge of renewing the vault token
+--- a/pkg/scaling/resolver/hashicorpvault_handler_test.go
++++ b/pkg/scaling/resolver/hashicorpvault_handler_test.go
+@@ -17,6 +17,7 @@
+ package resolver
+ 
+ import (
++	"context"
+ 	"encoding/base64"
+ 	"encoding/json"
+ 	"fmt"
+@@ -25,10 +26,14 @@
+ 	"net/http/httptest"
+ 	"testing"
+ 
++	"github.com/golang-jwt/jwt/v5"
+ 	vaultapi "github.com/hashicorp/vault/api"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"go.uber.org/atomic"
+ 	"go.uber.org/mock/gomock"
+ 	authv1 "k8s.io/api/authentication/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	logf "sigs.k8s.io/controller-runtime/pkg/log"
+ 
+ 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
+@@ -207,6 +212,10 @@
+ func TestHashicorpVaultHandler_getSecretValue_specify_secret_type(t *testing.T) {
+ 	server := mockVault(t, false)
+ 	defer server.Close()
++
++	prevCfg := globalConfig
++	SetConfig(&Config{AllowedOutboundEndpoints: []string{server.URL}})
++	defer SetConfig(&prevCfg)
+ 	ctrl := gomock.NewController(t)
+ 	mockCoreV1Interface := mock_serviceaccounts.NewMockCoreV1Interface(ctrl)
+ 	mockSecretLister := mock_secretlister.NewMockSecretLister(ctrl)
+@@ -354,6 +363,10 @@
+ func TestHashicorpVaultHandler_ResolveSecret(t *testing.T) {
+ 	server := mockVault(t, false)
+ 	defer server.Close()
++
++	prevCfg := globalConfig
++	SetConfig(&Config{AllowedOutboundEndpoints: []string{server.URL}})
++	defer SetConfig(&prevCfg)
+ 	ctrl := gomock.NewController(t)
+ 	mockCoreV1Interface := mock_serviceaccounts.NewMockCoreV1Interface(ctrl)
+ 	mockSecretLister := mock_secretlister.NewMockSecretLister(ctrl)
+@@ -398,6 +411,10 @@
+ 	server := mockVault(t, true)
+ 	defer server.Close()
+ 
++	prevCfg := globalConfig
++	SetConfig(&Config{AllowedOutboundEndpoints: []string{server.URL}})
++	defer SetConfig(&prevCfg)
++
+ 	vault := kedav1alpha1.HashiCorpVault{
+ 		Address:        server.URL,
+ 		Authentication: kedav1alpha1.VaultAuthenticationToken,
+@@ -439,7 +456,9 @@
+ }
+ 
+ func TestHashicorpVaultHandler_DefaultKubernetesVaultRole(t *testing.T) {
+-	defaultServiceAccountPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
++	prev := globalConfig
++	SetConfig(&Config{OutboundEndpointPolicy: "enforce"})
++	defer SetConfig(&prev)
+ 	server := mockVault(t, false)
+ 	defer server.Close()
+ 	ctrl := gomock.NewController(t)
+@@ -457,16 +476,185 @@
+ 		Role:           "my-role",
+ 	}
+ 
++	// In enforce mode, with no outbound endpoint allowlist configured, KEDA refuses to fall back
++	// to the operator service account token instead of silently exfiltrating it.
+ 	vaultHandler := NewHashicorpVaultHandler(&vault, authClientSet, "default")
+ 	err := vaultHandler.Initialize(logf.Log.WithName("test"))
+ 	defer vaultHandler.Stop()
++	assert.ErrorContains(t, err, "no outbound endpoint allowlist is configured")
++	assert.Nil(t, vaultHandler.vault.Credential, "operator SA fallback must not be set when refused")
++
++	// An allowlist alone is insufficient: secure mode also requires an explicit audience and
++	// never silently falls back to the kube-apiserver-audience ambient token.
++	SetConfig(&Config{OutboundEndpointPolicy: "enforce", AllowedOutboundEndpoints: []string{server.URL}, ServiceAccountTokenMode: "enforce-audience"})
++
++	vaultAllowed := kedav1alpha1.HashiCorpVault{
++		Address:        server.URL,
++		Authentication: kedav1alpha1.VaultAuthenticationKubernetes,
++		Mount:          "my-mount",
++		Role:           "my-role",
++	}
++	vaultHandlerAllowed := NewHashicorpVaultHandler(&vaultAllowed, authClientSet, "default")
++	errAllowed := vaultHandlerAllowed.Initialize(logf.Log.WithName("test"))
++	defer vaultHandlerAllowed.Stop()
++	assert.ErrorContains(t, errAllowed, "no approved service account token audiences")
++}
++
++func TestHashicorpVaultHandler_AddressAllowlist(t *testing.T) {
++	authClientSet := &authentication.AuthClientSet{}
++
++	prev := globalConfig
++	SetConfig(&Config{OutboundEndpointPolicy: "enforce", AllowedOutboundEndpoints: []string{"https://vault.example.com:8200"}})
++	defer SetConfig(&prev)
++
++	// Address not in the allowlist is refused before any connection is attempted.
++	rogue := kedav1alpha1.HashiCorpVault{
++		Address:        "http://rogue.attacker.example:8200",
++		Authentication: kedav1alpha1.VaultAuthenticationKubernetes,
++		Mount:          "my-mount",
++		Role:           "my-role",
++	}
++	err := NewHashicorpVaultHandler(&rogue, authClientSet, "default").Initialize(logf.Log.WithName("test"))
++	assert.ErrorContains(t, err, "not in the configured allowlist")
++}
++
++func TestHashicorpVaultHandler_LegacyPolicies(t *testing.T) {
++	defaultServiceAccountPath := "/var/run/secrets/kubernetes.io/serviceaccount/token"
++	authClientSet := &authentication.AuthClientSet{}
++
++	prev := globalConfig
++	SetConfig(&Config{ServiceAccountTokenMode: "legacy"})
++	defer SetConfig(&prev)
++
++	// Explicit legacy mode restores the old operator token path, even without an
++	// allowlist. This bypass is never selected by default.
++	vault := kedav1alpha1.HashiCorpVault{
++		Address:        "http://rogue.attacker.example:8200",
++		Authentication: kedav1alpha1.VaultAuthenticationKubernetes,
++		Mount:          "my-mount",
++		Role:           "my-role",
++	}
++	vh := NewHashicorpVaultHandler(&vault, authClientSet, "default")
++	err := vh.Initialize(logf.Log.WithName("test"))
+ 	assert.Errorf(t, err, "open %s : no such file or directory", defaultServiceAccountPath)
+-	assert.Equal(t, vaultHandler.vault.Credential.ServiceAccount, defaultServiceAccountPath)
++	assert.NotContains(t, err.Error(), "allowlist")
++	assert.Contains(t, err.Error(), defaultServiceAccountPath)
++	assert.Nil(t, vh.vault.Credential, "defaulting must not mutate the authentication resource")
+ }
+ 
++func TestHashicorpVaultHandler_FollowsVaultRedirectsInEnforceMode(t *testing.T) {
++	t.Setenv("VAULT_DISABLE_REDIRECTS", "false")
++	var redirectedRequests atomic.Int32
++	server := mockVault(t, false)
++	defer server.Close()
++	redirectTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		redirectedRequests.Add(1)
++		assert.Equal(t, vaultTestToken, r.Header.Get("X-Vault-Token"))
++		server.Config.Handler.ServeHTTP(w, r)
++	}))
++	defer redirectTarget.Close()
++
++	redirectingVault := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		http.Redirect(w, r, redirectTarget.URL+r.URL.Path, http.StatusTemporaryRedirect)
++	}))
++	defer redirectingVault.Close()
++
++	prev := globalConfig
++	SetConfig(&Config{OutboundEndpointPolicy: "enforce", AllowedOutboundEndpoints: []string{redirectingVault.URL}})
++	defer SetConfig(&prev)
++
++	vault := kedav1alpha1.HashiCorpVault{
++		Address:        redirectingVault.URL,
++		Authentication: kedav1alpha1.VaultAuthenticationToken,
++		Credential:     &kedav1alpha1.Credential{Token: vaultTestToken},
++	}
++	err := NewHashicorpVaultHandler(&vault, &authentication.AuthClientSet{}, "default").Initialize(logf.Log.WithName("test"))
++	assert.NoError(t, err)
++	assert.EqualValues(t, 1, redirectedRequests.Load(), "enforce mode trusts the configured Vault origin's HA redirect")
++}
++
++func TestHashicorpVaultHandler_TokenAudiences(t *testing.T) {
++	prev := globalConfig
++	defer SetConfig(&prev)
++	vh := NewHashicorpVaultHandler(&kedav1alpha1.HashiCorpVault{
++		Credential: &kedav1alpha1.Credential{ServiceAccountName: "vault-login"},
++	}, nil, "tenant")
++
++	SetConfig(&Config{})
++	_, err := vh.kubernetesToken(t.Context())
++	assert.ErrorContains(t, err, "no configured token audience for service account tenant/vault-login")
++
++	// Approving a file-token audience does not authorize minting for arbitrary SAs.
++	SetConfig(&Config{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{Audience: "vault.example"}}})
++	_, err = vh.kubernetesToken(t.Context())
++	assert.ErrorContains(t, err, "no configured token audience")
++}
++
++// TestHashicorpVaultHandler_ExplicitCredentialDeniedWithoutAllowlist proves enforce mode's
++// address gate cannot be bypassed by explicitly naming a credential (the operator token path, any
++// mounted token, a minted SA, or a literal token) instead of relying on the nil-credential
++// fallback. The address is validated before credential/auth handling, so every form is refused.
++func TestHashicorpVaultHandler_ExplicitCredentialDeniedWithoutAllowlist(t *testing.T) {
++	authClientSet := &authentication.AuthClientSet{}
++
++	prev := globalConfig
++	SetConfig(&Config{OutboundEndpointPolicy: "enforce"})
++	defer SetConfig(&prev)
++
++	cases := []struct {
++		name string
++		auth kedav1alpha1.VaultAuthentication
++		cred kedav1alpha1.Credential
++	}{
++		{"operator token path", kedav1alpha1.VaultAuthenticationKubernetes, kedav1alpha1.Credential{ServiceAccount: serviceAccountTokenFile}},
++		{"arbitrary mounted token", kedav1alpha1.VaultAuthenticationKubernetes, kedav1alpha1.Credential{ServiceAccount: "/var/run/secrets/other/token"}},
++		{"minted by name", kedav1alpha1.VaultAuthenticationKubernetes, kedav1alpha1.Credential{ServiceAccountName: "keda-operator"}},
++		{"literal token", kedav1alpha1.VaultAuthenticationToken, kedav1alpha1.Credential{Token: "s.tenant-supplied"}},
++	}
++	for _, tc := range cases {
++		cred := tc.cred
++		vault := kedav1alpha1.HashiCorpVault{
++			Address:        "http://attacker.tenant.svc:8200",
++			Authentication: tc.auth,
++			Mount:          "my-mount",
++			Role:           "my-role",
++			Credential:     &cred,
++		}
++		vh := NewHashicorpVaultHandler(&vault, authClientSet, "red")
++		err := vh.Initialize(logf.Log.WithName("test"))
++		vh.Stop()
++		assert.ErrorContains(t, err, "no outbound endpoint allowlist is configured",
++			"credential form %q must be refused when no allowlist is configured", tc.name)
++	}
++}
++
++func TestVaultAddressesEqual(t *testing.T) {
++	cases := []struct {
++		a, b  string
++		equal bool
++	}{
++		{"https://vault:8200", "https://vault:8200/", true},
++		{"https://vault:8200", "https://vault:8200/v1/foo", true},
++		{"https://VAULT:8200", "https://vault:8200", true},
++		{"https://vault:8200", "http://vault:8200", false},
++		{"https://vault:8200", "https://vault:8201", false},
++		{"https://vault.internal:8200", "https://vault.internal.attacker.com:8200", false},
++		{"ftp://vault:8200", "ftp://vault:8200", false},
++		{"https://user@vault:8200", "https://user@vault:8200", false},
++		{"vault:8200", "vault:8200", false},
++	}
++	for _, c := range cases {
++		assert.Equalf(t, c.equal, vaultAddressesEqual(c.a, c.b), "vaultAddressesEqual(%q,%q)", c.a, c.b)
++	}
++}
++
+ func TestHashicorpVaultHandler_ResolveSecrets_SameCertAndKey(t *testing.T) {
+ 	server := mockVault(t, false)
+ 	defer server.Close()
++
++	prevCfg := globalConfig
++	SetConfig(&Config{AllowedOutboundEndpoints: []string{server.URL}})
++	defer SetConfig(&prevCfg)
+ 	ctrl := gomock.NewController(t)
+ 	mockCoreV1Interface := mock_serviceaccounts.NewMockCoreV1Interface(ctrl)
+ 	mockSecretLister := mock_secretlister.NewMockSecretLister(ctrl)
+@@ -543,6 +731,10 @@
+ 	server := mockVault(t, false)
+ 	defer server.Close()
+ 
++	prevCfg := globalConfig
++	SetConfig(&Config{AllowedOutboundEndpoints: []string{server.URL}})
++	defer SetConfig(&prevCfg)
++
+ 	ctrl := gomock.NewController(t)
+ 	mockCoreV1Interface := mock_serviceaccounts.NewMockCoreV1Interface(ctrl)
+ 	mockSecretLister := mock_secretlister.NewMockSecretLister(ctrl)
+@@ -605,6 +797,10 @@
+ 	server := mockVault(t, false)
+ 	defer server.Close()
+ 
++	prevCfg := globalConfig
++	SetConfig(&Config{AllowedOutboundEndpoints: []string{server.URL}})
++	defer SetConfig(&prevCfg)
++
+ 	ctrl := gomock.NewController(t)
+ 	mockCoreV1Interface := mock_serviceaccounts.NewMockCoreV1Interface(ctrl)
+ 	mockSecretLister := mock_secretlister.NewMockSecretLister(ctrl)
+@@ -688,6 +884,10 @@
+ 	server := mockVault(t, false)
+ 	defer server.Close()
+ 
++	prev := globalConfig
++	SetConfig(&Config{ServiceAccountTokenMode: "enforce-audience", ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{Audience: "vault.example"}}})
++	defer SetConfig(&prev)
++
+ 	ctrl := gomock.NewController(t)
+ 	mockCoreV1Interface := mock_serviceaccounts.NewMockCoreV1Interface(ctrl)
+ 	mockSecretLister := mock_secretlister.NewMockSecretLister(ctrl)
+@@ -711,7 +911,7 @@
+ 			config := vaultapi.DefaultConfig()
+ 			client, err := vaultapi.NewClient(config)
+ 			assert.Nil(t, err)
+-			token, err := vaultHandler.token(client)
++			token, err := vaultHandler.token(client, logf.Log.WithName("test"))
+ 			if testData.isError {
+ 				assert.Equalf(t, vaultHandler.vault.Credential.ServiceAccount, testData.credential.ServiceAccount, "test %s: expected %s but found %s", testData.name, "random/path", vaultHandler.vault.Credential.ServiceAccount)
+ 				assert.NotNilf(t, err, "test %s: expected error but got success, testData - %+v", testData.name, testData)
+@@ -727,6 +927,12 @@
+ 	server := mockVault(t, false)
+ 	defer server.Close()
+ 
++	prev := globalConfig
++	SetConfig(&Config{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{
++		{ServiceAccountName: bsatSAName, Namespace: "default", Audience: "vault.example"},
++	}})
++	defer SetConfig(&prev)
++
+ 	ctrl := gomock.NewController(t)
+ 	mockCoreV1Interface := mock_serviceaccounts.NewMockCoreV1Interface(ctrl)
+ 	mockSecretLister := mock_secretlister.NewMockSecretLister(ctrl)
+@@ -738,12 +944,24 @@
+ 	defer ctrl.Finish()
+ 
+ 	mockServiceAccountInterface := mockCoreV1Interface.GetServiceAccountInterface()
++	key, err := generateTestRSAKeyPair()
++	require.NoError(t, err)
++	serviceAccountToken, err := createJWTToken(key, jwt.MapClaims{
++		"sub": "system:serviceaccount:default:" + bsatSAName,
++		"aud": []string{"vault.example"},
++		"exp": time.Now().Add(time.Hour).Unix(),
++	})
++	require.NoError(t, err)
+ 	tokenRequest := &authv1.TokenRequest{
+ 		Status: authv1.TokenRequestStatus{
+-			Token: bsatData,
++			Token: string(serviceAccountToken),
+ 		},
+ 	}
+-	mockServiceAccountInterface.EXPECT().CreateToken(gomock.Any(), gomock.Eq(bsatSAName), gomock.Any(), gomock.Any()).Return(tokenRequest, nil).AnyTimes()
++	mockServiceAccountInterface.EXPECT().CreateToken(gomock.Any(), gomock.Eq(bsatSAName), gomock.Any(), gomock.Any()).DoAndReturn(
++		func(_ context.Context, _ string, request *authv1.TokenRequest, _ metav1.CreateOptions) (*authv1.TokenRequest, error) {
++			assert.Equal(t, []string{"vault.example"}, request.Spec.Audiences)
++			return tokenRequest, nil
++		})
+ 
+ 	vault := kedav1alpha1.HashiCorpVault{
+ 		Address:        server.URL,
+@@ -763,7 +981,7 @@
+ 	client, err := vaultapi.NewClient(config)
+ 	assert.NoError(t, err)
+ 
+-	token, err := vaultHandler.token(client)
++	token, err := vaultHandler.token(client, logf.Log.WithName("test"))
+ 	assert.NoError(t, err)
+ 	assert.NotEmpty(t, token)
+ }
+--- a/pkg/scaling/resolver/k8s_validator.go
++++ b/pkg/scaling/resolver/k8s_validator.go
+@@ -4,6 +4,7 @@
+ 	"fmt"
+ 	"io"
+ 	"os"
++	"slices"
+ 	"strings"
+ 
+ 	"github.com/golang-jwt/jwt/v5"
+@@ -58,5 +59,36 @@
+ 		return fmt.Errorf("error validating token: subject isn't a service account")
+ 	}
+ 
++	return nil
++}
++
++// validateK8sSATokenAudiences filters outgoing tokens; the recipient verifies signatures.
++// Configured audiences should not be accepted by kube-apiserver.
++func validateK8sSATokenAudiences(saToken []byte, allowed []string) error {
++	if len(allowed) == 0 {
++		return fmt.Errorf("at least one approved service account token audience is required")
++	}
++	if err := validateK8sSAToken(saToken); err != nil {
++		return err
++	}
++	claims := jwt.MapClaims{}
++	if _, _, err := parser.ParseUnverified(string(saToken), &claims); err != nil {
++		return fmt.Errorf("error parsing token audiences: %w", err)
++	}
++	actual, err := claims.GetAudience()
++	if err != nil {
++		return fmt.Errorf("error getting token audiences: %w", err)
++	}
++	if len(actual) == 0 {
++		return fmt.Errorf("service account token has no audience")
++	}
++	for _, audience := range actual {
++		if audience == "" || !slices.Contains(allowed, audience) {
++			return fmt.Errorf("service account token contains an audience not approved by the allowed audience list")
++		}
++	}
++	if err := jwt.NewValidator(jwt.WithExpirationRequired()).Validate(claims); err != nil {
++		return fmt.Errorf("invalid service account token lifetime: %w", err)
++	}
+ 	return nil
+ }
+--- a/pkg/scaling/resolver/k8s_validator_test.go
++++ b/pkg/scaling/resolver/k8s_validator_test.go
+@@ -141,6 +141,70 @@
+ 	}
+ }
+ 
++func TestValidateK8sSATokenAudiences(t *testing.T) {
++	privateKey, err := generateTestRSAKeyPair()
++	assert.NoError(t, err)
++
++	tests := []struct {
++		name      string
++		audiences any
++		expected  []string
++		wantError bool
++	}{
++		{name: "single matching audience", audiences: []string{"vault.example"}, expected: []string{"vault.example"}},
++		{name: "string audience", audiences: "vault.example", expected: []string{"vault.example"}},
++		{name: "missing audience", expected: []string{"vault.example"}, wantError: true},
++		{name: "wrong audience", audiences: []string{"kube-apiserver"}, expected: []string{"vault.example"}, wantError: true},
++		{name: "additional audience", audiences: []string{"vault.example", "kube-apiserver"}, expected: []string{"vault.example"}, wantError: true},
++		{name: "no required audience", audiences: []string{"vault.example"}, wantError: true},
++		{name: "subset of approved audiences", audiences: []string{"other.example"}, expected: []string{"vault.example", "other.example"}},
++		{name: "all audiences approved", audiences: []string{"other.example", "vault.example"}, expected: []string{"vault.example", "other.example"}},
++		{name: "duplicates do not expand privileges", audiences: []string{"vault.example", "vault.example"}, expected: []string{"vault.example", "other.example"}},
++		{name: "one approved audience cannot hide another", audiences: []string{"vault.example", "api"}, expected: []string{"vault.example", "other.example"}, wantError: true},
++		{name: "empty audience", audiences: []string{""}, expected: []string{""}, wantError: true},
++		{name: "empty audience list", audiences: []string{}, expected: []string{"vault.example"}, wantError: true},
++		{name: "wrong claim type", audiences: 1, expected: []string{"vault.example"}, wantError: true},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			claims := jwt.MapClaims{
++				"iss": "kubernetes/serviceaccount",
++				"sub": "system:serviceaccount:default:default",
++				"exp": time.Now().Add(time.Hour).Unix(),
++			}
++			if tt.audiences != nil {
++				claims["aud"] = tt.audiences
++			}
++			token, err := createJWTToken(privateKey, claims)
++			assert.NoError(t, err)
++
++			err = validateK8sSATokenAudiences(token, tt.expected)
++			if tt.wantError {
++				assert.Error(t, err)
++			} else {
++				assert.NoError(t, err)
++			}
++		})
++	}
++}
++
++func TestValidateK8sSATokenLifetime(t *testing.T) {
++	key, err := generateTestRSAKeyPair()
++	assert.NoError(t, err)
++	for _, lifetime := range []jwt.MapClaims{
++		{}, {"exp": time.Now().Add(-time.Minute).Unix()},
++		{"exp": "invalid"},
++		{"exp": time.Now().Add(time.Hour).Unix(), "nbf": time.Now().Add(time.Minute).Unix()},
++	} {
++		lifetime["sub"] = "system:serviceaccount:default:default"
++		lifetime["aud"] = []string{"vault"}
++		token, err := createJWTToken(key, lifetime)
++		assert.NoError(t, err)
++		assert.Error(t, validateK8sSATokenAudiences(token, []string{"vault"}))
++	}
++}
++
+ // Helper function to generate RSA key pair for testing
+ func generateTestRSAKeyPair() (*rsa.PrivateKey, error) {
+ 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
+--- /dev/null
++++ b/pkg/scaling/resolver/outbound_policy.go
+@@ -0,0 +1,66 @@
++/*
++Copyright 2026 The KEDA Authors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resolver
++
++import (
++	"bufio"
++	"errors"
++	"fmt"
++	"io"
++	"strings"
++
++	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
++	"sigs.k8s.io/yaml"
++)
++
++const OutboundFilterEnvVar = "KEDA_OUTBOUND_FILTER"
++
++type endpointPolicy struct {
++	Mode             *string  `json:"mode"`
++	AllowedEndpoints []string `json:"allowedEndpoints"`
++}
++
++// LoadOutboundFilter configures HashiCorp Vault destination filtering.
++// The default is off; warn logs unlisted endpoints and enforce rejects them.
++func (cfg *Config) LoadOutboundFilter(value string) error {
++	defaultMode := outboundPolicyOff
++	filter := &struct {
++		HashiCorpVault *endpointPolicy `json:"hashiCorpVault"`
++	}{HashiCorpVault: &endpointPolicy{Mode: &defaultMode}}
++	if strings.TrimSpace(value) != "" {
++		reader := k8syaml.NewYAMLReader(bufio.NewReader(strings.NewReader(value)))
++		document, err := reader.Read()
++		if err != nil {
++			return fmt.Errorf("invalid %s: %w", OutboundFilterEnvVar, err)
++		}
++		if _, err = reader.Read(); !errors.Is(err, io.EOF) {
++			return fmt.Errorf("%s must contain one YAML or JSON document", OutboundFilterEnvVar)
++		}
++		if err := yaml.UnmarshalStrict(document, &filter); err != nil {
++			return fmt.Errorf("invalid %s: %w", OutboundFilterEnvVar, err)
++		}
++	}
++	if filter == nil || filter.HashiCorpVault == nil {
++		return fmt.Errorf("%s and its hashiCorpVault section must be objects, not null", OutboundFilterEnvVar)
++	}
++	if filter.HashiCorpVault.Mode == nil || *filter.HashiCorpVault.Mode == "" {
++		return fmt.Errorf("%s.hashiCorpVault.mode must be off, warn, or enforce", OutboundFilterEnvVar)
++	}
++	cfg.OutboundEndpointPolicy = *filter.HashiCorpVault.Mode
++	cfg.AllowedOutboundEndpoints = filter.HashiCorpVault.AllowedEndpoints
++	return cfg.Validate()
++}
+--- /dev/null
++++ b/pkg/scaling/resolver/outbound_policy_test.go
+@@ -0,0 +1,130 @@
++/*
++Copyright 2026 The KEDA Authors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resolver
++
++import (
++	"testing"
++
++	"github.com/go-logr/logr"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++
++	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
++)
++
++func TestOutboundFilter(t *testing.T) {
++	tests := []struct {
++		name      string
++		value     string
++		mode      string
++		endpoints []string
++	}{
++		{name: "unset", mode: "off"},
++		{name: "whitespace", value: " \n\t", mode: "off"},
++		{name: "empty object", value: "{}", mode: "off"},
++		{name: "empty vault object", value: "hashiCorpVault: {}", mode: "off"},
++		{
++			name: "omitted mode", value: `{"hashiCorpVault":{"allowedEndpoints":["https://vault.example"]}}`,
++			mode: "off", endpoints: []string{"https://vault.example"},
++		},
++		{
++			name: "JSON warn", value: `{"hashiCorpVault":{"mode":"warn","allowedEndpoints":["https://vault.example"]}}`,
++			mode: "warn", endpoints: []string{"https://vault.example"},
++		},
++		{
++			name: "YAML enforce", value: "hashiCorpVault:\n  mode: enforce\n  allowedEndpoints:\n    - https://vault.example:8200\n    - http://vault.internal\n",
++			mode: "enforce", endpoints: []string{"https://vault.example:8200", "http://vault.internal"},
++		},
++		{name: "quoted YAML off", value: "hashiCorpVault:\n  mode: \"off\"", mode: "off"},
++		{name: "enforce empty allowlist", value: `{"hashiCorpVault":{"mode":"enforce","allowedEndpoints":[]}}`, mode: "enforce", endpoints: []string{}},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			cfg := Config{}
++			require.NoError(t, cfg.LoadOutboundFilter(tt.value))
++			assert.Equal(t, tt.mode, cfg.OutboundEndpointPolicy)
++			assert.Equal(t, tt.endpoints, cfg.AllowedOutboundEndpoints)
++		})
++	}
++}
++
++func TestOutboundFilterInvalidConfiguration(t *testing.T) {
++	tests := []struct {
++		name  string
++		value string
++	}{
++		{name: "malformed YAML", value: "hashiCorpVault: ["},
++		{name: "null configuration", value: "null"},
++		{name: "null vault", value: "hashiCorpVault: null"},
++		{name: "null mode", value: "hashiCorpVault:\n  mode: null"},
++		{name: "empty mode", value: `{"hashiCorpVault":{"mode":""}}`},
++		{name: "unknown mode", value: `{"hashiCorpVault":{"mode":"enfroce"}}`},
++		{name: "unquoted YAML off", value: "hashiCorpVault:\n  mode: off"},
++		{name: "unknown section", value: `{"prometheus":{}}`},
++		{name: "old vault section", value: `{"vault":{"mode":"enforce","allowedEndpoints":[]}}`},
++		{name: "old and new sections", value: `{"vault":{},"hashiCorpVault":{"mode":"enforce"}}`},
++		{name: "unknown field", value: `{"hashiCorpVault":{"allowedEndpoint":[]}}`},
++		{name: "duplicate key", value: "hashiCorpVault:\n  mode: warn\n  mode: enforce"},
++		{name: "multiple documents", value: "hashiCorpVault: {}\n---\nhashiCorpVault: {}\n"},
++		{name: "missing scheme", value: `{"hashiCorpVault":{"allowedEndpoints":["vault.example:8200"]}}`},
++		{name: "wildcard", value: `{"hashiCorpVault":{"allowedEndpoints":["https://*.example"]}}`},
++		{name: "URL credentials", value: `{"hashiCorpVault":{"allowedEndpoints":["https://user@vault.example"]}}`},
++		{name: "URL path", value: `{"hashiCorpVault":{"allowedEndpoints":["https://vault.example/login"]}}`},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			cfg := Config{}
++			assert.Error(t, cfg.LoadOutboundFilter(tt.value))
++		})
++	}
++}
++
++func TestOutboundFilterEnforcement(t *testing.T) {
++	previous := globalConfig
++	t.Cleanup(func() { SetConfig(&previous) })
++	tests := []struct {
++		name      string
++		mode      string
++		endpoints []string
++		wantError bool
++	}{
++		{name: "zero config allows all"},
++		{name: "off ignores allowlist", mode: "off", endpoints: []string{"https://other.example"}},
++		{name: "warn allows unlisted endpoint", mode: "warn", endpoints: []string{"https://other.example"}},
++		{name: "enforce allows listed endpoint", mode: "enforce", endpoints: []string{"https://vault.example"}},
++		{name: "enforce rejects unlisted endpoint", mode: "enforce", endpoints: []string{"https://other.example"}, wantError: true},
++		{name: "enforce empty allowlist denies all", mode: "enforce", wantError: true},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			SetConfig(&Config{OutboundEndpointPolicy: tt.mode, AllowedOutboundEndpoints: tt.endpoints})
++			vh := &HashicorpVaultHandler{vault: &kedav1alpha1.HashiCorpVault{Address: "https://vault.example"}}
++			err := vh.validateAddress(logr.Discard())
++			if tt.wantError {
++				assert.Error(t, err)
++			} else {
++				assert.NoError(t, err)
++			}
++		})
++	}
++	t.Run("off still requires a Vault audience", func(t *testing.T) {
++		SetConfig(&Config{OutboundEndpointPolicy: "off"})
++		vh := &HashicorpVaultHandler{vault: &kedav1alpha1.HashiCorpVault{}}
++		_, err := vh.kubernetesToken(t.Context())
++		assert.ErrorContains(t, err, "no approved service account token audiences")
++	})
++}
+--- a/pkg/scaling/resolver/scale_resolvers.go
++++ b/pkg/scaling/resolver/scale_resolvers.go
+@@ -20,6 +20,7 @@
+ 	"bytes"
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"net/url"
+ 	"os"
+@@ -29,7 +30,6 @@
+ 
+ 	"github.com/go-logr/logr"
+ 	appsv1 "k8s.io/api/apps/v1"
+-	authenticationv1 "k8s.io/api/authentication/v1"
+ 	corev1 "k8s.io/api/core/v1"
+ 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+ 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+@@ -56,6 +56,9 @@
+ 	deploymentKind        = "Deployment"
+ 	statefulSetKind       = "StatefulSet"
+ 	replicaSetKind        = "ReplicaSet"
++	outboundPolicyOff     = "off"
++	outboundPolicyEnforce = "enforce"
++	outboundPolicyWarn    = "warn"
+ )
+ 
+ // podSpecable is a local duck type matching the PodSpecable shape used by
+@@ -91,8 +94,50 @@
+ 
+ type Config struct {
+ 	FilePathAuthRootPath string
++
++	// AllowedOutboundEndpoints lists trusted Vault origins for warn and enforce modes.
++	// Other integrations do not yet enforce this option.
++	AllowedOutboundEndpoints []string
++	// OutboundEndpointPolicy is "off" (the default, including when empty), "warn", or "enforce".
++	// In enforce mode, an empty allowlist denies all Vault destinations.
++	OutboundEndpointPolicy string
++
++	// ServiceAccountTokenMode defaults to enforce-audience. Legacy explicitly disables
++	// audience enforcement for both Vault file tokens and all TokenRequest consumers.
++	ServiceAccountTokenMode string
++	// ServiceAccountTokenAudiences permits file-token audiences. Entries with namespace
++	// and serviceAccountName also select the audience for Vault and generic BSAT minting.
++	ServiceAccountTokenAudiences []ServiceAccountTokenAudience
++	// VaultKubernetesAuthTokenFile is the operator's dedicated projected token, read on each login.
++	VaultKubernetesAuthTokenFile string
+ }
+ 
++// IsWarnOutboundPolicy reports whether unlisted destinations log warnings.
++func (cfg *Config) IsWarnOutboundPolicy() bool {
++	return cfg.OutboundEndpointPolicy == outboundPolicyWarn
++}
++
++// Validate rejects invalid policy settings at startup. Missing audiences are checked
++// when service account token authentication is requested, not for unrelated auth methods.
++func (cfg *Config) Validate() error {
++	switch cfg.OutboundEndpointPolicy {
++	case "", outboundPolicyOff, outboundPolicyWarn, outboundPolicyEnforce:
++	default:
++		return fmt.Errorf("unsupported %s.hashiCorpVault.mode %q: expected off, warn, or enforce", OutboundFilterEnvVar, cfg.OutboundEndpointPolicy)
++	}
++	if err := cfg.validateServiceAccountTokenPolicy(); err != nil {
++		return err
++	}
++	for _, endpoint := range cfg.AllowedOutboundEndpoints {
++		origin, err := url.Parse(endpoint)
++		if err != nil || !vaultAddressesEqual(endpoint, endpoint) || strings.Contains(origin.Host, "*") ||
++			(origin.Path != "" && origin.Path != "/") || origin.RawQuery != "" || origin.Fragment != "" {
++			return fmt.Errorf("invalid %s.hashiCorpVault.allowedEndpoints entry: expected an HTTP(S) origin without user information", OutboundFilterEnvVar)
++		}
++	}
++	return nil
++}
++
+ // SetConfig sets the global configuration for the resolver package.
+ // This avoids updating the callstack to pass in the config.
+ // It's distinct from the env-based approach (env_resolver) to avoid external modification at runtime.
+@@ -419,7 +464,11 @@
+ 			}
+ 			if triggerAuthSpec.BoundServiceAccountToken != nil {
+ 				for _, e := range triggerAuthSpec.BoundServiceAccountToken {
+-					result[e.Parameter] = resolveBoundServiceAccountToken(ctx, client, logger, triggerNamespace, &e, authClientSet)
++					token, err := resolveBoundServiceAccountToken(ctx, client, triggerNamespace, &e, authClientSet)
++					if err != nil {
++						return nil, podIdentity, err
++					}
++					result[e.Parameter] = token
+ 				}
+ 			}
+ 			if triggerAuthSpec.OAuth2 != nil {
+@@ -729,42 +778,16 @@
+ 	return params, nil
+ }
+ 
+-func resolveBoundServiceAccountToken(ctx context.Context, client client.Client, logger logr.Logger, namespace string, bsat *kedav1alpha1.BoundServiceAccountToken, acs *authentication.AuthClientSet) string {
++func resolveBoundServiceAccountToken(ctx context.Context, client client.Client, namespace string, bsat *kedav1alpha1.BoundServiceAccountToken, acs *authentication.AuthClientSet) (string, error) {
+ 	serviceAccountName := bsat.ServiceAccountName
+ 	if serviceAccountName == "" {
+-		logger.Error(fmt.Errorf("error trying to get token"), "serviceAccountName is required")
+-		return ""
++		return "", errors.New("serviceAccountName is required for boundServiceAccountToken")
+ 	}
+-	var err error
+-
+ 	serviceAccount := &corev1.ServiceAccount{}
+-	err = client.Get(ctx, types.NamespacedName{Name: serviceAccountName, Namespace: namespace}, serviceAccount)
+-	if err != nil {
+-		logger.Error(err, "error trying to get service account from namespace", "ServiceAccount.Namespace", namespace, "ServiceAccount.Name", serviceAccountName)
+-		return ""
++	if err := client.Get(ctx, types.NamespacedName{Name: serviceAccountName, Namespace: namespace}, serviceAccount); err != nil {
++		return "", fmt.Errorf("failed to get service account %s/%s: %w", namespace, serviceAccountName, err)
+ 	}
+ 	return GenerateBoundServiceAccountToken(ctx, serviceAccountName, namespace, acs)
+-}
+-
+-// GenerateBoundServiceAccountToken creates a Kubernetes token for a namespaced service account with a runtime-configurable expiration time and returns the token string.
+-func GenerateBoundServiceAccountToken(ctx context.Context, serviceAccountName, namespace string, acs *authentication.AuthClientSet) string {
+-	expirationSeconds := ptr.To(int64(boundServiceAccountTokenExpiry.Seconds()))
+-	token, err := acs.CoreV1Interface.ServiceAccounts(namespace).CreateToken(
+-		ctx,
+-		serviceAccountName,
+-		&authenticationv1.TokenRequest{
+-			Spec: authenticationv1.TokenRequestSpec{
+-				ExpirationSeconds: expirationSeconds,
+-			},
+-		},
+-		metav1.CreateOptions{},
+-	)
+-	if err != nil {
+-		log.V(1).Error(err, "error trying to create bound service account token for service account", "ServiceAccount.Name", serviceAccountName)
+-		return ""
+-	}
+-	log.V(1).Info("Bound service account token created successfully", "ServiceAccount.Name", serviceAccountName)
+-	return token.Status.Token
+ }
+ 
+ // resolveServiceAccountAnnotation retrieves the value of a specific annotation
+--- a/pkg/scaling/resolver/scale_resolvers_test.go
++++ b/pkg/scaling/resolver/scale_resolvers_test.go
+@@ -23,9 +23,12 @@
+ 	"os"
+ 	"path/filepath"
+ 	"testing"
++	"time"
+ 
++	"github.com/golang-jwt/jwt/v5"
+ 	"github.com/google/go-cmp/cmp"
+ 	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
+ 	"go.uber.org/mock/gomock"
+ 	appsv1 "k8s.io/api/apps/v1"
+ 	authv1 "k8s.io/api/authentication/v1"
+@@ -53,8 +56,7 @@
+ 	cmName                    = "supercm"
+ 	cmKey                     = "mycmkey"
+ 	cmData                    = "cmDataHere"
+-	bsatSAName                = "bsatServiceAccount"
+-	bsatData                  = "k8s-bsat-token"
++	bsatSAName                = "bsat-service-account"
+ 	trueValue                 = true
+ 	falseValue                = false
+ 	envKey                    = "test-env-key"
+@@ -251,6 +253,17 @@
+ }
+ 
+ func TestResolveAuthRef(t *testing.T) {
++	previous := globalConfig
++	t.Cleanup(func() { SetConfig(&previous) })
++	SetConfig(&Config{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{
++		{ServiceAccountName: bsatSAName, Namespace: namespace, Audience: "metrics"},
++		{ServiceAccountName: bsatSAName, Namespace: clusterNamespace, Audience: "metrics"},
++	}})
++	bsatData, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
++		"sub": "system:serviceaccount:test:test", "aud": []string{"metrics"},
++		"exp": time.Now().Add(time.Hour).Unix(),
++	}).SignedString([]byte("test-only"))
++	require.NoError(t, err)
+ 	if err := corev1.AddToScheme(scheme.Scheme); err != nil {
+ 		t.Errorf("Expected Error because: %v", err)
+ 	}
+@@ -683,7 +696,8 @@
+ 			expectedPodIdentity: kedav1alpha1.AuthPodIdentity{Provider: kedav1alpha1.PodIdentityProviderNone},
+ 		},
+ 		{
+-			name: "clustertriggerauth exists bound service account token but service account in the wrong namespace",
++			name:    "clustertriggerauth exists bound service account token but service account in the wrong namespace",
++			isError: true,
+ 			existing: []runtime.Object{
+ 				&kedav1alpha1.ClusterTriggerAuthentication{
+ 					ObjectMeta: metav1.ObjectMeta{
+@@ -709,7 +723,7 @@
+ 				},
+ 			},
+ 			soar:                &kedav1alpha1.AuthenticationRef{Name: triggerAuthenticationName, Kind: "ClusterTriggerAuthentication"},
+-			expected:            map[string]string{"token": ""},
++			expected:            nil,
+ 			expectedPodIdentity: kedav1alpha1.AuthPodIdentity{Provider: kedav1alpha1.PodIdentityProviderNone},
+ 		},
+ 	}
+--- /dev/null
++++ b/pkg/scaling/resolver/service_account_token.go
+@@ -0,0 +1,157 @@
++/*
++Copyright 2026 The KEDA Authors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resolver
++
++import (
++	"bufio"
++	"context"
++	"errors"
++	"fmt"
++	"io"
++	"strings"
++
++	authenticationv1 "k8s.io/api/authentication/v1"
++	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
++	"k8s.io/apimachinery/pkg/types"
++	"k8s.io/apimachinery/pkg/util/validation"
++	k8syaml "k8s.io/apimachinery/pkg/util/yaml"
++	"sigs.k8s.io/yaml"
++
++	"github.com/kedacore/keda/v2/pkg/scalers/authentication"
++)
++
++const ServiceAccountTokenAudiencesEnvVar = "KEDA_SERVICE_ACCOUNT_TOKEN_AUDIENCES"
++
++// ServiceAccountTokenAudience permits an audience for file tokens and optionally
++// selects it for token minting for an exact namespace/service account pair.
++type ServiceAccountTokenAudience struct {
++	Audience           string `json:"audience"`
++	Namespace          string `json:"namespace,omitempty"`
++	ServiceAccountName string `json:"serviceAccountName,omitempty"`
++}
++
++// LoadServiceAccountTokenAudiences reads audience approvals and minting mappings from YAML or JSON.
++func (cfg *Config) LoadServiceAccountTokenAudiences(value string) error {
++	var audiences []ServiceAccountTokenAudience
++	if strings.TrimSpace(value) != "" {
++		reader := k8syaml.NewYAMLReader(bufio.NewReader(strings.NewReader(value)))
++		document, err := reader.Read()
++		if err != nil {
++			return fmt.Errorf("invalid %s: %w", ServiceAccountTokenAudiencesEnvVar, err)
++		}
++		if _, err = reader.Read(); !errors.Is(err, io.EOF) {
++			return fmt.Errorf("%s must contain one YAML or JSON document", ServiceAccountTokenAudiencesEnvVar)
++		}
++		if err := yaml.UnmarshalStrict(document, &audiences); err != nil {
++			return fmt.Errorf("invalid %s: %w", ServiceAccountTokenAudiencesEnvVar, err)
++		}
++		if audiences == nil {
++			return fmt.Errorf("%s must be an array, not null", ServiceAccountTokenAudiencesEnvVar)
++		}
++	}
++	cfg.ServiceAccountTokenAudiences = audiences
++	return cfg.validateServiceAccountTokenPolicy()
++}
++
++// IsLegacyServiceAccountTokenMode reports whether the audience enforcement is disabled.
++func (cfg *Config) IsLegacyServiceAccountTokenMode() bool {
++	return cfg.ServiceAccountTokenMode == "legacy"
++}
++
++func (cfg *Config) validateServiceAccountTokenPolicy() error {
++	switch cfg.ServiceAccountTokenMode {
++	case "legacy":
++		if len(cfg.ServiceAccountTokenAudiences) != 0 {
++			return errors.New("legacy token mode cannot be combined with configured audiences; use enforce-audience or remove the audience settings")
++		}
++		return nil
++	case "", "enforce-audience":
++	default:
++		return fmt.Errorf("unsupported service-account-token-mode %q: expected enforce-audience or legacy", cfg.ServiceAccountTokenMode)
++	}
++	seen := make(map[types.NamespacedName]bool)
++	for _, entry := range cfg.ServiceAccountTokenAudiences {
++		if entry.Audience == "" || entry.Audience != strings.TrimSpace(entry.Audience) {
++			return errors.New("service account token audiences must be nonempty and contain no surrounding whitespace")
++		}
++		if entry.Namespace == "" && entry.ServiceAccountName == "" {
++			continue
++		}
++		if entry.Namespace == "" || entry.ServiceAccountName == "" {
++			return fmt.Errorf("%s entries must set both namespace and serviceAccountName for minting, or omit both for audience approval only", ServiceAccountTokenAudiencesEnvVar)
++		}
++		if len(validation.IsDNS1123Label(entry.Namespace)) != 0 || len(validation.IsDNS1123Subdomain(entry.ServiceAccountName)) != 0 {
++			return fmt.Errorf("%s entries require valid, exact Kubernetes namespace and service account names; wildcards are not supported", ServiceAccountTokenAudiencesEnvVar)
++		}
++		key := types.NamespacedName{Namespace: entry.Namespace, Name: entry.ServiceAccountName}
++		if seen[key] {
++			return fmt.Errorf("duplicate service account token audience mapping for %s", key)
++		}
++		seen[key] = true
++	}
++	return nil
++}
++
++// Every entry permits file tokens; the allowed set is shared across integrations.
++func (cfg *Config) serviceAccountTokenAllowedAudiences() []string {
++	audiences := make([]string, 0, len(cfg.ServiceAccountTokenAudiences))
++	for _, entry := range cfg.ServiceAccountTokenAudiences {
++		audiences = append(audiences, entry.Audience)
++	}
++	return audiences
++}
++
++func (cfg *Config) serviceAccountTokenAudiences(namespace, name string) ([]string, error) {
++	for _, mapping := range cfg.ServiceAccountTokenAudiences {
++		if mapping.ServiceAccountName != "" && mapping.Namespace == namespace && mapping.ServiceAccountName == name {
++			return []string{mapping.Audience}, nil
++		}
++	}
++	return nil, fmt.Errorf("no configured token audience for service account %s/%s in %s", namespace, name, ServiceAccountTokenAudiencesEnvVar)
++}
++
++// GenerateBoundServiceAccountToken mints a token for Vault or BSAT authentication.
++// Outside legacy mode, the configured SA audience is required before TokenRequest.
++func GenerateBoundServiceAccountToken(ctx context.Context, serviceAccountName, namespace string, acs *authentication.AuthClientSet) (string, error) {
++	legacy := globalConfig.IsLegacyServiceAccountTokenMode()
++	var audiences []string
++	if !legacy {
++		var err error
++		audiences, err = globalConfig.serviceAccountTokenAudiences(namespace, serviceAccountName)
++		if err != nil {
++			return "", err
++		}
++	}
++	token, err := acs.CoreV1Interface.ServiceAccounts(namespace).CreateToken(ctx, serviceAccountName,
++		&authenticationv1.TokenRequest{Spec: authenticationv1.TokenRequestSpec{
++			ExpirationSeconds: new(int64(boundServiceAccountTokenExpiry.Seconds())),
++			Audiences:         audiences,
++		}}, metav1.CreateOptions{})
++	if err != nil {
++		return "", fmt.Errorf("failed to create bound service account token for %s/%s: %w", namespace, serviceAccountName, err)
++	}
++	if token == nil || token.Status.Token == "" {
++		return "", fmt.Errorf("token request for %s/%s returned an empty token", namespace, serviceAccountName)
++	}
++	if legacy {
++		log.Info("Warning: minting a legacy service account token without an explicit audience; forwarding it may expose Kubernetes API access. Configure KEDA_SERVICE_ACCOUNT_TOKEN_AUDIENCES and --service-account-token-mode=enforce-audience", "ServiceAccount.Namespace", namespace, "ServiceAccount.Name", serviceAccountName)
++	} else if err := validateK8sSATokenAudiences([]byte(token.Status.Token), audiences); err != nil {
++		return "", fmt.Errorf("invalid token returned for service account %s/%s: %w", namespace, serviceAccountName, err)
++	}
++	log.V(1).Info("Bound service account token created successfully", "ServiceAccount.Namespace", namespace, "ServiceAccount.Name", serviceAccountName, "Token.Audiences", audiences)
++	return token.Status.Token, nil
++}
+--- /dev/null
++++ b/pkg/scaling/resolver/service_account_token_test.go
+@@ -0,0 +1,242 @@
++/*
++Copyright 2026 The KEDA Authors
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package resolver
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/golang-jwt/jwt/v5"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	authenticationv1 "k8s.io/api/authentication/v1"
++	"k8s.io/apimachinery/pkg/runtime"
++	kubernetesfake "k8s.io/client-go/kubernetes/fake"
++	k8stesting "k8s.io/client-go/testing"
++
++	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
++	"github.com/kedacore/keda/v2/pkg/scalers/authentication"
++)
++
++func TestServiceAccountTokenPolicyConfiguration(t *testing.T) {
++	for _, value := range []string{
++		`[{"audience":"vault"},{"serviceAccountName":"reader","namespace":"tenant","audience":"metrics"}]`,
++		"- audience: vault\n- serviceAccountName: reader\n  namespace: tenant\n  audience: metrics\n",
++	} {
++		cfg := Config{}
++		require.NoError(t, cfg.LoadServiceAccountTokenAudiences(value))
++		assert.Equal(t, []string{"vault", "metrics"}, cfg.serviceAccountTokenAllowedAudiences())
++		audiences, err := cfg.serviceAccountTokenAudiences("tenant", "reader")
++		require.NoError(t, err)
++		assert.Equal(t, []string{"metrics"}, audiences, "do not mint the global audience union")
++	}
++	for _, value := range []string{
++		"null", "{}", "[", "[]\n---\n[]", "- serviceAccountName: reader",
++		`[{"name":"reader","namespace":"tenant","audience":"metrics"}]`, // Old schema is not silently treated as approval only.
++		`[{"serviceAccountName":"reader","namespace":"tenant","audiences":["metrics"]}]`,
++		`[{"audience":""}]`, `[{"audience":" metrics"}]`,
++		`[{"audience":"metrics","mint":true}]`,
++		`[{"serviceAccountName":"reader","audience":"metrics"}]`,
++		`[{"namespace":"tenant","audience":"metrics"}]`,
++		`[{"serviceAccountName":"*","namespace":"tenant","audience":"metrics"}]`,
++		`[{"serviceAccountName":"reader","namespace":"tenant/other","audience":"metrics"}]`,
++		"- audience: metrics\n  audience: vault\n",
++		`[{"serviceAccountName":"reader","namespace":"tenant","audience":"metrics"},{"serviceAccountName":"reader","namespace":"tenant","audience":"vault"}]`,
++		`[{"serviceAccountName":"reader","namespace":"tenant","audience":"metrics"},{"serviceAccountName":"reader","namespace":"tenant","audience":"metrics"}]`,
++	} {
++		t.Run(value, func(t *testing.T) {
++			cfg := Config{}
++			assert.Error(t, cfg.LoadServiceAccountTokenAudiences(value))
++		})
++	}
++	for _, cfg := range []Config{
++		{ServiceAccountTokenMode: "unknown"},
++		{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{Audience: ""}}},
++		{ServiceAccountTokenMode: "legacy", ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{Audience: "vault"}}},
++		{ServiceAccountTokenMode: "legacy", ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{ServiceAccountName: "reader", Namespace: "tenant", Audience: "metrics"}}},
++	} {
++		assert.Error(t, cfg.Validate())
++	}
++	// API audiences may be explicitly allowed; KEDA does not guess them.
++	assert.NoError(t, (&Config{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{Audience: "https://kubernetes.default.svc"}}}).Validate())
++	for _, value := range []string{"", "[]"} {
++		for _, mode := range []string{"enforce-audience", "legacy"} {
++			cfg := Config{ServiceAccountTokenMode: mode}
++			require.NoError(t, cfg.LoadServiceAccountTokenAudiences(value))
++			require.NoError(t, cfg.Validate(), "unrelated auth does not require token audiences")
++		}
++	}
++}
++
++func TestServiceAccountTokenSharedAudience(t *testing.T) {
++	cfg := Config{}
++	require.NoError(t, cfg.LoadServiceAccountTokenAudiences(`
++- audience: metrics
++- audience: metrics
++  namespace: tenant
++  serviceAccountName: reader
++- audience: metrics
++  namespace: other
++  serviceAccountName: reader
++`))
++	for _, namespace := range []string{"tenant", "other"} {
++		audiences, err := cfg.serviceAccountTokenAudiences(namespace, "reader")
++		require.NoError(t, err)
++		assert.Equal(t, []string{"metrics"}, audiences)
++	}
++	_, err := cfg.serviceAccountTokenAudiences("", "")
++	assert.Error(t, err, "approval-only entries never select a minting audience")
++}
++
++func TestServiceAccountTokenMintingRequiresExactMapping(t *testing.T) {
++	previous := globalConfig
++	t.Cleanup(func() { SetConfig(&previous) })
++	client := kubernetesfake.NewClientset()
++	acs := &authentication.AuthClientSet{CoreV1Interface: client.CoreV1()}
++	for _, cfg := range []Config{
++		{},
++		{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{Audience: "metrics"}}},
++		{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{ServiceAccountName: "reader", Namespace: "other", Audience: "metrics"}}},
++		{ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{{ServiceAccountName: "other", Namespace: "tenant", Audience: "metrics"}}},
++	} {
++		SetConfig(&cfg)
++		token, err := GenerateBoundServiceAccountToken(t.Context(), "reader", "tenant", acs)
++		assert.ErrorContains(t, err, "no configured token audience")
++		assert.Empty(t, token)
++	}
++	assert.Empty(t, client.Actions(), "must not request a default API token before rejecting configuration")
++}
++
++func TestServiceAccountTokenMintingValidatesResponse(t *testing.T) {
++	previous := globalConfig
++	t.Cleanup(func() { SetConfig(&previous) })
++	SetConfig(&Config{
++		ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{
++			{Audience: "vault"},
++			{ServiceAccountName: "reader", Namespace: "tenant", Audience: "metrics"},
++		},
++	})
++	for _, tt := range []struct {
++		name      string
++		token     string
++		apiError  error
++		wantError bool
++	}{
++		{name: "requested audience", token: testServiceAccountJWT(t, "metrics")},
++		{name: "API audience", token: testServiceAccountJWT(t, "kube-apiserver"), wantError: true},
++		{name: "mixed audiences", token: testServiceAccountJWT(t, "metrics", "kube-apiserver"), wantError: true},
++		{name: "approved but not requested", token: testServiceAccountJWT(t, "vault"), wantError: true},
++		{name: "no audience", token: testServiceAccountJWT(t), wantError: true},
++		{name: "empty response", wantError: true},
++		{name: "API failure", apiError: errors.New("token request forbidden"), wantError: true},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			client := kubernetesfake.NewClientset()
++			client.PrependReactor("create", "serviceaccounts", func(action k8stesting.Action) (bool, runtime.Object, error) {
++				assert.Equal(t, "tenant", action.GetNamespace())
++				assert.Equal(t, "token", action.GetSubresource())
++				request := action.(k8stesting.CreateAction).GetObject().(*authenticationv1.TokenRequest)
++				assert.Equal(t, []string{"metrics"}, request.Spec.Audiences)
++				assert.Positive(t, *request.Spec.ExpirationSeconds)
++				return true, &authenticationv1.TokenRequest{Status: authenticationv1.TokenRequestStatus{Token: tt.token}}, tt.apiError
++			})
++			token, err := GenerateBoundServiceAccountToken(t.Context(), "reader", "tenant", &authentication.AuthClientSet{CoreV1Interface: client.CoreV1()})
++			if tt.wantError {
++				require.Error(t, err)
++				assert.Empty(t, token)
++			} else {
++				require.NoError(t, err)
++				assert.Equal(t, tt.token, token)
++			}
++		})
++	}
++}
++
++func TestServiceAccountTokenLegacyMinting(t *testing.T) {
++	previous := globalConfig
++	t.Cleanup(func() { SetConfig(&previous) })
++	SetConfig(&Config{ServiceAccountTokenMode: "legacy"})
++	want := testServiceAccountJWT(t, "kube-apiserver")
++	client := kubernetesfake.NewClientset()
++	client.PrependReactor("create", "serviceaccounts", func(action k8stesting.Action) (bool, runtime.Object, error) {
++		request := action.(k8stesting.CreateAction).GetObject().(*authenticationv1.TokenRequest)
++		assert.Empty(t, request.Spec.Audiences)
++		return true, &authenticationv1.TokenRequest{Status: authenticationv1.TokenRequestStatus{Token: want}}, nil
++	})
++	token, err := GenerateBoundServiceAccountToken(t.Context(), "reader", "tenant", &authentication.AuthClientSet{CoreV1Interface: client.CoreV1()})
++	require.NoError(t, err)
++	assert.Equal(t, want, token)
++}
++
++func TestVaultFileTokenAudiencePolicy(t *testing.T) {
++	previous := globalConfig
++	t.Cleanup(func() { SetConfig(&previous) })
++	path := filepath.Join(t.TempDir(), "token")
++	SetConfig(&Config{
++		VaultKubernetesAuthTokenFile: path,
++		ServiceAccountTokenAudiences: []ServiceAccountTokenAudience{
++			{Audience: "vault"},
++			{ServiceAccountName: "reader", Namespace: "tenant", Audience: "metrics"},
++		},
++	})
++	for _, credential := range []*kedav1alpha1.Credential{nil, {ServiceAccount: path}} {
++		vh := NewHashicorpVaultHandler(&kedav1alpha1.HashiCorpVault{Credential: credential}, nil, "tenant")
++		for _, tt := range []struct {
++			audiences []string
++			wantError bool
++		}{
++			{audiences: []string{"vault"}},
++			{audiences: []string{"metrics"}}, // Configured minting audiences also allow file tokens.
++			{audiences: []string{"vault", "metrics"}},
++			{audiences: []string{"kube-apiserver"}, wantError: true},
++			{audiences: []string{"vault", "kube-apiserver"}, wantError: true},
++			{wantError: true},
++		} {
++			// Replacing the contents also checks that each login observes token rotation.
++			want := testServiceAccountJWT(t, tt.audiences...)
++			require.NoError(t, os.WriteFile(path, []byte(want), 0o600))
++			token, err := vh.kubernetesToken(t.Context())
++			if tt.wantError {
++				require.Error(t, err)
++				assert.Empty(t, token)
++			} else {
++				require.NoError(t, err)
++				assert.Equal(t, want, string(token))
++			}
++		}
++	}
++	SetConfig(&Config{ServiceAccountTokenMode: "legacy"})
++	want := testServiceAccountJWT(t, "kube-apiserver")
++	require.NoError(t, os.WriteFile(path, []byte(want), 0o600))
++	vh := NewHashicorpVaultHandler(&kedav1alpha1.HashiCorpVault{Credential: &kedav1alpha1.Credential{ServiceAccount: path}}, nil, "tenant")
++	token, err := vh.kubernetesToken(t.Context())
++	require.NoError(t, err)
++	assert.Equal(t, want, string(token))
++}
++
++func testServiceAccountJWT(t *testing.T, audiences ...string) string {
++	t.Helper()
++	token, err := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
++		"sub": "system:serviceaccount:tenant:reader", "aud": audiences,
++		"exp": time.Now().Add(time.Hour).Unix(),
++	}).SignedString([]byte("test-only"))
++	require.NoError(t, err)
++	return token
++}
+--- a/tests/secret-providers/hashicorp_vault/hashicorp_vault_test.go
++++ b/tests/secret-providers/hashicorp_vault/hashicorp_vault_test.go
+@@ -24,6 +24,8 @@
+ 
+ const (
+ 	testName = "hashicorp-vault-test"
++	// Must match the projection and named-SA audience mapping in config/e2e/vault.
++	vaultAudience = "keda-vault-e2e"
+ )
+ 
+ var (
+@@ -137,9 +139,13 @@
+     authentication: {{.HashiCorpAuthentication}}
+     role: {{.VaultRole}}
+     mount: kubernetes
++    {{- if .VaultServiceAccountName}}
+     credential:
+-      token: {{.HashiCorpToken}}
+       serviceAccountName: {{.VaultServiceAccountName}}
++    {{- else if eq .HashiCorpAuthentication "token"}}
++    credential:
++      token: {{.HashiCorpToken}}
++    {{- end}}
+     secrets:
+     - parameter: connection
+       key: connectionString
+@@ -350,8 +356,11 @@
+     role: keda
+     mount: kubernetes
+     credential:
++      {{- if eq .HashiCorpAuthentication "kubernetes"}}
++      serviceAccount: /var/run/secrets/keda-vault/token
++      {{- else}}
+       token: {{.HashiCorpToken}}
+-      serviceAccount: /var/run/secrets/kubernetes.io/serviceaccount/token
++      {{- end}}
+     secrets:
+       - key: "ca_chain"
+         parameter: "ca"
+@@ -441,9 +450,10 @@
+   - ""
+   resources:
+   - serviceaccounts/token
++  resourceNames:
++  - default
+   verbs:
+   - create
+-  - get
+ `
+ 	serviceAccountTokenCreationRoleBindingTemplate = `
+ apiVersion: rbac.authorization.k8s.io/v1
+@@ -498,6 +508,7 @@
+ 			// cleanup
+ 			KubectlDeleteMultipleWithTemplate(t, data, templates)
+ 			prometheus.Uninstall(t, prometheusServerName, testNamespace, nil)
++			cleanupHashiCorpVault(t)
+ 		})
+ 	}
+ }
+@@ -525,10 +536,17 @@
+ 			useDelegatesSAAuth: false,
+ 		},
+ 		{
+-			name:               "vault kv engine v2",
++			name:               "vault kv engine v2 with default projected token",
+ 			vaultEngineVersion: 2,
+ 			vaultSecretPath:    "secret/data/keda",
+ 			useKubernetesAuth:  true,
++			useDelegatesSAAuth: false,
++		},
++		{
++			name:               "vault kv engine v2 with delegated service account",
++			vaultEngineVersion: 2,
++			vaultSecretPath:    "secret/data/keda",
++			useKubernetesAuth:  true,
+ 			useDelegatesSAAuth: true,
+ 		},
+ 	}
+@@ -625,11 +643,11 @@
+ 	_, err := ExecuteCommand("helm repo add hashicorp https://helm.releases.hashicorp.com")
+ 	assert.NoErrorf(t, err, "cannot add hashicorp repo - %s", err)
+ 
+-	_, err = ExecuteCommand("helm repo update")
++	_, err = ExecuteCommand("helm repo update hashicorp")
+ 	assert.NoErrorf(t, err, "cannot update repos - %s", err)
+ 
+ 	var helmValues strings.Builder
+-	helmValues.WriteString("--set server.dev.enabled=true")
++	helmValues.WriteString("--set server.dev.enabled=true --set server.authDelegator.enabled=true")
+ 
+ 	if kvVersion == 1 {
+ 		helmValues.WriteString(" --set server.extraArgs=-dev-kv-v1")
+@@ -642,28 +660,24 @@
+ 
+ 	// Enable Kubernetes auth
+ 	if useKubernetesAuth {
++		policyName, policy := "secretReadPolicy", secretReadPolicyTemplate
+ 		if pki {
+-			remoteFile := "/tmp/pki_policy.hcl"
+-			KubectlCopyToPod(t, pkiPolicyTemplate, remoteFile, podName, vaultNamespace)
+-			assert.NoErrorf(t, err, "cannot create policy file in hashicorp vault - %s", err)
+-			_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, fmt.Sprintf("vault policy write pkiPolicy %s", remoteFile))
+-			assert.NoErrorf(t, err, "cannot create policy in hashicorp vault - %s", err)
++			policyName, policy = "pkiPolicy", pkiPolicyTemplate
+ 		}
++		remoteFile := "/tmp/keda_policy.hcl"
++		KubectlCopyToPod(t, policy, remoteFile, podName, vaultNamespace)
++		_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, fmt.Sprintf("vault policy write %s %s", policyName, remoteFile))
++		assert.NoErrorf(t, err, "cannot create policy in hashicorp vault - %s", err)
+ 		_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, "vault auth enable kubernetes")
+ 		assert.NoErrorf(t, err, "cannot enable kubernetes in hashicorp vault - %s", err)
+-		_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, "vault write auth/kubernetes/config kubernetes_host=https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT")
++		// Vault uses its own API token for TokenReview, not KEDA's audience-bound login token.
++		_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, "vault write auth/kubernetes/config kubernetes_host=https://$KUBERNETES_SERVICE_HOST:$KUBERNETES_SERVICE_PORT disable_local_ca_jwt=false")
+ 		assert.NoErrorf(t, err, "cannot set kubernetes host in hashicorp vault - %s", err)
+-		_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, "vault write auth/kubernetes/role/keda bound_service_account_names=keda-operator bound_service_account_namespaces=keda policies=pkiPolicy ttl=1h")
+-		assert.NoErrorf(t, err, "cannot cerate keda role in hashicorp vault - %s", err)
++		_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, fmt.Sprintf("vault write auth/kubernetes/role/keda bound_service_account_names=keda-operator bound_service_account_namespaces=keda audience=%s policies=%s ttl=1h", vaultAudience, policyName))
++		assert.NoErrorf(t, err, "cannot create keda role in hashicorp vault - %s", err)
+ 		if delegatedAuth {
+-			remoteFile := "/tmp/secret_read_policy.hcl"
+-			KubectlCopyToPod(t, secretReadPolicyTemplate, remoteFile, podName, vaultNamespace)
+-			assert.NoErrorf(t, err, "cannot create policy file in hashicorp vault - %s", err)
+-			_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, fmt.Sprintf("vault policy write secretReadPolicy %s", remoteFile))
+-			assert.NoErrorf(t, err, "cannot create policy in hashicorp vault - %s", err)
+-
+-			_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, fmt.Sprintf("vault write auth/kubernetes/role/vault-delegated-sa bound_service_account_names=default bound_service_account_namespaces=%s policies=secretReadPolicy ttl=1h", testNamespace))
+-			assert.NoErrorf(t, err, "cannot cerate keda role in hashicorp vault - %s", err)
++			_, _, err = ExecCommandOnSpecificPod(t, podName, vaultNamespace, fmt.Sprintf("vault write auth/kubernetes/role/vault-delegated-sa bound_service_account_names=default bound_service_account_namespaces=%s audience=%s policies=%s ttl=1h", testNamespace, vaultAudience, policyName))
++			assert.NoErrorf(t, err, "cannot create delegated role in hashicorp vault - %s", err)
+ 		}
+ 	}
+ 
+--- a/tests/secret-providers/trigger_auth_bound_service_account_token/trigger_auth_bound_service_account_token_test.go
++++ b/tests/secret-providers/trigger_auth_bound_service_account_token/trigger_auth_bound_service_account_token_test.go
+@@ -172,6 +172,11 @@
+       - name: k8s-protected-metrics-api
+         image: ghcr.io/kedacore/tests-bound-service-account-token:latest
+         imagePullPolicy: Always
++        # Requires the test-tools image with audience-aware TokenReview support.
++        # Keep in sync with the operator's mapping in config/e2e/vault.
++        env:
++        - name: TOKEN_AUDIENCE
++          value: keda-metrics-e2e
+         securityContext:
+           allowPrivilegeEscalation: false
+           runAsNonRoot: true
+@@ -305,37 +310,37 @@
+ 
+ func getTemplateData() (templateData, []Template) {
+ 	return templateData{
+-			TestNamespace:                          testNamespace,
+-			ServiceAccountName:                     serviceAccountName,
+-			ServiceAccountTokenCreationRole:        serviceAccountTokenCreationRole,
+-			ServiceAccountTokenCreationRoleBinding: serviceAccountTokenCreationRoleBinding,
+-			MetricsServerDeploymentName:            metricsServerDeploymentName,
+-			MetricsServerEndpoint:                  metricsServerEndpoint,
+-			MetricsServerServiceName:               metricsServerServiceName,
+-			DeploymentName:                         deploymentName,
+-			TriggerAuthName:                        triggerAuthName,
+-			ScaledObjectName:                       scaledObjectName,
+-			MinReplicaCount:                        fmt.Sprintf("%d", minReplicaCount),
+-			MaxReplicaCount:                        fmt.Sprintf("%d", maxReplicaCount),
+-			MetricValue:                            1,
+-		}, []Template{
+-			// required for the keda to act as the service account which has the necessary permissions
+-			{Name: "serviceAccountTemplate", Config: serviceAccountTemplate},
+-			{Name: "serviceAccountClusterRoleTemplate", Config: serviceAccountClusterRoleTemplate},
+-			{Name: "serviceAccountClusterRoleBindingTemplate", Config: serviceAccountClusterRoleBindingTemplate},
+-			// required for the keda to request token creations for the service account
+-			{Name: "serviceAccountTokenCreationRoleTemplate", Config: serviceAccountTokenCreationRoleTemplate},
+-			{Name: "serviceAccountTokenCreationRoleBindingTemplate", Config: serviceAccountTokenCreationRoleBindingTemplate},
+-			// required for the metrics-api container to delegate authenticate/authorize requests to k8s apiserver
+-			{Name: "tokenReviewAndSubjectAccessReviewClusterRoleTemplate", Config: tokenReviewAndSubjectAccessReviewClusterRoleTemplate},
+-			{Name: "tokenReviewAndSubjectAccessReviewClusterRoleBindingTemplate", Config: tokenReviewAndSubjectAccessReviewClusterRoleBindingTemplate},
+-			{Name: "metricsServerDeploymentTemplate", Config: metricsServerDeploymentTemplate},
+-			{Name: "metricsServerService", Config: metricsServerService},
+-			// scale target and trigger auths
+-			{Name: "deploymentTemplate", Config: deploymentTemplate},
+-			{Name: "triggerAuthTemplate", Config: triggerAuthTemplate},
+-			{Name: "scaledObjectTemplate", Config: scaledObjectTemplate},
+-		}
++		TestNamespace:                          testNamespace,
++		ServiceAccountName:                     serviceAccountName,
++		ServiceAccountTokenCreationRole:        serviceAccountTokenCreationRole,
++		ServiceAccountTokenCreationRoleBinding: serviceAccountTokenCreationRoleBinding,
++		MetricsServerDeploymentName:            metricsServerDeploymentName,
++		MetricsServerEndpoint:                  metricsServerEndpoint,
++		MetricsServerServiceName:               metricsServerServiceName,
++		DeploymentName:                         deploymentName,
++		TriggerAuthName:                        triggerAuthName,
++		ScaledObjectName:                       scaledObjectName,
++		MinReplicaCount:                        fmt.Sprintf("%d", minReplicaCount),
++		MaxReplicaCount:                        fmt.Sprintf("%d", maxReplicaCount),
++		MetricValue:                            1,
++	}, []Template{
++		// required for the keda to act as the service account which has the necessary permissions
++		{Name: "serviceAccountTemplate", Config: serviceAccountTemplate},
++		{Name: "serviceAccountClusterRoleTemplate", Config: serviceAccountClusterRoleTemplate},
++		{Name: "serviceAccountClusterRoleBindingTemplate", Config: serviceAccountClusterRoleBindingTemplate},
++		// required for the keda to request token creations for the service account
++		{Name: "serviceAccountTokenCreationRoleTemplate", Config: serviceAccountTokenCreationRoleTemplate},
++		{Name: "serviceAccountTokenCreationRoleBindingTemplate", Config: serviceAccountTokenCreationRoleBindingTemplate},
++		// required for the metrics-api container to delegate authenticate/authorize requests to k8s apiserver
++		{Name: "tokenReviewAndSubjectAccessReviewClusterRoleTemplate", Config: tokenReviewAndSubjectAccessReviewClusterRoleTemplate},
++		{Name: "tokenReviewAndSubjectAccessReviewClusterRoleBindingTemplate", Config: tokenReviewAndSubjectAccessReviewClusterRoleBindingTemplate},
++		{Name: "metricsServerDeploymentTemplate", Config: metricsServerDeploymentTemplate},
++		{Name: "metricsServerService", Config: metricsServerService},
++		// scale target and trigger auths
++		{Name: "deploymentTemplate", Config: deploymentTemplate},
++		{Name: "triggerAuthTemplate", Config: triggerAuthTemplate},
++		{Name: "scaledObjectTemplate", Config: scaledObjectTemplate},
++	}
+ }
+ 
+ func testScaleOut(t *testing.T, kc *kubernetes.Clientset, data templateData) {
