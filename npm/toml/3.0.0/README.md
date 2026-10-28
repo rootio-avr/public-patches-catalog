@@ -6,6 +6,9 @@ unknown
 ## Affected CVEs:
 - CVE-2026-63376
 - CVE-2026-77465
+- CVE-2026-114141
+- CVE-2026-114143
+- CVE-2026-114144
 
 ## How to Apply:
 1. Clone or download the source code for toml
