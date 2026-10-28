@@ -4,7 +4,11 @@ This patch is based on virtualenv version 21.9.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-113726
 - CVE-2026-113722
+- CVE-2026-113725
+- CVE-2026-113732
+- CVE-2026-113776
 
 ## How to Apply:
 1. Clone or download the source code for virtualenv
