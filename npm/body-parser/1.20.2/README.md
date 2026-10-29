@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2024-45590
 - CVE-2026-12590
+- CVE-2026-111181
 
 ## How to Apply:
 1. Clone or download the source code for body-parser
