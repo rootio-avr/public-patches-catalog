@@ -1,0 +1,185 @@
+--- a/lib/read.js
++++ b/lib/read.js
+@@ -51,6 +51,15 @@
+     : null
+   var verify = opts.verify
+ 
++  // assert charset is supported before creating the decompression stream, so a
++  // 415 cannot leave a decoder piped with no error listener
++  if (verify && encoding !== null && !iconv.encodingExists(encoding)) {
++    return next(createError(415, 'unsupported charset "' + encoding.toUpperCase() + '"', {
++      charset: encoding.toLowerCase(),
++      type: 'charset.unsupported'
++    }))
++  }
++
+   try {
+     // get the content stream
+     stream = contentstream(req, debug, opts.inflate)
+@@ -66,14 +75,6 @@
+     ? null
+     : encoding
+ 
+-  // assert charset is supported
+-  if (opts.encoding === null && encoding !== null && !iconv.encodingExists(encoding)) {
+-    return next(createError(415, 'unsupported charset "' + encoding.toUpperCase() + '"', {
+-      charset: encoding.toLowerCase(),
+-      type: 'charset.unsupported'
+-    }))
+-  }
+-
+   // read body
+   debug('read body')
+   getBody(stream, opts, function (error, body) {
+@@ -102,6 +103,23 @@
+         next(createError(400, _error))
+       })
+       return
++    }
++
++    // detach and destroy the decompression stream to avoid
++    // decompression errors on the finished stream
++    if (stream !== req) {
++      // only detach the decompression stream, keep other consumers piped
++      if (typeof req.unpipe === 'function') {
++        req.unpipe(stream)
++      } else {
++        // Node.js 0.8 streams have no unpipe(dest)
++        unpipe(req)
++      }
++      stream.on('error', function () {})
++      destroy(stream, true)
++
++      // consume any remaining bytes so the HTTP request can finish
++      req.resume()
+     }
+ 
+     // verify
+--- /dev/null
++++ b/test/cve-2026-111181.test.js
+@@ -0,0 +1,125 @@
++/**
++ * Regression test for CVE-2026-111181
++ *
++ * A compressed request body followed by extra trailing bytes could crash the
++ * process: once the decompression stream had finished the valid frame, the
++ * trailing bytes made it emit an 'error' event with no listener attached
++ * (uncaught exception). This was reachable via the unsupported-charset 415
++ * path as well. The fix detaches and destroys the decompression stream after
++ * the body is read and keeps draining the request.
++ *
++ * The upstream fix commit's assertions live in test/json.js, so this
++ * standalone regression test carries the same behavior forward.
++ */
++
++var assert = require('assert')
++var Buffer = require('safe-buffer').Buffer
++var http = require('http')
++var onFinished = require('on-finished')
++
++var bodyParser = require('..')
++
++// Since Node.js 11 zlib ends the readable side of a decompression stream as
++// soon as the compressed frame is complete (Z_STREAM_END).
++var zlibEndsAtStreamEnd = parseInt(process.versions.node.split('.')[0], 10) >= 11
++var itZlibEndsAtStreamEnd = zlibEndsAtStreamEnd ? it : it.skip
++
++// zlib.deflateSync('{"a":1}') and zlib.gzipSync('{"a":1}')
++var DEFLATED_JSON = Buffer.from('789cab564a54b232ac0500082a0209', 'hex')
++var GZIPPED_JSON = Buffer.from('1f8b0800000000000003ab564a54b232ac0500afac1b5607000000', 'hex')
++
++describe('CVE-2026-111181 trailing bytes after a compressed body', function () {
++  itZlibEndsAtStreamEnd('should finish the request when the decompressor finishes early', function (done) {
++    var jsonParser = bodyParser.json()
++    var client
++    var trailing = Buffer.alloc(1024)
++    var first = Buffer.concat([DEFLATED_JSON, Buffer.from([0x00])])
++    var server = http.createServer(function (req, res) {
++      jsonParser(req, res, function (err) {
++        if (err) {
++          res.statusCode = err.status || 500
++          res.end('[' + err.type + '] ' + err.message)
++          return
++        }
++        // downstream middleware waits for the entire HTTP request to finish
++        onFinished(req, function (err) {
++          res.statusCode = err ? 500 : 200
++          res.end(JSON.stringify(req.body))
++        })
++        // ensure the last bytes arrive after the decompressor has finished
++        client.end(trailing)
++      })
++    })
++
++    server.listen(0, '127.0.0.1', function () {
++      client = http.request({
++        host: '127.0.0.1',
++        port: server.address().port,
++        method: 'POST',
++        path: '/',
++        agent: false,
++        headers: {
++          'Content-Type': 'application/json',
++          'Content-Encoding': 'deflate',
++          'Content-Length': first.length + trailing.length
++        }
++      }, function (res) {
++        var data = ''
++        res.setEncoding('utf8')
++        res.on('data', function (c) { data += c })
++        res.on('end', function () {
++          server.close()
++          assert.strictEqual(res.statusCode, 200)
++          assert.strictEqual(data, '{"a":1}')
++          done()
++        })
++      })
++      client.on('error', done)
++      client.setTimeout(1000, function () {
++        client.destroy(new Error('Timed out waiting for the HTTP request to finish'))
++      })
++      client.write(first)
++    })
++  })
++
++  it('should not crash when an unsupported charset rejects a compressed body', function (done) {
++    var jsonParser = bodyParser.json({ verify: function () {} })
++    var server = http.createServer(function (req, res) {
++      jsonParser(req, res, function (err) {
++        res.statusCode = err ? (err.status || 500) : 200
++        res.end(err ? '[' + err.type + '] ' + err.message : JSON.stringify(req.body))
++      })
++    })
++
++    server.listen(0, '127.0.0.1', function () {
++      var body = Buffer.concat([
++        GZIPPED_JSON,
++        Buffer.from([0x00]),
++        Buffer.alloc(100 * 1024, 0x58)
++      ])
++      var req = http.request({
++        host: '127.0.0.1',
++        port: server.address().port,
++        method: 'POST',
++        path: '/',
++        headers: {
++          'Content-Type': 'application/json; charset=utf-999',
++          'Content-Encoding': 'gzip',
++          'Content-Length': body.length
++        }
++      }, function (res) {
++        res.on('data', function () {})
++        res.on('end', function () {
++          // give an unhandled decoder error time to surface
++          setTimeout(function () {
++            server.close()
++            assert.strictEqual(res.statusCode, 415)
++            done()
++          }, 200)
++        })
++      })
++      req.on('error', done)
++      req.end(body)
++    })
++  })
++})
