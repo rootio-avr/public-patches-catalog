@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-114125
+- CVE-2026-114126
 
 ## How to Apply:
 1. Clone or download the source code for storybook
