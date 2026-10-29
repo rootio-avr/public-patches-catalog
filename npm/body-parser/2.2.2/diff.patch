@@ -89,3 +89,172 @@
 +    }, /option limit "\[object Object\]" is invalid/)
 +  })
 +})
+
+--- a/lib/read.js
++++ b/lib/read.js
+@@ -85,6 +85,15 @@
+   // read options
+   var verify = opts.verify
+ 
++  // assert charset is supported before creating the decompression stream, so an
++  // unsupported charset cannot leave a decoder piped with no error listener
++  if (verify && encoding !== null && !iconv.encodingExists(encoding)) {
++    return next(createError(415, 'unsupported charset "' + encoding.toUpperCase() + '"', {
++      charset: encoding.toLowerCase(),
++      type: 'charset.unsupported'
++    }))
++  }
++
+   try {
+     // get the content stream
+     stream = contentstream(req, debug, opts.inflate)
+@@ -100,14 +109,6 @@
+     ? null
+     : encoding
+ 
+-  // assert charset is supported
+-  if (opts.encoding === null && encoding !== null && !iconv.encodingExists(encoding)) {
+-    return next(createError(415, 'unsupported charset "' + encoding.toUpperCase() + '"', {
+-      charset: encoding.toLowerCase(),
+-      type: 'charset.unsupported'
+-    }))
+-  }
+-
+   // read body
+   debug('read body')
+   getBody(stream, opts, function (error, body) {
+@@ -136,6 +137,17 @@
+         next(createError(400, _error))
+       })
+       return
++    }
++
++    // detach and destroy the decompression stream to
++    // avoid decompression errors on the finished stream
++    if (stream !== req) {
++      req.unpipe(stream)
++      stream.on('error', function () {})
++      stream.destroy()
++
++      // consume any remaining bytes so the HTTP request can finish
++      req.resume()
+     }
+ 
+     // verify
+--- /dev/null
++++ b/test/cve-2026-111181.test.js
+@@ -0,0 +1,114 @@
++'use strict'
++
++// Regression test for CVE-2026-111181 (GHSA-27r3-jxmh-p828): trailing bytes
++// after a compressed body must not crash the process or stall the request.
++// Uses a raw socket client so the trailing bytes reach the decoder after it
++// has already finished the valid frame.
++
++const assert = require('node:assert')
++const { createHash } = require('node:crypto')
++const { once } = require('node:events')
++const http = require('node:http')
++const zlib = require('node:zlib')
++const onFinished = require('on-finished')
++
++const bodyParser = require('..')
++
++describe('CVE-2026-111181: trailing bytes after a compressed body', function () {
++  function run (handler, label) {
++    const first = Buffer.concat([
++      zlib.deflateSync(Buffer.from('{"a":1}')),
++      Buffer.from([0x00])
++    ])
++    const trailing = Buffer.alloc(1024)
++    let client
++
++    const server = http.createServer(function (req, res) {
++      handler(req, res, function () { client.end(trailing) }, first, trailing)
++    })
++
++    return (async function () {
++      try {
++        server.listen(0, '127.0.0.1')
++        await once(server, 'listening')
++
++        return await new Promise(function (resolve, reject) {
++          client = http.request({
++            host: '127.0.0.1',
++            port: server.address().port,
++            method: 'POST',
++            agent: false,
++            headers: {
++              'Content-Type': 'application/json',
++              'Content-Encoding': 'deflate',
++              'Content-Length': first.length + trailing.length
++            }
++          }, function (res) {
++            let body = ''
++            res.setEncoding('utf8')
++            res.on('data', function (chunk) { body += chunk })
++            res.on('error', reject)
++            res.on('end', function () { resolve({ res, body, first, trailing }) })
++          })
++          client.on('error', reject)
++          client.setTimeout(1000, function () {
++            client.destroy(new Error('Timed out waiting for ' + label))
++          })
++          client.write(first)
++        })
++      } finally {
++        if (client) client.destroy()
++        await new Promise(function (resolve) { server.close(resolve) })
++      }
++    })()
++  }
++
++  it('should finish the request when the decompressor finishes early', async function () {
++    const jsonParser = bodyParser.json()
++    const response = await run(function (req, res, sendTrailing) {
++      jsonParser(req, res, function (err) {
++        if (err) {
++          res.statusCode = err.status || 500
++          return res.end(err.message)
++        }
++        // wait for the entire HTTP request to finish
++        onFinished(req, function () {
++          res.statusCode = 200
++          res.end(JSON.stringify(req.body))
++        })
++        sendTrailing()
++      })
++    }, 'the HTTP request to finish')
++
++    assert.strictEqual(response.res.statusCode, 200)
++    assert.strictEqual(response.body, '{"a":1}')
++  })
++
++  it('should preserve other consumers of the request body', async function () {
++    const jsonParser = bodyParser.json()
++    const response = await run(function (req, res, sendTrailing, first, trailing) {
++      // a second consumer hashes the raw request
++      const hash = createHash('sha256')
++      req.pipe(hash)
++
++      jsonParser(req, res, function (err) {
++        if (err) {
++          res.statusCode = err.status || 500
++          return res.end(err.message)
++        }
++        hash.once('finish', function () {
++          res.setHeader('X-Body-SHA256', hash.digest('hex'))
++          res.statusCode = 200
++          res.end(JSON.stringify(req.body))
++        })
++        sendTrailing()
++      })
++    }, 'the request body hash')
++
++    const expectedHash = createHash('sha256')
++      .update(response.first).update(response.trailing).digest('hex')
++    assert.strictEqual(response.res.statusCode, 200)
++    assert.strictEqual(response.body, '{"a":1}')
++    assert.strictEqual(response.res.headers['x-body-sha256'], expectedHash)
++  })
++})
