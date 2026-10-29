@@ -184,3 +184,497 @@
 +	assert.Equal(t, 1, callbackCalls)
 +	require.ErrorContains(t, r.Error, "stop")
 +}
+
+--- a/codec_array.go
++++ b/codec_array.go
+@@ -53,12 +53,13 @@
+ 		}
+ 
+ 		start := size
+-		size += int(l)
+-
+-		if size > r.cfg.getMaxSliceAllocSize() {
++		// Compare before adding. size += int(l) wraps at MaxInt and the
++		// wrapped negative total then passes a `size > limit` check.
++		if l > int64(r.cfg.getMaxSliceAllocSize()-size) {
+ 			r.ReportError("decode array", "size is greater than `Config.MaxSliceAllocSize`")
+ 			return
+ 		}
++		size += int(l)
+ 
+ 		sliceType.UnsafeGrow(ptr, size)
+ 
+--- a/codec_skip.go
++++ b/codec_skip.go
+@@ -148,7 +148,7 @@
+ 		}
+ 
+ 		if size > 0 {
+-			r.SkipNBytes(int(size))
++			r.SkipNBytesInt64(size)
+ 			continue
+ 		}
+ 
+@@ -182,7 +182,7 @@
+ 		}
+ 
+ 		if size > 0 {
+-			r.SkipNBytes(int(size))
++			r.SkipNBytesInt64(size)
+ 			continue
+ 		}
+ 
+--- a/decoder_array_test.go
++++ b/decoder_array_test.go
+@@ -2,6 +2,7 @@
+ 
+ import (
+ 	"bytes"
++	"math"
+ 	"testing"
+ 
+ 	"github.com/hamba/avro/v2"
+@@ -153,4 +154,26 @@
+ 	err = dec.Decode(&got)
+ 
+ 	assert.Error(t, err)
++}
++
++func TestDecoder_ArrayMultiBlockExceedsMaxInt(t *testing.T) {
++	avro.DefaultConfig = avro.Config{MaxSliceAllocSize: 13}.Freeze()
++	defer ConfigTeardown()
++
++	data := []byte{
++		0x06,             // block 1: l = 3
++		0x00, 0x01, 0x00, // false, true, false
++	}
++	w := avro.NewWriter(nil, 0)
++	w.WriteLong(int64(math.MaxInt - 2))
++	data = append(data, w.Buffer()...)
++
++	schema := `{"type":"array", "items": { "type": "boolean" }}`
++	dec, err := avro.NewDecoder(schema, bytes.NewReader(data))
++	require.NoError(t, err)
++
++	var got []bool
++	err = dec.Decode(&got)
++
++	assert.ErrorContains(t, err, "size is greater than `Config.MaxSliceAllocSize`")
+ }
+--- a/ocf/ocf.go
++++ b/ocf/ocf.go
+@@ -11,6 +11,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	"os"
+ 
+ 	"github.com/hamba/avro/v2"
+@@ -201,7 +202,16 @@
+ 	}
+ 
+ 	count := d.reader.ReadLong()
+-	size := d.reader.ReadLong()
++	size64 := d.reader.ReadLong()
++	if size64 < 0 {
++		d.reader.ReportError("ocf decoder: read block", "block size is too small")
++		return 0
++	}
++	if size64 > math.MaxInt {
++		d.reader.ReportError("ocf decoder: read block", "block size is too big")
++		return 0
++	}
++	size := int(size64)
+ 
+ 	// Read the blocks data
+ 	switch {
+@@ -627,7 +637,7 @@
+ 			return nil
+ 		}
+ 		size := reader.ReadLong()
+-		reader.SkipNBytes(int(size))
++		reader.SkipNBytesInt64(size)
+ 		if reader.Error != nil {
+ 			return reader.Error
+ 		}
+--- a/ocf/ocf_test.go
++++ b/ocf/ocf_test.go
+@@ -7,7 +7,10 @@
+ 	"errors"
+ 	"flag"
+ 	"io"
++	"math"
+ 	"os"
++	"slices"
++	"strconv"
+ 	"strings"
+ 	"testing"
+ 
+@@ -1648,4 +1651,52 @@
+ 	dec2, err := ocf.NewDecoder(buf2)
+ 	require.NoError(t, err)
+ 	assert.Equal(t, []byte("deflate"), dec2.Metadata()["avro.codec"])
++}
++
++func TestDecoder_BlockSizeOutOfRange(t *testing.T) {
++	cases := []struct {
++		name    string
++		size    int64
++		wantMsg string
++	}{
++		{"too small", -1, "block size is too small"},
++		{"too big on 32-bit", int64(1) << 33, "block size is too big"},
++	}
++
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			if tc.size >= 0 && tc.size <= math.MaxInt {
++				t.Skipf("size fits in int on %d-bit; only out-of-range on smaller", strconv.IntSize)
++			}
++
++			buf := &bytes.Buffer{}
++			enc, err := ocf.NewEncoder(`"long"`, buf)
++			require.NoError(t, err)
++			require.NoError(t, enc.Encode(int64(1)))
++			require.NoError(t, enc.Close())
++
++			raw := buf.Bytes()
++			sync := raw[len(raw)-16:]
++			headerEnd := bytes.Index(raw, sync) + 16
++			require.Equal(t, byte(0x02), raw[headerEnd])
++			sizeOffset := headerEnd + 1
++
++			w := avro.NewWriter(nil, 0)
++			w.WriteLong(tc.size)
++			patched := slices.Concat(raw[:sizeOffset], w.Buffer(), raw[sizeOffset+1:])
++
++			dec, err := ocf.NewDecoder(bytes.NewReader(patched))
++			require.NoError(t, err)
++
++			for dec.HasNext() {
++				var v int64
++				if err := dec.Decode(&v); err != nil {
++					break
++				}
++			}
++
++			require.Error(t, dec.Error())
++			assert.Contains(t, dec.Error().Error(), tc.wantMsg)
++		})
++	}
+ }
+--- a/reader.go
++++ b/reader.go
+@@ -4,6 +4,7 @@
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"math"
+ 	"strings"
+ 	"unsafe"
+ )
+@@ -278,21 +279,29 @@
+ }
+ 
+ func (r *Reader) readBytes(op string) []byte {
+-	size := int(r.ReadLong())
+-	if size < 0 {
+-		fnName := "Read" + strings.ToTitle(op)
++	fnName := "Read" + strings.ToTitle(op)
++	size64 := r.ReadLong()
++	if size64 < 0 {
+ 		r.ReportError(fnName, "invalid "+op+" length")
+ 		return nil
+ 	}
+-	if size == 0 {
++	if size64 == 0 {
+ 		return []byte{}
+ 	}
+-	if maxSize := r.cfg.getMaxByteSliceSize(); maxSize > 0 && size > maxSize {
+-		fnName := "Read" + strings.ToTitle(op)
++	if maxSize := r.cfg.getMaxByteSliceSize(); maxSize > 0 && size64 > int64(maxSize) {
+ 		r.ReportError(fnName, "size is greater than `Config.MaxByteSliceSize`")
+ 		return nil
+ 	}
++	// MaxByteSliceSize defaults to 1MiB, so the cap above usually catches
++	// oversize lengths. The standalone check defends configurations that
++	// disable the cap (negative) or set it above the platform int range.
++	if size64 > math.MaxInt {
++		r.ReportError(fnName, op+" length is too big")
++		return nil
++	}
+ 
++	size := int(size64)
++
+ 	// The bytes are entirely in the buffer and of a reasonable size.
+ 	// Use the byte slab.
+ 	if r.head+size <= r.tail && size <= 1024 {
+@@ -312,13 +321,36 @@
+ }
+ 
+ // ReadBlockHeader reads a Block Header from the Reader.
++//
++// Returned counts and sizes are validated to fit in a platform int before
++// they are handed back. The signature stays (int64, int64) so existing
++// callers keep compiling; narrowing after this check cannot truncate.
+ func (r *Reader) ReadBlockHeader() (int64, int64) {
+-	length := r.ReadLong()
+-	if length < 0 {
+-		size := r.ReadLong()
++	length64 := r.ReadLong()
++	if length64 > math.MaxInt {
++		r.ReportError("read block header", "block length is too big")
++		return 0, 0
++	}
++	// Reject values that do not fit in int on 32-bit, and math.MinInt on
++	// every platform: negating MinInt overflows.
++	if length64 <= math.MinInt {
++		r.ReportError("read block header", "block length is too small")
++		return 0, 0
++	}
+ 
+-		return -length, size
++	if length64 >= 0 {
++		return length64, 0
+ 	}
+ 
+-	return length, 0
++	size64 := r.ReadLong()
++	if size64 > math.MaxInt {
++		r.ReportError("read block header", "skip size is too big")
++		return 0, 0
++	}
++	if size64 < 0 {
++		r.ReportError("read block header", "skip size is too small")
++		return 0, 0
++	}
++
++	return -length64, size64
+ }
+--- a/reader_generic.go
++++ b/reader_generic.go
+@@ -97,11 +97,14 @@
+ 		return obj
+ 	case Union:
+ 		types := schema.(*UnionSchema).Types()
+-		idx := int(r.ReadLong())
+-		if idx < 0 || idx > len(types)-1 {
++		idx64 := r.ReadLong()
++		// Compare in int64 so a value such as 1<<32 cannot narrow to 0 on
++		// 32-bit and silently select types[0].
++		if idx64 < 0 || idx64 > int64(len(types)-1) {
+ 			r.ReportError("Read", "unknown union type")
+ 			return nil
+ 		}
++		idx := int(idx64)
+ 		schema = types[idx]
+ 		if schema.Type() == Null {
+ 			return nil
+--- a/reader_generic_test.go
++++ b/reader_generic_test.go
+@@ -253,3 +253,18 @@
+ 	assert.Equal(t, 1, callbackCalls)
+ 	require.ErrorContains(t, r.Error, "stop")
+ }
++
++func TestReader_ReadNextUnionIndexOutOfRange(t *testing.T) {
++	schema := avro.MustParse(`["null","long"]`)
++
++	buf := &bytes.Buffer{}
++	w := avro.NewWriter(buf, 0)
++	w.WriteLong(int64(1) << 32)
++	require.NoError(t, w.Flush())
++
++	r := avro.NewReader(bytes.NewReader(buf.Bytes()), 10)
++	got := r.ReadNext(schema)
++
++	assert.Nil(t, got)
++	require.ErrorContains(t, r.Error, "unknown union type")
++}
+--- a/reader_skip.go
++++ b/reader_skip.go
+@@ -1,5 +1,20 @@
+ package avro
+ 
++import "math"
++
++// SkipNBytesInt64 skips n bytes after rejecting lengths that do not fit in int.
++func (r *Reader) SkipNBytesInt64(n int64) {
++	if n < 0 {
++		r.ReportError("skip n bytes", "n is negative")
++		return
++	}
++	if n > math.MaxInt {
++		r.ReportError("skip n bytes", "n exceeds max int")
++		return
++	}
++	r.SkipNBytes(int(n))
++}
++
+ // SkipNBytes skips the given number of bytes in the reader.
+ func (r *Reader) SkipNBytes(n int) {
+ 	read := 0
+@@ -62,18 +77,10 @@
+ 
+ // SkipString skips a String in the reader.
+ func (r *Reader) SkipString() {
+-	size := r.ReadLong()
+-	if size <= 0 {
+-		return
+-	}
+-	r.SkipNBytes(int(size))
++	r.SkipNBytesInt64(r.ReadLong())
+ }
+ 
+ // SkipBytes skips Bytes in the reader.
+ func (r *Reader) SkipBytes() {
+-	size := r.ReadLong()
+-	if size <= 0 {
+-		return
+-	}
+-	r.SkipNBytes(int(size))
++	r.SkipNBytesInt64(r.ReadLong())
+ }
+--- a/reader_test.go
++++ b/reader_test.go
+@@ -679,6 +679,139 @@
+ 	assert.Equal(t, "avro", got2)
+ }
+ 
++func TestReader_ReadBlockHeaderBounds(t *testing.T) {
++	type testCase struct {
++		name    string
++		data    []byte
++		length  int64
++		size    int64
++		wantErr string
++	}
++
++	tests := []testCase{
++		{
++			name:   "positive length",
++			data:   []byte{0x06},
++			length: 3,
++		},
++		{
++			name:   "negative length with size",
++			data:   []byte{0x05, 0x08},
++			length: 3,
++			size:   4,
++		},
++		{
++			name:    "skip size negative",
++			data:    []byte{0x03, 0x01},
++			wantErr: "avro: read block header: skip size is too small",
++		},
++	}
++
++	switch strconv.IntSize {
++	case 32:
++		tests = append(tests,
++			testCase{
++				name:    "length too big on 32-bit",
++				data:    []byte{0xfe, 0xff, 0xff, 0xff, 0xff, 0x0f},
++				wantErr: "avro: read block header: block length is too big",
++			},
++			testCase{
++				name:    "length too small on 32-bit",
++				data:    []byte{0xff, 0xff, 0xff, 0xff, 0x0f},
++				wantErr: "avro: read block header: block length is too small",
++			},
++			testCase{
++				name:    "skip size too big on 32-bit",
++				data:    []byte{0x03, 0xfe, 0xff, 0xff, 0xff, 0xff, 0x0f},
++				wantErr: "avro: read block header: skip size is too big",
++			},
++		)
++	case 64:
++		tests = append(tests, testCase{
++			name:    "length min int64",
++			data:    []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01},
++			wantErr: "avro: read block header: block length is too small",
++		})
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			r := avro.NewReader(bytes.NewReader(test.data), 4)
++
++			length, size := r.ReadBlockHeader()
++
++			assert.Equal(t, test.length, length)
++			assert.Equal(t, test.size, size)
++			if test.wantErr == "" {
++				require.NoError(t, r.Error)
++			} else {
++				assert.EqualError(t, r.Error, test.wantErr)
++			}
++		})
++	}
++}
++
++func TestReader_SkipNBytesInt64(t *testing.T) {
++	tests := []struct {
++		name        string
++		n           int64
++		wantErr     string
++		wantNextInt int32
++	}{
++		{
++			name:        "valid",
++			n:           3,
++			wantNextInt: 27,
++		},
++		{
++			name:    "negative",
++			n:       -1,
++			wantErr: "avro: skip n bytes: n is negative",
++		},
++		{
++			name:    "exceeds max int on 32-bit",
++			n:       int64(1 << 31),
++			wantErr: "avro: skip n bytes: n exceeds max int",
++		},
++	}
++
++	if strconv.IntSize != 32 {
++		tests = tests[:len(tests)-1]
++	}
++
++	for _, test := range tests {
++		t.Run(test.name, func(t *testing.T) {
++			r := avro.NewReader(bytes.NewReader([]byte{0x01, 0x01, 0x01, 0x36}), 2)
++
++			r.SkipNBytesInt64(test.n)
++
++			if test.wantErr == "" {
++				require.NoError(t, r.Error)
++				assert.Equal(t, test.wantNextInt, r.ReadInt())
++				require.NoError(t, r.Error)
++			} else {
++				assert.EqualError(t, r.Error, test.wantErr)
++			}
++		})
++	}
++}
++
++func TestReader_ReadBytesTruncationBypassesMaxByteSliceSize(t *testing.T) {
++	avro.DefaultConfig = avro.Config{MaxByteSliceSize: 10}.Freeze()
++	defer ConfigTeardown()
++
++	buf := &bytes.Buffer{}
++	w := avro.NewWriter(buf, 0)
++	w.WriteLong(int64(1)<<32 + 5)
++	require.NoError(t, w.Flush())
++
++	r := avro.NewReader(bytes.NewReader(buf.Bytes()), 10)
++	got := r.ReadBytes()
++
++	assert.Nil(t, got)
++	require.ErrorContains(t, r.Error, "MaxByteSliceSize")
++}
++
+ func TestReader_ReadBlockHeader(t *testing.T) {
+ 	tests := []struct {
+ 		data []byte

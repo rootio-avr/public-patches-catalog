@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-46385
+- CVE-2026-46384
 
 ## How to Apply:
 1. Clone or download the source code for github.com/hamba/avro/v2
