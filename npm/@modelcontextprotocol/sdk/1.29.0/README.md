@@ -5,6 +5,9 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-104850
+- GHSA-f897-62hf-6gxq
+- CVE-2026-111768
+- CVE-2026-111767
 
 ## How to Apply:
 1. Clone or download the source code for @modelcontextprotocol/sdk
