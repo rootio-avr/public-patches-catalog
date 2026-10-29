@@ -4,6 +4,7 @@ This patch is based on github.com/labstack/echo/v4 version v4.15.3, which is ava
 unknown
 
 ## Affected CVEs:
+- GHSA-f48p-c9v4-h7xv
 - GHSA-h7wr-284f-5qvc
 
 ## How to Apply:
