@@ -1,0 +1,2365 @@
+--- a/src/filelock/_api.py
++++ b/src/filelock/_api.py
+@@ -721,7 +721,9 @@
+             negative value or ``inf``. A timeout of 0 means that there is exactly one attempt to acquire the file lock.
+         :param mode: file permissions for the lockfile. When not specified, the OS controls permissions via umask and
+             default ACLs, preserving POSIX default ACL inheritance in shared directories. Construction raises
+-            :class:`ValueError` unless it grants the owner read and write, which the lock needs for its own files.
++            :class:`ValueError` unless it grants the owner read and write, which the lock needs for its own files. On
++            Windows a native lock creates its file with an owner-only ACL when the mode has no group and other bits; any
++            other mode, and a soft lock, leave the file the ACL its directory hands down.
+         :param thread_local: Whether this object's internal context should be thread local or not. If this is set to
+             ``False`` then the lock will be reentrant across threads. When ``True`` (the default), **all fields of the
+             lock's internal context are per-thread**, including the configuration values ``poll_interval``, ``timeout``,
+--- a/src/filelock/_read_write.py
++++ b/src/filelock/_read_write.py
+@@ -4,7 +4,7 @@
+ import logging
+ import os
+ import pathlib
+-import shutil
++import secrets
+ import sqlite3
+ import stat
+ import sys
+@@ -36,7 +36,14 @@
+ from ._identity import host_name, owner_is_stale, process_start_token
+ 
+ if sys.platform == "win32":  # pragma: win32 cover
+-    from ._windows import _open_non_reparse_fd
++    from ._windows import (
++        _directory_is_private,
++        _identity_at,
++        _identity_of_fd,
++        _make_private_directory,
++        _open_non_reparse_fd,
++        _pinned,
++    )
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable, Generator
+@@ -60,8 +67,7 @@
+ _UNSAFE_FORK_EXIT_STATUS: Final[int] = 70
+ # O_NONBLOCK keeps an open from blocking on a FIFO planted at the path; the regular-file check then rejects it.
+ _DB_OPEN_FLAGS: Final[int] = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+-# Descriptor paths reopen the validated inode; journal_mode=MEMORY avoids an on-disk journal at the synthetic path.
+-_FD_DIR: Final[str] = "/proc/self/fd" if sys.platform == "linux" else "/dev/fd"
++_DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+ # Header bytes 18 and 19 hold the file format versions, 2 in WAL mode: https://www.sqlite.org/fileformat.html
+ _SQLITE_MAGIC: Final[bytes] = b"SQLite format 3\x00"
+ _FORMAT_VERSIONS: Final[slice] = slice(18, 20)
+@@ -159,7 +165,8 @@
+ _FORKED_DATABASES: Final = _ForkedDatabaseRegistry()
+ 
+ _LINK_PREFIX: Final[str] = ".filelock-"
+-_SWEPT_DIRECTORIES: Final[set[str]] = set()
++_LINK_NAME: Final[str] = "lock.db"
++_SWEPT_DATABASES: Final[set[_DatabaseIdentity]] = set()
+ 
+ 
+ # POSIX locks belong to the process and the inode, so closing any descriptor on the inode drops the locks every other
+@@ -174,7 +181,7 @@
+ 
+     def adopt(self, database: str, claimed: list[_Probe]) -> _Probe | None:  # pragma: win32 no cover
+         # Reuse a probe no live connection holds: each connect would otherwise keep another descriptor open until the
+-        # inode's last close, and two live connections through one /dev/fd name make macOS SQLite fail to open.
++        # inode's last close.
+         try:
+             stat_result: Final = os.lstat(database)
+         except OSError:
+@@ -197,11 +204,6 @@
+             probes.leases.add(retained.lease)
+         return retained
+ 
+-    # macOS opens through a hard link, so only descriptor-path connections need this check.
+-    def shared(self, probe: _Probe) -> bool:  # pragma: win32 no cover  # pragma: darwin no cover
+-        with self._lock:
+-            return len(self._inodes[probe.identity].leases) > 1
+-
+     def release(self, probe: _Probe) -> None:  # pragma: win32 no cover
+         # A finalizer may run this on a thread already inside the lock, so it never waits; the lock holder drains.
+         self._releases.append(probe)
+@@ -267,7 +269,7 @@
+ class _ForkSafeConnection(sqlite3.Connection):
+     _creator_pid: int
+     _decrement_escrow: Callable[[sqlite3.Connection], None] | None
+-    _database_directory: pathlib.Path | None
++    _database_directory: _LinkDirectory | None
+     database_identity: _DatabaseIdentity | None = None
+     _probe: _Probe | None = None
+ 
+@@ -291,9 +293,7 @@
+                 try:
+                     if (directory := self._database_directory) is not None:  # pragma: needs posix-hard-link
+                         self._database_directory = None
+-                        # Leftover private links are plain directories someone may already have removed.
+-                        with suppress(FileNotFoundError):
+-                            shutil.rmtree(directory)
++                        _remove_link_directory(directory)
+                 finally:
+                     if (probe := self._probe) is not None:  # pragma: win32 no cover
+                         self._probe = self.database_identity = None
+@@ -302,7 +302,11 @@
+                     self._decrement_escrow = None
+                     decrement(self)
+ 
+-    def retain_until_close(self, directory: pathlib.Path | None, probe: _Probe) -> None:  # pragma: win32 no cover
++    def retain_link(self, directory: _LinkDirectory | None) -> None:  # pragma: win32 cover
++        """Keep the private link directory, if there is one, until SQLite no longer uses it."""
++        self._database_directory = directory
++
++    def retain_until_close(self, directory: _LinkDirectory | None, probe: _Probe) -> None:  # pragma: win32 no cover
+         """Keep the private link and this connection's probe descriptor until SQLite no longer uses them."""
+         self._database_directory = directory
+         self._probe = probe
+@@ -412,8 +416,10 @@
+ 
+     By default, ``is_singleton=True``: calling ``ReadWriteLock(path)`` with the same resolved path returns the same
+     instance. A ``.db`` extension is a convention rather than a requirement; the filesystem must be one the active
+-    SQLite VFS supports. On macOS, the database directory must be writable and support hard links. Give the lock a file
+-    of its own: a WAL-mode database raises :class:`ValueError`.
++    SQLite VFS supports. Give the lock a file of its own: a WAL-mode database, or one with a schema larger than a lock
++    needs, raises :class:`ValueError`. A database directory that other accounts can write must also be writable by
++    this one and support hard links; the protection against other accounts ends once one of them can replace the
++    database directory or a directory above it.
+ 
+     :param lock_file: path to the SQLite database file used as the lock
+     :param timeout: maximum wait time in seconds; ``-1`` waits up to SQLite's busy-timeout cap of about 23 days
+@@ -810,28 +816,32 @@
+         with _sqlite_transition():
+             operation_pid, start_time = operation
+             connection = cast("_ForkSafeConnection", self._con)
+-            waited = time.perf_counter() - start_time
+-            timeout_ms = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
+-            self._raise_if_process_changed(operation_pid)
+-            connection.executescript(f"PRAGMA busy_timeout={timeout_ms}; PRAGMA journal_mode=MEMORY;").close()
+-            # Use legacy journal mode (not WAL) because WAL does not block readers while a concurrent EXCLUSIVE
+-            # write transaction is active, which makes read-write locking impossible without modifying table data.
+-            # MEMORY is safe here since no writes happen, so a crash cannot corrupt the DB.
+-            # See https://sqlite.org/lang_transaction.html#deferred_immediate_and_exclusive_transactions
+-            #
+-            # Recompute the remaining timeout after the blocking journal_mode pragma.
+-            waited = time.perf_counter() - start_time
+-            recomputed = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
+-            self._raise_if_process_changed(operation_pid)
+-            statements = f"PRAGMA busy_timeout={recomputed}; " if recomputed != timeout_ms else ""
+-            statements += "BEGIN EXCLUSIVE TRANSACTION;" if mode == "write" else "BEGIN TRANSACTION;"
+-            if mode == "read":
+-                # SQLite takes the SHARED lock only when a statement reads; BEGIN alone stays deferred.
+-                # https://www.sqlite.org/lockingv3.html#transaction_control
+-                # sqlite_schema is an alias added in SQLite 3.33.0; sqlite_master works on every version.
+-                statements += " SELECT name FROM sqlite_master LIMIT 1;"
+-            connection.executescript(statements).close()
++            # SQLite opened the file the name held at connect time, and its first statement would replay a journal
++            # beside that file, so the name is checked before any statement runs.
+             self._raise_if_database_replaced(connection)
++            with _bounded_schema(connection, self.lock_file):
++                waited = time.perf_counter() - start_time
++                timeout_ms = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
++                self._raise_if_process_changed(operation_pid)
++                connection.executescript(f"PRAGMA busy_timeout={timeout_ms}; PRAGMA journal_mode=MEMORY;").close()
++                # Use legacy journal mode (not WAL) because WAL does not block readers while a concurrent EXCLUSIVE
++                # write transaction is active, which makes read-write locking impossible without modifying table data.
++                # MEMORY is safe here since no writes happen, so a crash cannot corrupt the DB.
++                # See https://sqlite.org/lang_transaction.html#deferred_immediate_and_exclusive_transactions
++                #
++                # Recompute the remaining timeout after the blocking journal_mode pragma.
++                waited = time.perf_counter() - start_time
++                recomputed = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
++                self._raise_if_process_changed(operation_pid)
++                statements = f"PRAGMA busy_timeout={recomputed}; " if recomputed != timeout_ms else ""
++                statements += "BEGIN EXCLUSIVE TRANSACTION;" if mode == "write" else "BEGIN TRANSACTION;"
++                if mode == "read":
++                    # SQLite takes the SHARED lock only when a statement reads; BEGIN alone stays deferred.
++                    # https://www.sqlite.org/lockingv3.html#transaction_control
++                    # sqlite_schema is an alias added in SQLite 3.33.0; sqlite_master works on every version.
++                    statements += " SELECT name FROM sqlite_master LIMIT 1;"
++                connection.executescript(statements).close()
++            self._raise_if_database_replaced(connection)
+ 
+     def _raise_if_database_replaced(self, connection: _ForkSafeConnection) -> None:
+         # Windows pins the name: SQLite opens the database without delete sharing, so it cannot be unlinked or renamed.
+@@ -954,24 +964,38 @@
+     # refuses one.
+     if sys.platform == "win32":  # pragma: win32 cover
+         fd: Final = _open_lock_database(database)
++        link: _LinkDirectory | None = None
+         # A Windows lock belongs to the handle that took it, so closing this one leaves SQLite's locks in place.
+         try:
+             _raise_if_wal(fd, database)
+-            return sqlite3.connect(
+-                database, check_same_thread=False, factory=factory, cached_statements=0, timeout=timeout
+-            )
++            target = database
++            if not _directory_is_private(os.fspath(pathlib.Path(database).parent)):
++                link = _link_beside_on_windows(database, _identity_of_fd(fd))
++                target = os.fspath(link.database)
++            try:
++                connection = sqlite3.connect(
++                    target, check_same_thread=False, factory=factory, cached_statements=0, timeout=timeout
++                )
++            except BaseException:
++                if link is not None:
++                    _remove_link_directory(link)
++                raise
++            connection.retain_link(link)
++            return connection
+         finally:
+             os.close(fd)
+-    return _connect_through_descriptor(database, factory=factory, timeout=timeout)  # pragma: win32 no cover
++    return _connect_through_descriptor(  # pragma: win32 no cover
++        database, factory=factory, timeout=timeout, owner=os.geteuid()
++    )
+ 
+ 
+ def _connect_through_descriptor(  # pragma: win32 no cover
+-    database: str, *, factory: type[_ForkSafeConnection], timeout: float
++    database: str, *, factory: type[_ForkSafeConnection], timeout: float, owner: int
+ ) -> _ForkSafeConnection:
+     # Listed before its lease is taken and cleared once a connection owns it, so any exception between, an interrupt
+     # included, releases the lease instead of pinning the inode's probes.
+     claimed: Final[list[_Probe]] = []
+-    directory: pathlib.Path | None = None
++    link: _LinkDirectory | None = None
+     try:
+         if (probe := _PROBE_DESCRIPTORS.adopt(database, claimed)) is None:
+             probe = _PROBE_DESCRIPTORS.retain(_open_lock_database(database), claimed)
+@@ -979,80 +1003,146 @@
+         # Releases a finalizer queued while the table was locked.
+         _PROBE_DESCRIPTORS.drain()
+         _raise_if_wal(fd, database)
+-        target = pathlib.Path(f"{_FD_DIR}/{fd}")
+-        # macOS /dev/fd lookup can panic the kernel: https://github.com/tox-dev/filelock/issues/818
+-        descriptor_usable: Final = sys.platform != "darwin" and os.access(target, os.F_OK)
+-        # SQLite reuses a descriptor it deferred closing for a peer's locks only when stat of the name it opened reports
+-        # the file, which macOS's /dev/fd does not, so every connect beside a holder would keep one more open. NetBSD's
+-        # static /dev/fd exposes only descriptors 0-63. A private hard link names the file and pins the validated inode.
+-        if not descriptor_usable or (  # pragma: needs posix-hard-link
+-            _PROBE_DESCRIPTORS.shared(probe) and ((named := target.stat()).st_dev, named.st_ino) != identity
+-        ):
+-            try:
+-                directory = _link_beside(database, identity)
+-            except OSError:
+-                # A usable descriptor path still pins the inode; macOS must not fall back to /dev/fd.
+-                if not descriptor_usable:
+-                    raise
+-            else:
+-                target = directory / "lock.db"
++        target = database
++        # SQLite opens the name it is given, following symlinks, and uses the -journal, -wal and -shm names beside it,
++        # so the database name is safe only where no process of another account can create names. A descriptor path
++        # such as /proc/self/fd/<n> is no better: SQLite reads it back into the name the kernel reports.
++        if not _names_are_private(pathlib.Path(database).parent, owner):  # pragma: needs posix-hard-link
++            link = _link_beside(database, identity, owner)
++            target = os.fspath(link.database)
+         connection = sqlite3.connect(
+-            os.fspath(target), check_same_thread=False, factory=factory, cached_statements=0, timeout=timeout
++            target, check_same_thread=False, factory=factory, cached_statements=0, timeout=timeout
+         )
+-        connection.retain_until_close(directory, probe)
++        connection.retain_until_close(link, probe)
+         claimed.clear()
+         return connection
+     finally:
+         for unowned in claimed:
+             _PROBE_DESCRIPTORS.release(unowned)
+-        if claimed and directory is not None:  # pragma: needs posix-hard-link
++        if claimed and link is not None:  # pragma: needs posix-hard-link
+             # A connection that already took the link removes it too when it closes.
+-            with suppress(FileNotFoundError):
+-                shutil.rmtree(directory)
++            _remove_link_directory(link)
+ 
+ 
+-def _link_beside(database: str, identity: _DatabaseIdentity) -> pathlib.Path:  # pragma: needs posix-hard-link
++def _names_are_private(directory: pathlib.Path, owner: int) -> bool:  # pragma: win32 no cover
++    status: Final = os.lstat(directory)
++    # The sticky bit still lets others create names, so a directory anyone else may write to never qualifies.
++    return status.st_uid in {owner, 0} and not status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
++
++
++class _LinkDirectory(NamedTuple):  # pragma: needs posix-hard-link
++    path: pathlib.Path
++    identity: _DatabaseIdentity
++    # Made through a descriptor of path, which nobody else can list, so a directory another process swaps in under
++    # path cannot hold this name and SQLite fails to open instead of following the swap.
++    name: str
++
++    @property
++    def database(self) -> pathlib.Path:
++        return self.path / self.name / _LINK_NAME
++
++
++def _link_beside(  # pragma: needs posix-hard-link
++    database: str, identity: _DatabaseIdentity, owner: int
++) -> _LinkDirectory:
+     # Beside the database because a link cannot cross filesystems, and TMPDIR is often on another one.
+     parent: Final = pathlib.Path(database).parent
+-    _sweep_links_of_the_dead(parent)
+-    directory: Final = pathlib.Path(tempfile.mkdtemp(prefix=_link_prefix(), dir=parent))
++    _sweep_links_of_the_dead(parent, identity, owner)
++    path: Final = pathlib.Path(tempfile.mkdtemp(prefix=_link_prefix(), dir=parent))
++    fd: Final = os.open(path, _DIRECTORY_FLAGS)
+     try:
+-        os.link(database, link := directory / "lock.db", follow_symlinks=False)
+-        linked: Final = link.stat(follow_symlinks=False)
+-    except BaseException:
+-        shutil.rmtree(directory)
+-        raise
++        made: Final = os.fstat(fd)
++        # Whoever can rename in the parent can put another directory under the new name before it opens.
++        if made.st_uid != owner or made.st_mode & 0o077:
++            msg = f"link directory {os.fspath(path)!r} was replaced while opening"
++            raise OSError(msg)
++        link: Final = _LinkDirectory(path, (made.st_dev, made.st_ino), secrets.token_hex(8))
++        try:
++            os.mkdir(link.name, 0o700, dir_fd=fd)
++            os.link(database, link.database, follow_symlinks=False)
++            linked: Final = link.database.stat(follow_symlinks=False)
++        except BaseException:
++            _remove_link_directory(link)
++            raise
++    finally:
++        os.close(fd)
+     if (linked.st_dev, linked.st_ino) != identity:
+-        shutil.rmtree(directory)
++        _remove_link_directory(link)
+         msg = f"lock database changed while opening: {database!r}"
+         raise OSError(msg)
+-    return directory
++    return link
+ 
+ 
+-def _sweep_links_of_the_dead(parent: pathlib.Path) -> None:  # pragma: needs posix-hard-link
++def _sweep_links_of_the_dead(
++    parent: pathlib.Path, identity: _DatabaseIdentity, owner: int
++) -> None:  # pragma: needs posix-hard-link
+     # A process killed while it held a link leaves the directory, and an extra link to the database, behind for good.
+     # Two threads sweeping at once only both try the same removals, which a lock would cost a fork-safety reset for.
+-    if (key := os.fspath(parent)) in _SWEPT_DIRECTORIES:
++    if identity in _SWEPT_DATABASES:
+         return
+-    _SWEPT_DIRECTORIES.add(key)
++    _SWEPT_DATABASES.add(identity)
+     try:
+         with os.scandir(parent) as entries:
+-            directories: Final = [
+-                pathlib.Path(entry.path)
++            names: Final = [
++                entry.name
+                 for entry in entries
+                 if entry.name.startswith(_LINK_PREFIX) and entry.is_dir(follow_symlinks=False)
+             ]
+     except OSError:
+         return
+-    for directory in directories:
+-        if _owner_is_gone(directory.name):
+-            # A peer sweeping alongside, or a directory this user cannot remove, must not fail the connect.
++    for name in names:
++        # A peer sweeping alongside, or a directory this user cannot remove, must not fail the connect.
++        with suppress(OSError):
++            _remove_dead_links(parent / name, identity, owner)
++
++
++def _remove_dead_links(
++    path: pathlib.Path, identity: _DatabaseIdentity, owner: int
++) -> None:  # pragma: needs posix-hard-link
++    if sys.platform == "win32":  # pragma: win32 cover
++        _remove_dead_links_on_windows(path, identity)
++        return
++    # Any directory can carry a dead holder's name after a rename in the parent, so only hard links to this database
++    # go, and the directory only once that leaves it empty.
++    fd: Final = os.open(path, _DIRECTORY_FLAGS)
++    try:
++        # Only a directory this account made carries a holder of its own; a name another account chose is never
++        # parsed, so no PID is probed on its behalf.
++        if os.fstat(fd).st_uid != owner or not _owner_is_gone(path.name):
++            return
++        with os.scandir(fd) as entries:
++            names: Final = [entry.name for entry in entries]
++        for entry in names:
++            # Releases up to 4.2.0 linked the database right inside the directory.
++            if entry == _LINK_NAME:
++                _unlink_link_to(identity, fd)
++                continue
++            try:
++                nested = os.open(entry, _DIRECTORY_FLAGS, dir_fd=fd)
++            except OSError:
++                continue
++            try:
++                _unlink_link_to(identity, nested)
++            finally:
++                os.close(nested)
+             with suppress(OSError):
+-                shutil.rmtree(directory)
++                os.rmdir(entry, dir_fd=fd)
++    finally:
++        os.close(fd)
++    with suppress(OSError):
++        path.rmdir()
+ 
+ 
++def _unlink_link_to(identity: _DatabaseIdentity, dir_fd: int) -> None:  # pragma: needs posix-hard-link
++    try:
++        linked: Final = os.stat(_LINK_NAME, dir_fd=dir_fd, follow_symlinks=False)
++    except OSError:
++        return
++    if (linked.st_dev, linked.st_ino) == identity:
++        os.unlink(_LINK_NAME, dir_fd=dir_fd)
++
++
+ def _owner_is_gone(name: str) -> bool:  # pragma: needs posix-hard-link
+-    # A peer can plant a malformed name; leave it untouched rather than probing a forged PID during acquisition.
+     match name.removeprefix(_LINK_PREFIX).split("-"):
+         case [pid, start, digest, _] if (
+             pid.isascii() and pid.isdigit() and (not start or (start.isascii() and start.isdigit()))
+@@ -1076,6 +1166,95 @@
+     return hashlib.sha256(host.encode()).hexdigest()[:16]
+ 
+ 
++def _remove_link_directory(link: _LinkDirectory) -> None:  # pragma: needs posix-hard-link
++    if sys.platform == "win32":  # pragma: win32 cover
++        _remove_link_directory_on_windows(link)
++        return
++    # A rename in the parent may have put any directory under this name, so entries go through a descriptor checked
++    # to be the directory made, and the name goes only through rmdir, which refuses a non-empty directory.
++    try:
++        fd: Final = os.open(link.path, _DIRECTORY_FLAGS)
++    except OSError:
++        return
++    try:
++        opened: Final = os.fstat(fd)
++        if (opened.st_dev, opened.st_ino) != link.identity:
++            return
++        for suffix in ("", "-journal", "-wal", "-shm"):
++            with suppress(FileNotFoundError):
++                os.unlink(f"{link.name}/{_LINK_NAME}{suffix}", dir_fd=fd)
++        with suppress(FileNotFoundError):
++            os.rmdir(link.name, dir_fd=fd)
++    finally:
++        os.close(fd)
++    # The link is gone, so a failure here leaves one stray empty directory and is not worth failing a release for.
++    with suppress(OSError):
++        link.path.rmdir()
++
++
++if sys.platform == "win32":  # pragma: win32 cover
++
++    def _link_beside_on_windows(database: str, identity: _DatabaseIdentity) -> _LinkDirectory:
++        parent: Final = pathlib.Path(database).parent
++        # No uid exists here: a directory is a dead holder's only if its ACL admits nobody but the trusted accounts.
++        _sweep_links_of_the_dead(parent, identity, 0)
++        path: Final = parent / f"{_link_prefix()}{secrets.token_hex(8)}"
++        _make_private_directory(os.fspath(path))
++        link: _LinkDirectory | None = None
++        try:
++            # The handle keeps a rename in the parent from swapping the directory while the link is made inside it.
++            with _pinned(os.fspath(path)) as directory_identity:
++                link = _LinkDirectory(path, directory_identity, secrets.token_hex(8))
++                _fill_link_directory(link, database, identity)
++        except BaseException:
++            if link is not None:  # pragma: no branch  # a pinned directory always gets its link
++                _remove_link_directory(link)
++            raise
++        return link
++
++    def _fill_link_directory(link: _LinkDirectory, database: str, identity: _DatabaseIdentity) -> None:
++        if not _directory_is_private(os.fspath(link.path)):
++            msg = f"link directory {os.fspath(link.path)!r} was replaced while opening"
++            raise OSError(msg)
++        _make_private_directory(os.fspath(link.path / link.name))
++        os.link(database, link.database)
++        # The open database handle pins its path against a rename, so only a file index that is not unique can differ.
++        if _identity_at(os.fspath(link.database)) != identity:  # pragma: no cover
++            msg = f"lock database changed while opening: {database!r}"
++            raise OSError(msg)
++
++    def _remove_dead_links_on_windows(path: pathlib.Path, identity: _DatabaseIdentity) -> None:
++        with _pinned(os.fspath(path)):
++            if not _directory_is_private(os.fspath(path)) or not _owner_is_gone(path.name):
++                return
++            with os.scandir(path) as entries:
++                nested: Final = [pathlib.Path(entry.path) for entry in entries]
++            for directory in nested:
++                _unlink_link_to_on_windows(identity, directory / _LINK_NAME)
++                with suppress(OSError):
++                    directory.rmdir()
++        with suppress(OSError):
++            path.rmdir()
++
++    def _unlink_link_to_on_windows(identity: _DatabaseIdentity, path: pathlib.Path) -> None:
++        with suppress(OSError):
++            if _identity_at(os.fspath(path)) == identity:
++                path.unlink()
++
++    def _remove_link_directory_on_windows(link: _LinkDirectory) -> None:
++        # A removal never fails a release: SQLite or a scanner may still hold a name, and the next sweep retries.
++        with suppress(OSError):
++            with _pinned(os.fspath(link.path)) as directory_identity:
++                if directory_identity != link.identity:
++                    return
++                for suffix in ("", "-journal", "-wal", "-shm"):
++                    with suppress(FileNotFoundError):
++                        pathlib.Path(f"{link.database}{suffix}").unlink()
++                with suppress(FileNotFoundError):
++                    pathlib.Path(link.database.parent).rmdir()
++            link.path.rmdir()
++
++
+ def _open_lock_database(database: str) -> int:
+     if sys.platform == "win32":  # pragma: win32 cover
+         # The handle refuses a reparse point and omits delete sharing, so the name cannot be swapped while it is open.
+@@ -1099,6 +1278,29 @@
+     if header.startswith(_SQLITE_MAGIC) and _WAL_FORMAT_VERSION in header[_FORMAT_VERSIONS]:
+         msg = f"refusing a WAL-mode lock database: {database!r}; give ReadWriteLock a file of its own"
+         raise ValueError(msg)
++
++
++@contextmanager
++def _bounded_schema(connection: sqlite3.Connection, database: str) -> Generator[None]:
++    # The first statement loads the file's complete schema, which no timeout bounds, and a lock database has none.
++    # Waiting for a lock runs no virtual machine steps, so a step budget bounds only that load.
++    calls: Final = count()
++    max_calls: Final = 10
++    connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 4096)
++    connection.set_progress_handler(lambda: next(calls) >= max_calls, 1000)
++    try:
++        yield
++    except sqlite3.DatabaseError as error:
++        # An interrupted schema load reports a malformed schema rather than the interrupt.
++        if isinstance(error, sqlite3.DataError) or next(calls) > max_calls:
++            msg = (
++                f"refusing a lock database whose schema is too large to load: {database!r}; "
++                "give ReadWriteLock a file of its own"
++            )
++            raise ValueError(msg) from error
++        raise
++    finally:
++        connection.set_progress_handler(None, 0)
+ 
+ 
+ @contextmanager
+--- a/src/filelock/_windows.py
++++ b/src/filelock/_windows.py
+@@ -1,15 +1,20 @@
+ from __future__ import annotations
+ 
+ import os
++import struct
+ import sys
+ import time
+-from contextlib import suppress
++from contextlib import contextmanager, suppress
++from functools import cache
+ from pathlib import Path
+-from typing import Final, cast
++from typing import TYPE_CHECKING, Final, cast
+ 
+ from ._api import BaseFileLock
+ from ._util import ensure_directory_exists, raise_on_not_writable_file
+ 
++if TYPE_CHECKING:
++    from collections.abc import Generator
++
+ if sys.platform == "win32":  # pragma: win32 cover
+     import ctypes
+     import msvcrt
+@@ -23,6 +28,9 @@
+         0x00000001 | 0x00000002
+     )  # read | write; matches os.open (_SH_DENYNO), no delete
+     _FILE_OPEN_IF: Final[int] = 3  # open the file if it exists, create it otherwise; the NtCreateFile OPEN_ALWAYS
++    # Attribute-only access skips share-mode checks, so the probe sees a name's deletion state rather than a reader.
++    _FILE_READ_ATTRIBUTES: Final[int] = 0x00000080
++    _FILE_SHARE_ALL: Final[int] = 0x00000001 | 0x00000002 | 0x00000004  # read | write | delete
+     _FILE_ATTRIBUTE_READONLY: Final[int] = 0x00000001
+     _FILE_ATTRIBUTE_NORMAL: Final[int] = 0x00000080
+     _FILE_ATTRIBUTE_REPARSE_POINT: Final[int] = 0x00000400
+@@ -34,6 +42,12 @@
+     _CREATE_OPTIONS: Final[int] = _FILE_SYNCHRONOUS_IO_NONALERT | _FILE_NON_DIRECTORY_FILE | _FILE_OPEN_REPARSE_POINT
+     _OBJ_CASE_INSENSITIVE: Final[int] = 0x00000040  # Win32 name lookups are case-insensitive
+     _OWNER_WRITE: Final[int] = 0o200
++    _GROUP_AND_OTHERS: Final[int] = 0o077
++    # The DACL os.mkdir(mode=0o700) applies, less the inheritance flags a file has no use for: protected, so the
++    # directory's inheritable entries stay out, with full access for SYSTEM, Administrators and the owner.
++    _OWNER_ONLY_SDDL: Final[str] = "D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)"
++    _SDDL_REVISION_1: Final[int] = 1
++    _INVALID_HANDLE_VALUE: Final[int | None] = ctypes.c_void_p(-1).value
+ 
+     # LockFileEx locks a byte range at an offset carried in OVERLAPPED, independent of the descriptor's file position.
+     # msvcrt.locking starts at the current position instead, so a metadata write between lock and unlock could shift
+@@ -41,6 +55,7 @@
+     # descriptor lock.
+     _LOCKFILE_FAIL_IMMEDIATELY: Final[int] = 0x00000001
+     _LOCKFILE_EXCLUSIVE_LOCK: Final[int] = 0x00000002
++    _ERROR_ACCESS_DENIED: Final[int] = 5
+     _ERROR_LOCK_VIOLATION: Final[int] = 33  # another handle holds the byte range
+     _ERROR_NOT_LOCKED: Final[int] = 158  # the byte range is not locked
+ 
+@@ -58,6 +73,7 @@
+ 
+     _ntdll: Final[ctypes.WinDLL] = ctypes.WinDLL("ntdll")
+     _kernel32: Final[ctypes.WinDLL] = ctypes.WinDLL("kernel32", use_last_error=True)
++    _advapi32: Final[ctypes.WinDLL] = ctypes.WinDLL("advapi32", use_last_error=True)
+ 
+     class _UNICODE_STRING(ctypes.Structure):  # ruff:ignore[invalid-class-name]  # mirrors the Win32 struct name
+         _fields_ = (
+@@ -82,6 +98,13 @@
+             ("Information", ctypes.c_void_p),
+         )
+ 
++    class _SECURITY_ATTRIBUTES(ctypes.Structure):  # ruff:ignore[invalid-class-name]  # mirrors the Win32 struct name
++        _fields_ = (
++            ("nLength", wintypes.DWORD),
++            ("lpSecurityDescriptor", ctypes.c_void_p),
++            ("bInheritHandle", wintypes.BOOL),
++        )
++
+     class _OVERLAPPED(ctypes.Structure):  # mirrors the Win32 struct name
+         _fields_ = (
+             ("Internal", ctypes.c_void_p),  # ULONG_PTR: pointer-sized, not DWORD, or the x64 layout corrupts Offset
+@@ -152,6 +175,57 @@
+         ctypes.POINTER(_OVERLAPPED),
+     ]
+     _kernel32.UnlockFileEx.restype = wintypes.BOOL
++    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
++        wintypes.LPCWSTR,
++        wintypes.DWORD,
++        ctypes.POINTER(ctypes.c_void_p),
++        ctypes.POINTER(wintypes.ULONG),
++    ]
++    _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
++    _advapi32.GetNamedSecurityInfoW.argtypes = [
++        wintypes.LPCWSTR,
++        ctypes.c_int,
++        wintypes.DWORD,
++        ctypes.POINTER(ctypes.c_void_p),
++        ctypes.POINTER(ctypes.c_void_p),
++        ctypes.POINTER(ctypes.c_void_p),
++        ctypes.POINTER(ctypes.c_void_p),
++        ctypes.POINTER(ctypes.c_void_p),
++    ]
++    _advapi32.GetNamedSecurityInfoW.restype = wintypes.DWORD
++    _advapi32.OpenThreadToken.argtypes = [
++        wintypes.HANDLE,
++        wintypes.DWORD,
++        wintypes.BOOL,
++        ctypes.POINTER(wintypes.HANDLE),
++    ]
++    _advapi32.OpenThreadToken.restype = wintypes.BOOL
++    _advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
++    _advapi32.OpenProcessToken.restype = wintypes.BOOL
++    _advapi32.GetTokenInformation.argtypes = [
++        wintypes.HANDLE,
++        ctypes.c_int,
++        ctypes.c_void_p,
++        wintypes.DWORD,
++        ctypes.POINTER(wintypes.DWORD),
++    ]
++    _advapi32.GetTokenInformation.restype = wintypes.BOOL
++    _kernel32.GetCurrentProcess.restype = wintypes.HANDLE
++    _kernel32.GetCurrentThread.restype = wintypes.HANDLE
++    _kernel32.LocalFree.argtypes = [ctypes.c_void_p]
++    _kernel32.LocalFree.restype = ctypes.c_void_p
++    _kernel32.CreateDirectoryW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(_SECURITY_ATTRIBUTES)]
++    _kernel32.CreateDirectoryW.restype = wintypes.BOOL
++    _kernel32.CreateFileW.argtypes = [
++        wintypes.LPCWSTR,
++        wintypes.DWORD,
++        wintypes.DWORD,
++        ctypes.c_void_p,
++        wintypes.DWORD,
++        wintypes.DWORD,
++        wintypes.HANDLE,
++    ]
++    _kernel32.CreateFileW.restype = ctypes.c_void_p
+ 
+     def _lock_fd_nonblocking(fd: int) -> bool:
+         # One nonblocking exclusive LockFileEx attempt shared by WindowsFileLock and lock_descriptor, over the one-byte
+@@ -237,7 +311,9 @@
+ 
+         :param path: the lock file path.
+         :param mode: the permission mode; as ``os.open`` does on Windows, a cleared owner-write bit creates the file
+-            read-only. The attribute only takes effect when the file is created, not when an existing one is opened.
++            read-only. A mode without group and other bits creates it with an owner-only DACL; any other mode has no
++            Windows counterpart and leaves the file the entries its directory hands down. Both only take effect when the
++            file is created, not when an existing one is opened.
+ 
+         :returns: a file descriptor owning the opened handle, or ``None`` on a sharing violation or a delete-pending
+             name the caller should treat as contention and retry.
+@@ -250,12 +326,13 @@
+         # Emit the audit event os.open would, so consumers watching "open" still see the path-level open and can veto.
+         sys.audit("open", path, None, os.O_RDWR | os.O_CREAT)
+         read_only = not mode & _OWNER_WRITE
+-        handle, status = _nt_open(path, read_only=read_only)
++        owner_only = not mode & _GROUP_AND_OTHERS
++        handle, status = _nt_open(path, read_only=read_only, owner_only=owner_only)
+         if status == _STATUS_ACCESS_DENIED:
+             deadline = time.monotonic() + _ACCESS_DENIED_GRACE
+             while status == _STATUS_ACCESS_DENIED and time.monotonic() < deadline:
+                 time.sleep(_ACCESS_DENIED_RETRY)
+-                handle, status = _nt_open(path, read_only=read_only)
++                handle, status = _nt_open(path, read_only=read_only, owner_only=owner_only)
+         if status != _STATUS_SUCCESS:
+             if status in {_STATUS_SHARING_VIOLATION, _STATUS_DELETE_PENDING}:
+                 return None
+@@ -280,10 +357,22 @@
+             _kernel32.CloseHandle(handle)
+             raise
+ 
+-    def _nt_open(path: str, *, read_only: bool) -> tuple[int, int]:
++    @cache
++    def _owner_only_descriptor() -> ctypes.c_void_p:
++        # Converted once and never freed: the open retries every few milliseconds while it waits.
++        descriptor = ctypes.c_void_p()
++        if not _advapi32.ConvertStringSecurityDescriptorToSecurityDescriptorW(
++            _OWNER_ONLY_SDDL, _SDDL_REVISION_1, ctypes.byref(descriptor), None
++        ):  # pragma: no cover  # a constant string converts
++            raise ctypes.WinError(ctypes.get_last_error())
++        return descriptor
++
++    def _nt_open(path: str, *, read_only: bool, owner_only: bool) -> tuple[int, int]:
+         """
+         Open *path* through ``NtCreateFile`` and return ``(handle, status)``.
+ 
++        Without *owner_only* a file this call creates gets no DACL of its own and inherits its directory's ACL.
++
+         ``RtlDosPathNameToNtPathName_U_WithStatus`` translates the Win32 path to the NT namespace, handling relative,
+         drive, UNC and extended-length path forms as Win32 itself would, and allocates a buffer that
+         ``RtlFreeUnicodeString`` releases. The handle is ``0`` unless the status is ``STATUS_SUCCESS``.
+@@ -297,6 +386,7 @@
+             attributes.Length = ctypes.sizeof(_OBJECT_ATTRIBUTES)
+             attributes.ObjectName = ctypes.pointer(nt_name)
+             attributes.Attributes = _OBJ_CASE_INSENSITIVE
++            attributes.SecurityDescriptor = _owner_only_descriptor() if owner_only else None
+             handle = wintypes.HANDLE()
+             io_status = _IO_STATUS_BLOCK()
+             status = (
+@@ -321,6 +411,137 @@
+             return 0, status
+         return handle.value or 0, status
+ 
++    def _directory_is_private(path: str) -> bool:
++        """
++        Report whether only the current user, ``SYSTEM`` and ``Administrators`` can create or remove names in *path*.
++
++        A directory whose owner is anyone else can have its ACL rewritten by that owner. Entries that only a child
++        inherits count too, since the DACL says nothing more precise about who may write.
++        """
++        owner, dacl, descriptor = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
++        error = _advapi32.GetNamedSecurityInfoW(
++            path,
++            1,  # SE_FILE_OBJECT
++            0x1 | 0x4,  # OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION
++            ctypes.byref(owner),
++            None,
++            ctypes.byref(dacl),
++            None,
++            ctypes.byref(descriptor),
++        )
++        if error == _ERROR_ACCESS_DENIED:
++            # C:\Windows\Temp is one. Anything that cannot be proven private is not.
++            return False
++        if error:  # pragma: no cover  # the directory was opened or listed an instant earlier
++            raise ctypes.WinError(error)
++        try:
++            # SYSTEM, Administrators, CREATOR OWNER and OWNER RIGHTS; the last two stand for the owner.
++            trusted = {_sid_from_text(text) for text in ("S-1-5-18", "S-1-5-32-544", "S-1-3-0", "S-1-3-4")}
++            trusted.add(_user_sid())
++            # A missing DACL grants everyone full access.
++            return (
++                bool(dacl.value)
++                and _sid_at(cast("int", owner.value)) in trusted
++                and _name_writers(cast("int", dacl.value)) <= trusted
++            )
++        finally:
++            _kernel32.LocalFree(descriptor)
++
++    def _name_writers(dacl: int) -> set[bytes]:
++        (count,) = struct.unpack("<4xH2x", ctypes.string_at(dacl, 8))
++        writers = set()
++        offset = 8
++        for _ in range(count):
++            ace_type, _flags, ace_size, mask = struct.unpack("<BBHI", ctypes.string_at(dacl + offset, 8))
++            # Allowed and allowed-callback ACEs share a layout; object ACEs exist only in directory services. The check
++            # is conservative: any right that can turn into creating a name counts, namely FILE_ADD_FILE,
++            # FILE_ADD_SUBDIRECTORY, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER, GENERIC_WRITE and GENERIC_ALL.
++            if ace_type in {0, 9} and mask & (0x2 | 0x4 | 0x40 | 0x40000 | 0x80000 | 0x40000000 | 0x10000000):
++                writers.add(_sid_at(dacl + offset + 8))
++            offset += ace_size
++        return writers
++
++    def _user_sid() -> bytes:
++        token = wintypes.HANDLE()
++        token_query: Final = 0x0008
++        open_as_self: Final = True
++        # An impersonating thread acts as the account it impersonates, which is the one whose names the lock creates.
++        if not (
++            _advapi32.OpenThreadToken(_kernel32.GetCurrentThread(), token_query, open_as_self, ctypes.byref(token))
++            or _advapi32.OpenProcessToken(_kernel32.GetCurrentProcess(), token_query, ctypes.byref(token))
++        ):  # pragma: no cover  # every process may query its own token
++            raise ctypes.WinError(ctypes.get_last_error())
++        try:
++            size = wintypes.DWORD()
++            _advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
++            buffer = ctypes.create_string_buffer(size.value)
++            if not _advapi32.GetTokenInformation(
++                token, 1, buffer, size, ctypes.byref(size)
++            ):  # pragma: no cover  # the buffer has the size the first call asked for
++                raise ctypes.WinError(ctypes.get_last_error())
++            return _sid_at(cast("int", ctypes.c_void_p.from_buffer(buffer).value))
++        finally:
++            _kernel32.CloseHandle(token)
++
++    def _sid_from_text(text: str) -> bytes:
++        revision, authority, *subauthorities = (int(part) for part in text.removeprefix("S-").split("-"))
++        return (
++            struct.pack("<BB", revision, len(subauthorities))
++            + authority.to_bytes(6, "big")
++            + struct.pack(f"<{len(subauthorities)}I", *subauthorities)
++        )
++
++    def _sid_at(address: int) -> bytes:
++        return ctypes.string_at(address, 8 + 4 * ctypes.string_at(address + 1, 1)[0])
++
++    def _make_private_directory(path: str) -> None:
++        """Create *path* with the owner-only descriptor, so that nobody else can add a name to it."""
++        attributes = _SECURITY_ATTRIBUTES(
++            nLength=ctypes.sizeof(_SECURITY_ATTRIBUTES),
++            lpSecurityDescriptor=_owner_only_descriptor(),
++            bInheritHandle=False,
++        )
++        if not _kernel32.CreateDirectoryW(path, ctypes.byref(attributes)):  # pragma: no cover  # the name is fresh
++            raise ctypes.WinError(ctypes.get_last_error())
++
++    @contextmanager
++    def _pinned(path: str) -> Generator[tuple[int, int]]:
++        """Hold *path* open without delete sharing, which keeps its name from being renamed or removed."""
++        with _opened(path, _FILE_SHARE_READ_WRITE) as handle:
++            yield _identity_of(handle)
++
++    def _identity_at(path: str) -> tuple[int, int]:
++        with _opened(path, _FILE_SHARE_ALL) as handle:
++            return _identity_of(handle)
++
++    def _identity_of_fd(fd: int) -> tuple[int, int]:
++        return _identity_of(msvcrt.get_osfhandle(fd))
++
++    @contextmanager
++    def _opened(path: str, share: int) -> Generator[int]:
++        # The final component is opened as itself, never through a reparse point.
++        handle = _kernel32.CreateFileW(
++            path,
++            _FILE_READ_ATTRIBUTES,
++            share,
++            None,
++            3,  # OPEN_EXISTING
++            0x02000000 | 0x00200000,  # FILE_FLAG_BACKUP_SEMANTICS opens a directory; FILE_FLAG_OPEN_REPARSE_POINT
++            None,
++        )
++        if handle in {None, _INVALID_HANDLE_VALUE}:  # pragma: no cover  # callers open a name they just made or listed
++            raise ctypes.WinError(ctypes.get_last_error())
++        try:
++            yield cast("int", handle)
++        finally:
++            _kernel32.CloseHandle(handle)
++
++    def _identity_of(handle: int) -> tuple[int, int]:
++        info = _BY_HANDLE_FILE_INFORMATION()
++        if not _kernel32.GetFileInformationByHandle(handle, ctypes.byref(info)):  # pragma: no cover
++            raise ctypes.WinError(ctypes.get_last_error())
++        return info.dwVolumeSerialNumber, info.nFileIndexHigh << 32 | info.nFileIndexLow
++
+ else:  # pragma: win32 no cover
+ 
+     class WindowsFileLock(BaseFileLock):
+@@ -335,5 +556,10 @@
+ 
+ __all__ = [
+     "WindowsFileLock",
++    "_directory_is_private",
++    "_identity_at",
++    "_identity_of_fd",
++    "_make_private_directory",
+     "_open_non_reparse_fd",
++    "_pinned",
+ ]
+--- a/tasks/capabilities.py
++++ b/tasks/capabilities.py
+@@ -298,19 +298,6 @@
+             probe.chmod(0o600)
+ 
+ 
+-def _fd_directory_names_the_file() -> bool:
+-    # Mirrors the view ReadWriteLock connects through. SQLite reuses a descriptor it deferred closing only when stat of
+-    # the name it opened reports the file itself; macOS's /dev/fd reports devfs instead.
+-    view: Final = Path("/proc/self/fd" if sys.platform == "linux" else "/dev/fd")
+-    if not view.is_dir():
+-        return False
+-    with tempfile.TemporaryFile() as handle:
+-        try:
+-            return os.path.samestat((view / str(handle.fileno())).stat(), os.fstat(handle.fileno()))
+-        except OSError:  # a static /dev/fd, like NetBSD's or FreeBSD's without fdescfs, lists only low numbers
+-            return False
+-
+-
+ _LINK_FOLLOW_SYMLINKS: Final[bool] = _honors_link_follow_symlinks()
+ 
+ 
+@@ -340,7 +327,6 @@
+     "settrace-safe-audit-hooks": _survives_settrace_inside_audit_hook(),
+     "profile-interrupted-generator-finishes": _finishes_a_generator_a_profile_hook_interrupts_on_resume(),
+     "fd-directory": any(Path(view).is_dir() for view in ("/dev/fd", "/proc/self/fd")),
+-    "fd-directory-names-file": _fd_directory_names_the_file(),
+     "fifo": hasattr(os, "mkfifo"),
+     "af-unix": hasattr(socket, "AF_UNIX"),
+     # Distinct from "symlink": a runtime can create them yet still not refuse to follow one.
+--- a/tasks/coverage_pragmas.py
++++ b/tasks/coverage_pragmas.py
+@@ -61,8 +61,8 @@
+ #: Modules a missing capability makes unrunnable in full; marking every line would restate one module-level gate.
+ _CAPABILITY_MODULES: Final[dict[str, tuple[str, ...]]] = {
+     "posix-hard-link": (
+-        "*/tests/test_read_write_fd_fallback.py",
+-        "*\\tests\\test_read_write_fd_fallback.py",
++        "*/tests/test_read_write_private_link.py",
++        "*\\tests\\test_read_write_private_link.py",
+     ),
+     "hard-link": (
+         "*/tests/test_strict_soft*.py",
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -2,6 +2,7 @@
+ 
+ import gc
+ import os
++import subprocess  # ruff:ignore[suspicious-subprocess-import]  # only the fixed-argument, no-shell run below
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+@@ -79,3 +80,14 @@
+     yield capture, release_error, release_cause
+     if locked_fd is not None:  # pragma: no branch  # every consumer calls capture, so this is always set
+         real_close(locked_fd)
++
++
++@pytest.fixture
++def inheriting_directory(tmp_path: Path) -> Path:  # pragma: win32 cover
++    # A directory whose ACL has no inheritable entry hands a new file the token's default DACL, which icacls cannot
++    # tell from an explicit one, so grant Users an inheritable entry for the file to show as (I).
++    directory = tmp_path / "inheriting"
++    directory.mkdir()
++    icacls = Path(os.environ["SYSTEMROOT"], "System32", "icacls.exe")
++    subprocess.run([icacls, directory, "/grant", "*S-1-5-32-545:(OI)(CI)(RX)"], capture_output=True, check=True)
++    return directory
+--- a/tests/test_filelock.py
++++ b/tests/test_filelock.py
+@@ -6,7 +6,7 @@
+ import math
+ import os
+ import signal
+-import subprocess  # ruff:ignore[suspicious-subprocess-import]  # only the fixed-argument, no-shell run below
++import subprocess  # ruff:ignore[suspicious-subprocess-import]  # only fixed-argument, no-shell runs below
+ import sys
+ import threading
+ import time
+@@ -2219,10 +2219,10 @@
+ 
+         statuses = [0xC0000022]
+ 
+-        def deny_once(path: str, *, read_only: bool) -> tuple[int, int]:
++        def deny_once(path: str, *, read_only: bool, owner_only: bool) -> tuple[int, int]:
+             if statuses:
+                 return 0, statuses.pop()
+-            return real_nt_open(path, read_only=read_only)
++            return real_nt_open(path, read_only=read_only, owner_only=owner_only)
+ 
+         nt_open = mocker.patch("filelock._windows._nt_open", side_effect=deny_once)
+         lock = FileLock(str(tmp_path / "a"), timeout=0)
+@@ -2258,6 +2258,27 @@
+                 FileLock(target, timeout=0.3).acquire()
+         finally:
+             kernel32.CloseHandle(handle)
++
++
++@_WINDOWS_ONLY  # pragma: win32 cover
++@pytest.mark.parametrize(
++    ("mode", "inherits"),
++    [
++        pytest.param(-1, True, id="unset"),
++        pytest.param(0o644, True, id="others-read"),
++        pytest.param(0o600, False, id="owner-only"),
++    ],
++)
++def test_windows_owner_only_mode_keeps_out_the_directory_acl(
++    inheriting_directory: Path, mode: int, *, inherits: bool
++) -> None:
++    lock_path = inheriting_directory / "a"
++    with FileLock(str(lock_path), mode=mode):
++        acl = subprocess.run(
++            [Path(os.environ["SYSTEMROOT"], "System32", "icacls.exe"), lock_path], capture_output=True, check=True
++        ).stdout
++    # icacls marks each entry the directory handed down with (I), whatever the display language.
++    assert (b"(I)" in acl) is inherits
+ 
+ 
+ @pytest.mark.parametrize(
+--- a/tests/test_read_write.py
++++ b/tests/test_read_write.py
+@@ -3,6 +3,8 @@
+ import ctypes
+ import os
+ import re
++import struct
++import subprocess  # ruff:ignore[suspicious-subprocess-import]  # only fixed-argument, no-shell runs below
+ import sys
+ import time
+ from contextlib import closing
+@@ -22,6 +24,11 @@
+ from tests.process_helpers import cleanup_processes
+ from tests.read_write_helpers import assert_read_write_lock_state
+ 
++if sys.platform == "win32":  # pragma: win32 cover
++    from filelock._identity import host_name
++    from filelock._read_write import _host_digest, _remove_link_directory_on_windows
++    from filelock._windows import _advapi32, _directory_is_private, _make_private_directory
++
+ # Bounds how long a spawned process may take to reach the lock, not how fast it must be: an interpreter that starts
+ # slowly under a loaded suite is not a locking failure. Only a genuine hang waits this out. Each test's own timeout
+ # has to outlast the waits it makes, so those are multiples of this rather than bare seconds.
+@@ -38,13 +45,15 @@
+     )  # pragma: no cover  # exercised only under the pypy fork backend, which runs without coverage
+ 
+ if TYPE_CHECKING:
+-    from collections.abc import Callable
++    from collections.abc import Callable, Generator
+     from multiprocessing.sharedctypes import Synchronized
+     from multiprocessing.synchronize import Event as EventType
+ 
+     from pytest_mock import MockerFixture
+ 
++    from filelock._read_write import _LinkDirectory
+ 
++
+ @pytest.mark.timeout(_PROCESS_DEADLINE * 5)
+ def test_read_locks_are_shared(lock_file: str) -> None:
+     read1_acquired = Event()
+@@ -444,23 +453,26 @@
+ 
+ @pytest.fixture(
+     params=[
+-        pytest.param(True, id="descriptor-path"),
++        pytest.param(False, id="private-directory"),
+         pytest.param(
+-            False,
+-            id="hard-link-fallback",
++            True,
++            id="shared-directory",
+             marks=[
+                 pytest.mark.requires_hard_links,
+                 pytest.mark.skipif(
+-                    not CAPABILITIES["posix-hard-link"],
++                    not CAPABILITIES["posix-hard-link"] and sys.platform != "win32",
+                     reason="private database aliases need POSIX hard links without following symlinks",
+                 ),
+             ],
+         ),
+     ]
+ )
+-def connect_route(request: pytest.FixtureRequest, mocker: MockerFixture) -> None:
+-    if not request.param:  # pragma: needs posix-hard-link
+-        mocker.patch("os.access", autospec=True, return_value=False)
++def connect_route(request: pytest.FixtureRequest, tmp_path: Path) -> None:
++    # Where others may create names beside the database, SQLite connects through a private link instead of the name.
++    if request.param and sys.platform == "win32":  # pragma: win32 cover
++        _grant_everyone_write(tmp_path)
++    elif request.param:  # pragma: needs posix-hard-link
++        tmp_path.chmod(0o777)
+ 
+ 
+ def test_read_write_lock_refuses_a_symlinked_path(tmp_path: Path) -> None:
+@@ -561,6 +573,19 @@
+         kernel32.CloseHandle(ctypes.c_void_p(handle))
+ 
+ 
++@pytest.mark.skipif(sys.platform != "win32", reason="POSIX creates the database 0o600 through its mode bits")
++def test_read_write_lock_database_keeps_out_the_directory_acl(
++    inheriting_directory: Path,
++) -> None:  # pragma: win32 cover
++    lock_path = inheriting_directory / "lock.db"
++    with closing(ReadWriteLock(lock_path, is_singleton=False)):
++        acl = subprocess.run(
++            [Path(os.environ["SYSTEMROOT"], "System32", "icacls.exe"), lock_path], capture_output=True, check=True
++        ).stdout
++    # icacls marks each entry the directory handed down with (I), whatever the display language.
++    assert b"(I)" not in acl
++
++
+ @pytest.mark.parametrize(
+     ("held_mode", "probe_mode"),
+     [
+@@ -795,3 +820,490 @@
+         acquired_event.set()
+         while True:  # pragma: win32 no cover
+             time.sleep(0.1)
++
++
++
++
++@pytest.mark.timeout(60)
++@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
++def test_read_write_lock_refuses_a_schema_that_never_finishes_loading(
++    tmp_path: Path, mode: Literal["read", "write"]
++) -> None:
++    # Every interior page leads to the next one through each of its 660 cells, so the schema has 661**4 rows to scan.
++    database = tmp_path / "lock.db"
++    pages = [
++        _btree_page(
++            0x05,  # table interior page
++            struct.pack(">IB", number + 1, 1),
++            660,
++            right_child=struct.pack(">I", number + 1),
++            header_at=100 if number == 1 else 0,
++        )
++        for number in range(1, 5)
++    ]
++    pages.append(_btree_page(_TABLE_LEAF_PAGE, bytes([6, 1, 6, 0, 0, 0, 0, 0]), 1))
++    pages[0][:100] = _file_header(len(pages))
++    database.write_bytes(b"".join(pages))
++    lock = ReadWriteLock(database, is_singleton=False)
++
++    with pytest.raises(ValueError, match="schema"):
++        (lock.acquire_read if mode == "read" else lock.acquire_write)(timeout=1)
++
++
++@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
++def test_read_write_lock_refuses_a_schema_row_longer_than_a_lock_needs(
++    tmp_path: Path, mode: Literal["read", "write"]
++) -> None:
++    # The row's text continues on an overflow page that names itself as the next one, so one page of disk reads as a
++    # megabyte, far more schema text than a lock database holds and below SQLite's one-billion-byte string limit.
++    long_sql_length = 1_000_000
++    database = tmp_path / "lock.db"
++    statement = b"CREATE TABLE application (value) --"
++    columns = [b"table", b"application", b"application", b"\x02"]
++    serial_types = [13 + 2 * len(column) for column in columns[:3]] + [1, 13 + 2 * long_sql_length]
++    record_header = b"".join(_varint(serial_type) for serial_type in serial_types)
++    record_start = _varint(len(record_header) + 1) + record_header + b"".join(columns) + statement
++    record_length = len(record_start) + long_sql_length - len(statement)
++    # How much of an overflowing record a table leaf keeps on its own page.
++    local = (minimum := (_PAGE_SIZE - 12) * 32 // 255 - 23) + (record_length - minimum) % (_PAGE_SIZE - 4)
++    cell = _varint(record_length) + _varint(1) + record_start.ljust(local, b"-") + struct.pack(">I", 2)
++    leaf = _btree_page(_TABLE_LEAF_PAGE, cell, 1, header_at=100)
++    page_count = long_sql_length // _PAGE_SIZE + 2
++    leaf[:100] = _file_header(page_count)
++    database.write_bytes(leaf + struct.pack(">I", 2).ljust(_PAGE_SIZE, b"-"))
++    # SQLite refuses a record longer than the file, which a hole stretches at no cost.
++    os.truncate(database, page_count * _PAGE_SIZE)
++    lock = ReadWriteLock(database, is_singleton=False)
++
++    with pytest.raises(ValueError, match="schema"):
++        (lock.acquire_read if mode == "read" else lock.acquire_write)(timeout=1)
++
++
++# https://www.sqlite.org/fileformat.html
++_PAGE_SIZE: Final[int] = 4096
++_TABLE_LEAF_PAGE: Final[int] = 0x0D
++
++
++def _btree_page(kind: int, cell: bytes, cell_count: int, *, right_child: bytes = b"", header_at: int = 0) -> bytearray:
++    page = bytearray(_PAGE_SIZE)
++    cell_at = _PAGE_SIZE - len(cell)
++    page[cell_at:] = cell
++    # Every slot of the cell pointer array names the one cell.
++    header = struct.pack(">BHHHB", kind, 0, cell_count, cell_at, 0) + right_child
++    pointers = struct.pack(">H", cell_at) * cell_count
++    page[header_at : header_at + len(header) + len(pointers)] = header + pointers
++    return page
++
++
++def _file_header(page_count: int) -> bytes:
++    # Rollback journal format, a matching change counter and version-valid-for, so SQLite trusts the page count.
++    return struct.pack(
++        ">16sH6B12I20s2I",
++        b"SQLite format 3\0",
++        _PAGE_SIZE,
++        *(1, 1, 0, 64, 32, 32),
++        *(1, page_count, 0, 0, 1, 4, 0, 0, 1, 0, 0, 0),
++        b"",
++        1,
++        3040001,
++    )
++
++
++def _varint(value: int) -> bytes:
++    groups = [value & 0x7F]
++    while value := value >> 7:
++        groups.insert(0, value & 0x7F | 0x80)
++    return bytes(groups)
++
++
++_NEEDS_POSIX_HARD_LINK: Final[pytest.MarkDecorator] = pytest.mark.skipif(
++    not CAPABILITIES["posix-hard-link"],
++    reason="a shared lock directory gets a private link to the database only where POSIX hard links work",
++)
++
++
++@pytest.mark.requires_hard_links
++@_NEEDS_POSIX_HARD_LINK
++def test_shared_directory_ignores_a_journal_beside_the_database(  # pragma: needs posix-hard-link
++    shared_database: Path, tmp_path: Path
++) -> None:
++    # SQLite treats a journal beside a non-empty database as an interrupted transaction, and finishing it deletes the
++    # super-journal file the journal names.
++    named = tmp_path / "notes.txt"
++    named.write_text("keep")
++    with closing(sqlite3.connect(shared_database)) as connection:
++        connection.execute("CREATE TABLE application (value)")
++    Path(f"{shared_database}-journal").write_bytes(_hot_journal(named))
++
++    with ReadWriteLock(shared_database, is_singleton=False).read_lock():
++        pass
++
++    assert named.read_text() == "keep"
++
++
++@pytest.mark.requires_hard_links
++@_NEEDS_POSIX_HARD_LINK
++def test_shared_directory_ignores_a_directory_at_the_wal_name(  # pragma: needs posix-hard-link
++    shared_database: Path,
++) -> None:
++    # SQLite removes a leftover -wal beside an empty database, so a name it cannot remove failed every acquire.
++    wal = Path(f"{shared_database}-wal")
++    wal.mkdir()
++    (wal / "entry").touch()
++
++    with ReadWriteLock(shared_database, is_singleton=False).write_lock():
++        assert_read_write_lock_state(str(shared_database), "read", available=False)
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_ignores_a_journal_beside_the_database(  # pragma: win32 cover
++    everyone_writable_database: Path, tmp_path: Path
++) -> None:
++    # SQLite treats a journal beside a non-empty database as an interrupted transaction, and finishing it deletes the
++    # super-journal file the journal names.
++    named = tmp_path / "notes.txt"
++    named.write_text("keep")
++    with closing(sqlite3.connect(everyone_writable_database)) as connection:
++        connection.execute("CREATE TABLE application (value)")
++    Path(f"{everyone_writable_database}-journal").write_bytes(_hot_journal(named))
++
++    with ReadWriteLock(everyone_writable_database, is_singleton=False).read_lock():
++        pass
++
++    assert named.read_text() == "keep"
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_ignores_an_undeletable_file_at_the_wal_name(  # pragma: win32 cover
++    everyone_writable_database: Path,
++) -> None:
++    # SQLite removes a leftover -wal beside an empty database, so a name it cannot remove failed every acquire.
++    with Path(f"{everyone_writable_database}-wal").open("wb") as wal:
++        wal.write(b"\0" * 32)
++        wal.flush()
++
++        with ReadWriteLock(everyone_writable_database, is_singleton=False).write_lock():
++            assert_read_write_lock_state(str(everyone_writable_database), "read", available=False)
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_directory_whose_acl_cannot_be_read_gets_a_private_link(  # pragma: win32 cover
++    tmp_path: Path, mocker: MockerFixture
++) -> None:
++    # An account without read access to a directory's ACL, as with C:\Windows\Temp, cannot tell who may write there.
++    read_acl = _advapi32.GetNamedSecurityInfoW
++    denials = [5]
++    mocker.patch.object(
++        _advapi32,
++        "GetNamedSecurityInfoW",
++        side_effect=lambda *args: denials.pop() if denials else read_acl(*args),
++    )
++    connect = mocker.spy(sqlite3, "connect")
++    database = tmp_path / "lock.db"
++
++    ReadWriteLock(database, is_singleton=False).close()
++
++    opened = Path(connect.call_args_list[0].args[0])
++    assert (opened.name, opened.parent.parent.parent) == ("lock.db", tmp_path)
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++@pytest.mark.parametrize("right", [pytest.param("WDAC", id="write-dac"), pytest.param("WO", id="write-owner")])
++def test_windows_directory_whose_acl_can_be_rewritten_gets_a_private_link(  # pragma: win32 cover
++    tmp_path: Path, mocker: MockerFixture, right: str
++) -> None:
++    # An account that can rewrite a directory's ACL or take its ownership can grant itself the right to add names.
++    directory = tmp_path / "rewritable"
++    directory.mkdir()
++    icacls = Path(os.environ["SYSTEMROOT"], "System32", "icacls.exe")
++    subprocess.run([icacls, directory, "/grant", f"*S-1-1-0:({right})"], capture_output=True, check=True)
++    connect = mocker.spy(sqlite3, "connect")
++    database = directory / "lock.db"
++
++    ReadWriteLock(database, is_singleton=False).close()
++
++    opened = Path(connect.call_args_list[0].args[0])
++    assert (_directory_is_private(os.fspath(directory)), opened.parent.parent.parent) == (False, directory)
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_directory_only_the_account_can_write_connects_by_name(  # pragma: win32 cover
++    tmp_path: Path, mocker: MockerFixture
++) -> None:
++    connect = mocker.spy(sqlite3, "connect")
++    database = tmp_path / "lock.db"
++
++    ReadWriteLock(database, is_singleton=False).close()
++
++    assert (_directory_is_private(os.fspath(tmp_path)), connect.call_args_list[0].args[0]) == (True, str(database))
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_leaves_only_the_database_after_release(  # pragma: win32 cover
++    everyone_writable_database: Path,
++) -> None:
++    lock = ReadWriteLock(everyone_writable_database, is_singleton=False)
++    lock.acquire_read()
++    assert len(list(everyone_writable_database.parent.iterdir())) == 2
++    lock.release()
++
++    assert list(everyone_writable_database.parent.iterdir()) == [everyone_writable_database]
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++@pytest.mark.parametrize(
++    "boundary", [pytest.param("os.link", id="link"), pytest.param("sqlite3.connect", id="connect")]
++)
++def test_windows_shared_directory_removes_the_link_after_a_failure(  # pragma: win32 cover
++    everyone_writable_database: Path, mocker: MockerFixture, boundary: str
++) -> None:
++    mocker.patch(boundary, autospec=True, side_effect=OSError("cannot open database"))
++
++    with pytest.raises(OSError, match="cannot open database"):
++        ReadWriteLock(everyone_writable_database, is_singleton=False)
++
++    assert list(everyone_writable_database.parent.iterdir()) == [everyone_writable_database]
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_refuses_a_link_directory_others_can_write(  # pragma: win32 cover
++    everyone_writable_database: Path, mocker: MockerFixture
++) -> None:
++    mocker.patch("filelock._read_write._directory_is_private", autospec=True, return_value=False)
++
++    with pytest.raises(OSError, match="replaced while opening"):
++        ReadWriteLock(everyone_writable_database, is_singleton=False)
++
++    assert list(everyone_writable_database.parent.iterdir()) == [everyone_writable_database]
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_release_keeps_a_directory_renamed_onto_the_link(  # pragma: win32 cover
++    everyone_writable_database: Path, tmp_path: Path, mocker: MockerFixture
++) -> None:
++    other = tmp_path / "other"
++    other.mkdir()
++    (other / "notes.txt").write_text("keep")
++    renamed: list[Path] = []
++
++    def swap_then_remove(link: _LinkDirectory) -> None:
++        link.path.rename(tmp_path / "aside")
++        other.rename(link.path)
++        renamed.append(link.path)
++        _remove_link_directory_on_windows(link)
++
++    mocker.patch("filelock._read_write._remove_link_directory_on_windows", autospec=True, side_effect=swap_then_remove)
++    ReadWriteLock(everyone_writable_database, is_singleton=False).close()
++
++    assert (renamed[0] / "notes.txt").read_text() == "keep"
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_sweeps_the_link_of_a_dead_holder(  # pragma: win32 cover
++    everyone_writable_database: Path,
++) -> None:
++    everyone_writable_database.touch()
++    left = everyone_writable_database.parent / f".filelock-{2**31 - 1}--{_host_digest(host_name())}-x"
++    _make_private_directory(os.fspath(left))
++    (left / "0123456789abcdef").mkdir()
++    (left / "0123456789abcdef" / "lock.db").hardlink_to(everyone_writable_database)
++
++    with ReadWriteLock(everyone_writable_database, is_singleton=False).read_lock():
++        pass
++
++    assert (_link_directories(everyone_writable_database), everyone_writable_database.stat().st_nlink) == ([], 1)
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_sweep_keeps_a_file_that_is_not_a_link_to_the_database(  # pragma: win32 cover
++    everyone_writable_database: Path,
++) -> None:
++    left = everyone_writable_database.parent / f".filelock-{2**31 - 1}--{_host_digest(host_name())}-x"
++    _make_private_directory(os.fspath(left))
++    (left / "0123456789abcdef").mkdir()
++    (left / "0123456789abcdef" / "lock.db").write_text("keep")
++
++    ReadWriteLock(everyone_writable_database, is_singleton=False).close()
++
++    assert (left / "0123456789abcdef" / "lock.db").read_text() == "keep"
++
++
++@pytest.mark.skipif(sys.platform != "win32", reason="a Windows directory is shared through its ACL")
++def test_windows_shared_directory_sweep_keeps_the_link_of_a_live_holder(  # pragma: win32 cover
++    everyone_writable_database: Path, holder: subprocess.Popen[str]
++) -> None:
++    left = _link_directories(everyone_writable_database)
++
++    ReadWriteLock(everyone_writable_database, is_singleton=False).close()
++
++    assert (len(left), _link_directories(everyone_writable_database)) == (1, left)
++    assert holder.poll() is None
++
++
++@pytest.mark.requires_hard_links
++@_NEEDS_POSIX_HARD_LINK
++def test_shared_directory_keeps_sqlite_off_the_name_of_an_unlinked_database(  # pragma: needs posix-hard-link
++    shared_database: Path, tmp_path: Path, mocker: MockerFixture
++) -> None:
++    # The kernel names an open file whose name was unlinked "<name> (deleted)", a name anyone sharing the directory can
++    # create; relinking the same inode under the database name keeps every check on the path satisfied.
++    target = tmp_path / "target.txt"
++    Path(f"{shared_database} (deleted)").symlink_to(target)
++    shared_database.touch()
++    kept = shared_database.with_name("kept.db")
++    kept.hardlink_to(shared_database)
++    connect = sqlite3.connect
++
++    def relink_then_connect(
++        path: str,
++        *,
++        check_same_thread: bool,
++        factory: type[sqlite3.Connection],
++        cached_statements: int,
++        timeout: float,
++    ) -> sqlite3.Connection:
++        shared_database.unlink()
++        shared_database.hardlink_to(kept)
++        return connect(
++            path,
++            check_same_thread=check_same_thread,
++            factory=factory,
++            cached_statements=cached_statements,
++            timeout=timeout,
++        )
++
++    mocker.patch("sqlite3.connect", autospec=True, side_effect=relink_then_connect)
++
++    ReadWriteLock(shared_database, is_singleton=False).close()
++
++    assert not target.exists()
++
++
++@pytest.mark.requires_hard_links
++@_NEEDS_POSIX_HARD_LINK
++def test_private_directory_connects_by_the_database_name(  # pragma: needs posix-hard-link
++    tmp_path: Path, mocker: MockerFixture
++) -> None:
++    # Nobody else can create or rename names there, so SQLite may derive its side files beside the database.
++    database = tmp_path / "lock.db"
++    connect = mocker.spy(sqlite3, "connect")
++
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        assert_read_write_lock_state(str(database), "write", available=False)
++
++    assert (connect.call_args.args[0], list(tmp_path.iterdir())) == (str(database), [database])
++
++
++@pytest.mark.requires_hard_links
++@_NEEDS_POSIX_HARD_LINK
++@pytest.mark.parametrize(
++    "replacement", [pytest.param("database", id="database"), pytest.param("symlink", id="symlink")]
++)
++def test_private_directory_under_a_shared_parent_refuses_a_replaced_directory(  # pragma: needs posix-hard-link
++    shared_database: Path, mocker: MockerFixture, tmp_path: Path, replacement: str
++) -> None:
++    # A rename in the shared parent owns every name below it, so the private directory check cannot stop SQLite from
++    # opening a replacement swapped in before it connects; the acquire refuses before any statement runs, so a hot
++    # journal beside the replacement is neither replayed nor finished.
++    private = shared_database.parent / "private"
++    private.mkdir(mode=0o700)
++    lock = ReadWriteLock(private / "lock.db", is_singleton=False)
++    moved = shared_database.parent / "moved"
++    (private / "notes.txt").write_text("keep")
++    connect = sqlite3.connect
++    before: dict[Path, list[tuple[str, bytes | None]]] = {moved: _entries(private)}
++
++    def replace_then_connect(
++        path: str,
++        *,
++        check_same_thread: bool,
++        factory: type[sqlite3.Connection],
++        cached_statements: int,
++        timeout: float,
++    ) -> sqlite3.Connection:
++        private.rename(moved)
++        private.mkdir(mode=0o700)
++        if replacement == "symlink":
++            (private / "lock.db").symlink_to(tmp_path / "elsewhere.txt")
++        else:
++            with closing(connect(private / "lock.db")) as created:
++                created.execute("CREATE TABLE application (value)")
++            (private / "lock.db-journal").write_bytes(_hot_journal(moved / "notes.txt"))
++            (private / "lock.db-wal").write_bytes(b"\0" * 32)
++            before[private] = _entries(private)
++        return connect(
++            path,
++            check_same_thread=check_same_thread,
++            factory=factory,
++            cached_statements=cached_statements,
++            timeout=timeout,
++        )
++
++    mocker.patch("sqlite3.connect", autospec=True, side_effect=replace_then_connect)
++
++    with pytest.raises(OSError, match="replaced while acquiring"):
++        lock.acquire_write()
++    if replacement == "symlink":
++        # SQLite's open creates the missing name, which a symlink there sends to its target.
++        assert ((tmp_path / "elsewhere.txt").read_bytes(), (moved / "notes.txt").read_text()) == (b"", "keep")
++    else:
++        # The journal and WAL beside the replacement stay, the file the journal names stays, and no bytes change.
++        assert {directory: _entries(directory) for directory in before} == before
++    assert_read_write_lock_state(str(moved / "lock.db"), "write", available=True)
++
++
++def _hot_journal(super_journal: Path) -> bytes:  # pragma: needs posix-hard-link
++    # A journal whose tail names a super-journal makes SQLite unlink that file once it finishes the journal:
++    # https://www.sqlite.org/fileformat.html#the_rollback_journal
++    name = os.fsencode(super_journal)
++    return name + struct.pack(">II", len(name), sum(name)) + bytes.fromhex("d9d505f920a163d7")
++
++
++def _entries(directory: Path) -> list[tuple[str, bytes | None]]:  # pragma: needs posix-hard-link
++    return sorted((path.name, path.read_bytes() if path.is_file() else None) for path in directory.iterdir())
++
++
++@pytest.fixture
++def shared_database(tmp_path: Path) -> Path:  # pragma: needs posix-hard-link
++    shared = tmp_path / "shared"
++    shared.mkdir()
++    shared.chmod(0o777)
++    return shared / "lock.db"
++
++
++@pytest.fixture
++def everyone_writable_database(tmp_path: Path) -> Path:  # pragma: win32 cover
++    shared = tmp_path / "shared"
++    shared.mkdir()
++    _grant_everyone_write(shared)
++    return shared / "lock.db"
++
++
++def _grant_everyone_write(directory: Path) -> None:  # pragma: win32 cover
++    icacls = Path(os.environ["SYSTEMROOT"], "System32", "icacls.exe")
++    subprocess.run([icacls, directory, "/grant", "*S-1-1-0:(OI)(CI)(M)"], capture_output=True, check=True)
++
++
++@pytest.fixture
++def holder(everyone_writable_database: Path) -> Generator[subprocess.Popen[str]]:  # pragma: win32 cover
++    script = (
++        "import sys, time\n"
++        "from filelock import ReadWriteLock\n"
++        "lock = ReadWriteLock(sys.argv[1], is_singleton=False)\n"
++        "lock.acquire_read()\n"
++        "print('held', flush=True)\n"
++        "time.sleep(600)\n"
++    )
++    command = [sys.executable, "-c", script, str(everyone_writable_database)]
++    with subprocess.Popen(command, stdout=subprocess.PIPE, text=True) as process:
++        try:
++            assert process.stdout is not None
++            assert process.stdout.readline() == "held\n"
++            yield process
++        finally:
++            process.kill()
++            process.wait(timeout=_PROCESS_DEADLINE)
++
++
++def _link_directories(database: Path) -> list[Path]:  # pragma: win32 cover
++    return sorted(path for path in database.parent.iterdir() if path.name.startswith(".filelock-"))
+--- a/tests/test_read_write_fd_fallback.py
++++ /dev/null
+@@ -1,274 +0,0 @@
+-from __future__ import annotations
+-
+-import asyncio
+-import errno
+-import os
+-import shutil
+-import subprocess  # ruff:ignore[suspicious-subprocess-import]  # runs this test's own interpreter
+-import sys
+-import tempfile
+-from pathlib import Path
+-from typing import TYPE_CHECKING, Final, Literal
+-
+-import pytest
+-from capabilities import CAPABILITIES
+-
+-pytest.importorskip("sqlite3")
+-
+-import sqlite3
+-
+-from filelock import AsyncReadWriteLock, ReadWriteLock
+-from tests.capability_marks import NEEDS_FILE_PERMISSIONS
+-from tests.read_write_helpers import assert_read_write_lock_state
+-
+-if TYPE_CHECKING:
+-    from collections.abc import Generator
+-
+-    from pytest_mock import MockerFixture, MockType
+-
+-pytestmark: Final = [
+-    pytest.mark.requires_hard_links,
+-    pytest.mark.skipif(
+-        not CAPABILITIES["posix-hard-link"],
+-        reason="private database aliases need POSIX hard links without following symlinks",
+-    ),
+-]
+-
+-
+-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS must avoid /dev/fd lookups")
+-@pytest.mark.usefixtures("macos_descriptor_guard")
+-@pytest.mark.asyncio
+-@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+-async def test_macos_connects_through_the_validated_inode(
+-    database: Path, mocker: MockerFixture, mode: Literal["read", "write"]
+-) -> None:  # pragma: darwin cover
+-    connect: Final = mocker.spy(sqlite3, "connect")
+-    lock: Final = AsyncReadWriteLock(database, is_singleton=False)
+-    try:
+-        async with (lock.read_lock if mode == "read" else lock.write_lock)():
+-            opened: Final = Path(connect.call_args.args[0])
+-            assert (opened.name, opened.parent.parent, await asyncio.to_thread(opened.samefile, database)) == (
+-                "lock.db",
+-                database.parent,
+-                True,
+-            )
+-            await asyncio.to_thread(assert_read_write_lock_state, str(database), "write", available=False)
+-    finally:
+-        await lock.close()
+-
+-
+-@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+-def test_missing_descriptor_path_preserves_contention(database: Path, mode: Literal["read", "write"]) -> None:
+-    lock: Final = ReadWriteLock(database, is_singleton=False)
+-    with (lock.read_lock if mode == "read" else lock.write_lock)():
+-        assert_read_write_lock_state(str(database), "write", available=False)
+-
+-
+-@pytest.mark.skipif(sys.platform != "darwin", reason="macOS must reject a failed alias")
+-@pytest.mark.usefixtures("macos_descriptor_guard")
+-@pytest.mark.parametrize(
+-    "boundary", [pytest.param("tempfile.mkdtemp", id="mkdtemp"), pytest.param("os.link", id="link")]
+-)
+-def test_macos_failed_alias_preserves_a_peer_lock(
+-    database: Path, mocker: MockerFixture, boundary: str
+-) -> None:  # pragma: darwin cover
+-    with ReadWriteLock(database, is_singleton=False).read_lock():
+-        mocker.patch(boundary, autospec=True, side_effect=PermissionError(errno.EACCES, "read-only directory"))
+-        with pytest.raises(PermissionError, match="read-only directory"):
+-            ReadWriteLock(database, is_singleton=False)
+-        assert_read_write_lock_state(str(database), "write", available=False)
+-    assert list(database.parent.glob(".filelock-*")) == []
+-
+-
+-@pytest.mark.asyncio
+-@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
+-async def test_missing_descriptor_path_preserves_async_contention(
+-    database: Path, mode: Literal["read", "write"]
+-) -> None:
+-    lock: Final = AsyncReadWriteLock(database, is_singleton=False)
+-    async with (lock.read_lock if mode == "read" else lock.write_lock)():
+-        assert_read_write_lock_state(str(database), "write", available=False)
+-    await lock.close()
+-
+-
+-def test_missing_descriptor_path_removes_alias_after_release(database: Path, created_directories: list[Path]) -> None:
+-    lock: Final = ReadWriteLock(database, is_singleton=False)
+-    lock.acquire_read()
+-    assert [directory.exists() for directory in created_directories] == [False, True]
+-    lock.release()
+-    assert [directory.exists() for directory in created_directories] == [False, False]
+-
+-
+-def test_missing_descriptor_path_links_beside_the_database(database: Path, created_directories: list[Path]) -> None:
+-    # A hard link cannot cross filesystems, so an alias in TMPDIR fails for a database stored anywhere else.
+-    ReadWriteLock(database, is_singleton=False).close()
+-    assert [directory.parent for directory in created_directories] == [database.parent]
+-
+-
+-def test_missing_descriptor_path_release_survives_a_removed_alias(
+-    database: Path, created_directories: list[Path]
+-) -> None:
+-    lock: Final = ReadWriteLock(database, is_singleton=False)
+-    lock.acquire_read()
+-    shutil.rmtree(created_directories[-1])
+-    lock.release()
+-
+-    with ReadWriteLock(database, is_singleton=False).write_lock(blocking=False):
+-        assert_read_write_lock_state(str(database), "write", available=False)
+-
+-
+-@pytest.mark.parametrize(
+-    "boundary",
+-    [pytest.param("os.link", id="link"), pytest.param("sqlite3.connect", id="connect")],
+-)
+-def test_missing_descriptor_path_cleans_up_after_failure(
+-    database: Path, mocker: MockerFixture, boundary: str, created_directories: list[Path]
+-) -> None:
+-    mocker.patch(boundary, autospec=True, side_effect=OSError("cannot open database"))
+-    with pytest.raises(OSError, match="cannot open database"):
+-        ReadWriteLock(database, is_singleton=False)
+-    assert [directory.exists() for directory in created_directories] == [False]
+-
+-
+-@pytest.mark.parametrize("replacement_kind", [pytest.param("file", id="file"), pytest.param("symlink", id="symlink")])
+-def test_missing_descriptor_path_rejects_replaced_database(
+-    database: Path, tmp_path: Path, mocker: MockerFixture, replacement_kind: str, created_directories: list[Path]
+-) -> None:
+-    replacement: Final = tmp_path / "replacement.db"
+-    if replacement_kind == "file":
+-        replacement.touch()
+-    else:
+-        replacement.symlink_to(tmp_path / "victim.db")
+-    link: Final = os.link
+-
+-    def replace_and_link(source: str, destination: Path, *, follow_symlinks: bool) -> None:
+-        replacement.replace(source)
+-        link(source, destination, follow_symlinks=follow_symlinks)
+-
+-    mocker.patch("os.link", autospec=True, side_effect=replace_and_link)
+-    with pytest.raises(OSError, match="database changed"):
+-        ReadWriteLock(database, is_singleton=False)
+-    assert ([directory.exists() for directory in created_directories], (tmp_path / "victim.db").exists()) == (
+-        [False],
+-        False,
+-    )
+-
+-
+-def test_missing_descriptor_path_sweeps_the_link_of_a_killed_holder(
+-    database: Path, holder: subprocess.Popen[str]
+-) -> None:
+-    holder.kill()
+-    holder.wait(timeout=_PROCESS_DEADLINE)
+-    left: Final = _link_directories(database)
+-    with ReadWriteLock(database, is_singleton=False).read_lock():
+-        pass
+-
+-    assert (len(left), _link_directories(database), database.stat().st_nlink) == (1, [], 1)
+-
+-
+-@pytest.mark.usefixtures("holder")
+-def test_missing_descriptor_path_keeps_the_link_of_a_live_holder(database: Path) -> None:
+-    held: Final = _link_directories(database)
+-    with ReadWriteLock(database, is_singleton=False).read_lock():
+-        pass
+-    assert (len(held), _link_directories(database)) == (1, held)
+-
+-
+-def test_missing_descriptor_path_keeps_a_directory_it_did_not_name(database: Path) -> None:
+-    foreign: Final = database.parent / ".filelock-not-ours"
+-    foreign.mkdir()
+-    with ReadWriteLock(database, is_singleton=False).read_lock():
+-        pass
+-    assert foreign.is_dir()
+-
+-
+-@pytest.mark.parametrize(
+-    ("pid_text", "start_text"),
+-    [
+-        pytest.param("²", "1", id="non-ascii-pid"),
+-        pytest.param("\uff19" * 9, "1", id="parsed-non-ascii-pid"),
+-        pytest.param(str(2**31), "1", id="out-of-range-pid"),
+-        pytest.param("0", "1", id="zero-pid"),
+-        pytest.param("1", "²", id="non-ascii-start"),
+-    ],
+-)
+-def test_missing_descriptor_path_survives_a_hostile_link_name(
+-    database: Path, mocker: MockerFixture, pid_text: str, start_text: str
+-) -> None:
+-    seed_parent: Final = database.parent / "seed"
+-    seed_parent.mkdir()
+-    with ReadWriteLock(seed_parent / "lock.db", is_singleton=False).read_lock():
+-        link_name: Final = next(seed_parent.glob(".filelock-*")).name
+-    hostile: Final = database.parent / f".filelock-{pid_text}-{start_text}-{link_name.rsplit('-', 2)[1]}-x"
+-    hostile.mkdir()
+-    mocker.patch("os.kill", autospec=True, side_effect=AssertionError("invalid PID probed"))
+-    with ReadWriteLock(database, is_singleton=False).read_lock():
+-        assert_read_write_lock_state(str(database), "write", available=False)
+-    assert hostile.is_dir()
+-
+-
+-@NEEDS_FILE_PERMISSIONS  # pragma: needs file-permissions
+-def test_missing_descriptor_path_links_in_a_directory_it_cannot_list(database: Path) -> None:
+-    database.parent.chmod(0o300)
+-    try:
+-        with ReadWriteLock(database, is_singleton=False).read_lock():
+-            assert_read_write_lock_state(str(database), "write", available=False)
+-    finally:
+-        database.parent.chmod(0o700)
+-
+-
+-_PROCESS_DEADLINE: Final = 30
+-
+-
+-@pytest.fixture
+-def holder(database: Path) -> Generator[subprocess.Popen[str]]:
+-    script: Final = (
+-        "import os, sys, time\n"
+-        "os.access = lambda *args, **kwargs: False\n"
+-        "from filelock import ReadWriteLock\n"
+-        "lock = ReadWriteLock(sys.argv[1], is_singleton=False)\n"
+-        "lock.acquire_read()\n"
+-        "print('held', flush=True)\n"
+-        "time.sleep(600)\n"
+-    )
+-    with subprocess.Popen([sys.executable, "-c", script, str(database)], stdout=subprocess.PIPE, text=True) as holder:
+-        try:
+-            assert holder.stdout is not None
+-            assert holder.stdout.readline() == "held\n"
+-            yield holder
+-        finally:
+-            holder.kill()
+-            holder.wait(timeout=_PROCESS_DEADLINE)
+-
+-
+-def _link_directories(database: Path) -> list[Path]:
+-    return sorted(path for path in database.parent.iterdir() if path.name.startswith(".filelock-"))
+-
+-
+-@pytest.fixture
+-def database(tmp_path: Path) -> Path:
+-    return tmp_path / "lock.db"
+-
+-
+-@pytest.fixture
+-def created_directories(mocker: MockerFixture) -> list[Path]:
+-    directories: Final[list[Path]] = []
+-    mkdtemp: Final = tempfile.mkdtemp
+-
+-    def create_directory(*, prefix: str, dir: Path) -> str:  # ruff:ignore[builtin-argument-shadowing]  # mirrors tempfile.mkdtemp
+-        directory: Final = mkdtemp(prefix=prefix, dir=dir)
+-        directories.append(Path(directory))
+-        return directory
+-
+-    mocker.patch("tempfile.mkdtemp", autospec=True, side_effect=create_directory)
+-    return directories
+-
+-
+-@pytest.fixture(autouse=True)
+-def missing_descriptor_path(mocker: MockerFixture) -> MockType:
+-    return mocker.patch("os.access", autospec=True, return_value=False)
+-
+-
+-@pytest.fixture
+-def macos_descriptor_guard(missing_descriptor_path: MockType) -> None:  # pragma: darwin cover
+-    missing_descriptor_path.side_effect = AssertionError("macOS must not look up descriptor paths")
+--- a/tests/test_read_write_fork.py
++++ b/tests/test_read_write_fork.py
+@@ -1,7 +1,6 @@
+ from __future__ import annotations
+ 
+ import contextlib
+-import errno
+ import gc
+ import os
+ import signal
+@@ -34,10 +33,6 @@
+ _NEEDS_PROBE_DESCRIPTORS: Final[pytest.MarkDecorator] = pytest.mark.skipif(
+     sys.platform == "win32", reason="Windows connects without probe descriptors"
+ )
+-_LINKS_BEFORE_THE_DESCRIPTOR: Final[pytest.MarkDecorator] = pytest.mark.skipif(
+-    not CAPABILITIES["fd-directory"] or CAPABILITIES["fd-directory-names-file"],
+-    reason="only a descriptor path that misreports the file sends a connect through a hard link first",
+-)
+ 
+ 
+ @NEEDS_AUDIT_EVENTS
+@@ -53,11 +48,9 @@
+         if event != "sqlite3.connect":
+             return
+         database = args[0]
+-        # The lock connects through /dev/fd, /proc/self/fd or a private hard link, or by its own path on Windows.
++        # The lock connects by its own path, or through a private hard link where others share its directory.
+         if isinstance(database, (str, bytes)) and (
+-            (path := os.fsdecode(database)) == str(lock_path)
+-            or path.startswith(("/dev/fd/", "/proc/self/fd/"))
+-            or Path(path).parent.name.startswith(".filelock-")
++            (path := os.fsdecode(database)) == str(lock_path) or Path(path).parent.parent.name.startswith(".filelock-")
+         ):
+             connection_events += 1
+ 
+@@ -105,28 +98,6 @@
+         assert _descriptors_on(lock_path) == before
+ 
+ 
+-@pytest.mark.skipif(sys.platform == "darwin", reason="macOS must reject a failed alias")
+-@_LINKS_BEFORE_THE_DESCRIPTOR  # pragma: needs fd-directory  # pragma: lacks fd-directory-names-file
+-@pytest.mark.parametrize(
+-    "failing", [pytest.param("tempfile.mkdtemp", id="mkdtemp"), pytest.param("os.link", id="link")]
+-)
+-def test_read_write_lock_connects_through_the_descriptor_when_linking_fails(  # pragma: darwin no cover
+-    tmp_path: Path, mocker: MockerFixture, failing: str
+-) -> None:
+-    lock_path: Final[Path] = tmp_path / "held.db"
+-    # Only a connect beside a live peer links: that is when SQLite defers its closes.
+-    peer: Final = ReadWriteLock(lock_path, is_singleton=False)
+-    peer.acquire_read()
+-    mocker.patch(failing, autospec=True, side_effect=PermissionError(errno.EACCES, "read-only directory"))
+-    lock: Final = ReadWriteLock(lock_path, is_singleton=False)
+-    lock.acquire_read()
+-    peer.release()
+-    contender: Final = _run_fork_script(_TRY_WRITE_SCRIPT, [str(lock_path)], timeout=30)
+-    lock.release()
+-
+-    assert (contender, sorted(path.name for path in tmp_path.iterdir())) == ((0, "Timeout\n", ""), ["held.db"])
+-
+-
+ @_NEEDS_FD_DIRECTORY
+ def test_read_write_locks_held_together_each_keep_their_own_probe(tmp_path: Path) -> None:  # pragma: needs fd-directory
+     # macOS SQLite fails, now and then, to open two live connections through one /dev/fd name.
+@@ -153,15 +124,10 @@
+     newer.acquire_read()
+     first, last = (older, newer) if newer_releases_last else (newer, older)
+     first.release()
+-    database: Final = lock_path.stat()
+     real_close: Final = os.close
+ 
+     def close_then_interrupt(fd: int) -> None:
+-        same_inode: Final = os.path.samestat(os.fstat(fd), database)
+         real_close(fd)
+-        # Removing a private hard link's directory closes descriptors of its own.
+-        if not same_inode:  # pragma: lacks fd-directory-names-file
+-            return
+         # A signal handler runs once the first probe's close returns, before the second one closes.
+         mocker.stopall()
+         raise KeyboardInterrupt
+--- /dev/null
++++ b/tests/test_read_write_private_link.py
+@@ -0,0 +1,415 @@
++from __future__ import annotations
++
++import asyncio
++import errno
++import os
++import shutil
++import stat
++import subprocess  # ruff:ignore[suspicious-subprocess-import]  # runs this test's own interpreter
++import sys
++import tempfile
++from pathlib import Path
++from typing import TYPE_CHECKING, Final, Literal
++
++import pytest
++from capabilities import CAPABILITIES
++
++pytest.importorskip("sqlite3")
++
++import sqlite3
++
++from filelock import AsyncReadWriteLock, ReadWriteLock
++from tests.capability_marks import NEEDS_FILE_PERMISSIONS
++from tests.read_write_helpers import assert_read_write_lock_state
++
++if TYPE_CHECKING:
++    from collections.abc import Generator
++
++    from pytest_mock import MockerFixture
++
++pytestmark: Final = [
++    pytest.mark.requires_hard_links,
++    pytest.mark.skipif(
++        not CAPABILITIES["posix-hard-link"],
++        reason="private database aliases need POSIX hard links without following symlinks",
++    ),
++]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
++async def test_private_link_connects_through_the_validated_inode(
++    database: Path, mocker: MockerFixture, mode: Literal["read", "write"]
++) -> None:
++    connect: Final = mocker.spy(sqlite3, "connect")
++    lock: Final = AsyncReadWriteLock(database, is_singleton=False)
++    try:
++        async with (lock.read_lock if mode == "read" else lock.write_lock)():
++            opened: Final = Path(connect.call_args.args[0])
++            link_directory: Final = opened.parent.parent
++            assert (
++                opened.name,
++                link_directory.parent,
++                stat.S_IMODE(link_directory.stat().st_mode),
++                await asyncio.to_thread(opened.samefile, database),
++            ) == ("lock.db", database.parent, 0o700, True)
++            await asyncio.to_thread(assert_read_write_lock_state, str(database), "write", available=False)
++    finally:
++        await lock.close()
++
++
++@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
++def test_private_link_preserves_contention(database: Path, mode: Literal["read", "write"]) -> None:
++    lock: Final = ReadWriteLock(database, is_singleton=False)
++    with (lock.read_lock if mode == "read" else lock.write_lock)():
++        assert_read_write_lock_state(str(database), "write", available=False)
++
++
++@pytest.mark.parametrize(
++    "boundary", [pytest.param("tempfile.mkdtemp", id="mkdtemp"), pytest.param("os.link", id="link")]
++)
++def test_private_link_failure_preserves_a_peer_lock(database: Path, mocker: MockerFixture, boundary: str) -> None:
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        mocker.patch(boundary, autospec=True, side_effect=PermissionError(errno.EACCES, "read-only directory"))
++        with pytest.raises(PermissionError, match="read-only directory"):
++            ReadWriteLock(database, is_singleton=False)
++        assert_read_write_lock_state(str(database), "write", available=False)
++    assert list(database.parent.glob(".filelock-*")) == []
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("mode", [pytest.param("read", id="read"), pytest.param("write", id="write")])
++async def test_private_link_preserves_async_contention(database: Path, mode: Literal["read", "write"]) -> None:
++    lock: Final = AsyncReadWriteLock(database, is_singleton=False)
++    async with (lock.read_lock if mode == "read" else lock.write_lock)():
++        assert_read_write_lock_state(str(database), "write", available=False)
++    await lock.close()
++
++
++def test_private_link_is_removed_after_release(database: Path, created_directories: list[Path]) -> None:
++    lock: Final = ReadWriteLock(database, is_singleton=False)
++    lock.acquire_read()
++    assert [directory.exists() for directory in created_directories] == [False, True]
++    lock.release()
++    assert [directory.exists() for directory in created_directories] == [False, False]
++
++
++def test_private_link_sits_beside_the_database(database: Path, created_directories: list[Path]) -> None:
++    # A hard link cannot cross filesystems, so an alias in TMPDIR fails for a database stored anywhere else.
++    ReadWriteLock(database, is_singleton=False).close()
++    assert [directory.parent for directory in created_directories] == [database.parent]
++
++
++def test_private_link_release_survives_a_removed_alias(database: Path, created_directories: list[Path]) -> None:
++    lock: Final = ReadWriteLock(database, is_singleton=False)
++    lock.acquire_read()
++    shutil.rmtree(created_directories[-1])
++    lock.release()
++
++    with ReadWriteLock(database, is_singleton=False).write_lock(blocking=False):
++        assert_read_write_lock_state(str(database), "write", available=False)
++
++
++@pytest.mark.parametrize(
++    "boundary",
++    [pytest.param("os.link", id="link"), pytest.param("sqlite3.connect", id="connect")],
++)
++def test_private_link_is_removed_after_failure(
++    database: Path, mocker: MockerFixture, boundary: str, created_directories: list[Path]
++) -> None:
++    mocker.patch(boundary, autospec=True, side_effect=OSError("cannot open database"))
++    with pytest.raises(OSError, match="cannot open database"):
++        ReadWriteLock(database, is_singleton=False)
++    assert [directory.exists() for directory in created_directories] == [False]
++
++
++@pytest.mark.parametrize("replacement_kind", [pytest.param("file", id="file"), pytest.param("symlink", id="symlink")])
++def test_private_link_rejects_replaced_database(
++    database: Path, tmp_path: Path, mocker: MockerFixture, replacement_kind: str, created_directories: list[Path]
++) -> None:
++    replacement: Final = tmp_path / "replacement.db"
++    if replacement_kind == "file":
++        replacement.touch()
++    else:
++        replacement.symlink_to(tmp_path / "victim.db")
++    link: Final = os.link
++
++    def replace_and_link(source: str, destination: Path, *, follow_symlinks: bool) -> None:
++        replacement.replace(source)
++        link(source, destination, follow_symlinks=follow_symlinks)
++
++    mocker.patch("os.link", autospec=True, side_effect=replace_and_link)
++    with pytest.raises(OSError, match="database changed"):
++        ReadWriteLock(database, is_singleton=False)
++    assert ([directory.exists() for directory in created_directories], (tmp_path / "victim.db").exists()) == (
++        [False],
++        False,
++    )
++
++
++def test_private_link_refuses_a_directory_swapped_in_before_it_opens(
++    database: Path, tmp_path: Path, mocker: MockerFixture
++) -> None:
++    swapped_in: Final[list[Path]] = []
++    mkdtemp: Final = tempfile.mkdtemp
++
++    def create_then_swap(*, prefix: str, dir: Path) -> str:  # ruff:ignore[builtin-argument-shadowing]  # mirrors tempfile.mkdtemp
++        directory: Final = Path(mkdtemp(prefix=prefix, dir=dir))
++        directory.rename(tmp_path / "aside")
++        directory.mkdir(mode=0o755)
++        (directory / "notes.txt").write_text("keep")
++        swapped_in.append(directory)
++        return str(directory)
++
++    mocker.patch("tempfile.mkdtemp", autospec=True, side_effect=create_then_swap)
++    with pytest.raises(OSError, match="replaced while opening"):
++        ReadWriteLock(database, is_singleton=False)
++    assert [(directory / "notes.txt").read_text() for directory in swapped_in] == ["keep"]
++
++
++def test_private_link_opens_nothing_through_a_swapped_link_directory(
++    database: Path, tmp_path: Path, mocker: MockerFixture, created_directories: list[Path]
++) -> None:
++    # Whoever can rename in the lock directory may swap the link directory for one of its own before SQLite opens it.
++    target: Final = tmp_path / "target.db"
++    connect: Final = sqlite3.connect
++
++    def swap_then_connect(
++        database: str,
++        *,
++        check_same_thread: bool,
++        factory: type[sqlite3.Connection],
++        cached_statements: int,
++        timeout: float,
++    ) -> sqlite3.Connection:
++        created_directories[-1].rename(tmp_path / "aside")
++        created_directories[-1].mkdir()
++        (created_directories[-1] / "lock.db").symlink_to(target)
++        return connect(
++            database,
++            check_same_thread=check_same_thread,
++            factory=factory,
++            cached_statements=cached_statements,
++            timeout=timeout,
++        )
++
++    mocker.patch("sqlite3.connect", autospec=True, side_effect=swap_then_connect)
++    with pytest.raises(sqlite3.OperationalError, match="unable to open database file"):
++        ReadWriteLock(database, is_singleton=False)
++    assert (target.exists(), (created_directories[-1] / "lock.db").is_symlink()) == (False, True)
++
++
++def test_private_link_release_keeps_a_directory_renamed_onto_the_link(database: Path, tmp_path: Path) -> None:
++    other: Final = database.parent / "project"
++    other.mkdir()
++    (other / "notes.txt").write_text("keep")
++    with ReadWriteLock(database, is_singleton=False).write_lock():
++        (link_directory,) = _link_directories(database)
++        link_directory.rename(tmp_path / "aside")
++        other.rename(link_directory)
++
++    assert (link_directory / "notes.txt").read_text() == "keep"
++
++
++def test_private_link_sweeps_the_link_of_a_killed_holder(database: Path, holder: subprocess.Popen[str]) -> None:
++    holder.kill()
++    holder.wait(timeout=_PROCESS_DEADLINE)
++    left: Final = _link_directories(database)
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        pass
++
++    assert (len(left), _link_directories(database), database.stat().st_nlink) == (1, [], 1)
++
++
++def test_private_link_sweep_removes_a_link_left_by_an_earlier_release(database: Path) -> None:
++    # Releases up to 4.2.0 linked the database right inside the directory.
++    database.touch()
++    left: Final = database.parent / f".filelock-{2**31 - 1}--{_host_digest(database)}-x"
++    left.mkdir(mode=0o700)
++    (left / "lock.db").hardlink_to(database)
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        pass
++
++    assert (_link_directories(database), database.stat().st_nlink) == ([], 1)
++
++
++@pytest.mark.parametrize(
++    "entry",
++    [
++        pytest.param("lock.db", id="flat"),
++        pytest.param("inner/lock.db", id="nested"),
++        pytest.param("inner/other", id="nested-without-link"),
++    ],
++)
++def test_private_link_sweep_keeps_a_directory_named_like_a_dead_holder(database: Path, entry: str) -> None:
++    named: Final = database.parent / f".filelock-{2**31 - 1}--{_host_digest(database)}-x"
++    (named / entry).parent.mkdir(parents=True)
++    (named / entry).write_text("keep")
++    (named / "notes.txt").write_text("keep")
++    ReadWriteLock(database, is_singleton=False).close()
++
++    assert [(named / name).read_text() for name in (entry, "notes.txt")] == ["keep", "keep"]
++
++
++@pytest.mark.parametrize(
++    "shape", [pytest.param("empty", id="empty"), pytest.param("empty-subdirectory", id="empty-subdirectory")]
++)
++def test_private_link_sweep_removes_a_directory_left_without_a_link(database: Path, shape: str) -> None:
++    left: Final = database.parent / f".filelock-{2**31 - 1}--{_host_digest(database)}-x"
++    left.mkdir(mode=0o700)
++    if shape == "empty-subdirectory":
++        (left / "0123456789abcdef").mkdir(mode=0o700)
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        pass
++
++    assert _link_directories(database) == []
++
++
++def test_private_link_sweep_never_parses_a_directory_of_another_account(database: Path, mocker: MockerFixture) -> None:
++    database.touch()
++    planted: Final = database.parent / f".filelock-{2**31 - 1}--{_host_digest(database)}-x"
++    planted.mkdir(mode=0o700)
++    (planted / "inner").mkdir()
++    (planted / "inner" / "lock.db").hardlink_to(database)
++    real_fstat: Final = os.fstat
++
++    def fstat_with_other_owner(fd: int) -> os.stat_result:
++        status = real_fstat(fd)
++        if status.st_ino != planted.stat().st_ino:
++            return status
++        fields = tuple(status)
++        return os.stat_result((*fields[:4], status.st_uid + 1, *fields[5:]))
++
++    mocker.patch("os.fstat", autospec=True, side_effect=fstat_with_other_owner)
++    mocker.patch("os.kill", autospec=True, side_effect=AssertionError("PID probed"))
++    ReadWriteLock(database, is_singleton=False).close()
++
++    assert ((planted / "inner" / "lock.db").exists(), database.stat().st_nlink) == (True, 2)
++
++
++def test_private_link_sweep_skips_a_symlink_under_a_dead_holder_name(database: Path) -> None:
++    # The symlink leads to the database's own directory.
++    database.touch()
++    named: Final = database.parent / f".filelock-{2**31 - 1}--{_host_digest(database)}-x"
++    named.mkdir()
++    (named / "inner").symlink_to(database.parent)
++    ReadWriteLock(database, is_singleton=False).close()
++
++    assert (database.exists(), (named / "inner").is_symlink()) == (True, True)
++
++
++def test_private_link_sweep_skips_a_symlink_to_a_live_holder(database: Path, holder: subprocess.Popen[str]) -> None:
++    (held,) = _link_directories(database)
++    (inner,) = list(held.iterdir())
++    named: Final = database.parent / f".filelock-{2**31 - 1}--{_host_digest(database)}-x"
++    named.mkdir()
++    (named / "inner").symlink_to(inner)
++    ReadWriteLock(database, is_singleton=False).close()
++
++    assert ((inner / "lock.db").exists(), holder.poll()) == (True, None)
++
++
++@pytest.mark.usefixtures("holder")
++def test_private_link_sweep_keeps_the_link_of_a_live_holder(database: Path) -> None:
++    held: Final = _link_directories(database)
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        pass
++    assert (len(held), _link_directories(database)) == (1, held)
++
++
++def test_private_link_sweep_keeps_a_directory_it_did_not_name(database: Path) -> None:
++    foreign: Final = database.parent / ".filelock-not-ours"
++    foreign.mkdir()
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        pass
++    assert foreign.is_dir()
++
++
++@pytest.mark.parametrize(
++    ("pid_text", "start_text"),
++    [
++        pytest.param("²", "1", id="non-ascii-pid"),
++        pytest.param("\uff19" * 9, "1", id="parsed-non-ascii-pid"),
++        pytest.param(str(2**31), "1", id="out-of-range-pid"),
++        pytest.param("0", "1", id="zero-pid"),
++        pytest.param("1", "²", id="non-ascii-start"),
++    ],
++)
++def test_private_link_sweep_survives_a_malformed_link_name(
++    database: Path, mocker: MockerFixture, pid_text: str, start_text: str
++) -> None:
++    malformed: Final = database.parent / f".filelock-{pid_text}-{start_text}-{_host_digest(database)}-x"
++    malformed.mkdir()
++    mocker.patch("os.kill", autospec=True, side_effect=AssertionError("invalid PID probed"))
++    with ReadWriteLock(database, is_singleton=False).read_lock():
++        assert_read_write_lock_state(str(database), "write", available=False)
++    assert malformed.is_dir()
++
++
++@NEEDS_FILE_PERMISSIONS  # pragma: needs file-permissions
++def test_private_link_in_a_directory_it_cannot_list(database: Path) -> None:
++    database.parent.chmod(0o333)
++    try:
++        with ReadWriteLock(database, is_singleton=False).read_lock():
++            assert_read_write_lock_state(str(database), "write", available=False)
++    finally:
++        database.parent.chmod(0o777)
++
++
++_PROCESS_DEADLINE: Final = 30
++
++
++@pytest.fixture
++def holder(database: Path) -> Generator[subprocess.Popen[str]]:
++    script: Final = (
++        "import sys, time\n"
++        "from filelock import ReadWriteLock\n"
++        "lock = ReadWriteLock(sys.argv[1], is_singleton=False)\n"
++        "lock.acquire_read()\n"
++        "print('held', flush=True)\n"
++        "time.sleep(600)\n"
++    )
++    with subprocess.Popen([sys.executable, "-c", script, str(database)], stdout=subprocess.PIPE, text=True) as holder:
++        try:
++            assert holder.stdout is not None
++            assert holder.stdout.readline() == "held\n"
++            yield holder
++        finally:
++            holder.kill()
++            holder.wait(timeout=_PROCESS_DEADLINE)
++
++
++def _link_directories(database: Path) -> list[Path]:
++    return sorted(path for path in database.parent.iterdir() if path.name.startswith(".filelock-"))
++
++
++def _host_digest(database: Path) -> str:
++    # Taken from a link of another database, so the sweep for this one has not run yet.
++    seed: Final = database.parent.with_name("seed")
++    seed.mkdir(mode=0o777)
++    seed.chmod(0o777)
++    with ReadWriteLock(seed / "lock.db", is_singleton=False).read_lock():
++        return next(seed.glob(".filelock-*")).name.rsplit("-", 2)[1]
++
++
++@pytest.fixture
++def database(tmp_path: Path) -> Path:
++    # Others may create names in this directory, so SQLite connects through a private link instead of the name.
++    shared: Final = tmp_path / "shared"
++    shared.mkdir()
++    shared.chmod(0o777)
++    return shared / "lock.db"
++
++
++@pytest.fixture
++def created_directories(mocker: MockerFixture) -> list[Path]:
++    directories: Final[list[Path]] = []
++    mkdtemp: Final = tempfile.mkdtemp
++
++    def create_directory(*, prefix: str, dir: Path) -> str:  # ruff:ignore[builtin-argument-shadowing]  # mirrors tempfile.mkdtemp
++        directory: Final = mkdtemp(prefix=prefix, dir=dir)
++        directories.append(Path(directory))
++        return directory
++
++    mocker.patch("tempfile.mkdtemp", autospec=True, side_effect=create_directory)
++    return directories
