@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-87018
+- CVE-2026-109869
+- CVE-2026-109383
 
 ## How to Apply:
 1. Clone or download the source code for undici
