@@ -12,6 +12,8 @@ unknown
 - CVE-2026-113725
 - CVE-2026-113732
 - CVE-2026-113776
+- CVE-2026-113723
+- CVE-2026-113718
 
 ## How to Apply:
 1. Clone or download the source code for virtualenv
