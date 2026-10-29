@@ -1,0 +1,560 @@
+--- /dev/null
++++ b/docs/changelog/834.bugfix.rst
+@@ -0,0 +1,6 @@
++Fix :class:`~filelock.ReadWriteLock` acting on ``-journal``, ``-wal`` or ``-shm`` files another process puts beside its
++database: a write could land in another file, a reader could get in beside a writer, and an acquire could fail. In a
++directory that other accounts can write, SQLite now opens the database through a private hard link instead of by its
++shared name, so those files are never consulted. Where hard links are unavailable there, the acquire raises
++:class:`OSError`; keep the database in a directory other accounts cannot write instead. A database whose schema takes
++more than a few kilobytes to load raises :class:`ValueError` instead of running past the acquire timeout.
+--- a/src/filelock/_read_write.py
++++ b/src/filelock/_read_write.py
+@@ -1,14 +1,19 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import logging
+ import os
+ import pathlib
++import secrets
+ import sqlite3
++import stat
+ import sys
++import tempfile
+ import threading
+ import time
+ from contextlib import contextmanager, suppress
+-from typing import TYPE_CHECKING, ClassVar, Final, Literal, TypeAlias, cast
++from itertools import count
++from typing import TYPE_CHECKING, ClassVar, Final, Literal, NamedTuple, TypeAlias, cast
+ from weakref import WeakValueDictionary
+ 
+ from ._api import (
+@@ -20,6 +25,7 @@
+     _register_fork_object,
+ )
+ from ._error import Timeout
++from ._identity import host_name, process_alive
+ 
+ if TYPE_CHECKING:
+     from collections.abc import Callable, Generator
+@@ -45,6 +51,12 @@
+ # sqlite3_busy_timeout() accepts a C int, max 2_147_483_647 on 32-bit. Use a lower value to be safe (~23 days).
+ _MAX_SQLITE_TIMEOUT_MS: Final[int] = 2_000_000_000 - 1
+ _UNSAFE_FORK_EXIT_STATUS: Final[int] = 70
++_DIRECTORY_FLAGS: Final[int] = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
++# O_NOFOLLOW keeps a symlink planted at the name from being created through; O_EXCL makes this open the creator.
++_CREATE_FLAGS: Final[int] = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
++_LINK_PREFIX: Final[str] = ".filelock-"
++_LINK_NAME: Final[str] = "lock.db"
++_SWEPT_DATABASES: Final[set[_DatabaseIdentity]] = set()
+ 
+ 
+ class _SQLiteTransitionContext(threading.local):
+@@ -140,6 +152,7 @@
+ class _ForkSafeConnection(sqlite3.Connection):
+     _creator_pid: int
+     _decrement_escrow: Callable[[sqlite3.Connection], None] | None
++    _link_directory: _LinkDirectory | None
+ 
+     def __new__(
+         cls,
+@@ -149,6 +162,7 @@
+         connection = super().__new__(cls)
+         connection._creator_pid = _GETPID()
+         connection._decrement_escrow = None
++        connection._link_directory = None
+         return connection
+ 
+     def close(self) -> None:
+@@ -156,11 +170,20 @@
+             if _GETPID() != self._creator_pid:  # pragma: needs fork
+                 return
+             with _fork_transition():
+-                sqlite3.Connection.close(self)
++                try:
++                    sqlite3.Connection.close(self)
++                finally:
++                    if (directory := self._link_directory) is not None:  # pragma: needs posix-hard-link
++                        self._link_directory = None
++                        _remove_link_directory(directory)
+                 if (decrement := self._decrement_escrow) is not None:  # pragma: <3.12 cover  # pragma: needs fork
+                     self._decrement_escrow = None
+                     decrement(self)
+ 
++    def retain_link(self, directory: _LinkDirectory | None) -> None:
++        """Keep the private link directory, if there is one, until SQLite no longer uses it."""
++        self._link_directory = directory
++
+     def acquire_escrow(  # pragma: <3.12 cover  # pragma: needs fork
+         self,
+         functions: tuple[Callable[[sqlite3.Connection], None], Callable[[sqlite3.Connection], None]] | None,
+@@ -255,7 +278,10 @@
+ 
+     By default, ``is_singleton=True``: calling ``ReadWriteLock(path)`` with the same resolved path returns the same
+     instance. The path is handed to :func:`sqlite3.connect` as given, so a ``.db`` extension is a convention rather
+-    than a requirement; the filesystem must be one the active SQLite VFS supports.
++    than a requirement; the filesystem must be one the active SQLite VFS supports. A database directory that other
++    accounts can write must also be writable by this one and support hard links, and a database whose schema is larger
++    than a lock needs raises :class:`ValueError`; the protection against other accounts ends once one of them can
++    replace the database directory or a directory above it.
+ 
+     :param lock_file: path to the SQLite database file used as the lock
+     :param timeout: maximum wait time in seconds; ``-1`` means block indefinitely
+@@ -609,23 +635,24 @@
+             waited = time.perf_counter() - start_time
+             timeout_ms = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
+             self._raise_if_process_changed(operation_pid)
+-            connection.executescript(f"PRAGMA busy_timeout={timeout_ms}; PRAGMA journal_mode=MEMORY;").close()
+-            # Use legacy journal mode (not WAL) because WAL does not block readers while a concurrent EXCLUSIVE
+-            # write transaction is active, which makes read-write locking impossible without modifying table data.
+-            # MEMORY is safe here since no writes happen, so a crash cannot corrupt the DB.
+-            # See https://sqlite.org/lang_transaction.html#deferred_immediate_and_exclusive_transactions
+-            #
+-            # Recompute the remaining timeout after the blocking journal_mode pragma.
+-            waited = time.perf_counter() - start_time
+-            recomputed = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
+-            self._raise_if_process_changed(operation_pid)
+-            statements = f"PRAGMA busy_timeout={recomputed}; " if recomputed != timeout_ms else ""
+-            statements += "BEGIN EXCLUSIVE TRANSACTION;" if mode == "write" else "BEGIN TRANSACTION;"
+-            if mode == "read":
+-                # SQLite takes the SHARED lock only when a statement reads; BEGIN alone stays deferred.
+-                # https://www.sqlite.org/lockingv3.html#transaction_control
+-                statements += " SELECT name FROM sqlite_schema LIMIT 1;"
+-            connection.executescript(statements).close()
++            with _bounded_schema(connection, self.lock_file):
++                connection.executescript(f"PRAGMA busy_timeout={timeout_ms}; PRAGMA journal_mode=MEMORY;").close()
++                # Use legacy journal mode (not WAL) because WAL does not block readers while a concurrent EXCLUSIVE
++                # write transaction is active, which makes read-write locking impossible without modifying table data.
++                # MEMORY is safe here since no writes happen, so a crash cannot corrupt the DB.
++                # See https://sqlite.org/lang_transaction.html#deferred_immediate_and_exclusive_transactions
++                #
++                # Recompute the remaining timeout after the blocking journal_mode pragma.
++                waited = time.perf_counter() - start_time
++                recomputed = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
++                self._raise_if_process_changed(operation_pid)
++                statements = f"PRAGMA busy_timeout={recomputed}; " if recomputed != timeout_ms else ""
++                statements += "BEGIN EXCLUSIVE TRANSACTION;" if mode == "write" else "BEGIN TRANSACTION;"
++                if mode == "read":
++                    # SQLite takes the SHARED lock only when a statement reads; BEGIN alone stays deferred.
++                    # https://www.sqlite.org/lockingv3.html#transaction_control
++                    statements += " SELECT name FROM sqlite_schema LIMIT 1;"
++                connection.executescript(statements).close()
+ 
+     def _open_connection(self, *, sqlite_timeout: float) -> _ForkSafeConnection:
+         with _sqlite_transition():
+@@ -723,13 +750,229 @@
+ 
+ def _connect(database: str, *, factory: type[_ForkSafeConnection], timeout: float) -> _ForkSafeConnection:
+     _FORKED_DATABASES.note_sqlite_use()
+-    return sqlite3.connect(
+-        database,
+-        check_same_thread=False,
+-        factory=factory,
+-        cached_statements=0,
+-        timeout=timeout,
+-    )
++    target = database
++    link: _LinkDirectory | None = None
++    # SQLite opens the name it is given, following symlinks, and uses the -journal, -wal and -shm names beside it, so
++    # the database name is safe only where no process of another account can create names. Elsewhere it opens a hard
++    # link inside a directory that only this account can reach.
++    if _needs_private_link(database):  # pragma: needs posix-hard-link
++        link = _link_beside(database)
++        target = os.fspath(link.database)
++    try:
++        connection = sqlite3.connect(target, check_same_thread=False, factory=factory, cached_statements=0, timeout=timeout)
++    except BaseException:
++        if link is not None:  # pragma: needs posix-hard-link
++            _remove_link_directory(link)
++        raise
++    connection.retain_link(link)
++    return connection
++
++
++def _needs_private_link(database: str) -> bool:
++    if sys.platform == "win32" or not hasattr(os, "link") or not hasattr(os, "geteuid"):  # pragma: win32 cover
++        return False
++    return not _names_are_private(pathlib.Path(database).parent, os.geteuid())
++
++
++def _names_are_private(directory: pathlib.Path, owner: int) -> bool:  # pragma: win32 no cover
++    status: Final = os.lstat(directory)
++    # The sticky bit still lets others create names, so a directory anyone else may write to never qualifies.
++    return status.st_uid in {owner, 0} and not status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
++
++
++class _LinkDirectory(NamedTuple):
++    path: pathlib.Path
++    identity: _DatabaseIdentity
++    # Made through a descriptor of path, which nobody else can list, so a directory another process swaps in under
++    # path cannot hold this name and SQLite fails to open instead of following the swap.
++    name: str
++
++    @property
++    def database(self) -> pathlib.Path:
++        return self.path / self.name / _LINK_NAME
++
++
++def _link_beside(database: str) -> _LinkDirectory:  # pragma: win32 no cover
++    # Beside the database because a link cannot cross filesystems, and TMPDIR is often on another one.
++    parent: Final = pathlib.Path(database).parent
++    owner: Final = os.geteuid()
++    _create_if_missing(database)
++    _sweep_links_of_the_dead(parent, database, owner)
++    path: Final = pathlib.Path(tempfile.mkdtemp(prefix=_link_prefix(), dir=parent))
++    fd: Final = os.open(path, _DIRECTORY_FLAGS)
++    link: _LinkDirectory | None = None
++    try:
++        made: Final = os.fstat(fd)
++        # Whoever can rename in the parent can put another directory under the new name before it opens.
++        if made.st_uid != owner or made.st_mode & 0o077:
++            msg = f"link directory {os.fspath(path)!r} was replaced while opening"
++            raise OSError(msg)
++        link = _LinkDirectory(path, (made.st_dev, made.st_ino), secrets.token_hex(8))
++        os.mkdir(link.name, 0o700, dir_fd=fd)
++        # Without following a symlink at the name: the link then names the symlink itself, which is refused below.
++        os.link(database, f"{link.name}/{_LINK_NAME}", dst_dir_fd=fd, follow_symlinks=False)
++        linked: Final = os.stat(f"{link.name}/{_LINK_NAME}", dir_fd=fd, follow_symlinks=False)
++        if not stat.S_ISREG(linked.st_mode):
++            msg = f"refusing a non-regular lock database: {database!r}"
++            raise OSError(msg)  # noqa: TRY301
++        named: Final = os.lstat(database)
++        if (named.st_dev, named.st_ino) != (linked.st_dev, linked.st_ino):
++            msg = f"lock database changed while opening: {database!r}"
++            raise OSError(msg)  # noqa: TRY301
++    except BaseException:
++        if link is None:
++            with suppress(OSError):
++                path.rmdir()
++        else:
++            _remove_link_directory(link)
++        raise
++    finally:
++        os.close(fd)
++    return link
++
++
++def _create_if_missing(database: str) -> None:  # pragma: win32 no cover
++    # SQLite would create a missing database on connect; the link needs the file first. O_EXCL and O_NOFOLLOW keep a
++    # name planted in the meantime from being written through, and closing a descriptor of a file no SQLite connection
++    # has opened yet cannot drop a lock.
++    try:
++        os.lstat(database)
++    except FileNotFoundError:
++        with suppress(FileExistsError):
++            os.close(os.open(database, _CREATE_FLAGS, 0o644))
++
++
++def _sweep_links_of_the_dead(parent: pathlib.Path, database: str, owner: int) -> None:  # pragma: win32 no cover
++    # A process killed while it held a link leaves the directory, and an extra link to the database, behind for good.
++    # Two threads sweeping at once only both try the same removals, which a lock would cost a fork-safety reset for.
++    try:
++        named: Final = os.lstat(database)
++    except OSError:
++        return
++    if (identity := (named.st_dev, named.st_ino)) in _SWEPT_DATABASES:
++        return
++    _SWEPT_DATABASES.add(identity)
++    try:
++        with os.scandir(parent) as entries:
++            names: Final = [
++                entry.name
++                for entry in entries
++                if entry.name.startswith(_LINK_PREFIX) and entry.is_dir(follow_symlinks=False)
++            ]
++    except OSError:
++        return
++    for name in names:
++        # A peer sweeping alongside, or a directory this user cannot remove, must not fail the connect.
++        with suppress(OSError):
++            _remove_dead_links(parent / name, identity, owner)
++
++
++def _remove_dead_links(path: pathlib.Path, identity: _DatabaseIdentity, owner: int) -> None:  # pragma: win32 no cover
++    # Any directory can carry a dead holder's name after a rename in the parent, so only hard links to this database
++    # go, and the directory only once that leaves it empty.
++    fd: Final = os.open(path, _DIRECTORY_FLAGS)
++    try:
++        # Only a directory this account made carries a holder of its own; a name another account chose is never
++        # parsed, so no PID is probed on its behalf.
++        if os.fstat(fd).st_uid != owner or not _owner_is_gone(path.name):
++            return
++        with os.scandir(fd) as entries:
++            names: Final = [entry.name for entry in entries]
++        for entry in names:
++            try:
++                nested = os.open(entry, _DIRECTORY_FLAGS, dir_fd=fd)
++            except OSError:
++                continue
++            try:
++                if not _unlink_link_to(identity, nested):
++                    continue
++            finally:
++                os.close(nested)
++            with suppress(OSError):
++                os.rmdir(entry, dir_fd=fd)
++    finally:
++        os.close(fd)
++    with suppress(OSError):
++        path.rmdir()
++
++
++def _unlink_link_to(identity: _DatabaseIdentity, dir_fd: int) -> bool:  # pragma: win32 no cover
++    try:
++        linked: Final = os.stat(_LINK_NAME, dir_fd=dir_fd, follow_symlinks=False)
++    except OSError:
++        return False
++    if (linked.st_dev, linked.st_ino) != identity:
++        return False
++    for suffix in ("", "-journal", "-wal", "-shm"):
++        with suppress(FileNotFoundError):
++            os.unlink(f"{_LINK_NAME}{suffix}", dir_fd=dir_fd)
++    return True
++
++
++def _owner_is_gone(name: str) -> bool:  # pragma: win32 no cover
++    # A peer can plant a malformed name; leave it untouched rather than probing a forged PID during acquisition.
++    match name.removeprefix(_LINK_PREFIX).split("-"):
++        case [pid, digest, _] if pid.isascii() and pid.isdigit() and 1 <= int(pid) <= 2**31 - 1:
++            return digest == _host_digest(host_name()) and not process_alive(int(pid))
++        case _:
++            return False
++
++
++def _link_prefix() -> str:  # pragma: win32 no cover
++    # The owner rides in the name, which mkdtemp creates in one step, so no directory ever exists without it.
++    return f"{_LINK_PREFIX}{os.getpid()}-{_host_digest(host_name())}-"
++
++
++def _host_digest(host: str) -> str:  # pragma: win32 no cover
++    # SHA-256 as host_name does: some runtimes, GraalPy's among them, have no BLAKE2 with a custom digest size.
++    return hashlib.sha256(host.encode()).hexdigest()[:16]
++
++
++def _remove_link_directory(link: _LinkDirectory) -> None:  # pragma: win32 no cover
++    # A rename in the parent may have put any directory under this name, so entries go through a descriptor checked
++    # to be the directory made, and the name goes only through rmdir, which refuses a non-empty directory.
++    try:
++        fd: Final = os.open(link.path, _DIRECTORY_FLAGS)
++    except OSError:
++        return
++    try:
++        opened: Final = os.fstat(fd)
++        if (opened.st_dev, opened.st_ino) != link.identity:
++            return
++        for suffix in ("", "-journal", "-wal", "-shm"):
++            with suppress(FileNotFoundError):
++                os.unlink(f"{link.name}/{_LINK_NAME}{suffix}", dir_fd=fd)
++        with suppress(FileNotFoundError):
++            os.rmdir(link.name, dir_fd=fd)
++    finally:
++        os.close(fd)
++    # The link is gone, so a failure here leaves one stray empty directory and is not worth failing a release for.
++    with suppress(OSError):
++        link.path.rmdir()
++
++
++@contextmanager
++def _bounded_schema(connection: sqlite3.Connection, database: str) -> Generator[None]:
++    # The first statement loads the file's complete schema, which no timeout bounds, and a lock database has none.
++    # Waiting for a lock runs no virtual machine steps, so a step budget bounds only that load.
++    calls: Final = count()
++    max_calls: Final = 10
++    if hasattr(connection, "setlimit"):  # pragma: <3.11 no cover  # Connection.setlimit is new in Python 3.11
++        connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, 4096)
++    connection.set_progress_handler(lambda: next(calls) >= max_calls, 1000)
++    try:
++        yield
++    except sqlite3.DatabaseError as error:
++        # An interrupted schema load reports a malformed schema rather than the interrupt.
++        if isinstance(error, sqlite3.DataError) or next(calls) > max_calls:
++            msg = (
++                f"refusing a lock database whose schema is too large to load: {database!r}; "
++                "give ReadWriteLock a file of its own"
++            )
++            raise ValueError(msg) from error
++        raise
++    finally:
++        connection.set_progress_handler(None, 0)
+ 
+ 
+ @contextmanager
+--- /dev/null
++++ b/tests/test_read_write_private_link.py
+@@ -0,0 +1,175 @@
++"""SQLite must not act on names another account can create beside a lock database (CVE-2026-112940)."""
++
++from __future__ import annotations
++
++import os
++import sqlite3
++import subprocess
++import sys
++from typing import TYPE_CHECKING
++
++import pytest
++
++from filelock import ReadWriteLock
++from filelock._read_write import _host_digest
++
++if TYPE_CHECKING:
++    from pathlib import Path
++
++    from pytest_mock import MockerFixture
++
++pytestmark = pytest.mark.skipif(
++    sys.platform == "win32" or not hasattr(os, "link") or not hasattr(os, "geteuid") or not hasattr(os, "fork"),
++    reason="the private link guards POSIX side files and needs os.link, os.geteuid and os.fork",
++)
++
++
++@pytest.fixture(autouse=True)
++def _fresh_sweep_registry(mocker: MockerFixture) -> None:
++    # Inode numbers repeat across short-lived test directories, which would skip a sweep the test expects.
++    mocker.patch("filelock._read_write._SWEPT_DATABASES", set())
++
++
++@pytest.fixture
++def shared_directory(tmp_path: Path) -> Path:
++    directory = tmp_path / "shared"
++    directory.mkdir()
++    directory.chmod(0o777)  # any other account may create names here, so SQLite must not use them
++    return directory
++
++
++def _leave_hot_journal(database: Path) -> None:
++    with sqlite3.connect(database, isolation_level=None) as connection:
++        connection.execute("PRAGMA journal_mode=DELETE")
++        connection.execute("CREATE TABLE t(a)")
++        connection.execute("BEGIN")
++        for _ in range(50):
++            connection.execute("INSERT INTO t VALUES (zeroblob(4000))")
++        connection.execute("COMMIT")
++    connection.close()
++    pid = os.fork()
++    if pid == 0:  # pragma: forked child
++        child = sqlite3.connect(database, isolation_level=None)
++        child.execute("PRAGMA journal_mode=DELETE")
++        child.execute("PRAGMA cache_size=2")
++        child.execute("BEGIN")
++        child.execute("UPDATE t SET a=zeroblob(3999)")
++        os._exit(0)  # dies mid-transaction, leaving a journal that SQLite would replay and delete
++    os.waitpid(pid, 0)
++
++
++def test_hot_journal_beside_shared_database_is_left_alone(shared_directory: Path) -> None:
++    database = shared_directory / "lock.db"
++    _leave_hot_journal(database)
++    journal = shared_directory / "lock.db-journal"
++    assert journal.exists()
++    size = journal.stat().st_size
++
++    lock = ReadWriteLock(str(database), is_singleton=False)
++    with lock.write_lock():
++        pass
++    lock.close()
++
++    assert journal.exists()
++    assert journal.stat().st_size == size
++
++
++def test_shared_directory_connects_through_a_private_link(shared_directory: Path, mocker: MockerFixture) -> None:
++    database = shared_directory / "lock.db"
++    spy = mocker.spy(sqlite3, "connect")
++
++    lock = ReadWriteLock(str(database), is_singleton=False)
++    with lock.read_lock():
++        connected = [call.args[0] for call in spy.call_args_list]
++        assert connected
++        for target in connected:
++            assert os.fspath(database) != target
++            assert os.path.dirname(os.path.dirname(os.path.dirname(target))) == os.fspath(shared_directory)
++            assert os.path.basename(os.path.dirname(os.path.dirname(target))).startswith(".filelock-")
++        assert os.stat(connected[-1]).st_ino == database.stat().st_ino  # the validation connection's link is gone
++    lock.close()
++
++    assert [entry.name for entry in shared_directory.iterdir()] == ["lock.db"]
++
++
++def test_private_directory_connects_by_name(tmp_path: Path, mocker: MockerFixture) -> None:
++    database = tmp_path / "lock.db"
++    spy = mocker.spy(sqlite3, "connect")
++
++    lock = ReadWriteLock(str(database), is_singleton=False)
++    with lock.write_lock():
++        pass
++    lock.close()
++
++    assert {call.args[0] for call in spy.call_args_list} == {os.fspath(database)}
++    assert [entry.name for entry in tmp_path.iterdir()] == ["lock.db"]
++
++
++def test_two_locks_in_shared_directory_exclude_each_other(shared_directory: Path) -> None:
++    database = str(shared_directory / "lock.db")
++    first = ReadWriteLock(database, is_singleton=False)
++    second = ReadWriteLock(database, is_singleton=False)
++    with first.write_lock():
++        from filelock import Timeout  # noqa: PLC0415
++
++        with pytest.raises(Timeout):
++            second.acquire_read(timeout=0.2)
++        with pytest.raises(Timeout):
++            second.acquire_write(timeout=0.2)
++    with second.write_lock():
++        pass
++    first.close()
++    second.close()
++
++
++def test_symlink_planted_at_the_database_name_is_refused(shared_directory: Path) -> None:
++    database = shared_directory / "lock.db"
++    victim = shared_directory / "victim"
++    victim.write_text("precious")
++    lock = ReadWriteLock(str(database), is_singleton=False)
++    database.unlink()
++    database.symlink_to(victim)
++
++    with pytest.raises(OSError, match="non-regular|symbolic link|Symbolic link|Too many levels"):
++        lock.acquire_write(timeout=1)
++
++    assert victim.read_text() == "precious"
++    assert sorted(entry.name for entry in shared_directory.iterdir()) == ["lock.db", "victim"]
++    lock.close()
++
++
++def test_schema_too_large_to_load_is_refused(shared_directory: Path) -> None:
++    database = shared_directory / "lock.db"
++    with sqlite3.connect(database) as connection:
++        columns = ", ".join(f"column_number_{index} INTEGER" for index in range(400))
++        connection.execute(f"CREATE TABLE t({columns})")
++    connection.close()
++
++    lock = ReadWriteLock(str(database), is_singleton=False)
++    with pytest.raises(ValueError, match="schema is too large"):
++        lock.acquire_read(timeout=1)
++    lock.close()
++
++
++def test_links_of_a_dead_process_are_swept(shared_directory: Path) -> None:
++    database = shared_directory / "lock.db"
++    database.touch()
++    finished = subprocess.run([sys.executable, "-c", "import os; print(os.getpid())"], capture_output=True, check=True)
++    dead_pid = int(finished.stdout)
++    from filelock._identity import host_name  # noqa: PLC0415
++
++    stale = shared_directory / f".filelock-{dead_pid}-{_host_digest(host_name())}-abcd1234"
++    nested = stale / "0011223344556677"
++    nested.mkdir(parents=True)
++    os.link(database, nested / "lock.db")
++    foreign = shared_directory / ".filelock-notapid-x-y"
++    foreign.mkdir()
++
++    lock = ReadWriteLock(str(database), is_singleton=False)
++    with lock.read_lock():
++        pass
++    lock.close()
++
++    assert not stale.exists()
++    assert foreign.exists()
++    assert database.stat().st_nlink == 1
