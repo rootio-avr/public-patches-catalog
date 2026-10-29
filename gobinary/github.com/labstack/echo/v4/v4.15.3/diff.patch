@@ -1,3 +1,452 @@
+--- a/middleware/proxy.go
++++ b/middleware/proxy.go
+@@ -4,8 +4,8 @@
+ package middleware
+ 
+ import (
++	"bufio"
+ 	"context"
+-	"crypto/tls"
+ 	"fmt"
+ 	"io"
+ 	"math/rand"
+@@ -21,8 +21,6 @@
+ 	"github.com/labstack/echo/v4"
+ )
+ 
+-// TODO: Handle TLS proxy
+-
+ // ProxyConfig defines the config for Proxy middleware.
+ type ProxyConfig struct {
+ 	// Skipper defines a function to skip middleware.
+@@ -131,63 +129,6 @@
+ 	ContextKey: "target",
+ }
+ 
+-func proxyRaw(t *ProxyTarget, c echo.Context, config ProxyConfig) http.Handler {
+-	var dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+-	if transport, ok := config.Transport.(*http.Transport); ok {
+-		if transport.TLSClientConfig != nil {
+-			d := tls.Dialer{
+-				Config: transport.TLSClientConfig,
+-			}
+-			dialFunc = d.DialContext
+-		}
+-	}
+-	if dialFunc == nil {
+-		var d net.Dialer
+-		dialFunc = d.DialContext
+-	}
+-
+-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+-		in, _, err := c.Response().Hijack()
+-		if err != nil {
+-			c.Set("_error", fmt.Errorf("proxy raw, hijack error=%w, url=%s", err, t.URL))
+-			return
+-		}
+-		defer in.Close()
+-		out, err := dialFunc(c.Request().Context(), "tcp", t.URL.Host)
+-		if err != nil {
+-			c.Set("_error", echo.NewHTTPError(http.StatusBadGateway, fmt.Sprintf("proxy raw, dial error=%v, url=%s", err, t.URL)))
+-			return
+-		}
+-		defer out.Close()
+-
+-		// Write header
+-		err = r.Write(out)
+-		if err != nil {
+-			c.Set("_error", echo.NewHTTPError(http.StatusBadGateway, fmt.Sprintf("proxy raw, request header copy error=%v, url=%s", err, t.URL)))
+-			return
+-		}
+-
+-		errCh := make(chan error, 2)
+-		cp := func(dst io.Writer, src io.Reader) {
+-			_, copyErr := io.Copy(dst, src)
+-			errCh <- copyErr
+-		}
+-
+-		go cp(out, in)
+-		go cp(in, out)
+-
+-		// Wait for BOTH goroutines to complete
+-		err1 := <-errCh
+-		err2 := <-errCh
+-
+-		if err1 != nil && err1 != io.EOF {
+-			c.Set("_error", fmt.Errorf("proxy raw, copy body error=%w, url=%s", err1, t.URL))
+-		} else if err2 != nil && err2 != io.EOF {
+-			c.Set("_error", fmt.Errorf("proxy raw, copy body error=%w, url=%s", err2, t.URL))
+-		}
+-	})
+-}
+-
+ // NewRandomBalancer returns a random proxy balancer.
+ func NewRandomBalancer(targets []*ProxyTarget) ProxyBalancer {
+ 	b := randomBalancer{}
+@@ -291,6 +232,8 @@
+ // Proxy returns a Proxy middleware.
+ //
+ // Proxy middleware forwards the request to upstream server using a configured load balancing technique.
++// The unvalidated Forwarded header is removed. Configure Echo#IPExtractor to
++// validate proxy-supplied client identities before trusting X-Real-IP upstream.
+ func Proxy(balancer ProxyBalancer) echo.MiddlewareFunc {
+ 	c := DefaultProxyConfig
+ 	c.Balancer = balancer
+@@ -352,9 +295,8 @@
+ 			if req.Header.Get(echo.HeaderXForwardedProto) == "" {
+ 				req.Header.Set(echo.HeaderXForwardedProto, c.Scheme())
+ 			}
+-			if c.IsWebSocket() && req.Header.Get(echo.HeaderXForwardedFor) == "" { // For HTTP, it is automatically set by Go HTTP reverse proxy.
+-				req.Header.Set(echo.HeaderXForwardedFor, c.RealIP())
+-			}
++			// Do not forward an unvalidated parallel source of client identity and scheme.
++			req.Header.Del("Forwarded")
+ 
+ 			retries := config.RetryCount
+ 			for {
+@@ -382,13 +324,8 @@
+ 				// that Balancer may have replaced with c.SetRequest.
+ 				req = c.Request()
+ 
+-				// Proxy
+-				switch {
+-				case c.IsWebSocket():
+-					proxyRaw(tgt, c, config).ServeHTTP(res, req)
+-				default: // even SSE requests
+-					proxyHTTP(tgt, c, config).ServeHTTP(res, req)
+-				}
++				// ReverseProxy validates upgrades and closes both sides when a tunnel ends.
++				proxyHTTP(tgt, c, config).ServeHTTP(res, req)
+ 
+ 				err, hasError := c.Get("_error").(error)
+ 				if !hasError {
+@@ -414,7 +351,17 @@
+ const StatusCodeContextCanceled = 499
+ 
+ func proxyHTTP(tgt *ProxyTarget, c echo.Context, config ProxyConfig) http.Handler {
+-	proxy := httputil.NewSingleHostReverseProxy(tgt.URL)
++	// The HTTP transport also handles WebSocket upgrades. Normalize WebSocket
++	// target schemes on a copy so shared balancer targets remain unchanged.
++	targetURL := *tgt.URL
++	switch targetURL.Scheme {
++	case "ws":
++		targetURL.Scheme = "http"
++	case "wss":
++		targetURL.Scheme = "https"
++	}
++	proxy := httputil.NewSingleHostReverseProxy(&targetURL)
++	isWebSocket := c.IsWebSocket()
+ 	proxy.ErrorHandler = func(resp http.ResponseWriter, req *http.Request, err error) {
+ 		desc := tgt.URL.String()
+ 		if tgt.Name != "" {
+@@ -436,6 +383,44 @@
+ 		}
+ 	}
+ 	proxy.Transport = config.Transport
+-	proxy.ModifyResponse = config.ModifyResponse
+-	return proxy
++	proxy.ModifyResponse = func(response *http.Response) error {
++		if config.ModifyResponse != nil {
++			if err := config.ModifyResponse(response); err != nil {
++				return err
++			}
++		}
++		if isWebSocket && response.StatusCode == http.StatusSwitchingProtocols {
++			if body, ok := response.Body.(io.ReadWriteCloser); ok {
++				// Hide backend CloseWrite after the user's hook, so a client EOF
++				// closes the tunnel even when the upstream ignores half-close.
++				response.Body = struct{ io.ReadWriteCloser }{body}
++			}
++		}
++		return nil
++	}
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		if isWebSocket {
++			w = proxyUpgradeResponseWriter{w}
++		}
++		proxy.ServeHTTP(w, r)
++	})
++}
++
++type proxyUpgradeResponseWriter struct {
++	http.ResponseWriter
++}
++
++func (w proxyUpgradeResponseWriter) Unwrap() http.ResponseWriter {
++	return w.ResponseWriter
++}
++
++func (w proxyUpgradeResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
++	conn, rw, err := http.NewResponseController(w.ResponseWriter).Hijack()
++	if err != nil {
++		return nil, nil, err
++	}
++	// WebSocket does not support TCP half-close. Hide CloseWrite so ReverseProxy
++	// closes both connections when either direction reaches EOF, rather than
++	// waiting indefinitely for an idle peer to close its other half.
++	return struct{ net.Conn }{conn}, rw, nil
+ }
+--- /dev/null
++++ b/middleware/proxy_security_test.go
+@@ -0,0 +1,257 @@
++// SPDX-License-Identifier: MIT
++// SPDX-FileCopyrightText: © 2026 LabStack LLC and Echo contributors
++
++package middleware
++
++import (
++	"bufio"
++	"context"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/http/httptest"
++	"net/url"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/labstack/echo/v4"
++	"github.com/stretchr/testify/require"
++	"golang.org/x/net/websocket"
++)
++
++func TestProxyRejectedUpgradeKeepsRouting(t *testing.T) {
++	for _, status := range []int{http.StatusOK, http.StatusUnauthorized, http.StatusForbidden} {
++		t.Run(fmt.Sprint(status), func(t *testing.T) {
++			var adminCalls atomic.Int32
++			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if r.URL.Path == "/admin" {
++					adminCalls.Add(1)
++					_, _ = io.WriteString(w, "upstream secret")
++					return
++				}
++				w.WriteHeader(status)
++				_, _ = io.WriteString(w, "upgrade declined")
++			}))
++			t.Cleanup(func() { upstream.CloseClientConnections(); upstream.Close() })
++			target, err := url.Parse(upstream.URL)
++			require.NoError(t, err)
++			transport := &http.Transport{}
++			t.Cleanup(transport.CloseIdleConnections)
++			e := echo.New()
++			e.GET("/gateway", func(c echo.Context) error { return c.NoContent(http.StatusNoContent) },
++				ProxyWithConfig(ProxyConfig{Balancer: NewRoundRobinBalancer([]*ProxyTarget{{URL: target}}), Transport: transport}))
++			e.GET("/admin", func(c echo.Context) error { return c.NoContent(http.StatusForbidden) })
++			server := httptest.NewServer(e)
++			t.Cleanup(server.Close)
++			conn, err := net.Dial("tcp", server.Listener.Addr().String())
++			require.NoError(t, err)
++			t.Cleanup(func() { _ = conn.Close() })
++			require.NoError(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
++			_, err = fmt.Fprint(conn, "GET /gateway HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
++			require.NoError(t, err)
++			reader := bufio.NewReader(conn)
++			response, err := http.ReadResponse(reader, nil)
++			require.NoError(t, err)
++			body, err := io.ReadAll(response.Body)
++			require.NoError(t, response.Body.Close())
++			require.NoError(t, err)
++			require.Equal(t, status, response.StatusCode)
++			require.Equal(t, "upgrade declined", string(body))
++			_, err = fmt.Fprint(conn, "GET /admin HTTP/1.1\r\nHost: example.com\r\nConnection: close\r\n\r\n")
++			require.NoError(t, err)
++			response, err = http.ReadResponse(reader, nil)
++			require.NoError(t, err)
++			_, err = io.Copy(io.Discard, response.Body)
++			require.NoError(t, response.Body.Close())
++			require.NoError(t, err)
++			require.Equal(t, http.StatusForbidden, response.StatusCode)
++			require.Zero(t, adminCalls.Load(), "later requests must return through Echo's route guards")
++		})
++	}
++}
++
++func TestProxyUpgradeClosesBothConnections(t *testing.T) {
++	for _, disconnect := range []string{"client", "upstream", "client_upstream_ignores_eof"} {
++		t.Run(disconnect, func(t *testing.T) {
++			backendConn := make(chan net.Conn, 1)
++			backendReturned := make(chan struct{})
++			backendReadEOF := make(chan struct{})
++			backendRelease := make(chan struct{})
++			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				defer close(backendReturned)
++				conn, rw, err := http.NewResponseController(w).Hijack()
++				if err != nil {
++					return
++				}
++				defer conn.Close()
++				backendConn <- conn
++				_, _ = fmt.Fprint(rw, "HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
++				if rw.Flush() != nil {
++					return
++				}
++				message := make([]byte, 4)
++				if _, err := io.ReadFull(rw, message); err != nil {
++					return
++				}
++				if string(message) != "ping" {
++					return
++				}
++				_, _ = conn.Write([]byte("pong"))
++				_, _ = io.Copy(io.Discard, rw)
++				close(backendReadEOF)
++				if disconnect == "client_upstream_ignores_eof" {
++					// Some upstreams retain the connection after receiving EOF.
++					// The proxy must finish without waiting for them to close it.
++					<-backendRelease
++				}
++			}))
++			t.Cleanup(upstream.Close)
++			t.Cleanup(func() { close(backendRelease) })
++			target, err := url.Parse(upstream.URL)
++			require.NoError(t, err)
++			target.Scheme = "ws"
++			e := echo.New()
++			proxyReturned := make(chan struct{})
++			e.Use(func(next echo.HandlerFunc) echo.HandlerFunc {
++				return func(c echo.Context) error { defer close(proxyReturned); return next(c) }
++			})
++			e.Use(Proxy(NewRoundRobinBalancer([]*ProxyTarget{{URL: target}})))
++			server := httptest.NewServer(e)
++			t.Cleanup(server.Close)
++			conn, err := net.Dial("tcp", server.Listener.Addr().String())
++			require.NoError(t, err)
++			t.Cleanup(func() { _ = conn.Close() })
++			require.NoError(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
++			_, err = fmt.Fprint(conn, "GET / HTTP/1.1\r\nHost: example.com\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
++			require.NoError(t, err)
++			var backend net.Conn
++			select {
++			case backend = <-backendConn:
++			case <-time.After(3 * time.Second):
++				t.Fatal("upstream was not reached")
++			}
++			t.Cleanup(func() { _ = backend.Close() })
++			reader := bufio.NewReader(conn)
++			response, err := http.ReadResponse(reader, nil)
++			require.NoError(t, err)
++			require.Equal(t, http.StatusSwitchingProtocols, response.StatusCode)
++			_, err = io.WriteString(conn, "ping")
++			require.NoError(t, err)
++			message := make([]byte, 4)
++			_, err = io.ReadFull(reader, message)
++			require.NoError(t, err)
++			require.Equal(t, "pong", string(message))
++			if disconnect != "upstream" {
++				require.NoError(t, conn.Close())
++			} else {
++				require.NoError(t, backend.Close())
++			}
++			select {
++			case <-proxyReturned:
++			case <-time.After(3 * time.Second):
++				t.Fatal("proxy retained the other side after disconnect")
++			}
++			require.Equal(t, "ws", target.Scheme, "shared target must not be mutated")
++			if disconnect == "client_upstream_ignores_eof" {
++				select {
++				case <-backendReadEOF:
++				case <-time.After(3 * time.Second):
++					t.Fatal("upstream did not receive EOF")
++				}
++				select {
++				case <-backendReturned:
++					t.Fatal("test upstream must remain open until cleanup")
++				default:
++				}
++				return
++			}
++			select {
++			case <-backendReturned:
++			case <-time.After(3 * time.Second):
++				t.Fatal("upstream connection was not closed")
++			}
++		})
++	}
++}
++
++func TestProxyRemovesForwardedHeader(t *testing.T) {
++	for _, upgrade := range []bool{false, true} {
++		t.Run(fmt.Sprint(upgrade), func(t *testing.T) {
++			received := make(chan http.Header, 1)
++			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { received <- r.Header.Clone() }))
++			defer upstream.Close()
++			target, err := url.Parse(upstream.URL)
++			require.NoError(t, err)
++			e := echo.New()
++			e.Use(Proxy(NewRoundRobinBalancer([]*ProxyTarget{{URL: target}})))
++			req := httptest.NewRequest(http.MethodGet, "/", nil)
++			req.Header.Set("Forwarded", "for=127.0.0.1;proto=https")
++			if upgrade {
++				req.Header.Set("Connection", "Upgrade")
++				req.Header.Set("Upgrade", "websocket")
++			}
++			rec := httptest.NewRecorder()
++			e.ServeHTTP(rec, req)
++			require.Equal(t, http.StatusOK, rec.Code)
++			require.Empty(t, (<-received).Values("Forwarded"))
++		})
++	}
++}
++
++func TestProxyRejectsMismatchedUpgrade(t *testing.T) {
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Connection", "Upgrade")
++		w.Header().Set("Upgrade", "h2c")
++		w.WriteHeader(http.StatusSwitchingProtocols)
++	}))
++	defer upstream.Close()
++	target, err := url.Parse(upstream.URL)
++	require.NoError(t, err)
++	e := echo.New()
++	e.Use(Proxy(NewRoundRobinBalancer([]*ProxyTarget{{URL: target}})))
++	req := httptest.NewRequest(http.MethodGet, "/", nil)
++	req.Header.Set("Connection", "Upgrade")
++	req.Header.Set("Upgrade", "websocket")
++	rec := httptest.NewRecorder()
++	e.ServeHTTP(rec, req)
++	require.Equal(t, http.StatusBadGateway, rec.Code)
++}
++
++func TestProxyUpgradeUsesConfiguredTransportAndResponseHook(t *testing.T) {
++	upstream := createSimpleWebSocketServer(false)
++	defer upstream.Close()
++	target, err := url.Parse(upstream.URL)
++	require.NoError(t, err)
++	var dials atomic.Int32
++	modified := make(chan int, 1)
++	transport := &http.Transport{DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
++		dials.Add(1)
++		return (&net.Dialer{}).DialContext(ctx, network, address)
++	}}
++	defer transport.CloseIdleConnections()
++	e := echo.New()
++	e.Use(ProxyWithConfig(ProxyConfig{
++		Balancer:       NewRoundRobinBalancer([]*ProxyTarget{{URL: target}}),
++		Transport:      transport,
++		ModifyResponse: func(response *http.Response) error { modified <- response.StatusCode; return nil },
++	}))
++	server := httptest.NewServer(e)
++	defer server.Close()
++	conn, err := websocket.Dial("ws"+server.URL[len("http"):], "", "http://localhost/")
++	require.NoError(t, err)
++	defer conn.Close()
++	require.NoError(t, conn.SetDeadline(time.Now().Add(3*time.Second)))
++	require.NoError(t, websocket.Message.Send(conn, "hello"))
++	var message string
++	require.NoError(t, websocket.Message.Receive(conn, &message))
++	require.Equal(t, "hello", message)
++	require.Positive(t, dials.Load())
++	select {
++	case status := <-modified:
++		require.Equal(t, http.StatusSwitchingProtocols, status)
++	case <-time.After(3 * time.Second):
++		t.Fatal("ModifyResponse was not called for the upgrade")
++	}
++}
+
 --- a/middleware/body_dump.go
 +++ b/middleware/body_dump.go
 @@ -22,6 +22,14 @@
