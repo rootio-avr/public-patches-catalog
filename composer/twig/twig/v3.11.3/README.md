@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-46633
 - CVE-2026-47732
+- CVE-2026-24425
 
 ## How to Apply:
 1. Clone or download the source code for twig/twig
