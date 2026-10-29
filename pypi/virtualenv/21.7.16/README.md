@@ -5,6 +5,10 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-113732
+- CVE-2026-113726
+- CVE-2026-113725
+- CVE-2026-113776
+- CVE-2026-113722
 
 ## How to Apply:
 1. Clone or download the source code for virtualenv
