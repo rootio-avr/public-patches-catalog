@@ -7,6 +7,9 @@ unknown
 - CVE-2026-102998
 - CVE-2026-103000
 - CVE-2026-102999
+- CVE-2026-115572
+- CVE-2026-115580
+- CVE-2026-115585
 
 ## How to Apply:
 1. Clone or download the source code for pypdf
