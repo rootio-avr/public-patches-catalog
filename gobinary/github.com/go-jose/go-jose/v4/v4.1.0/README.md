@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-34986
+- CVE-2026-116587
 
 ## How to Apply:
 1. Clone or download the source code for github.com/go-jose/go-jose/v4
