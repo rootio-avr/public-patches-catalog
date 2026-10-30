@@ -1,6 +1,6 @@
-# nginx : 1.20.2-r20075
+# nginx : 1.20.2-r20076
 
-This patch is based on nginx version 1.20.2-r20075, which is available at:
+This patch is based on nginx version 1.20.2-r20076, which is available at:
 unknown
 
 ## Affected CVEs:
@@ -14,6 +14,7 @@ unknown
 - CVE-2026-42946
 - CVE-2026-56434
 - CVE-2026-15176
+- CVE-2026-97629
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source nginx`
