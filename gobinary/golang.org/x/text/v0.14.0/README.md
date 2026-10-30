@@ -4,6 +4,7 @@ This patch is based on golang.org/x/text version v0.14.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-56851
 - CVE-2026-56852
 
 ## How to Apply:
