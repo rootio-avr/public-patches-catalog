@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-111768
 - CVE-2026-111770
+- GHSA-f897-62hf-6gxq
 
 ## How to Apply:
 1. Clone or download the source code for @modelcontextprotocol/server

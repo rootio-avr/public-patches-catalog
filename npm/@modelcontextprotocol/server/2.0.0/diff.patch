@@ -265,3 +265,609 @@
  	/**
  	* Registers new capabilities. This can only be called before connecting to a transport.
  	*
+
+--- a/dist/index.mjs
++++ b/dist/index.mjs
+@@ -247,6 +247,60 @@
+ }
+ 
+ //#endregion
++//#region src/server/requestBody.ts
++/** Default upper bound, in bytes, on a request body read by the HTTP entry points (4 MiB). */
++const DEFAULT_MAX_REQUEST_BODY_SIZE = 4 * 1024 * 1024;
++/** Upper bound on the number of messages accepted in one JSON-RPC batch array. */
++const MAX_BATCH_SIZE = 100;
++/** The message answered with 413 for a request body over `maxBytes`. */
++function requestBodyTooLargeMessage(maxBytes) {
++	return `Payload Too Large: Request body must not exceed ${maxBytes} bytes`;
++}
++/**
++* Resolves a `maxRequestBodySize` option to the bound to apply: the default when
++* omitted, otherwise the value itself, which must be a positive finite number of
++* bytes (a `RangeError` is thrown at configuration time for anything else).
++*/
++function resolveMaxRequestBodySize(value) {
++	if (value === void 0) return DEFAULT_MAX_REQUEST_BODY_SIZE;
++	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) throw new RangeError(`maxRequestBodySize must be a positive number of bytes, got ${String(value)}`);
++	return value;
++}
++/**
++* Reads a request body as text, up to `maxBytes`. A declared `Content-Length` over
++* the limit is refused without reading anything; otherwise the read stops as soon
++* as more than the limit has arrived. Stream failures propagate.
++*/
++async function readRequestBody(request, maxBytes = DEFAULT_MAX_REQUEST_BODY_SIZE) {
++	if (Number(request.headers.get("content-length")) > maxBytes) return { tooLarge: true };
++	if (request.body === null) return {
++		tooLarge: false,
++		text: ""
++	};
++	const reader = request.body.getReader();
++	const decoder = new TextDecoder();
++	let received = 0;
++	let text = "";
++	try {
++		for (;;) {
++			const { done, value } = await reader.read();
++			if (done) break;
++			received += value.byteLength;
++			if (received > maxBytes) {
++				reader.cancel().catch(() => {});
++				return { tooLarge: true };
++			}
++			text += decoder.decode(value, { stream: true });
++		}
++	} finally {
++		reader.releaseLock();
++	}
++	return {
++		tooLarge: false,
++		text: text + decoder.decode()
++	};
++}
++//#endregion
+ //#region src/server/streamableHttp.ts
+ /**
+ * Server transport for Web Standards Streamable HTTP: this implements the MCP Streamable HTTP transport specification
+@@ -318,6 +372,7 @@
+ 	_retryInterval;
+ 	_supportedProtocolVersions;
+ 	_keepAliveMs;
++	_maxRequestBodySize;
+ 	_hasHandledRequest = false;
+ 	sessionId;
+ 	onclose;
+@@ -335,6 +390,7 @@
+ 		this._retryInterval = options.retryInterval;
+ 		this._supportedProtocolVersions = options.supportedProtocolVersions ?? SUPPORTED_PROTOCOL_VERSIONS;
+ 		this._keepAliveMs = options.keepAliveMs ?? DEFAULT_SSE_KEEP_ALIVE_MS;
++		this._maxRequestBodySize = resolveMaxRequestBodySize(options.maxRequestBodySize);
+ 	}
+ 	startKeepAlive(controller, encoder) {
+ 		if (this._closed) return void 0;
+@@ -642,12 +698,22 @@
+ 			const request = req;
+ 			let rawMessage;
+ 			if (options?.parsedBody === void 0) try {
+-				rawMessage = await req.json();
++				const body = await readRequestBody(req, this._maxRequestBodySize);
++				if (body.tooLarge) {
++					const message = requestBodyTooLargeMessage(this._maxRequestBodySize);
++					this.onerror?.(new Error(message));
++					return this.createJsonErrorResponse(413, -32e3, message);
++				}
++				rawMessage = JSON.parse(body.text);
+ 			} catch (error) {
+ 				this.onerror?.(error);
+ 				return this.createJsonErrorResponse(400, -32700, "Parse error: Invalid JSON");
+ 			}
+ 			else rawMessage = options.parsedBody;
++			if (Array.isArray(rawMessage) && rawMessage.length > MAX_BATCH_SIZE) {
++				this.onerror?.(/* @__PURE__ */ new Error(`Invalid Request: Batch must not exceed ${MAX_BATCH_SIZE} messages`));
++				return this.createJsonErrorResponse(400, -32600, `Invalid Request: Batch must not exceed ${MAX_BATCH_SIZE} messages`);
++			}
+ 			let messages;
+ 			try {
+ 				messages = Array.isArray(rawMessage) ? rawMessage.map((msg) => JSONRPCMessageSchema.parse(msg)) : [JSONRPCMessageSchema.parse(rawMessage)];
+@@ -970,7 +1036,7 @@
+ * The entry passes its own `onerror` here when expanding the default, so
+ * legacy-leg failures are never silently swallowed.
+ */
+-function createLegacyStatelessFallback(factory, onerror, keepAliveMs) {
++function createLegacyStatelessFallback(factory, onerror, keepAliveMs, maxRequestBodySize) {
+ 	return async (request, options) => {
+ 		if (request.method.toUpperCase() !== "POST") return jsonRpcErrorResponse(405, -32e3, "Method not allowed.");
+ 		try {
+@@ -981,7 +1047,8 @@
+ 			});
+ 			const transport = new WebStandardStreamableHTTPServerTransport({
+ 				sessionIdGenerator: void 0,
+-				...keepAliveMs !== void 0 && { keepAliveMs }
++				...keepAliveMs !== void 0 && { keepAliveMs },
++				...maxRequestBodySize !== void 0 && { maxRequestBodySize }
+ 			});
+ 			await product.connect(transport);
+ 			const teardown = () => {
+@@ -1038,8 +1105,8 @@
+ 		}
+ 	};
+ }
+-function legacyStatelessFallback(factory, onerror) {
+-	return createLegacyStatelessFallback(factory, onerror);
++function legacyStatelessFallback(factory, onerror, options) {
++	return createLegacyStatelessFallback(factory, onerror, void 0, resolveMaxRequestBodySize(options?.maxRequestBodySize));
+ }
+ /**
+ * The entry's classification step: read the request body exactly once (unless
+@@ -1052,7 +1119,7 @@
+ * the body-preserving clone is then skipped and `forwardRequest` is the
+ * (consumed) input request.
+ */
+-async function classifyEntryRequest(request, providedParsedBody, needsForward = true) {
++async function classifyEntryRequest(request, providedParsedBody, needsForward = true, maxRequestBodySize = DEFAULT_MAX_REQUEST_BODY_SIZE) {
+ 	const httpMethod = request.method.toUpperCase();
+ 	let body;
+ 	let parsedBody = providedParsedBody;
+@@ -1063,7 +1130,9 @@
+ 			if (needsForward) forwardRequest = request.clone();
+ 			let bodyText;
+ 			try {
+-				bodyText = await request.text();
++				const read = await readRequestBody(request, maxRequestBodySize);
++				if (read.tooLarge) return { step: "body-too-large" };
++				bodyText = read.text;
+ 			} catch {
+ 				return { step: "unreadable-body" };
+ 			}
+@@ -1161,8 +1230,9 @@
+ *   a method named `server/discover` has no claim and classifies legacy,
+ *   exactly as the entry itself routes it.
+ */
+-async function isLegacyRequest(request, parsedBody) {
+-	const classified = await classifyEntryRequest(parsedBody === void 0 && request.method.toUpperCase() === "POST" ? request.clone() : request, parsedBody, false);
++async function isLegacyRequest(request, parsedBody, options) {
++	const maxRequestBodySize = resolveMaxRequestBodySize(options?.maxRequestBodySize);
++	const classified = await classifyEntryRequest(parsedBody === void 0 && request.method.toUpperCase() === "POST" ? request.clone() : request, parsedBody, false, maxRequestBodySize);
+ 	return classified.step === "no-json-body" || classified.step === "classified" && classified.outcome.kind === "legacy";
+ }
+ /**
+@@ -1211,6 +1281,7 @@
+ */
+ function createMcpHandler(factory, options = {}) {
+ 	const { legacy, onerror, responseMode } = options;
++	const maxRequestBodySize = resolveMaxRequestBodySize(options.maxRequestBodySize);
+ 	if (typeof legacy === "function") throw new TypeError("The 'legacy' option only accepts 'stateless' or 'reject', not a handler function. To serve 2025-era traffic with your own handler, route in user land with the exported isLegacyRequest(request) predicate in front of a strict (legacy: 'reject') handler.");
+ 	/** Modern per-request instances with an exchange still in flight (close() tears these down). */
+ 	const inflight = /* @__PURE__ */ new Set();
+@@ -1229,7 +1300,7 @@
+ 		onerror: reportError
+ 	});
+ 	if (responseMode === "json") console.warn("responseMode: 'json' drops mid-call notifications. subscriptions/listen streams are always served over SSE regardless; other notifications emitted before a result are dropped.");
+-	const legacyHandler = legacy === "reject" ? void 0 : createLegacyStatelessFallback(factory, reportError, options.keepAliveMs);
++	const legacyHandler = legacy === "reject" ? void 0 : createLegacyStatelessFallback(factory, reportError, options.keepAliveMs, maxRequestBodySize);
+ 	async function serveModern(route, request, authInfo) {
+ 		const claimedRevision = route.classification.revision;
+ 		if (claimedRevision === void 0 || !SUPPORTED_MODERN_PROTOCOL_VERSIONS.includes(claimedRevision)) {
+@@ -1338,8 +1409,9 @@
+ 			reportError(/* @__PURE__ */ new Error("Unsupported Media Type: Content-Type must be application/json"));
+ 			return jsonRpcErrorResponse(415, -32e3, "Unsupported Media Type: Content-Type must be application/json");
+ 		}
+-		const classified = await classifyEntryRequest(request, requestOptions?.parsedBody);
++		const classified = await classifyEntryRequest(request, requestOptions?.parsedBody, true, maxRequestBodySize);
+ 		if (classified.step === "unreadable-body") return jsonRpcErrorResponse(400, -32700, "Parse error: the request body could not be read");
++		if (classified.step === "body-too-large") return jsonRpcErrorResponse(413, -32e3, requestBodyTooLargeMessage(maxRequestBodySize));
+ 		if (classified.step === "no-json-body") {
+ 			if (legacyHandler !== void 0) return legacyHandler(classified.forwardRequest, { ...authInfo !== void 0 && { authInfo } });
+ 			return jsonRpcErrorResponse(400, -32700, "Parse error: the request body is not valid JSON");
+--- a/dist/index.cjs
++++ b/dist/index.cjs
+@@ -249,6 +249,60 @@
+ }
+ 
+ //#endregion
++//#region src/server/requestBody.ts
++/** Default upper bound, in bytes, on a request body read by the HTTP entry points (4 MiB). */
++const DEFAULT_MAX_REQUEST_BODY_SIZE = 4 * 1024 * 1024;
++/** Upper bound on the number of messages accepted in one JSON-RPC batch array. */
++const MAX_BATCH_SIZE = 100;
++/** The message answered with 413 for a request body over `maxBytes`. */
++function requestBodyTooLargeMessage(maxBytes) {
++	return `Payload Too Large: Request body must not exceed ${maxBytes} bytes`;
++}
++/**
++* Resolves a `maxRequestBodySize` option to the bound to apply: the default when
++* omitted, otherwise the value itself, which must be a positive finite number of
++* bytes (a `RangeError` is thrown at configuration time for anything else).
++*/
++function resolveMaxRequestBodySize(value) {
++	if (value === void 0) return DEFAULT_MAX_REQUEST_BODY_SIZE;
++	if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) throw new RangeError(`maxRequestBodySize must be a positive number of bytes, got ${String(value)}`);
++	return value;
++}
++/**
++* Reads a request body as text, up to `maxBytes`. A declared `Content-Length` over
++* the limit is refused without reading anything; otherwise the read stops as soon
++* as more than the limit has arrived. Stream failures propagate.
++*/
++async function readRequestBody(request, maxBytes = DEFAULT_MAX_REQUEST_BODY_SIZE) {
++	if (Number(request.headers.get("content-length")) > maxBytes) return { tooLarge: true };
++	if (request.body === null) return {
++		tooLarge: false,
++		text: ""
++	};
++	const reader = request.body.getReader();
++	const decoder = new TextDecoder();
++	let received = 0;
++	let text = "";
++	try {
++		for (;;) {
++			const { done, value } = await reader.read();
++			if (done) break;
++			received += value.byteLength;
++			if (received > maxBytes) {
++				reader.cancel().catch(() => {});
++				return { tooLarge: true };
++			}
++			text += decoder.decode(value, { stream: true });
++		}
++	} finally {
++		reader.releaseLock();
++	}
++	return {
++		tooLarge: false,
++		text: text + decoder.decode()
++	};
++}
++//#endregion
+ //#region src/server/streamableHttp.ts
+ /**
+ * Server transport for Web Standards Streamable HTTP: this implements the MCP Streamable HTTP transport specification
+@@ -320,6 +374,7 @@
+ 	_retryInterval;
+ 	_supportedProtocolVersions;
+ 	_keepAliveMs;
++	_maxRequestBodySize;
+ 	_hasHandledRequest = false;
+ 	sessionId;
+ 	onclose;
+@@ -337,6 +392,7 @@
+ 		this._retryInterval = options.retryInterval;
+ 		this._supportedProtocolVersions = options.supportedProtocolVersions ?? _modelcontextprotocol_core_internal.SUPPORTED_PROTOCOL_VERSIONS;
+ 		this._keepAliveMs = options.keepAliveMs ?? require_mcp.DEFAULT_SSE_KEEP_ALIVE_MS;
++		this._maxRequestBodySize = resolveMaxRequestBodySize(options.maxRequestBodySize);
+ 	}
+ 	startKeepAlive(controller, encoder) {
+ 		if (this._closed) return void 0;
+@@ -644,12 +700,22 @@
+ 			const request = req;
+ 			let rawMessage;
+ 			if (options?.parsedBody === void 0) try {
+-				rawMessage = await req.json();
++				const body = await readRequestBody(req, this._maxRequestBodySize);
++				if (body.tooLarge) {
++					const message = requestBodyTooLargeMessage(this._maxRequestBodySize);
++					this.onerror?.(new Error(message));
++					return this.createJsonErrorResponse(413, -32e3, message);
++				}
++				rawMessage = JSON.parse(body.text);
+ 			} catch (error) {
+ 				this.onerror?.(error);
+ 				return this.createJsonErrorResponse(400, -32700, "Parse error: Invalid JSON");
+ 			}
+ 			else rawMessage = options.parsedBody;
++			if (Array.isArray(rawMessage) && rawMessage.length > MAX_BATCH_SIZE) {
++				this.onerror?.(/* @__PURE__ */ new Error(`Invalid Request: Batch must not exceed ${MAX_BATCH_SIZE} messages`));
++				return this.createJsonErrorResponse(400, -32600, `Invalid Request: Batch must not exceed ${MAX_BATCH_SIZE} messages`);
++			}
+ 			let messages;
+ 			try {
+ 				messages = Array.isArray(rawMessage) ? rawMessage.map((msg) => _modelcontextprotocol_core_internal.JSONRPCMessageSchema.parse(msg)) : [_modelcontextprotocol_core_internal.JSONRPCMessageSchema.parse(rawMessage)];
+@@ -972,7 +1038,7 @@
+ * The entry passes its own `onerror` here when expanding the default, so
+ * legacy-leg failures are never silently swallowed.
+ */
+-function createLegacyStatelessFallback(factory, onerror, keepAliveMs) {
++function createLegacyStatelessFallback(factory, onerror, keepAliveMs, maxRequestBodySize) {
+ 	return async (request, options) => {
+ 		if (request.method.toUpperCase() !== "POST") return jsonRpcErrorResponse(405, -32e3, "Method not allowed.");
+ 		try {
+@@ -983,7 +1049,8 @@
+ 			});
+ 			const transport = new WebStandardStreamableHTTPServerTransport({
+ 				sessionIdGenerator: void 0,
+-				...keepAliveMs !== void 0 && { keepAliveMs }
++				...keepAliveMs !== void 0 && { keepAliveMs },
++				...maxRequestBodySize !== void 0 && { maxRequestBodySize }
+ 			});
+ 			await product.connect(transport);
+ 			const teardown = () => {
+@@ -1040,8 +1107,8 @@
+ 		}
+ 	};
+ }
+-function legacyStatelessFallback(factory, onerror) {
+-	return createLegacyStatelessFallback(factory, onerror);
++function legacyStatelessFallback(factory, onerror, options) {
++	return createLegacyStatelessFallback(factory, onerror, void 0, resolveMaxRequestBodySize(options?.maxRequestBodySize));
+ }
+ /**
+ * The entry's classification step: read the request body exactly once (unless
+@@ -1054,7 +1121,7 @@
+ * the body-preserving clone is then skipped and `forwardRequest` is the
+ * (consumed) input request.
+ */
+-async function classifyEntryRequest(request, providedParsedBody, needsForward = true) {
++async function classifyEntryRequest(request, providedParsedBody, needsForward = true, maxRequestBodySize = DEFAULT_MAX_REQUEST_BODY_SIZE) {
+ 	const httpMethod = request.method.toUpperCase();
+ 	let body;
+ 	let parsedBody = providedParsedBody;
+@@ -1065,7 +1132,9 @@
+ 			if (needsForward) forwardRequest = request.clone();
+ 			let bodyText;
+ 			try {
+-				bodyText = await request.text();
++				const read = await readRequestBody(request, maxRequestBodySize);
++				if (read.tooLarge) return { step: "body-too-large" };
++				bodyText = read.text;
+ 			} catch {
+ 				return { step: "unreadable-body" };
+ 			}
+@@ -1163,8 +1232,9 @@
+ *   a method named `server/discover` has no claim and classifies legacy,
+ *   exactly as the entry itself routes it.
+ */
+-async function isLegacyRequest(request, parsedBody) {
+-	const classified = await classifyEntryRequest(parsedBody === void 0 && request.method.toUpperCase() === "POST" ? request.clone() : request, parsedBody, false);
++async function isLegacyRequest(request, parsedBody, options) {
++	const maxRequestBodySize = resolveMaxRequestBodySize(options?.maxRequestBodySize);
++	const classified = await classifyEntryRequest(parsedBody === void 0 && request.method.toUpperCase() === "POST" ? request.clone() : request, parsedBody, false, maxRequestBodySize);
+ 	return classified.step === "no-json-body" || classified.step === "classified" && classified.outcome.kind === "legacy";
+ }
+ /**
+@@ -1213,6 +1283,7 @@
+ */
+ function createMcpHandler(factory, options = {}) {
+ 	const { legacy, onerror, responseMode } = options;
++	const maxRequestBodySize = resolveMaxRequestBodySize(options.maxRequestBodySize);
+ 	if (typeof legacy === "function") throw new TypeError("The 'legacy' option only accepts 'stateless' or 'reject', not a handler function. To serve 2025-era traffic with your own handler, route in user land with the exported isLegacyRequest(request) predicate in front of a strict (legacy: 'reject') handler.");
+ 	/** Modern per-request instances with an exchange still in flight (close() tears these down). */
+ 	const inflight = /* @__PURE__ */ new Set();
+@@ -1231,7 +1302,7 @@
+ 		onerror: reportError
+ 	});
+ 	if (responseMode === "json") console.warn("responseMode: 'json' drops mid-call notifications. subscriptions/listen streams are always served over SSE regardless; other notifications emitted before a result are dropped.");
+-	const legacyHandler = legacy === "reject" ? void 0 : createLegacyStatelessFallback(factory, reportError, options.keepAliveMs);
++	const legacyHandler = legacy === "reject" ? void 0 : createLegacyStatelessFallback(factory, reportError, options.keepAliveMs, maxRequestBodySize);
+ 	async function serveModern(route, request, authInfo) {
+ 		const claimedRevision = route.classification.revision;
+ 		if (claimedRevision === void 0 || !require_src.SUPPORTED_MODERN_PROTOCOL_VERSIONS.includes(claimedRevision)) {
+@@ -1340,8 +1411,9 @@
+ 			reportError(/* @__PURE__ */ new Error("Unsupported Media Type: Content-Type must be application/json"));
+ 			return jsonRpcErrorResponse(415, -32e3, "Unsupported Media Type: Content-Type must be application/json");
+ 		}
+-		const classified = await classifyEntryRequest(request, requestOptions?.parsedBody);
++		const classified = await classifyEntryRequest(request, requestOptions?.parsedBody, true, maxRequestBodySize);
+ 		if (classified.step === "unreadable-body") return jsonRpcErrorResponse(400, -32700, "Parse error: the request body could not be read");
++		if (classified.step === "body-too-large") return jsonRpcErrorResponse(413, -32e3, requestBodyTooLargeMessage(maxRequestBodySize));
+ 		if (classified.step === "no-json-body") {
+ 			if (legacyHandler !== void 0) return legacyHandler(classified.forwardRequest, { ...authInfo !== void 0 && { authInfo } });
+ 			return jsonRpcErrorResponse(400, -32700, "Parse error: the request body is not valid JSON");
+--- a/dist/index.d.mts
++++ b/dist/index.d.mts
+@@ -526,6 +526,14 @@
+    */
+   keepAliveMs?: number;
+   /**
++   * Upper bound, in bytes, on a POST body the transport reads itself. A body
++   * over the bound (declared `Content-Length`, or observed while streaming)
++   * is answered `413` before anything is parsed. Not applied when the caller
++   * supplies `parsedBody`. Must be a positive number.
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
++  /**
+    * List of protocol versions that this transport will accept.
+    * Used to validate the `mcp-protocol-version` header in incoming requests.
+    *
+--- a/dist/index.d.cts
++++ b/dist/index.d.cts
+@@ -526,6 +526,14 @@
+    */
+   keepAliveMs?: number;
+   /**
++   * Upper bound, in bytes, on a POST body the transport reads itself. A body
++   * over the bound (declared `Content-Length`, or observed while streaming)
++   * is answered `413` before anything is parsed. Not applied when the caller
++   * supplies `parsedBody`. Must be a positive number.
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
++  /**
+    * List of protocol versions that this transport will accept.
+    * Used to validate the `mcp-protocol-version` header in incoming requests.
+    *
+--- a/dist/createMcpHandler-CLhGwQTn.d.mts
++++ b/dist/createMcpHandler-CLhGwQTn.d.mts
+@@ -3890,6 +3890,15 @@
+    * @default 15000
+    */
+   keepAliveMs?: number;
++  /**
++   * Upper bound, in bytes, on a POST body the handler reads itself (the
++   * classification step and the stateless legacy leg). A body over the bound
++   * is answered `413` before anything is parsed or any server instance is
++   * created. Not applied to a body supplied as `parsedBody`. Must be a
++   * positive number.
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
+ }
+ /**
+  * The handler returned by {@linkcode createMcpHandler}: a web-standard
+@@ -3926,7 +3935,16 @@
+    */
+   bus: ServerEventBus;
+ }
+-declare function legacyStatelessFallback(factory: McpServerFactory, onerror?: (error: Error) => void): LegacyHttpHandler;
++/** Options for {@linkcode legacyStatelessFallback}. */
++interface LegacyStatelessFallbackOptions {
++  /**
++   * Upper bound, in bytes, on a POST body the leg reads itself (not applied
++   * to a body supplied as `parsedBody`). Must be a positive number.
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
++}
++declare function legacyStatelessFallback(factory: McpServerFactory, onerror?: (error: Error) => void, options?: LegacyStatelessFallbackOptions): LegacyHttpHandler;
+ /**
+  * Whether {@linkcode createMcpHandler} would route this request to its legacy
+  * (2025-era) serving rather than the modern (2026-07-28) path.
+@@ -3995,7 +4013,16 @@
+  *   a method named `server/discover` has no claim and classifies legacy,
+  *   exactly as the entry itself routes it.
+  */
+-declare function isLegacyRequest(request: Request, parsedBody?: unknown): Promise<boolean>;
++/** Options for {@linkcode isLegacyRequest}. */
++interface IsLegacyRequestOptions {
++  /**
++   * The same `maxRequestBodySize` the handler the predicate routes for was
++   * created with (a body over it classifies `false`; the modern handler answers `413`).
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
++}
++declare function isLegacyRequest(request: Request, parsedBody?: unknown, options?: IsLegacyRequestOptions): Promise<boolean>;
+ /**
+  * Creates an HTTP handler that serves the 2026-07-28 protocol revision from a
+  * per-request server factory and, by default, falls back to old-school
+--- a/dist/createMcpHandler-dBHMsxwf.d.cts
++++ b/dist/createMcpHandler-dBHMsxwf.d.cts
+@@ -3892,6 +3892,15 @@
+    * @default 15000
+    */
+   keepAliveMs?: number;
++  /**
++   * Upper bound, in bytes, on a POST body the handler reads itself (the
++   * classification step and the stateless legacy leg). A body over the bound
++   * is answered `413` before anything is parsed or any server instance is
++   * created. Not applied to a body supplied as `parsedBody`. Must be a
++   * positive number.
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
+ }
+ /**
+  * The handler returned by {@linkcode createMcpHandler}: a web-standard
+@@ -3928,7 +3937,16 @@
+    */
+   bus: ServerEventBus;
+ }
+-declare function legacyStatelessFallback(factory: McpServerFactory, onerror?: (error: Error) => void): LegacyHttpHandler;
++/** Options for {@linkcode legacyStatelessFallback}. */
++interface LegacyStatelessFallbackOptions {
++  /**
++   * Upper bound, in bytes, on a POST body the leg reads itself (not applied
++   * to a body supplied as `parsedBody`). Must be a positive number.
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
++}
++declare function legacyStatelessFallback(factory: McpServerFactory, onerror?: (error: Error) => void, options?: LegacyStatelessFallbackOptions): LegacyHttpHandler;
+ /**
+  * Whether {@linkcode createMcpHandler} would route this request to its legacy
+  * (2025-era) serving rather than the modern (2026-07-28) path.
+@@ -3997,7 +4015,16 @@
+  *   a method named `server/discover` has no claim and classifies legacy,
+  *   exactly as the entry itself routes it.
+  */
+-declare function isLegacyRequest(request: Request, parsedBody?: unknown): Promise<boolean>;
++/** Options for {@linkcode isLegacyRequest}. */
++interface IsLegacyRequestOptions {
++  /**
++   * The same `maxRequestBodySize` the handler the predicate routes for was
++   * created with (a body over it classifies `false`; the modern handler answers `413`).
++   * @default 4194304 (4 MiB)
++   */
++  maxRequestBodySize?: number;
++}
++declare function isLegacyRequest(request: Request, parsedBody?: unknown, options?: IsLegacyRequestOptions): Promise<boolean>;
+ /**
+  * Creates an HTTP handler that serves the 2026-07-28 protocol revision from a
+  * per-request server factory and, by default, falls back to old-school
+--- /dev/null
++++ b/test/ghsa-f897-62hf-6gxq.test.js
+@@ -0,0 +1,74 @@
++// Regression test for GHSA-f897-62hf-6gxq: HTTP request bodies are read with a
++// size limit (413) and JSON-RPC batches are bounded (400 / -32600).
++import assert from 'node:assert/strict';
++import { test } from 'node:test';
++
++import { createMcpHandler, McpServer, WebStandardStreamableHTTPServerTransport } from '../dist/index.mjs';
++
++const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
++
++const ping = id => ({ jsonrpc: '2.0', id, method: 'ping' });
++
++const post = (body, extra = {}) => new Request('http://localhost/mcp', { method: 'POST', headers: { ...headers, ...extra }, body });
++
++test('transport answers 413 for a body over maxRequestBodySize', async () => {
++    const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, maxRequestBodySize: 64 });
++    const response = await transport.handleRequest(post(JSON.stringify({ ...ping(1), padding: 'x'.repeat(1000) })));
++    assert.equal(response.status, 413);
++    const body = await response.json();
++    assert.equal(body.error.code, -32_000);
++});
++
++test('transport refuses an oversized streamed body that declares no Content-Length', async () => {
++    const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, maxRequestBodySize: 64 });
++    const stream = new ReadableStream({
++        pull(controller) {
++            controller.enqueue(new TextEncoder().encode('x'.repeat(40)));
++        }
++    });
++    const request = new Request('http://localhost/mcp', { method: 'POST', headers, body: stream, duplex: 'half' });
++    const response = await transport.handleRequest(request);
++    assert.equal(response.status, 413);
++});
++
++test('transport rejects a JSON-RPC batch of more than 100 messages', async () => {
++    const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
++    const batch = Array.from({ length: 101 }, (_, i) => ping(i + 1));
++    const response = await transport.handleRequest(post(JSON.stringify(batch)));
++    assert.equal(response.status, 400);
++    const body = await response.json();
++    assert.equal(body.error.code, -32_600);
++});
++
++test('transport rejects an oversized batch passed as parsedBody', async () => {
++    const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined });
++    const batch = Array.from({ length: 101 }, (_, i) => ping(i + 1));
++    const response = await transport.handleRequest(post('[]'), { parsedBody: batch });
++    assert.equal(response.status, 400);
++});
++
++test('transport still parses a normal body under the limit', async () => {
++    const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, maxRequestBodySize: 4096 });
++    const response = await transport.handleRequest(post('not json'));
++    assert.equal(response.status, 400);
++    assert.equal((await response.json()).error.code, -32_700);
++});
++
++test('createMcpHandler answers 413 before building any server for an oversized body', async () => {
++    let created = 0;
++    const handler = createMcpHandler(
++        () => {
++            created++;
++            return new McpServer({ name: 'test', version: '1.0.0' });
++        },
++        { maxRequestBodySize: 64 }
++    );
++    const response = await handler.fetch(post(JSON.stringify({ ...ping(1), padding: 'x'.repeat(1000) })));
++    assert.equal(response.status, 413);
++    assert.equal(created, 0);
++    await handler.close();
++});
++
++test('createMcpHandler rejects a non-positive maxRequestBodySize at construction', () => {
++    assert.throws(() => createMcpHandler(() => new McpServer({ name: 'test', version: '1.0.0' }), { maxRequestBodySize: 0 }), RangeError);
++});
