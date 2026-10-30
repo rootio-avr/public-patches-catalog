@@ -4,6 +4,7 @@ This patch is based on github.com/containerd/containerd version v1.7.33, which i
 unknown
 
 ## Affected CVEs:
+- CVE-2026-50195
 - CVE-2026-53492
 
 ## How to Apply:
