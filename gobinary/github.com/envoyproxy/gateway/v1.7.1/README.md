@@ -4,6 +4,7 @@ This patch is based on github.com/envoyproxy/gateway version v1.7.1, which is av
 unknown
 
 ## Affected CVEs:
+- CVE-2026-53713
 - CVE-2026-53714
 
 ## How to Apply:
