@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-cg2g-xh64-v4q7
+- GHSA-mrv2-3pqr-j5jr
 
 ## How to Apply:
 1. Clone or download the source code for dompurify
