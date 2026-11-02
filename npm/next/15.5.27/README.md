@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-104277
+- GHSA-2464-fhr4-w9xw
+- CVE-2026-94482
 
 ## How to Apply:
 1. Clone or download the source code for next
