@@ -4,6 +4,7 @@ This patch is based on dompurify version 3.4.16, which is available at:
 unknown
 
 ## Affected CVEs:
+- GHSA-mrv2-3pqr-j5jr
 - GHSA-cg2g-xh64-v4q7
 
 ## How to Apply:
