@@ -4,6 +4,7 @@ This patch is based on pyasn1 version 0.6.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-119197
 - CVE-2026-119196
 
 ## How to Apply:
