@@ -101,12 +101,453 @@
 +
 +    assert f"TK_LIBRARY={shlex.quote(payload)}" in content
 
+--- /dev/null
++++ b/tests/unit/activation/test_cve_2026_102925.py
+@@ -0,0 +1,78 @@
++"""Regression test for CVE-2026-102925.
++
++The bash ``activate`` and fish ``activate.fish`` templates must never evaluate shell metacharacters that
++originate from the virtual environment path or from the interpreter's Tcl/Tk library paths. The template
++substitution already applies ``shlex.quote``; the vulnerable templates additionally wrapped the placeholders in
++quotes, which let an embedded quote break out of the string and run commands.
++"""
++
++from __future__ import annotations
++
++import shlex
++import shutil
++import subprocess
++from argparse import Namespace
++from types import SimpleNamespace
++
++import pytest
++
++from virtualenv.activation import BashActivator, FishActivator
++from virtualenv.info import IS_WIN
++
++
++def _generate(activator_cls, dest, tcl_lib=None, tk_lib=None):
++    bin_dir = dest / "bin"
++    bin_dir.mkdir(parents=True)
++    creator = SimpleNamespace(
++        dest=dest,
++        bin_dir=bin_dir,
++        interpreter=SimpleNamespace(tcl_lib=tcl_lib, tk_lib=tk_lib),
++        pyenv_cfg={},
++        env_name="my-env",
++    )
++    activator_cls(Namespace(prompt=None)).generate(creator)
++    return bin_dir
++
++
++def test_bash_missing_dir_message_does_not_wrap_placeholder_in_quotes(tmp_path):
++    bin_dir = _generate(BashActivator, tmp_path / "env")
++    content = (bin_dir / "activate").read_text(encoding="utf-8")
++
++    assert 'echo "Virtual environment directory" ' in content
++    assert '"Virtual environment directory ' not in content
++
++
++@pytest.mark.parametrize("payload", ["/tcl/'$(touch PWNED)'/lib", "/tcl/';touch PWNED;'/lib"])
++def test_fish_tcl_tk_values_are_not_wrapped_in_extra_quotes(tmp_path, payload):
++    bin_dir = _generate(FishActivator, tmp_path / "env", tcl_lib=payload, tk_lib=payload)
++    content = (bin_dir / "activate.fish").read_text(encoding="utf-8")
++
++    assert f"set -gx TCL_LIBRARY {shlex.quote(payload)}\n" in content
++    assert f"set -gx TK_LIBRARY {shlex.quote(payload)}\n" in content
++    assert f"'{shlex.quote(payload)}'" not in content
++
++
++@pytest.mark.skipif(IS_WIN or shutil.which("bash") is None, reason="requires bash")
++@pytest.mark.parametrize(
++    "name",
++    [
++        "x'$(touch PWNED)'y",
++        "x'`touch PWNED`'y",
++        "a';touch PWNED;'b",
++    ],
++)
++def test_bash_activate_does_not_run_commands_from_venv_path(tmp_path, name):
++    bin_dir = _generate(BashActivator, tmp_path / name)
++    relocated = tmp_path / "relocated"
++    shutil.move(str(bin_dir.parent), str(relocated))
++    work_dir = tmp_path / "workdir"
++    work_dir.mkdir()
++
++    subprocess.run(
++        ["bash", "-c", f'source "{relocated / "bin" / "activate"}" >/dev/null 2>&1'],
++        cwd=str(work_dir),
++        check=False,
++        capture_output=True,
++    )
++
++    assert not (work_dir / "PWNED").exists()
+
+--- /dev/null
++++ b/docs/changelog/3251.bugfix.rst
+@@ -0,0 +1,2 @@
++Verify a downloaded seed wheel's sha256 against PyPI before seeding it into a virtual environment, skipped when a custom
++pip index is configured.
+--- a/src/virtualenv/seed/wheels/acquire.py
++++ b/src/virtualenv/seed/wheels/acquire.py
+@@ -9,12 +9,25 @@
+ from subprocess import PIPE, CalledProcessError, Popen
+ 
+ from .bundle import from_bundle
+-from .periodic_update import add_wheel_to_update_log
++from .periodic_update import add_wheel_to_update_log, verify_wheel_digest
+ from .util import Version, Wheel, discover_wheels
+ 
+ LOGGER = logging.getLogger(__name__)
+ 
++# A private index can legitimately serve a rebuilt wheel under the same distribution, version, and
++# filename PyPI also uses - an internal mirror re-signing or re-packaging a release for policy reasons,
++# for example. Verifying that file against PyPI's own digest would then reject a wheel that came from
++# exactly the source it was configured to come from, not a compromised one. This does not attempt to
++# find every way pip can be pointed elsewhere (a pip.conf file has the same effect and is invisible
++# here), only the common, explicit one, so treat this as a conservative signal rather than proof either
++# way: it exists to avoid false rejections, not to guarantee verification runs whenever it safely could.
++_CUSTOM_INDEX_ENV_VARS = ("PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX")
+ 
++
++def _uses_default_index(env):
++    return not any(env.get(var) for var in _CUSTOM_INDEX_ENV_VARS)
++
++
+ def get_wheel(  # noqa: PLR0913
+     distribution,
+     version,
+@@ -69,6 +82,7 @@
+         str(to_folder),
+         to_download,
+     ]
++    verify_against_pypi = _uses_default_index(env)
+     # pip has no interface in python - must be a new sub-process
+     env = pip_wheel_env_run(search_dirs, app_data, env)
+     process = Popen(cmd, env=env, stdout=PIPE, stderr=PIPE, universal_newlines=True, encoding="utf-8")
+@@ -77,7 +91,12 @@
+         kwargs = {"output": out, "stderr": err}
+         raise CalledProcessError(process.returncode, cmd, **kwargs)
+     result = _find_downloaded_wheel(distribution, version_spec, for_py_version, to_folder, out)
++    if result is None:
++        msg = f"could not find downloaded wheel for {to_download}"
++        raise RuntimeError(msg)
+     LOGGER.debug("downloaded wheel %s", result.name)
++    if verify_against_pypi:
++        verify_wheel_digest(result)
+     return result
+ 
+ 
+--- a/src/virtualenv/seed/wheels/periodic_update.py
++++ b/src/virtualenv/seed/wheels/periodic_update.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import logging
+ import os
+@@ -330,6 +331,42 @@
+     return None
+ 
+ 
++def verify_wheel_digest(wheel):
++    """
++    Verify a downloaded wheel's sha256 against the digest PyPI's JSON API reports for that release.
++
++    ``pip download`` trusts whatever index it is configured to use, and nothing else in this module checks the bytes it
++    hands back. A missing PyPI record only means this check cannot run - the wheel may come from a private index PyPI
++    has never heard of - so that case is logged and let through. An actual mismatch means the file on disk is not the
++    release PyPI published under that filename, which is what a compromised index, a stale mirror, or a MITM'd download
++    would produce, so that case is fatal: the wheel must never be cached or seeded into a venv.
++
++    :raises RuntimeError: if PyPI's record for this exact filename exists and the digest does not match.
++    """
++    entry = _pypi_release_entry_for_wheel(wheel)
++    if entry is None:
++        LOGGER.debug("could not verify %s against PyPI: no matching release record", wheel.name)
++        return
++    digests = entry.get("digests")
++    expected = digests.get("sha256") if isinstance(digests, dict) else None
++    if not isinstance(expected, str):
++        LOGGER.debug("could not verify %s against PyPI: no sha256 digest published", wheel.name)
++        return
++    actual = hashlib.sha256(wheel.path.read_bytes()).hexdigest()
++    if actual != expected:
++        msg = f"downloaded wheel {wheel.name} has sha256 {actual}, but PyPI reports {expected} for this release"
++        raise RuntimeError(msg)
++
++
++def _pypi_release_entry_for_wheel(wheel):
++    content = _pypi_get_distribution_info_cached(wheel.distribution)
++    releases = content.get("releases") if isinstance(content, dict) else None
++    entries = releases.get(wheel.version) if isinstance(releases, dict) else None
++    if not isinstance(entries, list):
++        return None
++    return next((entry for entry in entries if isinstance(entry, dict) and entry.get("filename") == wheel.name), None)
++
++
+ def _request_context():
+     yield None
+     # fallback to non verified HTTPS (the information we request is not sensitive, so fallback)
+@@ -425,4 +462,5 @@
+     "periodic_update",
+     "release_date_for_wheel_path",
+     "trigger_update",
++    "verify_wheel_digest",
+ ]
+--- a/tests/unit/seed/wheels/test_acquire.py
++++ b/tests/unit/seed/wheels/test_acquire.py
+@@ -38,6 +38,7 @@
+     distribution = "setuptools"
+     p_open = mocker.MagicMock()
+     mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
++    mocker.patch("virtualenv.seed.wheels.acquire.verify_wheel_digest")
+     p_open.communicate.return_value = "", ""
+     p_open.returncode = 0
+ 
+@@ -58,6 +59,19 @@
+     assert result.path == embed.path
+ 
+ 
++def test_download_wheel_not_found_raises(mocker, for_py_version, session_app_data):
++    """download_wheel must raise a clear error rather than crash when no wheel can be identified at all"""
++    p_open = mocker.MagicMock()
++    mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
++    p_open.communicate.return_value = "", ""
++    p_open.returncode = 0
++    as_path = mocker.MagicMock()
++    as_path.iterdir.return_value = []
++
++    with pytest.raises(RuntimeError, match="could not find downloaded wheel"):
++        download_wheel("setuptools", None, for_py_version, [], session_app_data, as_path, os.environ)
++
++
+ def test_download_fails(mocker, for_py_version, session_app_data):
+     p_open = mocker.MagicMock()
+     mocker.patch("virtualenv.seed.wheels.acquire.Popen", return_value=p_open)
+@@ -94,11 +108,49 @@
+     mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
+     mock_popen.return_value.returncode = 0
+     mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    mocker.patch("virtualenv.seed.wheels.acquire.verify_wheel_digest")
+ 
+     download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", os.environ.copy())
+ 
+     env = mock_popen.call_args[1]["env"]
+     assert env["PYTHONIOENCODING"] == "utf-8"
++
++
++def test_download_wheel_verifies_digest(mocker, for_py_version, session_app_data):
++    """download_wheel must reject a wheel whose bytes do not match PyPI's published digest"""
++    mock_popen = mocker.patch("virtualenv.seed.wheels.acquire.Popen")
++    mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
++    mock_popen.return_value.returncode = 0
++    mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    verify = mocker.patch(
++        "virtualenv.seed.wheels.acquire.verify_wheel_digest",
++        side_effect=RuntimeError("digest mismatch"),
++    )
++
++    with pytest.raises(RuntimeError, match="digest mismatch"):
++        download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", os.environ.copy())
++
++    assert verify.call_count == 1
++
++
++@pytest.mark.parametrize("env_var", ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL", "PIP_INDEX"])
++def test_download_wheel_skips_digest_check_for_custom_index(mocker, for_py_version, session_app_data, env_var):
++    """A configured custom index may legitimately serve a same-named wheel PyPI never built"""
++    mock_popen = mocker.patch("virtualenv.seed.wheels.acquire.Popen")
++    mock_popen.return_value.communicate.return_value = "Saved a-b-c.whl", ""
++    mock_popen.return_value.returncode = 0
++    mocker.patch("pathlib.Path.absolute", return_value=Path("a-b-c.whl"))
++    verify = mocker.patch(
++        "virtualenv.seed.wheels.acquire.verify_wheel_digest",
++        side_effect=RuntimeError("would have rejected a legitimate wheel"),
++    )
++    env = os.environ.copy()
++    env[env_var] = "https://example.com/simple"
++
++    result = download_wheel("pip", "==1", for_py_version, [], session_app_data, "folder", env)
++
++    assert result.name == "a-b-c.whl"
++    assert verify.call_count == 0
+ 
+ 
+ @pytest.fixture
+--- a/tests/unit/seed/wheels/test_periodic_update.py
++++ b/tests/unit/seed/wheels/test_periodic_update.py
+@@ -1,5 +1,6 @@
+ from __future__ import annotations
+ 
++import hashlib
+ import json
+ import os
+ import subprocess
+@@ -29,6 +30,7 @@
+     periodic_update,
+     release_date_for_wheel_path,
+     trigger_update,
++    verify_wheel_digest,
+ )
+ from virtualenv.util.subprocess import CREATE_NO_WINDOW
+ 
+@@ -545,6 +547,56 @@
+     assert result is None
+     assert url_o.call_count == 1
+     assert repr(exc) in caplog.text
++
++
++def _pypi_release_response(mocker, filename, digests, version="20.1"):
++    entry = {"filename": filename, "digests": digests}
++    body = json.dumps({"releases": {version: [entry]}})
++    return mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", return_value=StringIO(body))
++
++
++def test_verify_wheel_digest_matches(tmp_path, mocker):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    sha256 = hashlib.sha256(b"content").hexdigest()
++    _pypi_release_response(mocker, wheel.name, {"sha256": sha256})
++
++    verify_wheel_digest(wheel)  # must not raise
++
++
++def test_verify_wheel_digest_mismatch(tmp_path, mocker):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    _pypi_release_response(mocker, wheel.name, {"sha256": "0" * 64})
++
++    with pytest.raises(RuntimeError, match=r"has sha256 .* but PyPI reports"):
++        verify_wheel_digest(wheel)
++
++
++@pytest.mark.parametrize(
++    ("filename", "digests", "version"),
++    [
++        pytest.param("setuptools-99.0-py3-none-any.whl", {"sha256": "0" * 64}, "20.1", id="filename_not_in_release"),
++        pytest.param(
++            "pip-20.1-py3-none-any.whl", {"md5": "d41d8cd98f00b204e9800998ecf8427e"}, "20.1", id="no_sha256_digest"
++        ),
++        pytest.param("pip-20.1-py3-none-any.whl", {"sha256": "0" * 64}, "19.0", id="version_not_in_releases"),
++    ],
++)
++def test_verify_wheel_digest_skips_when_unverifiable(tmp_path, mocker, filename, digests, version):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    _pypi_release_response(mocker, filename, digests, version)
++
++    verify_wheel_digest(wheel)  # must not raise: nothing to compare against
++
++
++def test_verify_wheel_digest_skips_on_pypi_lookup_failure(tmp_path, mocker):
++    wheel = Wheel(tmp_path / "pip-20.1-py3-none-any.whl")
++    wheel.path.write_bytes(b"content")
++    mocker.patch("virtualenv.seed.wheels.periodic_update.urlopen", side_effect=URLError("offline"))
++
++    verify_wheel_digest(wheel)  # must not raise: a private mirror PyPI never heard of is legitimate
+ 
+ 
+ def mock_download(mocker, pip_version_remote):
+
+--- a/docs/changelog/3250.bugfix.rst
++++ b/docs/changelog/3250.bugfix.rst
+@@ -0,0 +1,2 @@
++Fix ``activate.bat`` running arbitrary commands from a crafted ``--prompt``, ``VIRTUALENV_PROMPT``, or config file
++value.
 --- a/src/virtualenv/activation/batch/__init__.py
 +++ b/src/virtualenv/activation/batch/__init__.py
-@@ -4,6 +4,28 @@ import os
+@@ -1,10 +1,34 @@
+ from __future__ import annotations
+ 
++import logging
+ import os
  
  from virtualenv.activation.via_template import ViaTemplateActivator
++from virtualenv.util.text import collapse_line_boundaries
  
++LOGGER = logging.getLogger(__name__)
+ 
++# cmd.exe's own command-line parser looks for these regardless of surrounding quotes: on a real
++# Windows runner `@set "VAR=x & cmd"` still runs `cmd` as a second statement even though the whole
++# VAR=value expression is quoted. `(` and `)` are not in this set: `@set "VAR=C:\Program Files (x86)\..."`
++# round-trips unchanged, since parentheses are only special to cmd.exe as block delimiters in
++# control-flow syntax (if/for), not as bare characters in a value. `!` is only live when the caller
++# already has delayed expansion enabled, but is neutered unconditionally so a crafted prompt cannot
++# leak the value of an existing variable.
++_CMD_OPERATORS = ("&", "|", "<", ">", "^", "!", '"')
++
++# Of _CMD_OPERATORS, only `&` can actually occur in a real Windows path: `|`, `<`, `>` and `"` are
++# already illegal in Windows filenames. quote() can neuter `&` in free text like the prompt, but doing
++# that to a path would silently point activate.bat at a directory that does not exist, so refuse instead.
++_PATH_UNSAFE_CHARS = ("&",)
++
++_PATH_REPLACEMENT_NAMES = {
++    "__VIRTUAL_ENV__": "the destination directory",
++    "__TCL_LIBRARY__": "the interpreter's Tcl library path",
++    "__TK_LIBRARY__": "the interpreter's Tk library path",
++}
++
++
+ class BatchActivator(ViaTemplateActivator):
+     @classmethod
+     def supports(cls, interpreter):
+@@ -15,14 +39,45 @@
+         yield "deactivate.bat"
+         yield "pydoc.bat"
+ 
++    def generate(self, creator):
++        values = super().replacements(creator, creator.bin_dir)
++        problems = [reason for key in _PATH_REPLACEMENT_NAMES if (reason := _unsafe_path_reason(key, values[key]))]
++        if problems:
++            for problem in problems:
++                LOGGER.warning("skipping batch activation scripts: %s", problem)
++            return []
++        return super().generate(creator)
++
+     @staticmethod
+     def quote(string):
+-        return string
++        """Make a value safe to sit inside ``@set "VAR=value"``.
+ 
++        Batch has no escape for a double quote in this context: it always closes the quoted string,
++        and whatever follows on the line runs as live cmd.exe syntax. A raw line boundary is worse -
++        batch is line-oriented regardless of quote state, so it starts a brand-new statement instead
++        of staying inside the value. None of these can be represented literally here, so replace them
++        with a space. ``%`` still triggers variable expansion inside the quotes, but doubling it to
++        ``%%`` is a real, in-file escape that keeps the literal character.
++        """
++        string = string.replace("%", "%%")
++        for operator in _CMD_OPERATORS:
++            string = string.replace(operator, " ")
++        return collapse_line_boundaries(string)
++
+     def instantiate_template(self, replacements, template, creator):
+         # ensure the text has all newlines as \r\n - required by batch
+         base = super().instantiate_template(replacements, template, creator)
+         return base.replace(os.linesep, "\n").replace("\n", os.linesep)
++
++
++def _unsafe_path_reason(key, value):
++    found = sorted({char for char in value if char in _PATH_UNSAFE_CHARS})
++    if not found:
++        return None
++    return (
++        f"{_PATH_REPLACEMENT_NAMES[key]} ({value!r}) contains {''.join(found)!r}, and cmd.exe has no way "
++        f'to keep that literal inside the @set "VAR=value" lines activate.bat relies on'
++    )
+ 
+ 
+ __all__ = [
+--- a/src/virtualenv/util/text.py
++++ b/src/virtualenv/util/text.py
+@@ -0,0 +1,31 @@
++"""Shared text-safety helpers for values written into line-based formats."""
++
++from __future__ import annotations
++
 +# A line-based format with no escape syntax reads any character str.splitlines() treats as a
 +# boundary back as an extra line - or, for a script, runs it as one. This is the exact boundary
 +# set splitlines() recognizes, per the Python string documentation.
@@ -123,39 +564,20 @@
 +    chr(0x2029),  # paragraph separator
 +)
 +
-+# cmd.exe's own command-line parser looks for these regardless of surrounding quotes: on a real
-+# Windows runner `@set "VAR=x & cmd"` still runs `cmd` as a second statement even though the whole
-+# VAR=value expression is quoted. Caret (^) escaping is itself suppressed inside a quoted string -
-+# the exact context every value here is substituted into - so there is no way to keep them literal.
-+_CMD_OPERATORS = ("&", "|", "<", ">", "(", ")", "^")
 +
- 
- class BatchActivator(ViaTemplateActivator):
-     @classmethod
-@@ -17,6 +39,20 @@ class BatchActivator(ViaTemplateActivator):
- 
-     @staticmethod
-     def quote(string):
-+        """Make a value safe to sit inside ``@set "VAR=value"``.
++def collapse_line_boundaries(text):
++    """Replace every line-boundary character with a space so text can never become extra lines."""
++    for boundary in _LINE_BOUNDARIES:
++        text = text.replace(boundary, " ")
++    return text
 +
-+        Batch has no escape for a double quote in this context: it always closes the quoted string,
-+        and whatever follows on the line runs as live cmd.exe syntax. A raw line boundary is worse -
-+        batch is line-oriented regardless of quote state, so it starts a brand-new statement instead
-+        of staying inside the value. None of these can be represented literally here, so replace them
-+        with a space. ``%`` still triggers variable expansion inside the quotes, but doubling it to
-+        ``%%`` is a real, in-file escape that keeps the literal character.
-+        """
-+        string = string.replace("%", "%%").replace('"', " ")
-+        for operator in _CMD_OPERATORS:
-+            string = string.replace(operator, " ")
-+        for boundary in _LINE_BOUNDARIES:
-+            string = string.replace(boundary, " ")
-         return string
- 
-     def instantiate_template(self, replacements, template, creator):
---- /dev/null
++
++__all__ = [
++    "collapse_line_boundaries",
++]
+--- a/tests/unit/activation/test_batch_quote.py
 +++ b/tests/unit/activation/test_batch_quote.py
-@@ -0,0 +1,51 @@
+@@ -0,0 +1,87 @@
 +"""Regression test for the batch activation injection fix (AIKIDO-2026-785880).
 +
 +``@set "VAR=value"`` is the only place a value from ``--prompt`` (or any other replacement) reaches
@@ -165,12 +587,14 @@
 +
 +from __future__ import annotations
 +
++from argparse import Namespace
++
 +import pytest
 +
 +from virtualenv.activation.batch import BatchActivator
 +
 +# Confirmed live syntax inside @set "VAR=value" on a real Windows runner.
-+DANGEROUS = '"&|<>()^'
++DANGEROUS = '"&|<>^!'
 +LINE_BOUNDARIES = "\n\r\v\f\x1c\x1d\x1e\x85" + chr(0x2028) + chr(0x2029)
 +
 +
@@ -181,6 +605,7 @@
 +        "x^& type nul ^> pwned.marker ^& ",  # caret-escaped: still live outside a quoted context
 +        "x\n@type nul > pwned.marker\n@rem ",  # newline: a full extra statement, not just a breakout
 +        'a"&type nul>pwned.marker&"b',
++        "foo!SECRET!bar",  # delayed-expansion variable substitution
 +        "plain-value",
 +        "with space and 100% done",
 +    ],
@@ -190,6 +615,12 @@
 +
 +    assert not (set(quoted) & set(DANGEROUS))
 +    assert not (set(quoted) & set(LINE_BOUNDARIES))
++
++
++@pytest.mark.parametrize("value", ["(x86)", r"C:\Program Files (x86)\env"])
++def test_quote_leaves_parentheses_untouched(value):
++    """Parentheses are not live syntax inside ``@set "VAR=value"`` and appear in common install paths."""
++    assert BatchActivator.quote(value) == value
 +
 +
 +@pytest.mark.parametrize("value", ["100%", "%PATH%", "a%%b", "no-percent"])
@@ -207,3 +638,30 @@
 +
 +    assert rendered.count("\n") == 0
 +    assert rendered.count('"') == 2
++
++
++def test_generate_skips_destination_with_ampersand(tmp_path, caplog):
++    """An ``&`` in the destination can never be represented, so generation must skip it, not guess."""
++
++    class MockInterpreter:
++        os = "nt"
++        tcl_lib = None
++        tk_lib = None
++
++    class MockCreator:
++        def __init__(self, dest) -> None:
++            self.dest = dest
++            self.bin_dir = dest / "Scripts"
++            self.bin_dir.mkdir(parents=True)
++            self.interpreter = MockInterpreter()
++            self.pyenv_cfg = {}
++            self.env_name = "test-env"
++
++    creator = MockCreator(tmp_path / "weird&dest")
++    activator = BatchActivator(Namespace(prompt=None))
++
++    generated = activator.generate(creator)
++
++    assert generated == []
++    assert list(creator.bin_dir.iterdir()) == []
++    assert "skipping batch activation scripts" in caplog.text
