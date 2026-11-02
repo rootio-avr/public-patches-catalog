@@ -4,6 +4,7 @@ This patch is based on twig/twig version v3.11.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-48805
 - CVE-2026-46633
 - CVE-2026-47732
 - CVE-2026-24425
