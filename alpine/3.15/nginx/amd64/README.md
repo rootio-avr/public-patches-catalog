@@ -1,6 +1,6 @@
-# nginx : 1.20.2-r20076
+# nginx : 1.20.2-r20077
 
-This patch is based on nginx version 1.20.2-r20076, which is available at:
+This patch is based on nginx version 1.20.2-r20077, which is available at:
 unknown
 
 ## Affected CVEs:
