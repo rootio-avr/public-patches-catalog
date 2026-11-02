@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-883745
+- CVE-2026-59939
 
 ## How to Apply:
 1. Clone or download the source code for httplib2
