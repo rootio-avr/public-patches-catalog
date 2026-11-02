@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2025-8869
 - AIKIDO-2026-949486
+- CVE-2026-8643
 
 ## How to Apply:
 1. Clone or download the source code for pip
