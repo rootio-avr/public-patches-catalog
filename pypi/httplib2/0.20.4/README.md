@@ -4,6 +4,7 @@ This patch is based on httplib2 version 0.20.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-59939
 - AIKIDO-2026-883745
 
 ## How to Apply:
