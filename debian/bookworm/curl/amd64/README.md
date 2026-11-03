@@ -1,6 +1,6 @@
-# curl : 7.88.1-10+deb12u15.aikido.18
+# curl : 7.88.1-10+deb12u15.aikido.19
 
-This patch is based on curl version 7.88.1-10+deb12u15.aikido.18, which is available at:
+This patch is based on curl version 7.88.1-10+deb12u15.aikido.19, which is available at:
 https://sources.debian.org/src/curl/7.88.1-10+deb12u15/
 
 ## Affected CVEs:
@@ -21,6 +21,7 @@ https://sources.debian.org/src/curl/7.88.1-10+deb12u15/
 - CVE-2026-12064
 - CVE-2026-8458
 - CVE-2026-10536
+- CVE-2026-107928
 - CVE-2026-8924
 - CVE-2026-11856
 - CVE-2026-8927
