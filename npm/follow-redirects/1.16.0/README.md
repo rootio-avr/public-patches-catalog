@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-111756
 - CVE-2026-111755
+- CVE-2026-116689
 
 ## How to Apply:
 1. Clone or download the source code for follow-redirects
