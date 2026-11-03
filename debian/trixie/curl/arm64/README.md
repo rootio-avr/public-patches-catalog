@@ -1,6 +1,6 @@
-# curl : 8.14.1-2+deb13u7.aikido.24
+# curl : 8.14.1-2+deb13u7.aikido.25
 
-This patch is based on curl version 8.14.1-2+deb13u7.aikido.24, which is available at:
+This patch is based on curl version 8.14.1-2+deb13u7.aikido.25, which is available at:
 https://sources.debian.org/src/curl/8.14.1-2+deb13u7/
 
 ## Affected CVEs:
@@ -24,6 +24,22 @@ https://sources.debian.org/src/curl/8.14.1-2+deb13u7/
 - CVE-2026-80229
 - CVE-2026-82209
 - CVE-2026-19931
+- CVE-2026-107928
+- CVE-2026-107929
+- CVE-2026-86409
+- CVE-2026-86410
+- CVE-2026-86414
+- CVE-2026-87862
+- CVE-2026-87863
+- CVE-2026-87864
+- CVE-2026-87865
+- CVE-2026-92386
+- CVE-2026-92387
+- CVE-2026-92388
+- CVE-2026-92389
+- CVE-2026-92390
+- CVE-2026-92391
+- CVE-2026-94266
 
 ## How to Apply:
 1. Obtain the source package: `apt source curl`
