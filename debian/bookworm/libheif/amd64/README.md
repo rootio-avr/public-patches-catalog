@@ -1,6 +1,6 @@
-# libheif : 1.15.1-1+deb12u1.aikido.15
+# libheif : 1.15.1-1+deb12u1.aikido.17
 
-This patch is based on libheif version 1.15.1-1+deb12u1.aikido.15, which is available at:
+This patch is based on libheif version 1.15.1-1+deb12u1.aikido.17, which is available at:
 https://sources.debian.org/src/libheif/1.15.1-1+deb12u1/
 
 ## Affected CVEs:
@@ -19,7 +19,10 @@ https://sources.debian.org/src/libheif/1.15.1-1+deb12u1/
 - CVE-2026-84444
 - CVE-2026-84446
 - CVE-2026-84447
+- CVE-2026-48029
+- CVE-2026-50142
 - CVE-2026-47247
+- CVE-2026-120208
 
 ## How to Apply:
 1. Obtain the source package: `apt source libheif`
