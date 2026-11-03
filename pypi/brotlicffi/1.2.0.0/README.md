@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-9v8h-qqgm-4m35
+- CVE-2026-111497
 
 ## How to Apply:
 1. Clone or download the source code for brotlicffi
