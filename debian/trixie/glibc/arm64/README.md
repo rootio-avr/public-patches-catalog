@@ -1,6 +1,6 @@
-# glibc : 2.41-12+deb13u4.aikido.13
+# glibc : 2.41-12+deb13u4.aikido.14
 
-This patch is based on glibc version 2.41-12+deb13u4.aikido.13, which is available at:
+This patch is based on glibc version 2.41-12+deb13u4.aikido.14, which is available at:
 https://sources.debian.org/src/glibc/2.41-12+deb13u4/
 
 ## Affected CVEs:
@@ -11,6 +11,7 @@ https://sources.debian.org/src/glibc/2.41-12+deb13u4/
 - CVE-2026-6238
 - CVE-2026-5435
 - CVE-2026-19499
+- CVE-2026-84243
 
 ## How to Apply:
 1. Obtain the source package: `apt source glibc`
