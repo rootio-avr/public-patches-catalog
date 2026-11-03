@@ -7,6 +7,8 @@ unknown
 - GHSA-wjpw-4j6x-6rwh
 - CVE-2025-11143
 - CVE-2024-6763
+- CVE-2026-10050
+- CVE-2026-2332
 
 ## How to Apply:
 1. Clone or download the source code for org.eclipse.jetty:jetty-project
