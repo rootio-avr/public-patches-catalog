@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-113872
+- CVE-2026-82333
+- CVE-2026-77078
 
 ## How to Apply:
 1. Clone or download the source code for multer
