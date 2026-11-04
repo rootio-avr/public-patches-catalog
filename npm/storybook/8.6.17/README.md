@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-83232
 - AIKIDO-2026-354517
+- CVE-2026-114125
 
 ## How to Apply:
 1. Clone or download the source code for storybook
