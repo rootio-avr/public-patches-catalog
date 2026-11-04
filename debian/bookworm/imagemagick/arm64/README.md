@@ -1,10 +1,11 @@
-# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u15.aikido.60
+# imagemagick : 8:6.9.11.60+dfsg-1.6+deb12u15.aikido.61
 
-This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u15.aikido.60, which is available at:
+This patch is based on imagemagick version 8:6.9.11.60+dfsg-1.6+deb12u15.aikido.61, which is available at:
 https://sources.debian.org/src/imagemagick/8:6.9.11.60+dfsg-1.6+deb12u15/
 
 ## Affected CVEs:
 - CVE-2023-34152
+- CVE-2026-119123
 - CVE-2026-66011
 
 ## How to Apply:
