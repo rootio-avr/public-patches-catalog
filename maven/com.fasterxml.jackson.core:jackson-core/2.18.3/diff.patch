@@ -698,3 +698,472 @@
 +        }
 +    }
 +}
+
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/core/json/async/AsyncIntegerStreamingLengthLimitTest.java
+@@ -0,0 +1,112 @@
++package com.fasterxml.jackson.core.json.async;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.core.JsonFactory;
++import com.fasterxml.jackson.core.JsonFactoryBuilder;
++import com.fasterxml.jackson.core.JsonParser;
++import com.fasterxml.jackson.core.JsonToken;
++import com.fasterxml.jackson.core.StreamReadConstraints;
++import com.fasterxml.jackson.core.async.ByteArrayFeeder;
++import com.fasterxml.jackson.core.exc.StreamConstraintsException;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++import static org.junit.jupiter.api.Assertions.fail;
++
++/**
++ * Regression test for CVE-2026-68494: the non-blocking (async) parser must enforce
++ * {@code StreamReadConstraints.maxNumberLength} while the integer part of a number is
++ * streamed over many input chunks, not only once the number completes.
++ */
++class AsyncIntegerStreamingLengthLimitTest
++    extends com.fasterxml.jackson.core.JUnit5TestBase
++{
++    private static final int MAX_NUM_LEN = 1000;
++
++    private final JsonFactory STRICT_F = new JsonFactoryBuilder()
++            .streamReadConstraints(StreamReadConstraints.builder()
++                    .maxNumberLength(MAX_NUM_LEN)
++                    .build())
++            .build();
++
++    @Test
++    void positiveIntegerLargeChunks() throws Exception {
++        _verifyRejected("[", 4096, 2);
++    }
++
++    @Test
++    void negativeIntegerLargeChunks() throws Exception {
++        _verifyRejected("[-", 4096, 2);
++    }
++
++    @Test
++    void positiveIntegerSmallChunks() throws Exception {
++        // 100 digits per chunk: limit (1000) is exceeded by the 11th chunk
++        _verifyRejected("[", 100, 12);
++    }
++
++    @Test
++    void negativeIntegerSmallChunks() throws Exception {
++        _verifyRejected("[-", 100, 12);
++    }
++
++    @Test
++    void integerWithinLimitStillParses() throws Exception {
++        try (JsonParser p = STRICT_F.createNonBlockingByteArrayParser()) {
++            ByteArrayFeeder feeder = (ByteArrayFeeder) p;
++            byte[] doc = utf8Bytes("[" + _digits(MAX_NUM_LEN) + "]");
++            feeder.feedInput(doc, 0, doc.length);
++            assertEquals(JsonToken.START_ARRAY, p.nextToken());
++            assertEquals(JsonToken.VALUE_NUMBER_INT, p.nextToken());
++            assertEquals(MAX_NUM_LEN, p.getText().length());
++            assertEquals(JsonToken.END_ARRAY, p.nextToken());
++        }
++    }
++
++    private void _verifyRejected(String prefix, int chunkSize, int maxChunksAllowed)
++        throws Exception
++    {
++        try (JsonParser p = STRICT_F.createNonBlockingByteArrayParser()) {
++            ByteArrayFeeder feeder = (ByteArrayFeeder) p;
++            byte[] pre = utf8Bytes(prefix);
++            feeder.feedInput(pre, 0, pre.length);
++            JsonToken t;
++            while ((t = p.nextToken()) != JsonToken.NOT_AVAILABLE) {
++                if (t == null) {
++                    fail("Unexpected end of content while draining prefix");
++                }
++            }
++
++            byte[] chunk = utf8Bytes(_digits(chunkSize));
++            int fed = 0;
++            try {
++                // Hard cap keeps a regressed build from consuming unbounded memory
++                for (int i = 0; i < 64; ++i) {
++                    feeder.feedInput(chunk, 0, chunk.length);
++                    ++fed;
++                    JsonToken tt = p.nextToken();
++                    if (tt != JsonToken.NOT_AVAILABLE) {
++                        fail("Expected NOT_AVAILABLE while streaming integer digits, got: " + tt);
++                    }
++                }
++                fail("Accepted " + (fed * chunkSize) + " integer digits with maxNumberLength="
++                        + MAX_NUM_LEN + "; expected StreamConstraintsException");
++            } catch (StreamConstraintsException e) {
++                String msg = String.valueOf(e.getMessage());
++                assertTrue(msg.contains("Number value length") && msg.contains("exceeds the maximum allowed"),
++                        "Unexpected message: " + msg);
++                assertTrue(fed <= maxChunksAllowed,
++                        "Constraint raised too late: after " + fed + " chunks of " + chunkSize + " digits");
++            }
++        }
++    }
++
++    private static String _digits(int len) {
++        StringBuilder sb = new StringBuilder(len);
++        for (int i = 0; i < len; ++i) {
++            sb.append((char) ('1' + (i % 9)));
++        }
++        return sb.toString();
++    }
++}
+
+--- a/src/main/java/com/fasterxml/jackson/core/io/NumberInput.java
++++ b/src/main/java/com/fasterxml/jackson/core/io/NumberInput.java
+@@ -6,7 +6,6 @@
+ 
+ import java.math.BigDecimal;
+ import java.math.BigInteger;
+-import java.util.regex.Pattern;
+ 
+ /**
+  * Helper class for efficient parsing of various JSON numbers.
+@@ -33,25 +32,6 @@
+     final static String MAX_LONG_STR = String.valueOf(Long.MAX_VALUE);
+ 
+     /**
+-     * Regexp used to pre-validate "Stringified Numbers": slightly looser than
+-     * JSON Number definition (allows leading zeroes, positive sign).
+-     *
+-     * @since 2.17
+-     */
+-    private final static Pattern PATTERN_FLOAT = Pattern.compile(
+-          "[+-]?[0-9]*[\\.]?[0-9]+([eE][+-]?[0-9]+)?");
+-
+-
+-    /**
+-     * Secondary regexp used along with {@code PATTERN_FLOAT} to cover
+-     * case where number ends with dot, like {@code "+12."}
+-     *
+-     * @since 2.17.2
+-     */
+-    private final static Pattern PATTERN_FLOAT_TRAILING_DOT = Pattern.compile(
+-            "[+-]?[0-9]+[\\.]");
+-    
+-    /**
+      * Fast method for parsing unsigned integers that are known to fit into
+      * regular 32-bit signed int type. This means that length is
+      * between 1 and 9 digits (inclusive) and there is no sign character.
+@@ -636,23 +616,86 @@
+      *<p>
+      * Note: this method returning {@code true} DOES NOT GUARANTEE String is valid
+      * number but just that it looks close enough.
++     *<p>
++     * Note: method rewritten in 2.18.11 to avoid use of JDK regexp functionality.
+      *
+      * @param s String to validate
+      *
+      * @return True if String looks like valid Java number; false otherwise.
+      *
+-     * @since 2.17
++     * @since 2.17 (rewritten in 2.18.11)
+      */
+     public static boolean looksLikeValidNumber(final String s) {
+-        // While PATTERN_FLOAT handles most cases we can optimize some simple ones:
+-        if (s == null || s.isEmpty()) {
++        // [core#1649] Hand-rolled scan; matches (union of)
++        //    "[+-]?[0-9]*[.]?[0-9]+([eE][+-]?[0-9]+)?" and "[+-]?[0-9]+[.]"
++        if (s == null) {
+             return false;
+         }
+-        if (s.length() == 1) {
+-            char c = s.charAt(0);
+-            return (c <= '9') && (c >= '0');
++        final int len = s.length();
++        if (len == 0) {
++            return false;
+         }
+-        return PATTERN_FLOAT.matcher(s).matches()
+-                || PATTERN_FLOAT_TRAILING_DOT.matcher(s).matches();
++        int i = 0;
++        char c = s.charAt(i);
++
++        // Optional sign
++        if (c == '+' || c == '-') {
++            if (++i == len) { // sign alone
++                return false;
++            }
++            c = s.charAt(i);
++        }
++
++        // Integer part, if any
++        final int intStart = i;
++        while (c >= '0' && c <= '9') {
++            if (++i == len) { // "[+-]?[0-9]+"
++                return true;
++            }
++            c = s.charAt(i);
++        }
++        final int intDigits = i - intStart;
++
++        if (c == '.') {
++            if (++i == len) { // trailing dot only allowed after digit(s)
++                return intDigits > 0;
++            }
++            c = s.charAt(i);
++            final int fractStart = i;
++            while (c >= '0' && c <= '9') {
++                if (++i == len) {
++                    return true;
++                }
++                c = s.charAt(i);
++            }
++            if (i == fractStart) { // "1.x": no fraction digits, and not trailing dot
++                return false;
++            }
++        } else if (intDigits == 0) { // no mantissa digits at all
++            return false;
++        }
++
++        // Only an exponent may follow
++        if (c != 'e' && c != 'E') {
++            return false;
++        }
++        if (++i == len) {
++            return false;
++        }
++        c = s.charAt(i);
++        if (c == '+' || c == '-') {
++            if (++i == len) {
++                return false;
++            }
++            c = s.charAt(i);
++        }
++        while (c >= '0' && c <= '9') {
++            if (++i == len) {
++                return true;
++            }
++            c = s.charAt(i);
++        }
++        // Either no exponent digits, or trailing garbage
++        return false;
+     }
+ }
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/core/io/NumberInputLooksLikeValidNumberTest.java
+@@ -0,0 +1,74 @@
++package com.fasterxml.jackson.core.io;
++
++import java.util.regex.Pattern;
++
++import org.junit.jupiter.api.Test;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertFalse;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++// [core#1649]: hand-rolled NumberInput.looksLikeValidNumber() must accept
++// exactly what the original Regexp-based implementation did
++class NumberInputLooksLikeValidNumberTest
++{
++    @Test
++    void validNumbers()
++    {
++        assertTrue(NumberInput.looksLikeValidNumber("0"));
++        assertTrue(NumberInput.looksLikeValidNumber("-1"));
++        assertTrue(NumberInput.looksLikeValidNumber("+12"));
++        assertTrue(NumberInput.looksLikeValidNumber("1.5"));
++        assertTrue(NumberInput.looksLikeValidNumber(".5"));
++        assertTrue(NumberInput.looksLikeValidNumber("6."));
++        assertTrue(NumberInput.looksLikeValidNumber("1.4E-45"));
++        assertTrue(NumberInput.looksLikeValidNumber("1.4e+45"));
++        assertTrue(NumberInput.looksLikeValidNumber("+1.2e+3"));
++        assertTrue(NumberInput.looksLikeValidNumber("-12.34E-56"));
++    }
++
++    @Test
++    void invalidNumbers()
++    {
++        assertFalse(NumberInput.looksLikeValidNumber(null));
++        assertFalse(NumberInput.looksLikeValidNumber(""));
++        assertFalse(NumberInput.looksLikeValidNumber("."));
++        assertFalse(NumberInput.looksLikeValidNumber("+."));
++        assertFalse(NumberInput.looksLikeValidNumber("-E"));
++        assertFalse(NumberInput.looksLikeValidNumber("1.2.3"));
++        assertFalse(NumberInput.looksLikeValidNumber("1.e5"));
++        assertFalse(NumberInput.looksLikeValidNumber("1e"));
++        assertFalse(NumberInput.looksLikeValidNumber("1e+"));
++        assertFalse(NumberInput.looksLikeValidNumber("1e5x"));
++        assertFalse(NumberInput.looksLikeValidNumber("1e5.0"));
++        assertFalse(NumberInput.looksLikeValidNumber("--1"));
++        assertFalse(NumberInput.looksLikeValidNumber("1 "));
++        assertFalse(NumberInput.looksLikeValidNumber(" 1"));
++        assertFalse(NumberInput.looksLikeValidNumber("0x1F"));
++    }
++
++    @Test
++    void matchesLegacyRegexps()
++    {
++        final Pattern patternFloat = Pattern.compile("[+-]?[0-9]*[\\.]?[0-9]+([eE][+-]?[0-9]+)?");
++        final Pattern patternTrailingDot = Pattern.compile("[+-]?[0-9]+[\\.]");
++        final char[] alphabet = new char[] { '0', '9', '/', ':', '+', '-', '.', 'e', 'E' };
++        _verify(patternFloat, patternTrailingDot, alphabet, "", 5);
++    }
++
++    private void _verify(Pattern patternFloat, Pattern patternTrailingDot,
++            char[] alphabet, String prefix, int remainingLength)
++    {
++        if (!prefix.isEmpty()) {
++            boolean exp = patternFloat.matcher(prefix).matches()
++                    || patternTrailingDot.matcher(prefix).matches();
++            assertEquals(exp, NumberInput.looksLikeValidNumber(prefix),
++                    "Mismatch for input '"+prefix+"'");
++        }
++        if (remainingLength > 0) {
++            for (char c : alphabet) {
++                _verify(patternFloat, patternTrailingDot, alphabet, prefix + c, remainingLength - 1);
++            }
++        }
++    }
++}
+
+--- a/src/main/java/com/fasterxml/jackson/core/json/UTF8DataInputJsonParser.java
++++ b/src/main/java/com/fasterxml/jackson/core/json/UTF8DataInputJsonParser.java
+@@ -2130,8 +2130,14 @@
+             return _handleInvalidNumberStart(_inputData.readUnsignedByte(), false, true);
+         }
+         // [core#77] Try to decode most likely token
+-        if (Character.isJavaIdentifierStart(c)) {
+-            _reportInvalidToken(c, ""+((char) c), _validJsonTokenList());
++        if (c > 0x7F) { // multi-byte UTF-8 char: decode first (consumes rest of its bytes)
++            c = _decodeCharForError(c);
++            if (Character.isJavaIdentifierStart(c)) {
++                _reportInvalidToken(_inputData.readUnsignedByte(), ""+((char) c), _validJsonTokenList());
++            }
++        } else if (Character.isJavaIdentifierStart(c)) {
++            // NOTE: 'c' is decoded (and appended) by _reportInvalidToken(); do not pre-append
++            _reportInvalidToken(c, "", _validJsonTokenList());
+         }
+         // but if it doesn't look like a token:
+         _reportUnexpectedChar(c, "expected a valid value "+_validJsonValueList());
+@@ -2272,7 +2278,9 @@
+         // but actually only alphanums are problematic
+         char c = (char) _decodeCharForError(ch);
+         if (Character.isJavaIdentifierPart(c)) {
+-            _reportInvalidToken(c, matchStr.substring(0, i));
++            // 'c' already decoded (all of its bytes consumed): include it as matched,
++            // continue from the following byte
++            _reportInvalidToken(_inputData.readUnsignedByte(), matchStr.substring(0, i) + c);
+         }
+     }
+ 
+@@ -2763,6 +2771,7 @@
+         throws IOException
+      {
+          StringBuilder sb = new StringBuilder(matchedPart);
++         final int maxTokenLength = _ioContext.errorReportConfiguration().getMaxErrorTokenLength();
+ 
+          /* Let's just try to find what appears to be the token, using
+           * regular Java identifier character rules. It's just a heuristic,
+@@ -2774,6 +2783,10 @@
+                  break;
+              }
+              sb.append(c);
++             if (sb.length() >= maxTokenLength) {
++                 sb.append("...");
++                 break;
++             }
+              ch = _inputData.readUnsignedByte();
+          }
+          _reportError("Unrecognized token '"+sb.toString()+"': was expecting "+msg);
+--- a/src/test/java/com/fasterxml/jackson/core/ErrorReportConfigurationTest.java
++++ b/src/test/java/com/fasterxml/jackson/core/ErrorReportConfigurationTest.java
+@@ -216,7 +216,58 @@
+         }
+     }
+ 
++    // [core#1698]: every parser backend must honor `maxErrorTokenLength`;
++    //   `UTF8DataInputJsonParser` used to accumulate the whole token instead
+     @Test
++    void errorTokenLengthBoundedInAllModes()
++            throws Exception
++    {
++        final int maxLen = 256;
++        final JsonFactory f = streamFactoryBuilder()
++                .errorReportConfiguration(ErrorReportConfiguration.builder()
++                        .maxErrorTokenLength(maxLen).build())
++                .build();
++        // Broken token far longer than the limit: must be truncated, not accumulated in full
++        final String doc = _buildBrokenJsonOfLength(50 * maxLen);
++        // limit, plus appended "..."
++        final String expToken = _brokenToken(maxLen) + "...";
++
++        for (int mode : ALL_MODES) {
++            try (JsonParser p = createParser(f, mode, doc)) {
++                p.nextToken();
++                p.nextToken();
++                fail("Should not pass, mode: "+mode);
++            } catch (JsonProcessingException e) {
++                assertThat(_unrecognizedToken(e.getMessage()))
++                        .as("mode: %d", mode)
++                        .isEqualTo(expToken);
++            }
++        }
++    }
++
++    // Short broken token (below limit) must be reported verbatim, without
++    // duplicated leading char, in all modes
++    @Test
++    void shortErrorTokenReportedExactlyInAllModes()
++            throws Exception
++    {
++        final JsonFactory f = newStreamFactory();
++        final String doc = "{\"key\":abc!}";
++
++        for (int mode : ALL_MODES) {
++            try (JsonParser p = createParser(f, mode, doc)) {
++                p.nextToken();
++                p.nextToken();
++                fail("Should not pass, mode: "+mode);
++            } catch (JsonProcessingException e) {
++                assertThat(_unrecognizedToken(e.getMessage()))
++                        .as("mode: %d", mode)
++                        .isEqualTo("abc");
++            }
++        }
++    }
++
++    @Test
+     void nonPositiveErrorTokenConfig()
+     {
+         // Zero should be ok
+@@ -318,13 +369,29 @@
+         }
+     }
+ 
++    // Extracts X from "Unrecognized token 'X': was expecting ..."
++    private String _unrecognizedToken(String msg)
++    {
++        final String prefix = "Unrecognized token '";
++        final int start = msg.indexOf(prefix);
++        assertThat(start).as("message: %s", msg).isGreaterThanOrEqualTo(0);
++        final int end = msg.indexOf("': was expecting", start);
++        assertThat(end).as("message: %s", msg).isGreaterThan(start);
++        return msg.substring(start + prefix.length(), end);
++    }
++
+     private String _buildBrokenJsonOfLength(int len)
+     {
+-        StringBuilder sb = new StringBuilder("{\"key\":");
++        return "{\"key\":" + _brokenToken(len) + "!}";
++    }
++
++    // Varied (not repeating single) chars so that duplicated/dropped chars are detectable
++    private String _brokenToken(int len)
++    {
++        StringBuilder sb = new StringBuilder(len);
+         for (int i = 0; i < len; i++) {
+-            sb.append("a");
++            sb.append((char) ('a' + (i % 26)));
+         }
+-        sb.append("!}");
+         return sb.toString();
+     }
+ }
