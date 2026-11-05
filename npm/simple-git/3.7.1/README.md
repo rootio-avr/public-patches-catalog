@@ -4,7 +4,11 @@ This patch is based on simple-git version 3.7.1, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2022-25860
+- CVE-2022-25912
+- CVE-2026-102827
 - CVE-2026-102826
+- CVE-2026-6951
 
 ## How to Apply:
 1. Clone or download the source code for simple-git
