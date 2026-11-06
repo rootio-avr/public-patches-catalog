@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-40175
+- CVE-2026-44490
 
 ## How to Apply:
 1. Clone or download the source code for axios
