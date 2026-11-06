@@ -9,6 +9,7 @@ unknown
 - CVE-2026-102827
 - CVE-2026-102826
 - CVE-2026-6951
+- AIKIDO-2026-10315
 
 ## How to Apply:
 1. Clone or download the source code for simple-git
