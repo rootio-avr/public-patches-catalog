@@ -30,6 +30,7 @@ unknown
 - CVE-2026-44495
 - CVE-2026-44496
 - CVE-2026-44492
+- GHSA-mmx7-hfxf-jppx
 - SNYK-JS-AXIOS-9403194
 - GHSA-42h9-826w-cgv3
 - GHSA-7q8q-rj6j-mhjq
