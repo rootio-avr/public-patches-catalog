@@ -1930,3 +1930,478 @@ index dc0bf74..05db007 100644
      }));
    };
  });
+
+Backport of upstream axios PR #10858 (merge caa00a9, released as v1.16.1) to
+axios v1.8.4, addressing AIKIDO-2026-10823 (CWE-319: HTTPS request data sent
+in cleartext to HTTP proxy).
+
+Root cause in v1.8.4: setProxy() unconditionally rewrites options.hostname /
+options.port / options.path / options.protocol to point at the proxy and
+switches the request into forward-proxy mode for every proxied request,
+regardless of whether the origin is http:// or https://. When the caller
+asked for https://origin/... axios still sent the full absolute URL, request
+headers, and body to the proxy in cleartext (or to the proxy's TLS session
+which terminates at the proxy, not the origin). Any proxy on the path -
+including one injected via HTTPS_PROXY env var - saw and could tamper with
+the whole request.
+
+Fix (semantic backport of the v1.16.1 change) - implemented WITHOUT adding a
+runtime dependency, since the internal npm build hook for axios@1.8.4 uses
+`mode: universal` / `alias: true` and does NOT run `npm install`, so any new
+`dependencies` entry in package.json cannot be resolved at build time.
+Instead of pulling `https-proxy-agent`, this patch inlines a minimal CONNECT
+tunnel implementation on top of Node's built-in `net`, `tls`, `http`, `https`,
+`url` modules:
+
+  * A local `HttpsTunnelAgent` class extends `https.Agent` and overrides
+    `createConnection(options, callback)`. It opens a plain `net.connect`
+    (or `tls.connect` when the proxy scheme is https:) to the configured
+    proxy host:port, writes an HTTP CONNECT request naming the true origin
+    host:port (with an optional Basic Proxy-Authorization line built from
+    proxy.auth only - never from the target request's Authorization header),
+    buffers the proxy response until the CRLFCRLF terminator, and on
+    HTTP/1.x 200 upgrades the socket via `tls.connect({ socket, servername:
+    <origin host>, ... })` so the ClientHello, HTTP request, and body all
+    travel end-to-end encrypted to the origin. Non-200 responses, socket
+    errors, and premature close are surfaced as an AxiosError through the
+    createConnection callback.
+  * A module-level `Map` caches tunnel agents by proxy URL + target host:port
+    + proxy-auth, so repeat requests through the same proxy reuse a single
+    agent (and its socket pool). The keyspace is bounded by the set of
+    distinct proxy configs the process uses.
+  * When the target scheme is HTTPS, setProxy() now installs the tunneling
+    agent on both `options.agent` (for the `config.maxRedirects === 0` path
+    that goes straight to https.request) and `options.agents.https` (for the
+    follow-redirects path, which ignores `options.agent` when `options.agents`
+    is present). It leaves `options.hostname`, `options.port`, `options.path`,
+    and `options.protocol` pointing at the true origin so TLS SNI and
+    certificate verification apply to the origin, not the proxy. User TLS
+    options from `config.httpsAgent` (custom CA, rejectUnauthorized, client
+    cert) are forwarded into the tunnel agent so pinning / verification
+    behavior is preserved.
+  * When the target scheme is HTTP, keep the existing forward-proxy
+    behavior verbatim: stamp Proxy-Authorization onto request headers and
+    rewrite hostname/port/path/protocol to point at the proxy. Plaintext HTTP
+    is already inspectable on the wire so this branch is unchanged.
+  * The redirect closure forwards `config.httpsAgent` through recursive
+    setProxy() calls and, before recomputing proxy state, strips any
+    tunneling agent we installed on the previous hop (matched by the
+    `kAxiosInstalledTunnel` Symbol so a user-supplied agent that happens to
+    be a proxy agent is left alone). This prevents a stale HTTPS-target
+    CONNECT agent from leaking into a subsequent HTTP-target hop or a
+    no-proxy hop.
+  * The httpAdapter call site now passes isRedirect=false and
+    config.httpsAgent to setProxy(), and no longer clobbers a tunneling
+    agent installed by setProxy() when it later assigns options.agent based
+    on the target protocol.
+
+Deltas from the upstream fix (adjustments made for v1.8.4):
+  * Rebased on top of the axios 1.8.4 CVE patches already merged in this build
+    (e.g. CVE-2026-44494 readProxyField()/own-property proxy field reads and
+    Object-form proxy.auth validation, and the isRedirect Proxy-Authorization
+    stripping). Those are reused unchanged; the HTTPS branch reads proxy
+    fields through readProxyField() and the validated proxyAuth string.
+  * The user-supplied Host-header preservation added post-1.8.4 is not
+    present; the HTTP-target branch keeps the existing
+    options.headers.host = hostname:port behavior, and the CONNECT-tunneled
+    HTTPS branch sets no Host override (the Host header travels inside TLS
+    to the origin).
+  * README.md and THREATMODEL.md prose updates from the fix are
+    documentation-only and are not included (v1.8.4's README section text
+    diverges significantly and THREATMODEL.md doesn't exist in v1.8.4;
+    neither affects security behavior).
+  * The upstream regression tests live at tests/unit/adapters/http.test.js
+    (vitest); v1.8.4 uses mocha at test/unit/adapters/http.js with a very
+    different scaffold. Test-file rebase is out of scope for the security
+    fix; verification is expected via manual regression against an HTTP
+    proxy (issue #6320 reproducer).
+  * package.json is intentionally NOT modified. The upstream fix adds
+    `https-proxy-agent` as a runtime dep; we implement the CONNECT tunnel
+    in-tree using Node built-ins because the axios@1.8.4 hook does not run
+    `npm install` and cannot resolve a newly introduced dep.
+
+Origin: upstream, https://github.com/axios/axios/commit/caa00a9
+Origin: upstream, https://github.com/axios/axios/pull/10858
+Bug: https://github.com/axios/axios/issues/6320
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -6,6 +6,8 @@
+ import buildURL from './../helpers/buildURL.js';
+ import proxyFromEnv from 'proxy-from-env';
+ import http from 'http';
++import net from 'net';
++import tls from 'tls';
+ import https from 'https';
+ import util from 'util';
+ import followRedirects from 'follow-redirects';
+@@ -44,6 +46,147 @@
+ 
+ const isHttps = /https:?/;
+ 
++// Tags tunneling agent instances installed by setProxy() so the redirect path
++// can strip them without clobbering a user-supplied agent.
++const kAxiosInstalledTunnel = Symbol('axios.http.installedTunnel');
++
++// Cache of CONNECT-tunneling agents keyed by proxy config + origin host:port so
++// repeat requests through the same proxy reuse a single agent (and its socket
++// pool). The keyspace is bounded by the set of distinct proxy/origin pairs the
++// process uses, so unbounded growth is not a concern in practice.
++const tunnelingAgentCache = new Map();
++
++/**
++ * https.Agent subclass that establishes an HTTP CONNECT tunnel through a proxy
++ * and then upgrades the socket to TLS to the true origin. Implemented on top
++ * of Node's built-in `net`, `tls`, and `https` modules only - no runtime
++ * dependency added.
++ */
++class HttpsTunnelAgent extends https.Agent {
++  constructor(tunnelOptions) {
++    // Forward user TLS options (custom CA, rejectUnauthorized, client cert,
++    // ALPN, etc.) into the underlying https.Agent so they apply to the
++    // origin TLS handshake performed after CONNECT.
++    super(tunnelOptions.userTlsOptions || {});
++    this.proxy = tunnelOptions.proxy;               // {protocol, hostname, port, auth?}
++    this.userTlsOptions = tunnelOptions.userTlsOptions || {};
++  }
++
++  createConnection(options, callback) {
++    const proxy = this.proxy;
++    const targetHost = options.host || options.hostname;
++    const targetPort = options.port || 443;
++    const proxyIsTls = proxy.protocol === 'https:';
++    const proxyPort = proxy.port
++      ? Number(proxy.port)
++      : (proxyIsTls ? 443 : 80);
++
++    let settled = false;
++    const done = (err, socket) => {
++      if (settled) return;
++      settled = true;
++      if (err) {
++        try { proxySocket && proxySocket.destroy(); } catch (_) {}
++      }
++      callback(err, socket);
++    };
++
++    const onProxyError = (err) => {
++      done(new AxiosError(
++        'Proxy CONNECT failed: ' + (err && err.message ? err.message : String(err)),
++        AxiosError.ECONNABORTED
++      ));
++    };
++    const onProxyClose = () => {
++      done(new AxiosError(
++        'Proxy closed connection before CONNECT response',
++        AxiosError.ECONNABORTED
++      ));
++    };
++
++    const proxySocket = proxyIsTls
++      ? tls.connect({
++          host: proxy.hostname,
++          port: proxyPort,
++          servername: proxy.hostname,
++          ALPNProtocols: ['http/1.1']
++        })
++      : net.connect({ host: proxy.hostname, port: proxyPort });
++
++    proxySocket.once('error', onProxyError);
++    proxySocket.once('close', onProxyClose);
++
++    const onConnected = () => {
++      // Send CONNECT request. Proxy-Authorization is derived only from
++      // proxy.auth - never from the target request's Authorization header.
++      let connectReq =
++        'CONNECT ' + targetHost + ':' + targetPort + ' HTTP/1.1\r\n' +
++        'Host: ' + targetHost + ':' + targetPort + '\r\n';
++      if (proxy.auth) {
++        const b64 = Buffer.from(proxy.auth, 'utf8').toString('base64');
++        connectReq += 'Proxy-Authorization: Basic ' + b64 + '\r\n';
++      }
++      connectReq += '\r\n';
++
++      let responseBuffer = Buffer.alloc(0);
++      const onData = (chunk) => {
++        responseBuffer = Buffer.concat([responseBuffer, chunk]);
++        const headerEnd = responseBuffer.indexOf('\r\n\r\n');
++        if (headerEnd === -1) {
++          if (responseBuffer.length > 16 * 1024) {
++            proxySocket.removeListener('data', onData);
++            done(new AxiosError('Proxy CONNECT response headers too large', AxiosError.ERR_BAD_RESPONSE));
++          }
++          return;
++        }
++        proxySocket.removeListener('data', onData);
++        proxySocket.removeListener('error', onProxyError);
++        proxySocket.removeListener('close', onProxyClose);
++        const statusLine = responseBuffer.slice(0, responseBuffer.indexOf('\r\n')).toString('ascii');
++        const m = /^HTTP\/1\.[01]\s+(\d{3})/.exec(statusLine);
++        if (!m || m[1] !== '200') {
++          return done(new AxiosError(
++            'Proxy CONNECT failed with status: ' + (m ? m[1] : statusLine),
++            AxiosError.ERR_BAD_RESPONSE
++          ));
++        }
++        // 200 established: upgrade the socket to TLS to the origin.
++        const tlsSocket = tls.connect({
++          ...this.userTlsOptions,
++          ...options,
++          socket: proxySocket,
++          servername: this.userTlsOptions.servername || targetHost,
++          host: targetHost,
++          port: targetPort
++        });
++        tlsSocket.once('error', (e) => done(e));
++        done(null, tlsSocket);
++      };
++      proxySocket.on('data', onData);
++      proxySocket.write(connectReq);
++    };
++
++    proxyIsTls
++      ? proxySocket.once('secureConnect', onConnected)
++      : proxySocket.once('connect', onConnected);
++  }
++}
++
++function getTunnelingAgent(proxy, targetHost, targetPort, userHttpsAgent) {
++  const userTlsOptions =
++    userHttpsAgent && userHttpsAgent.options ? userHttpsAgent.options : {};
++  const key =
++    (proxy.protocol || 'http:') + '//' +
++    (proxy.hostname || '') + ':' + (proxy.port || '') + '#' +
++    (proxy.auth || '') + '->' + targetHost + ':' + targetPort;
++  let agent = tunnelingAgentCache.get(key);
++  if (agent) return agent;
++  agent = new HttpsTunnelAgent({ proxy, userTlsOptions });
++  agent[kAxiosInstalledTunnel] = true;
++  tunnelingAgentCache.set(key, agent);
++  return agent;
++}
++
+ const supportedProtocols = platform.protocols.map(protocol => {
+   return protocol + ':';
+ });
+@@ -82,7 +225,7 @@
+  *
+  * @returns {http.ClientRequestArgs}
+  */
+-function setProxy(options, configProxy, location, isRedirect) {
++function setProxy(options, configProxy, location, isRedirect, configHttpsAgent) {
+   let proxy = configProxy;
+   if (!proxy && proxy !== false) {
+     const proxyUrl = proxyFromEnv.getProxyForUrl(location);
+@@ -103,6 +246,17 @@
+       }
+     }
+   }
++  // Strip any tunneling agent we installed for the previous hop so a redirect
++  // that drops the proxy or crosses an HTTPS<->HTTP boundary doesn't reuse a
++  // stale one. Match on our Symbol marker so a user-supplied agent (which
++  // won't carry the marker) is left alone.
++  if (isRedirect && options.agent && options.agent[kAxiosInstalledTunnel]) {
++    options.agent = undefined;
++  }
++  if (isRedirect && options.agents && options.agents.https &&
++      options.agents.https[kAxiosInstalledTunnel]) {
++    options.agents.https = undefined;
++  }
+   if (proxy) {
+     // Read proxy fields without traversing the prototype chain. URL instances expose
+     // username/password/hostname/host/port/protocol via getters on URL.prototype (so
+@@ -139,30 +293,80 @@
+       } else if (authIsObject) {
+         throw new AxiosError('Invalid proxy authorization', AxiosError.ERR_BAD_OPTION, { proxy });
+       }
+-
+-      const base64 = Buffer
+-        .from(proxyAuth, 'utf8')
+-        .toString('base64');
+-      options.headers['Proxy-Authorization'] = 'Basic ' + base64;
+     }
+ 
+-    options.headers.host = options.hostname + (options.port ? ':' + options.port : '');
+-    const proxyHost = readProxyField('hostname') || readProxyField('host');
+-    options.hostname = proxyHost;
+-    // Replace 'host' since options is not a URL object
+-    options.host = proxyHost;
+-    options.port = readProxyField('port');
+-    options.path = location;
+-    const proxyProtocol = readProxyField('protocol');
+-    if (proxyProtocol) {
+-      options.protocol = proxyProtocol.includes(':') ? proxyProtocol : `${proxyProtocol}:`;
++    const targetIsHttps = isHttps.test(options.protocol);
++
++    if (targetIsHttps) {
++      // CONNECT-tunneling path for HTTPS targets. Preserves end-to-end TLS to
++      // the origin so the proxy cannot inspect URL, headers, or body.
++      // Proxy-Authorization is placed on the CONNECT request only, never on
++      // the wrapped TLS request, so it is deliberately NOT stamped onto
++      // options.headers here.
++      const proxyHost = readProxyField('hostname') || readProxyField('host');
++      const rawProxyProtocol = readProxyField('protocol');
++      const proxyPort = readProxyField('port');
++      const normalizedProtocol = rawProxyProtocol
++        ? (rawProxyProtocol.includes(':') ? rawProxyProtocol : `${rawProxyProtocol}:`)
++        : 'http:';
++      // Bracket IPv6 literals for URL parsing; URL.hostname keeps brackets on
++      // read so they are stripped again below for the tunnel agent.
++      const proxyHostForURL =
++        proxyHost && proxyHost.includes(':') && !proxyHost.startsWith('[')
++          ? `[${proxyHost}]`
++          : proxyHost;
++      const proxyURL = new URL(
++        `${normalizedProtocol}//${proxyHostForURL}${proxyPort ? ':' + proxyPort : ''}`
++      );
++      const normalizedProxy = {
++        protocol: proxyURL.protocol,
++        hostname: proxyURL.hostname.replace(/^\[|\]$/g, ''),
++        port: proxyURL.port,
++        auth: proxyAuth && typeof proxyAuth === 'string' ? proxyAuth : undefined
++      };
++      const targetHost = options.hostname;
++      const targetPort = options.port || 443;
++      const tunnelingAgent = getTunnelingAgent(
++        normalizedProxy, targetHost, targetPort, configHttpsAgent
++      );
++      // Set both: `options.agent` is consumed by the native https.request path
++      // (config.maxRedirects === 0); `options.agents.https` is consumed by
++      // follow-redirects, which ignores `options.agent` when `options.agents`
++      // is present. Leave options.hostname/port/path/protocol pointing at the
++      // true origin so TLS SNI and cert verification apply to the origin.
++      options.agent = tunnelingAgent;
++      if (options.agents) {
++        options.agents.https = tunnelingAgent;
++      }
++    } else {
++      // Forward-proxy mode for plaintext HTTP targets. The request line carries
++      // the absolute URL and the proxy sees everything - acceptable for plain
++      // HTTP since the wire was already plaintext.
++      if (proxyAuth) {
++        const base64 = Buffer
++          .from(proxyAuth, 'utf8')
++          .toString('base64');
++        options.headers['Proxy-Authorization'] = 'Basic ' + base64;
++      }
++
++      options.headers.host = options.hostname + (options.port ? ':' + options.port : '');
++      const proxyHost = readProxyField('hostname') || readProxyField('host');
++      options.hostname = proxyHost;
++      // Replace 'host' since options is not a URL object
++      options.host = proxyHost;
++      options.port = readProxyField('port');
++      options.path = location;
++      const proxyProtocol = readProxyField('protocol');
++      if (proxyProtocol) {
++        options.protocol = proxyProtocol.includes(':') ? proxyProtocol : `${proxyProtocol}:`;
++      }
+     }
+   }
+ 
+   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
+     // Configure proxy for redirected request, passing the original config proxy to apply
+     // the exact same logic as if the redirected request was performed by axios directly.
+-    setProxy(redirectOptions, configProxy, redirectOptions.href, true);
++    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent);
+   };
+ }
+ 
+@@ -497,12 +701,22 @@
+     } else {
+       options.hostname = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+       options.port = parsed.port;
+-      setProxy(options, config.proxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path);
++      setProxy(
++        options,
++        config.proxy,
++        protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path,
++        false,
++        config.httpsAgent
++      );
+     }
+ 
+     let transport;
+     const isHttpsRequest = isHttps.test(options.protocol);
+-    options.agent = isHttpsRequest ? config.httpsAgent : config.httpAgent;
++    // Don't clobber a CONNECT-tunneling agent installed by setProxy() for an
++    // HTTPS target.
++    if (options.agent == null) {
++      options.agent = isHttpsRequest ? config.httpsAgent : config.httpAgent;
++    }
+     const configTransport = own('transport');
+     if (configTransport) {
+       transport = configTransport;
+--- /dev/null
++++ b/test/unit/adapters/httpsProxyTunnel.js
+@@ -0,0 +1,70 @@
++import assert from 'assert';
++import {__setProxy} from '../../../lib/adapters/http.js';
++
++describe('adapters::http HTTPS proxy CONNECT tunneling (AIKIDO-2026-10823)', function () {
++  const proxy = {protocol: 'http:', hostname: '127.0.0.1', port: 3128, auth: {username: 'u', password: 'p'}};
++
++  function httpsOptions() {
++    return {
++      protocol: 'https:',
++      hostname: 'origin.example',
++      port: '',
++      path: '/secret?token=1',
++      headers: {authorization: 'Bearer abc'},
++      beforeRedirects: Object.create(null)
++    };
++  }
++
++  it('does not rewrite an HTTPS request to point at the proxy', function () {
++    const options = httpsOptions();
++    __setProxy(options, proxy, 'https://origin.example/secret?token=1', false);
++
++    assert.strictEqual(options.hostname, 'origin.example');
++    assert.strictEqual(options.path, '/secret?token=1');
++    assert.strictEqual(options.protocol, 'https:');
++    assert.ok(options.agent, 'a CONNECT tunneling agent should be installed');
++    assert.strictEqual(typeof options.agent.createConnection, 'function');
++  });
++
++  it('keeps Proxy-Authorization off the tunneled request headers', function () {
++    const options = httpsOptions();
++    __setProxy(options, proxy, 'https://origin.example/secret?token=1', false);
++
++    assert.ok(!('Proxy-Authorization' in options.headers));
++    assert.strictEqual(options.headers.authorization, 'Bearer abc');
++  });
++
++  it('still uses forward-proxy mode for plain HTTP targets', function () {
++    const options = {
++      protocol: 'http:',
++      hostname: 'origin.example',
++      port: '',
++      path: '/x',
++      headers: {},
++      beforeRedirects: Object.create(null)
++    };
++    __setProxy(options, proxy, 'http://origin.example/x', false);
++
++    assert.strictEqual(options.hostname, '127.0.0.1');
++    assert.strictEqual(options.path, 'http://origin.example/x');
++    assert.ok(options.headers['Proxy-Authorization']);
++  });
++
++  it('drops a tunneling agent installed for a previous hop on redirect to a no-proxy target', function () {
++    const options = httpsOptions();
++    __setProxy(options, proxy, 'https://origin.example/secret?token=1', false);
++    assert.ok(options.agent);
++
++    const redirect = {
++      protocol: 'http:',
++      hostname: 'other.example',
++      port: '',
++      path: '/',
++      headers: {},
++      agent: options.agent,
++      beforeRedirects: Object.create(null)
++    };
++    __setProxy(redirect, false, 'http://other.example/', true);
++    assert.strictEqual(redirect.agent, undefined);
++  });
++});
