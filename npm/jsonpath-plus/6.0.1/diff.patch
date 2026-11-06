@@ -1,0 +1,4578 @@
+--- a/CHANGES.md
++++ b/CHANGES.md
+@@ -1,5 +1,11 @@
+ # CHANGES for jsonpath-plus
+ 
++## Unreleased
++
++- Security fix (CVE-2024-21534): Evaluate filter/script expressions with
++    a restricted, dependency-free expression interpreter instead of Node's
++    `vm`/`new Function`; block access to `constructor`, `__proto__`, etc.
++
+ ## 6.0.1 (2021-07-07)
+ 
+ - Fix: Some `package.json` paths needed updating (@matushorvath)
+--- a/README.md
++++ b/README.md
+@@ -183,6 +183,10 @@
+   operating on untrusted user input, for example), one may wish to
+   set this option to `true` to throw exceptions when these expressions
+   are attempted.
++  Note that filter and script expressions are evaluated by a restricted
++  built-in expression interpreter rather than by Node's `vm` (or
++  `new Function`), and cannot access globals or properties such as
++  `constructor` and `__proto__`.
+ - ***parent*** (**default: null**) - In the event that a query could be
+   made to return the root node, this allows the parent of that root node
+   to be returned within results.
+--- /dev/null
++++ b/src/Safe-Script.js
+@@ -0,0 +1,832 @@
++/* eslint-disable */
++/**
++ * A dependency-free, restricted JavaScript expression evaluator which
++ * replaces the previous use of Node's `vm` module (and of `new Function`
++ * in the browser build) for filter and script expressions. Expressions
++ * are parsed into an AST and interpreted directly so that nothing can
++ * reach the real global object or the `Function` constructor.
++ *
++ * Supported: literals (numbers, strings, regular expressions, `true`,
++ * `false`, `null`, `undefined`), arrays, identifiers (only those
++ * supplied via the sandbox), member access, calls, unary, binary,
++ * logical and ternary operators, (compound) assignment to identifiers
++ * and `var`/`let`/`const` prefixes in `;`-separated statements.
++ *
++ * Reading `constructor`, `__proto__`, etc. is blocked unless it is an
++ * own, non-function property of a non-function object.
++ */
++var SafeScript = (function () {
++    'use strict';
++
++    var hasOwn = Object.prototype.hasOwnProperty;
++
++    var BLOCKED_PROPS = [
++        'constructor',
++        '__proto__',
++        '__defineGetter__',
++        '__defineSetter__',
++        '__lookupGetter__',
++        '__lookupSetter__',
++        'prototype',
++        'caller',
++        'callee',
++        'arguments'
++    ];
++
++    var BINARY_PRECEDENCE = {
++        '||': 1,
++        '&&': 2,
++        '|': 3,
++        '^': 4,
++        '&': 5,
++        '==': 6,
++        '!=': 6,
++        '===': 6,
++        '!==': 6,
++        '<': 7,
++        '>': 7,
++        '<=': 7,
++        '>=': 7,
++        '<<': 8,
++        '>>': 8,
++        '>>>': 8,
++        '+': 9,
++        '-': 9,
++        '*': 10,
++        '/': 10,
++        '%': 10
++    };
++
++    // Longest first so that e.g. `>>>` wins over `>>` and `>`
++    var BINARY_OPERATORS = [
++        '>>>', '===', '!==',
++        '<<', '>>', '==', '!=', '<=', '>=', '&&', '||',
++        '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    // Binary operators which may be followed by `=` to form an assignment
++    var COMPOUND_ASSIGNABLE = [
++        '>>>', '<<', '>>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    var ASSIGNMENT_OPERATORS = [
++        '>>>=', '<<=', '>>=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
++        '='
++    ];
++
++    var NUMBER_REGEX = new RegExp(
++        '^(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|' +
++        '(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)'
++    );
++
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierStart (ch) {
++        return (/[A-Za-z_$]/).test(ch) ||
++            (ch > '\u007f' && !(/\s/).test(ch));
++    }
++
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierPart (ch) {
++        return isIdentifierStart(ch) || (/[0-9]/).test(ch);
++    }
++
++    /**
++     * @param {string} code
++     * @returns {object} The AST
++     */
++    function parse (code) {
++        var pos = 0;
++        var len = code.length;
++
++        /**
++         * @param {string} msg
++         * @throws {SyntaxError}
++         * @returns {void}
++         */
++        function fail (msg) {
++            throw new SyntaxError(msg + ' (at character ' + pos + ')');
++        }
++
++        /**
++         * @returns {void}
++         */
++        function skipWhitespace () {
++            while (pos < len && (/\s/).test(code.charAt(pos))) {
++                pos++;
++            }
++        }
++
++        /**
++         * @param {string} word
++         * @returns {boolean}
++         */
++        function peekWord (word) {
++            return code.substr(pos, word.length) === word &&
++                !isIdentifierPart(code.charAt(pos + word.length));
++        }
++
++        /**
++         * @returns {string}
++         */
++        function readIdentifier () {
++            var start = pos;
++            while (pos < len && isIdentifierPart(code.charAt(pos))) {
++                pos++;
++            }
++            return code.slice(start, pos);
++        }
++
++        /**
++         * @param {string} hex
++         * @returns {string}
++         */
++        function fromHex (hex) {
++            if (!(/^[0-9a-fA-F]+$/).test(hex)) {
++                fail('Invalid escape sequence');
++            }
++            return String.fromCharCode(parseInt(hex, 16));
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseString () {
++            var quote = code.charAt(pos++);
++            var out = '';
++            var ch;
++            while (pos < len) {
++                ch = code.charAt(pos++);
++                if (ch === quote) {
++                    return {type: 'Literal', value: out};
++                }
++                if (ch !== '\\') {
++                    out += ch;
++                    continue;
++                }
++                ch = code.charAt(pos++);
++                switch (ch) {
++                case 'n':
++                    out += '\n';
++                    break;
++                case 't':
++                    out += '\t';
++                    break;
++                case 'r':
++                    out += '\r';
++                    break;
++                case 'b':
++                    out += '\b';
++                    break;
++                case 'f':
++                    out += '\f';
++                    break;
++                case 'v':
++                    out += '\v';
++                    break;
++                case '0':
++                    out += '\0';
++                    break;
++                case 'x':
++                    out += fromHex(code.substr(pos, 2));
++                    pos += 2;
++                    break;
++                case 'u':
++                    out += fromHex(code.substr(pos, 4));
++                    pos += 4;
++                    break;
++                case '\r':
++                    if (code.charAt(pos) === '\n') {
++                        pos++;
++                    }
++                    break;
++                case '\n':
++                    break;
++                default:
++                    out += ch;
++                    break;
++                }
++            }
++            return fail('Unterminated string');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseRegex () {
++            var start = ++pos;
++            var inClass = false;
++            var ch;
++            var flagsStart;
++            var pattern;
++            var flags;
++            while (pos < len) {
++                ch = code.charAt(pos);
++                if (ch === '\\') {
++                    pos += 2;
++                } else if (ch === '\n' || ch === '\r') {
++                    break;
++                } else if (ch === '[') {
++                    inClass = true;
++                    pos++;
++                } else if (ch === ']') {
++                    inClass = false;
++                    pos++;
++                } else if (ch === '/' && !inClass) {
++                    break;
++                } else {
++                    pos++;
++                }
++            }
++            if (pos >= len || code.charAt(pos) !== '/') {
++                fail('Unterminated regular expression');
++            }
++            pattern = code.slice(start, pos);
++            pos++;
++            flagsStart = pos;
++            while (pos < len && (/[A-Za-z]/).test(code.charAt(pos))) {
++                pos++;
++            }
++            flags = code.slice(flagsStart, pos);
++            try {
++                new RegExp(pattern, flags); // eslint-disable-line no-new
++            } catch (err) {
++                fail('Invalid regular expression');
++            }
++            return {type: 'RegExpLiteral', pattern: pattern, flags: flags};
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePrimary () {
++            var ch, match, name, elements, node;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (!ch) {
++                return fail('Unexpected end of expression');
++            }
++            if ((/[0-9]/).test(ch) ||
++                (ch === '.' && (/[0-9]/).test(code.charAt(pos + 1)))
++            ) {
++                match = NUMBER_REGEX.exec(code.slice(pos));
++                if (!match) {
++                    fail('Invalid number');
++                }
++                pos += match[0].length;
++                if (isIdentifierStart(code.charAt(pos))) {
++                    fail('Invalid number');
++                }
++                return {type: 'Literal', value: Number(match[0])};
++            }
++            if (ch === '"' || ch === "'") {
++                return parseString();
++            }
++            if (ch === '(') {
++                pos++;
++                node = parseAssignment();
++                skipWhitespace();
++                if (code.charAt(pos) !== ')') {
++                    fail('Expected )');
++                }
++                pos++;
++                return node;
++            }
++            if (ch === '[') {
++                pos++;
++                elements = [];
++                skipWhitespace();
++                if (code.charAt(pos) === ']') {
++                    pos++;
++                    return {type: 'ArrayExpression', elements: elements};
++                }
++                for (;;) {
++                    elements.push(parseAssignment());
++                    skipWhitespace();
++                    ch = code.charAt(pos);
++                    pos++;
++                    if (ch === ']') {
++                        break;
++                    }
++                    if (ch !== ',') {
++                        pos--;
++                        fail('Expected , or ]');
++                    }
++                }
++                return {type: 'ArrayExpression', elements: elements};
++            }
++            if (ch === '/') {
++                return parseRegex();
++            }
++            if (isIdentifierStart(ch)) {
++                name = readIdentifier();
++                switch (name) {
++                case 'true':
++                    return {type: 'Literal', value: true};
++                case 'false':
++                    return {type: 'Literal', value: false};
++                case 'null':
++                    return {type: 'Literal', value: null};
++                case 'undefined':
++                    return {type: 'Literal', value: undefined};
++                default:
++                    return {type: 'Identifier', name: name};
++                }
++            }
++            return fail('Unexpected "' + ch + '"');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePostfix () {
++            var node = parsePrimary();
++            var ch, args, property;
++            for (;;) {
++                skipWhitespace();
++                ch = code.charAt(pos);
++                if (ch === '.') {
++                    pos++;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        fail('Expected property name');
++                    }
++                    node = {
++                        type: 'MemberExpression',
++                        computed: false,
++                        object: node,
++                        property: {type: 'Literal', value: readIdentifier()}
++                    };
++                } else if (ch === '[') {
++                    pos++;
++                    property = parseAssignment();
++                    skipWhitespace();
++                    if (code.charAt(pos) !== ']') {
++                        fail('Expected ]');
++                    }
++                    pos++;
++                    node = {
++                        type: 'MemberExpression',
++                        computed: true,
++                        object: node,
++                        property: property
++                    };
++                } else if (ch === '(') {
++                    pos++;
++                    args = [];
++                    skipWhitespace();
++                    if (code.charAt(pos) === ')') {
++                        pos++;
++                    } else {
++                        for (;;) {
++                            args.push(parseAssignment());
++                            skipWhitespace();
++                            ch = code.charAt(pos);
++                            pos++;
++                            if (ch === ')') {
++                                break;
++                            }
++                            if (ch !== ',') {
++                                pos--;
++                                fail('Expected , or )');
++                            }
++                        }
++                    }
++                    node = {
++                        type: 'CallExpression',
++                        callee: node,
++                        arguments: args
++                    };
++                } else {
++                    return node;
++                }
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseUnary () {
++            var ch;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (ch === '-' || ch === '+' || ch === '!' || ch === '~') {
++                if ((ch === '-' || ch === '+') && code.charAt(pos + 1) === ch) {
++                    fail('Increment and decrement operators are not supported');
++                }
++                pos++;
++                return {
++                    type: 'UnaryExpression',
++                    operator: ch,
++                    argument: parseUnary()
++                };
++            }
++            if (peekWord('typeof')) {
++                pos += 'typeof'.length;
++                return {
++                    type: 'UnaryExpression',
++                    operator: 'typeof',
++                    argument: parseUnary()
++                };
++            }
++            return parsePostfix();
++        }
++
++        /**
++         * @returns {string|null}
++         */
++        function peekBinaryOperator () {
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < BINARY_OPERATORS.length; i++) {
++                op = BINARY_OPERATORS[i];
++                if (code.substr(pos, op.length) === op) {
++                    if (COMPOUND_ASSIGNABLE.indexOf(op) > -1 &&
++                        code.charAt(pos + op.length) === '='
++                    ) {
++                        return null; // Assignment operator
++                    }
++                    return op;
++                }
++            }
++            return null;
++        }
++
++        /**
++         * @param {Integer} minPrecedence
++         * @returns {object}
++         */
++        function parseBinary (minPrecedence) {
++            var left = parseUnary();
++            var op, precedence;
++            for (;;) {
++                op = peekBinaryOperator();
++                if (!op) {
++                    return left;
++                }
++                precedence = BINARY_PRECEDENCE[op];
++                if (precedence < minPrecedence) {
++                    return left;
++                }
++                pos += op.length;
++                left = {
++                    type: 'BinaryExpression',
++                    operator: op,
++                    left: left,
++                    right: parseBinary(precedence + 1)
++                };
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseConditional () {
++            var test = parseBinary(1);
++            var consequent, alternate;
++            skipWhitespace();
++            if (code.charAt(pos) !== '?') {
++                return test;
++            }
++            pos++;
++            consequent = parseAssignment();
++            skipWhitespace();
++            if (code.charAt(pos) !== ':') {
++                fail('Expected :');
++            }
++            pos++;
++            alternate = parseAssignment();
++            return {
++                type: 'ConditionalExpression',
++                test: test,
++                consequent: consequent,
++                alternate: alternate
++            };
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseAssignment () {
++            var left = parseConditional();
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < ASSIGNMENT_OPERATORS.length; i++) {
++                op = ASSIGNMENT_OPERATORS[i];
++                if (code.substr(pos, op.length) === op &&
++                    // Not `==`, `===` or `=>`
++                    (op !== '=' ||
++                        (code.charAt(pos + 1) !== '=' &&
++                        code.charAt(pos + 1) !== '>'))
++                ) {
++                    if (left.type !== 'Identifier') {
++                        fail('Invalid left-hand side in assignment');
++                    }
++                    pos += op.length;
++                    return {
++                        type: 'AssignmentExpression',
++                        operator: op,
++                        name: left.name,
++                        right: parseAssignment()
++                    };
++                }
++            }
++            return left;
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseStatement () {
++            var keywords = ['var', 'let', 'const'];
++            var i, saved;
++            skipWhitespace();
++            for (i = 0; i < keywords.length; i++) {
++                if (peekWord(keywords[i])) {
++                    saved = pos;
++                    pos += keywords[i].length;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        // Not a declaration
++                        pos = saved;
++                    }
++                    break;
++                }
++            }
++            return parseAssignment();
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseProgram () {
++            var body = [];
++            for (;;) {
++                skipWhitespace();
++                while (code.charAt(pos) === ';') {
++                    pos++;
++                    skipWhitespace();
++                }
++                if (pos >= len) {
++                    break;
++                }
++                body.push(parseStatement());
++                skipWhitespace();
++                if (pos < len && code.charAt(pos) !== ';') {
++                    fail('Unexpected "' + code.charAt(pos) + '"');
++                }
++            }
++            return {type: 'Program', body: body};
++        }
++
++        return parseProgram();
++    }
++
++    /**
++     * @param {string} op
++     * @param {any} a
++     * @param {any} b
++     * @returns {any}
++     */
++    function applyBinary (op, a, b) {
++        switch (op) {
++        case '|':
++            return a | b;
++        case '^':
++            return a ^ b;
++        case '&':
++            return a & b;
++        case '==':
++            // eslint-disable-next-line eqeqeq
++            return a == b;
++        case '!=':
++            // eslint-disable-next-line eqeqeq
++            return a != b;
++        case '===':
++            return a === b;
++        case '!==':
++            return a !== b;
++        case '<':
++            return a < b;
++        case '>':
++            return a > b;
++        case '<=':
++            return a <= b;
++        case '>=':
++            return a >= b;
++        case '<<':
++            return a << b;
++        case '>>':
++            return a >> b;
++        case '>>>':
++            return a >>> b;
++        case '+':
++            return a + b;
++        case '-':
++            return a - b;
++        case '*':
++            return a * b;
++        case '/':
++            return a / b;
++        case '%':
++            return a % b;
++        default:
++            throw new SyntaxError('Unsupported operator ' + op);
++        }
++    }
++
++    /**
++     * @param {any} obj
++     * @param {any} prop
++     * @returns {any}
++     */
++    function getMember (obj, prop) {
++        var blocked, result;
++        if (typeof prop !== 'symbol') {
++            prop = String(prop);
++        }
++        if (obj === undefined || obj === null) {
++            throw new TypeError(
++                'Cannot read properties of ' + obj +
++                " (reading '" + String(prop) + "')"
++            );
++        }
++        blocked = BLOCKED_PROPS.indexOf(prop) > -1;
++        if (blocked && (typeof obj === 'function' || !hasOwn.call(obj, prop))) {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        result = obj[prop];
++        if (blocked && typeof result === 'function') {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        return result;
++    }
++
++    /**
++     * @param {object} ast
++     * @param {object} subs
++     * @returns {any}
++     */
++    function evalAst (ast, subs) {
++        var i, last, value, current, obj, prop, func, args, name;
++        switch (ast.type) {
++        case 'Program':
++            for (i = 0; i < ast.body.length; i++) {
++                last = evalAst(ast.body[i], subs);
++            }
++            return last;
++        case 'Literal':
++            return ast.value;
++        case 'RegExpLiteral':
++            return new RegExp(ast.pattern, ast.flags);
++        case 'Identifier':
++            if (hasOwn.call(subs, ast.name)) {
++                return subs[ast.name];
++            }
++            throw new ReferenceError(ast.name + ' is not defined');
++        case 'ArrayExpression':
++            return ast.elements.map(function (el) {
++                return evalAst(el, subs);
++            });
++        case 'ConditionalExpression':
++            return evalAst(ast.test, subs)
++                ? evalAst(ast.consequent, subs)
++                : evalAst(ast.alternate, subs);
++        case 'BinaryExpression':
++            value = evalAst(ast.left, subs);
++            if (ast.operator === '&&') {
++                return value && evalAst(ast.right, subs);
++            }
++            if (ast.operator === '||') {
++                return value || evalAst(ast.right, subs);
++            }
++            return applyBinary(ast.operator, value, evalAst(ast.right, subs));
++        case 'UnaryExpression':
++            if (ast.operator === 'typeof') {
++                if (ast.argument.type === 'Identifier' &&
++                    !hasOwn.call(subs, ast.argument.name)
++                ) {
++                    return 'undefined';
++                }
++                return typeof evalAst(ast.argument, subs);
++            }
++            value = evalAst(ast.argument, subs);
++            switch (ast.operator) {
++            case '-':
++                return -value;
++            case '+':
++                return Number(value);
++            case '!':
++                return !value;
++            default: // '~'
++                return ~value;
++            }
++        case 'MemberExpression':
++            obj = evalAst(ast.object, subs);
++            prop = ast.computed
++                ? evalAst(ast.property, subs)
++                : ast.property.value;
++            value = getMember(obj, prop);
++            // Arrow functions aren't affected by bind
++            return typeof value === 'function' ? value.bind(obj) : value;
++        case 'CallExpression':
++            if (ast.callee.type === 'MemberExpression') {
++                obj = evalAst(ast.callee.object, subs);
++                prop = ast.callee.computed
++                    ? evalAst(ast.callee.property, subs)
++                    : ast.callee.property.value;
++                func = getMember(obj, prop);
++                name = String(prop);
++            } else {
++                obj = undefined;
++                func = evalAst(ast.callee, subs);
++                name = ast.callee.type === 'Identifier'
++                    ? ast.callee.name
++                    : 'expression';
++            }
++            args = ast.arguments.map(function (arg) {
++                return evalAst(arg, subs);
++            });
++            if (typeof func !== 'function') {
++                throw new TypeError(name + ' is not a function');
++            }
++            return func.apply(obj, args);
++        case 'AssignmentExpression':
++            value = evalAst(ast.right, subs);
++            if (ast.operator !== '=') {
++                if (!hasOwn.call(subs, ast.name)) {
++                    throw new ReferenceError(ast.name + ' is not defined');
++                }
++                current = subs[ast.name];
++                value = applyBinary(
++                    ast.operator.slice(0, -1), current, value
++                );
++            }
++            subs[ast.name] = value;
++            return value;
++        default:
++            throw new SyntaxError('Unexpected expression');
++        }
++    }
++
++    var cache = Object.create(null);
++    var cacheSize = 0;
++
++    /**
++     * A replacement for NodeJS' `vm.Script` which neither exposes the
++     * global scope nor allows reaching `Function` and is also
++     * Content Security Policy friendly.
++     * @param {string} expr Expression to evaluate
++     */
++    function SafeScript (expr) {
++        this.code = expr;
++        this.ast = parse(String(expr));
++    }
++
++    /**
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.prototype.runInNewContext = function (context) {
++        // A prototype-less object, so that only the supplied keys exist
++        var keyMap = Object.create(null);
++        Object.keys(context || {}).forEach(function (key) {
++            keyMap[key] = context[key];
++        });
++        return evalAst(this.ast, keyMap);
++    };
++
++    /**
++     * @param {string} expr Expression to evaluate
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.runInNewContext = function (expr, context) {
++        var script = cache[expr];
++        if (!script) {
++            script = new SafeScript(expr);
++            if (cacheSize >= 1000) {
++                cache = Object.create(null);
++                cacheSize = 0;
++            }
++            cache[expr] = script;
++            cacheSize++;
++        }
++        return script.runInNewContext(context);
++    };
++
++    return SafeScript;
++}());
++
++export {SafeScript};
+--- a/src/jsonpath-browser.js
++++ b/src/jsonpath-browser.js
+@@ -1,29 +1,6 @@
+ import {JSONPath} from './jsonpath.js';
++import {SafeScript} from './Safe-Script.js';
+ 
+-/**
+-* @callback ConditionCallback
+-* @param {any} item
+-* @returns {boolean}
+-*/
+-
+-/**
+- * Copy items out of one array into another.
+- * @param {GenericArray} source Array with items to copy
+- * @param {GenericArray} target Array to which to copy
+- * @param {ConditionCallback} conditionCb Callback passed the current item;
+- *     will move item if evaluates to `true`
+- * @returns {void}
+- */
+-const moveToAnotherArray = function (source, target, conditionCb) {
+-    const il = source.length;
+-    for (let i = 0; i < il; i++) {
+-        const item = source[i];
+-        if (conditionCb(item)) {
+-            target.push(source.splice(i--, 1)[0]);
+-        }
+-    }
+-};
+-
+ JSONPath.prototype.vm = {
+     /**
+      * @param {string} expr Expression to evaluate
+@@ -32,46 +9,7 @@
+      * @returns {any} Result of evaluated code
+      */
+     runInNewContext (expr, context) {
+-        const keys = Object.keys(context);
+-        const funcs = [];
+-        moveToAnotherArray(keys, funcs, (key) => {
+-            return typeof context[key] === 'function';
+-        });
+-        const values = keys.map((vr, i) => {
+-            return context[vr];
+-        });
+-
+-        const funcString = funcs.reduce((s, func) => {
+-            let fString = context[func].toString();
+-            if (!(/function/u).test(fString)) {
+-                fString = 'function ' + fString;
+-            }
+-            return 'var ' + func + '=' + fString + ';' + s;
+-        }, '');
+-
+-        expr = funcString + expr;
+-
+-        // Mitigate http://perfectionkills.com/global-eval-what-are-the-options/#new_function
+-        if (!(/(['"])use strict\1/u).test(expr) &&
+-            !keys.includes('arguments')
+-        ) {
+-            expr = 'var arguments = undefined;' + expr;
+-        }
+-
+-        // Remove last semi so `return` will be inserted before
+-        //  the previous one instead, allowing for the return
+-        //  of a bare ending expression
+-        expr = expr.replace(/;\s*$/u, '');
+-
+-        // Insert `return`
+-        const lastStatementEnd = expr.lastIndexOf(';');
+-        const code = (lastStatementEnd > -1
+-            ? expr.slice(0, lastStatementEnd + 1) +
+-                ' return ' + expr.slice(lastStatementEnd + 1)
+-            : ' return ' + expr);
+-
+-        // eslint-disable-next-line no-new-func
+-        return (new Function(...keys, code))(...values);
++        return SafeScript.runInNewContext(expr, context);
+     }
+ };
+ 
+--- a/src/jsonpath-node.js
++++ b/src/jsonpath-node.js
+@@ -1,6 +1,16 @@
+-import vm from 'vm';
+ import {JSONPath} from './jsonpath.js';
++import {SafeScript} from './Safe-Script.js';
+ 
+-JSONPath.prototype.vm = vm;
++JSONPath.prototype.vm = {
++    /**
++     * @param {string} expr Expression to evaluate
++     * @param {PlainObject} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    runInNewContext (expr, context) {
++        return SafeScript.runInNewContext(expr, context);
++    }
++};
+ 
+ export {JSONPath};
+--- a/dist/index-browser-esm.js
++++ b/dist/index-browser-esm.js
+@@ -984,32 +984,835 @@
+ };
+ 
+ /**
+-* @callback ConditionCallback
+-* @param {any} item
+-* @returns {boolean}
+-*/
+-
+-/**
+- * Copy items out of one array into another.
+- * @param {GenericArray} source Array with items to copy
+- * @param {GenericArray} target Array to which to copy
+- * @param {ConditionCallback} conditionCb Callback passed the current item;
+- *     will move item if evaluates to `true`
+- * @returns {void}
++ * A dependency-free, restricted JavaScript expression evaluator which
++ * replaces the previous use of Node's `vm` module (and of `new Function`
++ * in the browser build) for filter and script expressions. Expressions
++ * are parsed into an AST and interpreted directly so that nothing can
++ * reach the real global object or the `Function` constructor.
++ *
++ * Supported: literals (numbers, strings, regular expressions, `true`,
++ * `false`, `null`, `undefined`), arrays, identifiers (only those
++ * supplied via the sandbox), member access, calls, unary, binary,
++ * logical and ternary operators, (compound) assignment to identifiers
++ * and `var`/`let`/`const` prefixes in `;`-separated statements.
++ *
++ * Reading `constructor`, `__proto__`, etc. is blocked unless it is an
++ * own, non-function property of a non-function object.
+  */
++var SafeScript = (function () {
++    'use strict';
+ 
+-var moveToAnotherArray = function moveToAnotherArray(source, target, conditionCb) {
+-  var il = source.length;
++    var hasOwn = Object.prototype.hasOwnProperty;
+ 
+-  for (var i = 0; i < il; i++) {
+-    var item = source[i];
++    var BLOCKED_PROPS = [
++        'constructor',
++        '__proto__',
++        '__defineGetter__',
++        '__defineSetter__',
++        '__lookupGetter__',
++        '__lookupSetter__',
++        'prototype',
++        'caller',
++        'callee',
++        'arguments'
++    ];
+ 
+-    if (conditionCb(item)) {
+-      target.push(source.splice(i--, 1)[0]);
++    var BINARY_PRECEDENCE = {
++        '||': 1,
++        '&&': 2,
++        '|': 3,
++        '^': 4,
++        '&': 5,
++        '==': 6,
++        '!=': 6,
++        '===': 6,
++        '!==': 6,
++        '<': 7,
++        '>': 7,
++        '<=': 7,
++        '>=': 7,
++        '<<': 8,
++        '>>': 8,
++        '>>>': 8,
++        '+': 9,
++        '-': 9,
++        '*': 10,
++        '/': 10,
++        '%': 10
++    };
++
++    // Longest first so that e.g. `>>>` wins over `>>` and `>`
++    var BINARY_OPERATORS = [
++        '>>>', '===', '!==',
++        '<<', '>>', '==', '!=', '<=', '>=', '&&', '||',
++        '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    // Binary operators which may be followed by `=` to form an assignment
++    var COMPOUND_ASSIGNABLE = [
++        '>>>', '<<', '>>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    var ASSIGNMENT_OPERATORS = [
++        '>>>=', '<<=', '>>=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
++        '='
++    ];
++
++    var NUMBER_REGEX = new RegExp(
++        '^(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|' +
++        '(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)'
++    );
++
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierStart (ch) {
++        return (/[A-Za-z_$]/).test(ch) ||
++            (ch > '\u007f' && !(/\s/).test(ch));
+     }
+-  }
+-};
+ 
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierPart (ch) {
++        return isIdentifierStart(ch) || (/[0-9]/).test(ch);
++    }
++
++    /**
++     * @param {string} code
++     * @returns {object} The AST
++     */
++    function parse (code) {
++        var pos = 0;
++        var len = code.length;
++
++        /**
++         * @param {string} msg
++         * @throws {SyntaxError}
++         * @returns {void}
++         */
++        function fail (msg) {
++            throw new SyntaxError(msg + ' (at character ' + pos + ')');
++        }
++
++        /**
++         * @returns {void}
++         */
++        function skipWhitespace () {
++            while (pos < len && (/\s/).test(code.charAt(pos))) {
++                pos++;
++            }
++        }
++
++        /**
++         * @param {string} word
++         * @returns {boolean}
++         */
++        function peekWord (word) {
++            return code.substr(pos, word.length) === word &&
++                !isIdentifierPart(code.charAt(pos + word.length));
++        }
++
++        /**
++         * @returns {string}
++         */
++        function readIdentifier () {
++            var start = pos;
++            while (pos < len && isIdentifierPart(code.charAt(pos))) {
++                pos++;
++            }
++            return code.slice(start, pos);
++        }
++
++        /**
++         * @param {string} hex
++         * @returns {string}
++         */
++        function fromHex (hex) {
++            if (!(/^[0-9a-fA-F]+$/).test(hex)) {
++                fail('Invalid escape sequence');
++            }
++            return String.fromCharCode(parseInt(hex, 16));
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseString () {
++            var quote = code.charAt(pos++);
++            var out = '';
++            var ch;
++            while (pos < len) {
++                ch = code.charAt(pos++);
++                if (ch === quote) {
++                    return {type: 'Literal', value: out};
++                }
++                if (ch !== '\\') {
++                    out += ch;
++                    continue;
++                }
++                ch = code.charAt(pos++);
++                switch (ch) {
++                case 'n':
++                    out += '\n';
++                    break;
++                case 't':
++                    out += '\t';
++                    break;
++                case 'r':
++                    out += '\r';
++                    break;
++                case 'b':
++                    out += '\b';
++                    break;
++                case 'f':
++                    out += '\f';
++                    break;
++                case 'v':
++                    out += '\v';
++                    break;
++                case '0':
++                    out += '\0';
++                    break;
++                case 'x':
++                    out += fromHex(code.substr(pos, 2));
++                    pos += 2;
++                    break;
++                case 'u':
++                    out += fromHex(code.substr(pos, 4));
++                    pos += 4;
++                    break;
++                case '\r':
++                    if (code.charAt(pos) === '\n') {
++                        pos++;
++                    }
++                    break;
++                case '\n':
++                    break;
++                default:
++                    out += ch;
++                    break;
++                }
++            }
++            return fail('Unterminated string');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseRegex () {
++            var start = ++pos;
++            var inClass = false;
++            var ch;
++            var flagsStart;
++            var pattern;
++            var flags;
++            while (pos < len) {
++                ch = code.charAt(pos);
++                if (ch === '\\') {
++                    pos += 2;
++                } else if (ch === '\n' || ch === '\r') {
++                    break;
++                } else if (ch === '[') {
++                    inClass = true;
++                    pos++;
++                } else if (ch === ']') {
++                    inClass = false;
++                    pos++;
++                } else if (ch === '/' && !inClass) {
++                    break;
++                } else {
++                    pos++;
++                }
++            }
++            if (pos >= len || code.charAt(pos) !== '/') {
++                fail('Unterminated regular expression');
++            }
++            pattern = code.slice(start, pos);
++            pos++;
++            flagsStart = pos;
++            while (pos < len && (/[A-Za-z]/).test(code.charAt(pos))) {
++                pos++;
++            }
++            flags = code.slice(flagsStart, pos);
++            try {
++                new RegExp(pattern, flags); // eslint-disable-line no-new
++            } catch (err) {
++                fail('Invalid regular expression');
++            }
++            return {type: 'RegExpLiteral', pattern: pattern, flags: flags};
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePrimary () {
++            var ch, match, name, elements, node;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (!ch) {
++                return fail('Unexpected end of expression');
++            }
++            if ((/[0-9]/).test(ch) ||
++                (ch === '.' && (/[0-9]/).test(code.charAt(pos + 1)))
++            ) {
++                match = NUMBER_REGEX.exec(code.slice(pos));
++                if (!match) {
++                    fail('Invalid number');
++                }
++                pos += match[0].length;
++                if (isIdentifierStart(code.charAt(pos))) {
++                    fail('Invalid number');
++                }
++                return {type: 'Literal', value: Number(match[0])};
++            }
++            if (ch === '"' || ch === "'") {
++                return parseString();
++            }
++            if (ch === '(') {
++                pos++;
++                node = parseAssignment();
++                skipWhitespace();
++                if (code.charAt(pos) !== ')') {
++                    fail('Expected )');
++                }
++                pos++;
++                return node;
++            }
++            if (ch === '[') {
++                pos++;
++                elements = [];
++                skipWhitespace();
++                if (code.charAt(pos) === ']') {
++                    pos++;
++                    return {type: 'ArrayExpression', elements: elements};
++                }
++                for (;;) {
++                    elements.push(parseAssignment());
++                    skipWhitespace();
++                    ch = code.charAt(pos);
++                    pos++;
++                    if (ch === ']') {
++                        break;
++                    }
++                    if (ch !== ',') {
++                        pos--;
++                        fail('Expected , or ]');
++                    }
++                }
++                return {type: 'ArrayExpression', elements: elements};
++            }
++            if (ch === '/') {
++                return parseRegex();
++            }
++            if (isIdentifierStart(ch)) {
++                name = readIdentifier();
++                switch (name) {
++                case 'true':
++                    return {type: 'Literal', value: true};
++                case 'false':
++                    return {type: 'Literal', value: false};
++                case 'null':
++                    return {type: 'Literal', value: null};
++                case 'undefined':
++                    return {type: 'Literal', value: undefined};
++                default:
++                    return {type: 'Identifier', name: name};
++                }
++            }
++            return fail('Unexpected "' + ch + '"');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePostfix () {
++            var node = parsePrimary();
++            var ch, args, property;
++            for (;;) {
++                skipWhitespace();
++                ch = code.charAt(pos);
++                if (ch === '.') {
++                    pos++;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        fail('Expected property name');
++                    }
++                    node = {
++                        type: 'MemberExpression',
++                        computed: false,
++                        object: node,
++                        property: {type: 'Literal', value: readIdentifier()}
++                    };
++                } else if (ch === '[') {
++                    pos++;
++                    property = parseAssignment();
++                    skipWhitespace();
++                    if (code.charAt(pos) !== ']') {
++                        fail('Expected ]');
++                    }
++                    pos++;
++                    node = {
++                        type: 'MemberExpression',
++                        computed: true,
++                        object: node,
++                        property: property
++                    };
++                } else if (ch === '(') {
++                    pos++;
++                    args = [];
++                    skipWhitespace();
++                    if (code.charAt(pos) === ')') {
++                        pos++;
++                    } else {
++                        for (;;) {
++                            args.push(parseAssignment());
++                            skipWhitespace();
++                            ch = code.charAt(pos);
++                            pos++;
++                            if (ch === ')') {
++                                break;
++                            }
++                            if (ch !== ',') {
++                                pos--;
++                                fail('Expected , or )');
++                            }
++                        }
++                    }
++                    node = {
++                        type: 'CallExpression',
++                        callee: node,
++                        arguments: args
++                    };
++                } else {
++                    return node;
++                }
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseUnary () {
++            var ch;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (ch === '-' || ch === '+' || ch === '!' || ch === '~') {
++                if ((ch === '-' || ch === '+') && code.charAt(pos + 1) === ch) {
++                    fail('Increment and decrement operators are not supported');
++                }
++                pos++;
++                return {
++                    type: 'UnaryExpression',
++                    operator: ch,
++                    argument: parseUnary()
++                };
++            }
++            if (peekWord('typeof')) {
++                pos += 'typeof'.length;
++                return {
++                    type: 'UnaryExpression',
++                    operator: 'typeof',
++                    argument: parseUnary()
++                };
++            }
++            return parsePostfix();
++        }
++
++        /**
++         * @returns {string|null}
++         */
++        function peekBinaryOperator () {
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < BINARY_OPERATORS.length; i++) {
++                op = BINARY_OPERATORS[i];
++                if (code.substr(pos, op.length) === op) {
++                    if (COMPOUND_ASSIGNABLE.indexOf(op) > -1 &&
++                        code.charAt(pos + op.length) === '='
++                    ) {
++                        return null; // Assignment operator
++                    }
++                    return op;
++                }
++            }
++            return null;
++        }
++
++        /**
++         * @param {Integer} minPrecedence
++         * @returns {object}
++         */
++        function parseBinary (minPrecedence) {
++            var left = parseUnary();
++            var op, precedence;
++            for (;;) {
++                op = peekBinaryOperator();
++                if (!op) {
++                    return left;
++                }
++                precedence = BINARY_PRECEDENCE[op];
++                if (precedence < minPrecedence) {
++                    return left;
++                }
++                pos += op.length;
++                left = {
++                    type: 'BinaryExpression',
++                    operator: op,
++                    left: left,
++                    right: parseBinary(precedence + 1)
++                };
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseConditional () {
++            var test = parseBinary(1);
++            var consequent, alternate;
++            skipWhitespace();
++            if (code.charAt(pos) !== '?') {
++                return test;
++            }
++            pos++;
++            consequent = parseAssignment();
++            skipWhitespace();
++            if (code.charAt(pos) !== ':') {
++                fail('Expected :');
++            }
++            pos++;
++            alternate = parseAssignment();
++            return {
++                type: 'ConditionalExpression',
++                test: test,
++                consequent: consequent,
++                alternate: alternate
++            };
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseAssignment () {
++            var left = parseConditional();
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < ASSIGNMENT_OPERATORS.length; i++) {
++                op = ASSIGNMENT_OPERATORS[i];
++                if (code.substr(pos, op.length) === op &&
++                    // Not `==`, `===` or `=>`
++                    (op !== '=' ||
++                        (code.charAt(pos + 1) !== '=' &&
++                        code.charAt(pos + 1) !== '>'))
++                ) {
++                    if (left.type !== 'Identifier') {
++                        fail('Invalid left-hand side in assignment');
++                    }
++                    pos += op.length;
++                    return {
++                        type: 'AssignmentExpression',
++                        operator: op,
++                        name: left.name,
++                        right: parseAssignment()
++                    };
++                }
++            }
++            return left;
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseStatement () {
++            var keywords = ['var', 'let', 'const'];
++            var i, saved;
++            skipWhitespace();
++            for (i = 0; i < keywords.length; i++) {
++                if (peekWord(keywords[i])) {
++                    saved = pos;
++                    pos += keywords[i].length;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        // Not a declaration
++                        pos = saved;
++                    }
++                    break;
++                }
++            }
++            return parseAssignment();
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseProgram () {
++            var body = [];
++            for (;;) {
++                skipWhitespace();
++                while (code.charAt(pos) === ';') {
++                    pos++;
++                    skipWhitespace();
++                }
++                if (pos >= len) {
++                    break;
++                }
++                body.push(parseStatement());
++                skipWhitespace();
++                if (pos < len && code.charAt(pos) !== ';') {
++                    fail('Unexpected "' + code.charAt(pos) + '"');
++                }
++            }
++            return {type: 'Program', body: body};
++        }
++
++        return parseProgram();
++    }
++
++    /**
++     * @param {string} op
++     * @param {any} a
++     * @param {any} b
++     * @returns {any}
++     */
++    function applyBinary (op, a, b) {
++        switch (op) {
++        case '|':
++            return a | b;
++        case '^':
++            return a ^ b;
++        case '&':
++            return a & b;
++        case '==':
++            // eslint-disable-next-line eqeqeq
++            return a == b;
++        case '!=':
++            // eslint-disable-next-line eqeqeq
++            return a != b;
++        case '===':
++            return a === b;
++        case '!==':
++            return a !== b;
++        case '<':
++            return a < b;
++        case '>':
++            return a > b;
++        case '<=':
++            return a <= b;
++        case '>=':
++            return a >= b;
++        case '<<':
++            return a << b;
++        case '>>':
++            return a >> b;
++        case '>>>':
++            return a >>> b;
++        case '+':
++            return a + b;
++        case '-':
++            return a - b;
++        case '*':
++            return a * b;
++        case '/':
++            return a / b;
++        case '%':
++            return a % b;
++        default:
++            throw new SyntaxError('Unsupported operator ' + op);
++        }
++    }
++
++    /**
++     * @param {any} obj
++     * @param {any} prop
++     * @returns {any}
++     */
++    function getMember (obj, prop) {
++        var blocked, result;
++        if (typeof prop !== 'symbol') {
++            prop = String(prop);
++        }
++        if (obj === undefined || obj === null) {
++            throw new TypeError(
++                'Cannot read properties of ' + obj +
++                " (reading '" + String(prop) + "')"
++            );
++        }
++        blocked = BLOCKED_PROPS.indexOf(prop) > -1;
++        if (blocked && (typeof obj === 'function' || !hasOwn.call(obj, prop))) {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        result = obj[prop];
++        if (blocked && typeof result === 'function') {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        return result;
++    }
++
++    /**
++     * @param {object} ast
++     * @param {object} subs
++     * @returns {any}
++     */
++    function evalAst (ast, subs) {
++        var i, last, value, current, obj, prop, func, args, name;
++        switch (ast.type) {
++        case 'Program':
++            for (i = 0; i < ast.body.length; i++) {
++                last = evalAst(ast.body[i], subs);
++            }
++            return last;
++        case 'Literal':
++            return ast.value;
++        case 'RegExpLiteral':
++            return new RegExp(ast.pattern, ast.flags);
++        case 'Identifier':
++            if (hasOwn.call(subs, ast.name)) {
++                return subs[ast.name];
++            }
++            throw new ReferenceError(ast.name + ' is not defined');
++        case 'ArrayExpression':
++            return ast.elements.map(function (el) {
++                return evalAst(el, subs);
++            });
++        case 'ConditionalExpression':
++            return evalAst(ast.test, subs)
++                ? evalAst(ast.consequent, subs)
++                : evalAst(ast.alternate, subs);
++        case 'BinaryExpression':
++            value = evalAst(ast.left, subs);
++            if (ast.operator === '&&') {
++                return value && evalAst(ast.right, subs);
++            }
++            if (ast.operator === '||') {
++                return value || evalAst(ast.right, subs);
++            }
++            return applyBinary(ast.operator, value, evalAst(ast.right, subs));
++        case 'UnaryExpression':
++            if (ast.operator === 'typeof') {
++                if (ast.argument.type === 'Identifier' &&
++                    !hasOwn.call(subs, ast.argument.name)
++                ) {
++                    return 'undefined';
++                }
++                return typeof evalAst(ast.argument, subs);
++            }
++            value = evalAst(ast.argument, subs);
++            switch (ast.operator) {
++            case '-':
++                return -value;
++            case '+':
++                return Number(value);
++            case '!':
++                return !value;
++            default: // '~'
++                return ~value;
++            }
++        case 'MemberExpression':
++            obj = evalAst(ast.object, subs);
++            prop = ast.computed
++                ? evalAst(ast.property, subs)
++                : ast.property.value;
++            value = getMember(obj, prop);
++            // Arrow functions aren't affected by bind
++            return typeof value === 'function' ? value.bind(obj) : value;
++        case 'CallExpression':
++            if (ast.callee.type === 'MemberExpression') {
++                obj = evalAst(ast.callee.object, subs);
++                prop = ast.callee.computed
++                    ? evalAst(ast.callee.property, subs)
++                    : ast.callee.property.value;
++                func = getMember(obj, prop);
++                name = String(prop);
++            } else {
++                obj = undefined;
++                func = evalAst(ast.callee, subs);
++                name = ast.callee.type === 'Identifier'
++                    ? ast.callee.name
++                    : 'expression';
++            }
++            args = ast.arguments.map(function (arg) {
++                return evalAst(arg, subs);
++            });
++            if (typeof func !== 'function') {
++                throw new TypeError(name + ' is not a function');
++            }
++            return func.apply(obj, args);
++        case 'AssignmentExpression':
++            value = evalAst(ast.right, subs);
++            if (ast.operator !== '=') {
++                if (!hasOwn.call(subs, ast.name)) {
++                    throw new ReferenceError(ast.name + ' is not defined');
++                }
++                current = subs[ast.name];
++                value = applyBinary(
++                    ast.operator.slice(0, -1), current, value
++                );
++            }
++            subs[ast.name] = value;
++            return value;
++        default:
++            throw new SyntaxError('Unexpected expression');
++        }
++    }
++
++    var cache = Object.create(null);
++    var cacheSize = 0;
++
++    /**
++     * A replacement for NodeJS' `vm.Script` which neither exposes the
++     * global scope nor allows reaching `Function` and is also
++     * Content Security Policy friendly.
++     * @param {string} expr Expression to evaluate
++     */
++    function SafeScript (expr) {
++        this.code = expr;
++        this.ast = parse(String(expr));
++    }
++
++    /**
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.prototype.runInNewContext = function (context) {
++        // A prototype-less object, so that only the supplied keys exist
++        var keyMap = Object.create(null);
++        Object.keys(context || {}).forEach(function (key) {
++            keyMap[key] = context[key];
++        });
++        return evalAst(this.ast, keyMap);
++    };
++
++    /**
++     * @param {string} expr Expression to evaluate
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.runInNewContext = function (expr, context) {
++        var script = cache[expr];
++        if (!script) {
++            script = new SafeScript(expr);
++            if (cacheSize >= 1000) {
++                cache = Object.create(null);
++                cacheSize = 0;
++            }
++            cache[expr] = script;
++            cacheSize++;
++        }
++        return script.runInNewContext(context);
++    };
++
++    return SafeScript;
++}());
++
+ JSONPath.prototype.vm = {
+   /**
+    * @param {string} expr Expression to evaluate
+@@ -1018,38 +1821,7 @@
+    * @returns {any} Result of evaluated code
+    */
+   runInNewContext: function runInNewContext(expr, context) {
+-    var keys = Object.keys(context);
+-    var funcs = [];
+-    moveToAnotherArray(keys, funcs, function (key) {
+-      return typeof context[key] === 'function';
+-    });
+-    var values = keys.map(function (vr, i) {
+-      return context[vr];
+-    });
+-    var funcString = funcs.reduce(function (s, func) {
+-      var fString = context[func].toString();
+-
+-      if (!/function/.test(fString)) {
+-        fString = 'function ' + fString;
+-      }
+-
+-      return 'var ' + func + '=' + fString + ';' + s;
+-    }, '');
+-    expr = funcString + expr; // Mitigate http://perfectionkills.com/global-eval-what-are-the-options/#new_function
+-
+-    if (!/(["'])use strict\1/.test(expr) && !keys.includes('arguments')) {
+-      expr = 'var arguments = undefined;' + expr;
+-    } // Remove last semi so `return` will be inserted before
+-    //  the previous one instead, allowing for the return
+-    //  of a bare ending expression
+-
+-
+-    expr = expr.replace(/;[\t-\r \xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*$/, ''); // Insert `return`
+-
+-    var lastStatementEnd = expr.lastIndexOf(';');
+-    var code = lastStatementEnd > -1 ? expr.slice(0, lastStatementEnd + 1) + ' return ' + expr.slice(lastStatementEnd + 1) : ' return ' + expr; // eslint-disable-next-line no-new-func
+-
+-    return _construct(Function, _toConsumableArray(keys).concat([code])).apply(void 0, _toConsumableArray(values));
++    return SafeScript.runInNewContext(expr, context);
+   }
+ };
+ 
+--- a/dist/index-browser-umd.cjs
++++ b/dist/index-browser-umd.cjs
+@@ -990,32 +990,835 @@
+   };
+ 
+   /**
+-  * @callback ConditionCallback
+-  * @param {any} item
+-  * @returns {boolean}
+-  */
+-
+-  /**
+-   * Copy items out of one array into another.
+-   * @param {GenericArray} source Array with items to copy
+-   * @param {GenericArray} target Array to which to copy
+-   * @param {ConditionCallback} conditionCb Callback passed the current item;
+-   *     will move item if evaluates to `true`
+-   * @returns {void}
++   * A dependency-free, restricted JavaScript expression evaluator which
++   * replaces the previous use of Node's `vm` module (and of `new Function`
++   * in the browser build) for filter and script expressions. Expressions
++   * are parsed into an AST and interpreted directly so that nothing can
++   * reach the real global object or the `Function` constructor.
++   *
++   * Supported: literals (numbers, strings, regular expressions, `true`,
++   * `false`, `null`, `undefined`), arrays, identifiers (only those
++   * supplied via the sandbox), member access, calls, unary, binary,
++   * logical and ternary operators, (compound) assignment to identifiers
++   * and `var`/`let`/`const` prefixes in `;`-separated statements.
++   *
++   * Reading `constructor`, `__proto__`, etc. is blocked unless it is an
++   * own, non-function property of a non-function object.
+    */
++  var SafeScript = (function () {
++      'use strict';
+ 
+-  var moveToAnotherArray = function moveToAnotherArray(source, target, conditionCb) {
+-    var il = source.length;
++      var hasOwn = Object.prototype.hasOwnProperty;
+ 
+-    for (var i = 0; i < il; i++) {
+-      var item = source[i];
++      var BLOCKED_PROPS = [
++          'constructor',
++          '__proto__',
++          '__defineGetter__',
++          '__defineSetter__',
++          '__lookupGetter__',
++          '__lookupSetter__',
++          'prototype',
++          'caller',
++          'callee',
++          'arguments'
++      ];
+ 
+-      if (conditionCb(item)) {
+-        target.push(source.splice(i--, 1)[0]);
++      var BINARY_PRECEDENCE = {
++          '||': 1,
++          '&&': 2,
++          '|': 3,
++          '^': 4,
++          '&': 5,
++          '==': 6,
++          '!=': 6,
++          '===': 6,
++          '!==': 6,
++          '<': 7,
++          '>': 7,
++          '<=': 7,
++          '>=': 7,
++          '<<': 8,
++          '>>': 8,
++          '>>>': 8,
++          '+': 9,
++          '-': 9,
++          '*': 10,
++          '/': 10,
++          '%': 10
++      };
++
++      // Longest first so that e.g. `>>>` wins over `>>` and `>`
++      var BINARY_OPERATORS = [
++          '>>>', '===', '!==',
++          '<<', '>>', '==', '!=', '<=', '>=', '&&', '||',
++          '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'
++      ];
++
++      // Binary operators which may be followed by `=` to form an assignment
++      var COMPOUND_ASSIGNABLE = [
++          '>>>', '<<', '>>', '+', '-', '*', '/', '%', '&', '|', '^'
++      ];
++
++      var ASSIGNMENT_OPERATORS = [
++          '>>>=', '<<=', '>>=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
++          '='
++      ];
++
++      var NUMBER_REGEX = new RegExp(
++          '^(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|' +
++          '(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)'
++      );
++
++      /**
++       * @param {string} ch
++       * @returns {boolean}
++       */
++      function isIdentifierStart (ch) {
++          return (/[A-Za-z_$]/).test(ch) ||
++              (ch > '\u007f' && !(/\s/).test(ch));
+       }
+-    }
+-  };
+ 
++      /**
++       * @param {string} ch
++       * @returns {boolean}
++       */
++      function isIdentifierPart (ch) {
++          return isIdentifierStart(ch) || (/[0-9]/).test(ch);
++      }
++
++      /**
++       * @param {string} code
++       * @returns {object} The AST
++       */
++      function parse (code) {
++          var pos = 0;
++          var len = code.length;
++
++          /**
++           * @param {string} msg
++           * @throws {SyntaxError}
++           * @returns {void}
++           */
++          function fail (msg) {
++              throw new SyntaxError(msg + ' (at character ' + pos + ')');
++          }
++
++          /**
++           * @returns {void}
++           */
++          function skipWhitespace () {
++              while (pos < len && (/\s/).test(code.charAt(pos))) {
++                  pos++;
++              }
++          }
++
++          /**
++           * @param {string} word
++           * @returns {boolean}
++           */
++          function peekWord (word) {
++              return code.substr(pos, word.length) === word &&
++                  !isIdentifierPart(code.charAt(pos + word.length));
++          }
++
++          /**
++           * @returns {string}
++           */
++          function readIdentifier () {
++              var start = pos;
++              while (pos < len && isIdentifierPart(code.charAt(pos))) {
++                  pos++;
++              }
++              return code.slice(start, pos);
++          }
++
++          /**
++           * @param {string} hex
++           * @returns {string}
++           */
++          function fromHex (hex) {
++              if (!(/^[0-9a-fA-F]+$/).test(hex)) {
++                  fail('Invalid escape sequence');
++              }
++              return String.fromCharCode(parseInt(hex, 16));
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parseString () {
++              var quote = code.charAt(pos++);
++              var out = '';
++              var ch;
++              while (pos < len) {
++                  ch = code.charAt(pos++);
++                  if (ch === quote) {
++                      return {type: 'Literal', value: out};
++                  }
++                  if (ch !== '\\') {
++                      out += ch;
++                      continue;
++                  }
++                  ch = code.charAt(pos++);
++                  switch (ch) {
++                  case 'n':
++                      out += '\n';
++                      break;
++                  case 't':
++                      out += '\t';
++                      break;
++                  case 'r':
++                      out += '\r';
++                      break;
++                  case 'b':
++                      out += '\b';
++                      break;
++                  case 'f':
++                      out += '\f';
++                      break;
++                  case 'v':
++                      out += '\v';
++                      break;
++                  case '0':
++                      out += '\0';
++                      break;
++                  case 'x':
++                      out += fromHex(code.substr(pos, 2));
++                      pos += 2;
++                      break;
++                  case 'u':
++                      out += fromHex(code.substr(pos, 4));
++                      pos += 4;
++                      break;
++                  case '\r':
++                      if (code.charAt(pos) === '\n') {
++                          pos++;
++                      }
++                      break;
++                  case '\n':
++                      break;
++                  default:
++                      out += ch;
++                      break;
++                  }
++              }
++              return fail('Unterminated string');
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parseRegex () {
++              var start = ++pos;
++              var inClass = false;
++              var ch;
++              var flagsStart;
++              var pattern;
++              var flags;
++              while (pos < len) {
++                  ch = code.charAt(pos);
++                  if (ch === '\\') {
++                      pos += 2;
++                  } else if (ch === '\n' || ch === '\r') {
++                      break;
++                  } else if (ch === '[') {
++                      inClass = true;
++                      pos++;
++                  } else if (ch === ']') {
++                      inClass = false;
++                      pos++;
++                  } else if (ch === '/' && !inClass) {
++                      break;
++                  } else {
++                      pos++;
++                  }
++              }
++              if (pos >= len || code.charAt(pos) !== '/') {
++                  fail('Unterminated regular expression');
++              }
++              pattern = code.slice(start, pos);
++              pos++;
++              flagsStart = pos;
++              while (pos < len && (/[A-Za-z]/).test(code.charAt(pos))) {
++                  pos++;
++              }
++              flags = code.slice(flagsStart, pos);
++              try {
++                  new RegExp(pattern, flags); // eslint-disable-line no-new
++              } catch (err) {
++                  fail('Invalid regular expression');
++              }
++              return {type: 'RegExpLiteral', pattern: pattern, flags: flags};
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parsePrimary () {
++              var ch, match, name, elements, node;
++              skipWhitespace();
++              ch = code.charAt(pos);
++              if (!ch) {
++                  return fail('Unexpected end of expression');
++              }
++              if ((/[0-9]/).test(ch) ||
++                  (ch === '.' && (/[0-9]/).test(code.charAt(pos + 1)))
++              ) {
++                  match = NUMBER_REGEX.exec(code.slice(pos));
++                  if (!match) {
++                      fail('Invalid number');
++                  }
++                  pos += match[0].length;
++                  if (isIdentifierStart(code.charAt(pos))) {
++                      fail('Invalid number');
++                  }
++                  return {type: 'Literal', value: Number(match[0])};
++              }
++              if (ch === '"' || ch === "'") {
++                  return parseString();
++              }
++              if (ch === '(') {
++                  pos++;
++                  node = parseAssignment();
++                  skipWhitespace();
++                  if (code.charAt(pos) !== ')') {
++                      fail('Expected )');
++                  }
++                  pos++;
++                  return node;
++              }
++              if (ch === '[') {
++                  pos++;
++                  elements = [];
++                  skipWhitespace();
++                  if (code.charAt(pos) === ']') {
++                      pos++;
++                      return {type: 'ArrayExpression', elements: elements};
++                  }
++                  for (;;) {
++                      elements.push(parseAssignment());
++                      skipWhitespace();
++                      ch = code.charAt(pos);
++                      pos++;
++                      if (ch === ']') {
++                          break;
++                      }
++                      if (ch !== ',') {
++                          pos--;
++                          fail('Expected , or ]');
++                      }
++                  }
++                  return {type: 'ArrayExpression', elements: elements};
++              }
++              if (ch === '/') {
++                  return parseRegex();
++              }
++              if (isIdentifierStart(ch)) {
++                  name = readIdentifier();
++                  switch (name) {
++                  case 'true':
++                      return {type: 'Literal', value: true};
++                  case 'false':
++                      return {type: 'Literal', value: false};
++                  case 'null':
++                      return {type: 'Literal', value: null};
++                  case 'undefined':
++                      return {type: 'Literal', value: undefined};
++                  default:
++                      return {type: 'Identifier', name: name};
++                  }
++              }
++              return fail('Unexpected "' + ch + '"');
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parsePostfix () {
++              var node = parsePrimary();
++              var ch, args, property;
++              for (;;) {
++                  skipWhitespace();
++                  ch = code.charAt(pos);
++                  if (ch === '.') {
++                      pos++;
++                      skipWhitespace();
++                      if (!isIdentifierStart(code.charAt(pos))) {
++                          fail('Expected property name');
++                      }
++                      node = {
++                          type: 'MemberExpression',
++                          computed: false,
++                          object: node,
++                          property: {type: 'Literal', value: readIdentifier()}
++                      };
++                  } else if (ch === '[') {
++                      pos++;
++                      property = parseAssignment();
++                      skipWhitespace();
++                      if (code.charAt(pos) !== ']') {
++                          fail('Expected ]');
++                      }
++                      pos++;
++                      node = {
++                          type: 'MemberExpression',
++                          computed: true,
++                          object: node,
++                          property: property
++                      };
++                  } else if (ch === '(') {
++                      pos++;
++                      args = [];
++                      skipWhitespace();
++                      if (code.charAt(pos) === ')') {
++                          pos++;
++                      } else {
++                          for (;;) {
++                              args.push(parseAssignment());
++                              skipWhitespace();
++                              ch = code.charAt(pos);
++                              pos++;
++                              if (ch === ')') {
++                                  break;
++                              }
++                              if (ch !== ',') {
++                                  pos--;
++                                  fail('Expected , or )');
++                              }
++                          }
++                      }
++                      node = {
++                          type: 'CallExpression',
++                          callee: node,
++                          arguments: args
++                      };
++                  } else {
++                      return node;
++                  }
++              }
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parseUnary () {
++              var ch;
++              skipWhitespace();
++              ch = code.charAt(pos);
++              if (ch === '-' || ch === '+' || ch === '!' || ch === '~') {
++                  if ((ch === '-' || ch === '+') && code.charAt(pos + 1) === ch) {
++                      fail('Increment and decrement operators are not supported');
++                  }
++                  pos++;
++                  return {
++                      type: 'UnaryExpression',
++                      operator: ch,
++                      argument: parseUnary()
++                  };
++              }
++              if (peekWord('typeof')) {
++                  pos += 'typeof'.length;
++                  return {
++                      type: 'UnaryExpression',
++                      operator: 'typeof',
++                      argument: parseUnary()
++                  };
++              }
++              return parsePostfix();
++          }
++
++          /**
++           * @returns {string|null}
++           */
++          function peekBinaryOperator () {
++              var i, op;
++              skipWhitespace();
++              for (i = 0; i < BINARY_OPERATORS.length; i++) {
++                  op = BINARY_OPERATORS[i];
++                  if (code.substr(pos, op.length) === op) {
++                      if (COMPOUND_ASSIGNABLE.indexOf(op) > -1 &&
++                          code.charAt(pos + op.length) === '='
++                      ) {
++                          return null; // Assignment operator
++                      }
++                      return op;
++                  }
++              }
++              return null;
++          }
++
++          /**
++           * @param {Integer} minPrecedence
++           * @returns {object}
++           */
++          function parseBinary (minPrecedence) {
++              var left = parseUnary();
++              var op, precedence;
++              for (;;) {
++                  op = peekBinaryOperator();
++                  if (!op) {
++                      return left;
++                  }
++                  precedence = BINARY_PRECEDENCE[op];
++                  if (precedence < minPrecedence) {
++                      return left;
++                  }
++                  pos += op.length;
++                  left = {
++                      type: 'BinaryExpression',
++                      operator: op,
++                      left: left,
++                      right: parseBinary(precedence + 1)
++                  };
++              }
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parseConditional () {
++              var test = parseBinary(1);
++              var consequent, alternate;
++              skipWhitespace();
++              if (code.charAt(pos) !== '?') {
++                  return test;
++              }
++              pos++;
++              consequent = parseAssignment();
++              skipWhitespace();
++              if (code.charAt(pos) !== ':') {
++                  fail('Expected :');
++              }
++              pos++;
++              alternate = parseAssignment();
++              return {
++                  type: 'ConditionalExpression',
++                  test: test,
++                  consequent: consequent,
++                  alternate: alternate
++              };
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parseAssignment () {
++              var left = parseConditional();
++              var i, op;
++              skipWhitespace();
++              for (i = 0; i < ASSIGNMENT_OPERATORS.length; i++) {
++                  op = ASSIGNMENT_OPERATORS[i];
++                  if (code.substr(pos, op.length) === op &&
++                      // Not `==`, `===` or `=>`
++                      (op !== '=' ||
++                          (code.charAt(pos + 1) !== '=' &&
++                          code.charAt(pos + 1) !== '>'))
++                  ) {
++                      if (left.type !== 'Identifier') {
++                          fail('Invalid left-hand side in assignment');
++                      }
++                      pos += op.length;
++                      return {
++                          type: 'AssignmentExpression',
++                          operator: op,
++                          name: left.name,
++                          right: parseAssignment()
++                      };
++                  }
++              }
++              return left;
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parseStatement () {
++              var keywords = ['var', 'let', 'const'];
++              var i, saved;
++              skipWhitespace();
++              for (i = 0; i < keywords.length; i++) {
++                  if (peekWord(keywords[i])) {
++                      saved = pos;
++                      pos += keywords[i].length;
++                      skipWhitespace();
++                      if (!isIdentifierStart(code.charAt(pos))) {
++                          // Not a declaration
++                          pos = saved;
++                      }
++                      break;
++                  }
++              }
++              return parseAssignment();
++          }
++
++          /**
++           * @returns {object}
++           */
++          function parseProgram () {
++              var body = [];
++              for (;;) {
++                  skipWhitespace();
++                  while (code.charAt(pos) === ';') {
++                      pos++;
++                      skipWhitespace();
++                  }
++                  if (pos >= len) {
++                      break;
++                  }
++                  body.push(parseStatement());
++                  skipWhitespace();
++                  if (pos < len && code.charAt(pos) !== ';') {
++                      fail('Unexpected "' + code.charAt(pos) + '"');
++                  }
++              }
++              return {type: 'Program', body: body};
++          }
++
++          return parseProgram();
++      }
++
++      /**
++       * @param {string} op
++       * @param {any} a
++       * @param {any} b
++       * @returns {any}
++       */
++      function applyBinary (op, a, b) {
++          switch (op) {
++          case '|':
++              return a | b;
++          case '^':
++              return a ^ b;
++          case '&':
++              return a & b;
++          case '==':
++              // eslint-disable-next-line eqeqeq
++              return a == b;
++          case '!=':
++              // eslint-disable-next-line eqeqeq
++              return a != b;
++          case '===':
++              return a === b;
++          case '!==':
++              return a !== b;
++          case '<':
++              return a < b;
++          case '>':
++              return a > b;
++          case '<=':
++              return a <= b;
++          case '>=':
++              return a >= b;
++          case '<<':
++              return a << b;
++          case '>>':
++              return a >> b;
++          case '>>>':
++              return a >>> b;
++          case '+':
++              return a + b;
++          case '-':
++              return a - b;
++          case '*':
++              return a * b;
++          case '/':
++              return a / b;
++          case '%':
++              return a % b;
++          default:
++              throw new SyntaxError('Unsupported operator ' + op);
++          }
++      }
++
++      /**
++       * @param {any} obj
++       * @param {any} prop
++       * @returns {any}
++       */
++      function getMember (obj, prop) {
++          var blocked, result;
++          if (typeof prop !== 'symbol') {
++              prop = String(prop);
++          }
++          if (obj === undefined || obj === null) {
++              throw new TypeError(
++                  'Cannot read properties of ' + obj +
++                  " (reading '" + String(prop) + "')"
++              );
++          }
++          blocked = BLOCKED_PROPS.indexOf(prop) > -1;
++          if (blocked && (typeof obj === 'function' || !hasOwn.call(obj, prop))) {
++              throw new TypeError(
++                  "Access to property '" + prop + "' is not allowed"
++              );
++          }
++          result = obj[prop];
++          if (blocked && typeof result === 'function') {
++              throw new TypeError(
++                  "Access to property '" + prop + "' is not allowed"
++              );
++          }
++          return result;
++      }
++
++      /**
++       * @param {object} ast
++       * @param {object} subs
++       * @returns {any}
++       */
++      function evalAst (ast, subs) {
++          var i, last, value, current, obj, prop, func, args, name;
++          switch (ast.type) {
++          case 'Program':
++              for (i = 0; i < ast.body.length; i++) {
++                  last = evalAst(ast.body[i], subs);
++              }
++              return last;
++          case 'Literal':
++              return ast.value;
++          case 'RegExpLiteral':
++              return new RegExp(ast.pattern, ast.flags);
++          case 'Identifier':
++              if (hasOwn.call(subs, ast.name)) {
++                  return subs[ast.name];
++              }
++              throw new ReferenceError(ast.name + ' is not defined');
++          case 'ArrayExpression':
++              return ast.elements.map(function (el) {
++                  return evalAst(el, subs);
++              });
++          case 'ConditionalExpression':
++              return evalAst(ast.test, subs)
++                  ? evalAst(ast.consequent, subs)
++                  : evalAst(ast.alternate, subs);
++          case 'BinaryExpression':
++              value = evalAst(ast.left, subs);
++              if (ast.operator === '&&') {
++                  return value && evalAst(ast.right, subs);
++              }
++              if (ast.operator === '||') {
++                  return value || evalAst(ast.right, subs);
++              }
++              return applyBinary(ast.operator, value, evalAst(ast.right, subs));
++          case 'UnaryExpression':
++              if (ast.operator === 'typeof') {
++                  if (ast.argument.type === 'Identifier' &&
++                      !hasOwn.call(subs, ast.argument.name)
++                  ) {
++                      return 'undefined';
++                  }
++                  return typeof evalAst(ast.argument, subs);
++              }
++              value = evalAst(ast.argument, subs);
++              switch (ast.operator) {
++              case '-':
++                  return -value;
++              case '+':
++                  return Number(value);
++              case '!':
++                  return !value;
++              default: // '~'
++                  return ~value;
++              }
++          case 'MemberExpression':
++              obj = evalAst(ast.object, subs);
++              prop = ast.computed
++                  ? evalAst(ast.property, subs)
++                  : ast.property.value;
++              value = getMember(obj, prop);
++              // Arrow functions aren't affected by bind
++              return typeof value === 'function' ? value.bind(obj) : value;
++          case 'CallExpression':
++              if (ast.callee.type === 'MemberExpression') {
++                  obj = evalAst(ast.callee.object, subs);
++                  prop = ast.callee.computed
++                      ? evalAst(ast.callee.property, subs)
++                      : ast.callee.property.value;
++                  func = getMember(obj, prop);
++                  name = String(prop);
++              } else {
++                  obj = undefined;
++                  func = evalAst(ast.callee, subs);
++                  name = ast.callee.type === 'Identifier'
++                      ? ast.callee.name
++                      : 'expression';
++              }
++              args = ast.arguments.map(function (arg) {
++                  return evalAst(arg, subs);
++              });
++              if (typeof func !== 'function') {
++                  throw new TypeError(name + ' is not a function');
++              }
++              return func.apply(obj, args);
++          case 'AssignmentExpression':
++              value = evalAst(ast.right, subs);
++              if (ast.operator !== '=') {
++                  if (!hasOwn.call(subs, ast.name)) {
++                      throw new ReferenceError(ast.name + ' is not defined');
++                  }
++                  current = subs[ast.name];
++                  value = applyBinary(
++                      ast.operator.slice(0, -1), current, value
++                  );
++              }
++              subs[ast.name] = value;
++              return value;
++          default:
++              throw new SyntaxError('Unexpected expression');
++          }
++      }
++
++      var cache = Object.create(null);
++      var cacheSize = 0;
++
++      /**
++       * A replacement for NodeJS' `vm.Script` which neither exposes the
++       * global scope nor allows reaching `Function` and is also
++       * Content Security Policy friendly.
++       * @param {string} expr Expression to evaluate
++       */
++      function SafeScript (expr) {
++          this.code = expr;
++          this.ast = parse(String(expr));
++      }
++
++      /**
++       * @param {object} context Object whose items will be added
++       *   to evaluation
++       * @returns {any} Result of evaluated code
++       */
++      SafeScript.prototype.runInNewContext = function (context) {
++          // A prototype-less object, so that only the supplied keys exist
++          var keyMap = Object.create(null);
++          Object.keys(context || {}).forEach(function (key) {
++              keyMap[key] = context[key];
++          });
++          return evalAst(this.ast, keyMap);
++      };
++
++      /**
++       * @param {string} expr Expression to evaluate
++       * @param {object} context Object whose items will be added
++       *   to evaluation
++       * @returns {any} Result of evaluated code
++       */
++      SafeScript.runInNewContext = function (expr, context) {
++          var script = cache[expr];
++          if (!script) {
++              script = new SafeScript(expr);
++              if (cacheSize >= 1000) {
++                  cache = Object.create(null);
++                  cacheSize = 0;
++              }
++              cache[expr] = script;
++              cacheSize++;
++          }
++          return script.runInNewContext(context);
++      };
++
++      return SafeScript;
++  }());
++
+   JSONPath.prototype.vm = {
+     /**
+      * @param {string} expr Expression to evaluate
+@@ -1024,38 +1827,7 @@
+      * @returns {any} Result of evaluated code
+      */
+     runInNewContext: function runInNewContext(expr, context) {
+-      var keys = Object.keys(context);
+-      var funcs = [];
+-      moveToAnotherArray(keys, funcs, function (key) {
+-        return typeof context[key] === 'function';
+-      });
+-      var values = keys.map(function (vr, i) {
+-        return context[vr];
+-      });
+-      var funcString = funcs.reduce(function (s, func) {
+-        var fString = context[func].toString();
+-
+-        if (!/function/.test(fString)) {
+-          fString = 'function ' + fString;
+-        }
+-
+-        return 'var ' + func + '=' + fString + ';' + s;
+-      }, '');
+-      expr = funcString + expr; // Mitigate http://perfectionkills.com/global-eval-what-are-the-options/#new_function
+-
+-      if (!/(["'])use strict\1/.test(expr) && !keys.includes('arguments')) {
+-        expr = 'var arguments = undefined;' + expr;
+-      } // Remove last semi so `return` will be inserted before
+-      //  the previous one instead, allowing for the return
+-      //  of a bare ending expression
+-
+-
+-      expr = expr.replace(/;[\t-\r \xA0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF]*$/, ''); // Insert `return`
+-
+-      var lastStatementEnd = expr.lastIndexOf(';');
+-      var code = lastStatementEnd > -1 ? expr.slice(0, lastStatementEnd + 1) + ' return ' + expr.slice(lastStatementEnd + 1) : ' return ' + expr; // eslint-disable-next-line no-new-func
+-
+-      return _construct(Function, _toConsumableArray(keys).concat([code])).apply(void 0, _toConsumableArray(values));
++      return SafeScript.runInNewContext(expr, context);
+     }
+   };
+ 
+--- a/dist/index-node-cjs.cjs
++++ b/dist/index-node-cjs.cjs
+@@ -2,12 +2,6 @@
+ 
+ Object.defineProperty(exports, '__esModule', { value: true });
+ 
+-var vm = require('vm');
+-
+-function _interopDefaultLegacy (e) { return e && typeof e === 'object' && 'default' in e ? e : { 'default': e }; }
+-
+-var vm__default = /*#__PURE__*/_interopDefaultLegacy(vm);
+-
+ const {
+   hasOwnProperty: hasOwnProp
+ } = Object.prototype;
+@@ -730,6 +724,846 @@
+   return cache[expr].concat();
+ };
+ 
+-JSONPath.prototype.vm = vm__default['default'];
++/**
++ * A dependency-free, restricted JavaScript expression evaluator which
++ * replaces the previous use of Node's `vm` module (and of `new Function`
++ * in the browser build) for filter and script expressions. Expressions
++ * are parsed into an AST and interpreted directly so that nothing can
++ * reach the real global object or the `Function` constructor.
++ *
++ * Supported: literals (numbers, strings, regular expressions, `true`,
++ * `false`, `null`, `undefined`), arrays, identifiers (only those
++ * supplied via the sandbox), member access, calls, unary, binary,
++ * logical and ternary operators, (compound) assignment to identifiers
++ * and `var`/`let`/`const` prefixes in `;`-separated statements.
++ *
++ * Reading `constructor`, `__proto__`, etc. is blocked unless it is an
++ * own, non-function property of a non-function object.
++ */
++var SafeScript = (function () {
++    'use strict';
++
++    var hasOwn = Object.prototype.hasOwnProperty;
++
++    var BLOCKED_PROPS = [
++        'constructor',
++        '__proto__',
++        '__defineGetter__',
++        '__defineSetter__',
++        '__lookupGetter__',
++        '__lookupSetter__',
++        'prototype',
++        'caller',
++        'callee',
++        'arguments'
++    ];
++
++    var BINARY_PRECEDENCE = {
++        '||': 1,
++        '&&': 2,
++        '|': 3,
++        '^': 4,
++        '&': 5,
++        '==': 6,
++        '!=': 6,
++        '===': 6,
++        '!==': 6,
++        '<': 7,
++        '>': 7,
++        '<=': 7,
++        '>=': 7,
++        '<<': 8,
++        '>>': 8,
++        '>>>': 8,
++        '+': 9,
++        '-': 9,
++        '*': 10,
++        '/': 10,
++        '%': 10
++    };
++
++    // Longest first so that e.g. `>>>` wins over `>>` and `>`
++    var BINARY_OPERATORS = [
++        '>>>', '===', '!==',
++        '<<', '>>', '==', '!=', '<=', '>=', '&&', '||',
++        '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    // Binary operators which may be followed by `=` to form an assignment
++    var COMPOUND_ASSIGNABLE = [
++        '>>>', '<<', '>>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    var ASSIGNMENT_OPERATORS = [
++        '>>>=', '<<=', '>>=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
++        '='
++    ];
++
++    var NUMBER_REGEX = new RegExp(
++        '^(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|' +
++        '(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)'
++    );
++
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierStart (ch) {
++        return (/[A-Za-z_$]/).test(ch) ||
++            (ch > '\u007f' && !(/\s/).test(ch));
++    }
++
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierPart (ch) {
++        return isIdentifierStart(ch) || (/[0-9]/).test(ch);
++    }
++
++    /**
++     * @param {string} code
++     * @returns {object} The AST
++     */
++    function parse (code) {
++        var pos = 0;
++        var len = code.length;
++
++        /**
++         * @param {string} msg
++         * @throws {SyntaxError}
++         * @returns {void}
++         */
++        function fail (msg) {
++            throw new SyntaxError(msg + ' (at character ' + pos + ')');
++        }
++
++        /**
++         * @returns {void}
++         */
++        function skipWhitespace () {
++            while (pos < len && (/\s/).test(code.charAt(pos))) {
++                pos++;
++            }
++        }
++
++        /**
++         * @param {string} word
++         * @returns {boolean}
++         */
++        function peekWord (word) {
++            return code.substr(pos, word.length) === word &&
++                !isIdentifierPart(code.charAt(pos + word.length));
++        }
++
++        /**
++         * @returns {string}
++         */
++        function readIdentifier () {
++            var start = pos;
++            while (pos < len && isIdentifierPart(code.charAt(pos))) {
++                pos++;
++            }
++            return code.slice(start, pos);
++        }
++
++        /**
++         * @param {string} hex
++         * @returns {string}
++         */
++        function fromHex (hex) {
++            if (!(/^[0-9a-fA-F]+$/).test(hex)) {
++                fail('Invalid escape sequence');
++            }
++            return String.fromCharCode(parseInt(hex, 16));
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseString () {
++            var quote = code.charAt(pos++);
++            var out = '';
++            var ch;
++            while (pos < len) {
++                ch = code.charAt(pos++);
++                if (ch === quote) {
++                    return {type: 'Literal', value: out};
++                }
++                if (ch !== '\\') {
++                    out += ch;
++                    continue;
++                }
++                ch = code.charAt(pos++);
++                switch (ch) {
++                case 'n':
++                    out += '\n';
++                    break;
++                case 't':
++                    out += '\t';
++                    break;
++                case 'r':
++                    out += '\r';
++                    break;
++                case 'b':
++                    out += '\b';
++                    break;
++                case 'f':
++                    out += '\f';
++                    break;
++                case 'v':
++                    out += '\v';
++                    break;
++                case '0':
++                    out += '\0';
++                    break;
++                case 'x':
++                    out += fromHex(code.substr(pos, 2));
++                    pos += 2;
++                    break;
++                case 'u':
++                    out += fromHex(code.substr(pos, 4));
++                    pos += 4;
++                    break;
++                case '\r':
++                    if (code.charAt(pos) === '\n') {
++                        pos++;
++                    }
++                    break;
++                case '\n':
++                    break;
++                default:
++                    out += ch;
++                    break;
++                }
++            }
++            return fail('Unterminated string');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseRegex () {
++            var start = ++pos;
++            var inClass = false;
++            var ch;
++            var flagsStart;
++            var pattern;
++            var flags;
++            while (pos < len) {
++                ch = code.charAt(pos);
++                if (ch === '\\') {
++                    pos += 2;
++                } else if (ch === '\n' || ch === '\r') {
++                    break;
++                } else if (ch === '[') {
++                    inClass = true;
++                    pos++;
++                } else if (ch === ']') {
++                    inClass = false;
++                    pos++;
++                } else if (ch === '/' && !inClass) {
++                    break;
++                } else {
++                    pos++;
++                }
++            }
++            if (pos >= len || code.charAt(pos) !== '/') {
++                fail('Unterminated regular expression');
++            }
++            pattern = code.slice(start, pos);
++            pos++;
++            flagsStart = pos;
++            while (pos < len && (/[A-Za-z]/).test(code.charAt(pos))) {
++                pos++;
++            }
++            flags = code.slice(flagsStart, pos);
++            try {
++                new RegExp(pattern, flags); // eslint-disable-line no-new
++            } catch (err) {
++                fail('Invalid regular expression');
++            }
++            return {type: 'RegExpLiteral', pattern: pattern, flags: flags};
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePrimary () {
++            var ch, match, name, elements, node;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (!ch) {
++                return fail('Unexpected end of expression');
++            }
++            if ((/[0-9]/).test(ch) ||
++                (ch === '.' && (/[0-9]/).test(code.charAt(pos + 1)))
++            ) {
++                match = NUMBER_REGEX.exec(code.slice(pos));
++                if (!match) {
++                    fail('Invalid number');
++                }
++                pos += match[0].length;
++                if (isIdentifierStart(code.charAt(pos))) {
++                    fail('Invalid number');
++                }
++                return {type: 'Literal', value: Number(match[0])};
++            }
++            if (ch === '"' || ch === "'") {
++                return parseString();
++            }
++            if (ch === '(') {
++                pos++;
++                node = parseAssignment();
++                skipWhitespace();
++                if (code.charAt(pos) !== ')') {
++                    fail('Expected )');
++                }
++                pos++;
++                return node;
++            }
++            if (ch === '[') {
++                pos++;
++                elements = [];
++                skipWhitespace();
++                if (code.charAt(pos) === ']') {
++                    pos++;
++                    return {type: 'ArrayExpression', elements: elements};
++                }
++                for (;;) {
++                    elements.push(parseAssignment());
++                    skipWhitespace();
++                    ch = code.charAt(pos);
++                    pos++;
++                    if (ch === ']') {
++                        break;
++                    }
++                    if (ch !== ',') {
++                        pos--;
++                        fail('Expected , or ]');
++                    }
++                }
++                return {type: 'ArrayExpression', elements: elements};
++            }
++            if (ch === '/') {
++                return parseRegex();
++            }
++            if (isIdentifierStart(ch)) {
++                name = readIdentifier();
++                switch (name) {
++                case 'true':
++                    return {type: 'Literal', value: true};
++                case 'false':
++                    return {type: 'Literal', value: false};
++                case 'null':
++                    return {type: 'Literal', value: null};
++                case 'undefined':
++                    return {type: 'Literal', value: undefined};
++                default:
++                    return {type: 'Identifier', name: name};
++                }
++            }
++            return fail('Unexpected "' + ch + '"');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePostfix () {
++            var node = parsePrimary();
++            var ch, args, property;
++            for (;;) {
++                skipWhitespace();
++                ch = code.charAt(pos);
++                if (ch === '.') {
++                    pos++;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        fail('Expected property name');
++                    }
++                    node = {
++                        type: 'MemberExpression',
++                        computed: false,
++                        object: node,
++                        property: {type: 'Literal', value: readIdentifier()}
++                    };
++                } else if (ch === '[') {
++                    pos++;
++                    property = parseAssignment();
++                    skipWhitespace();
++                    if (code.charAt(pos) !== ']') {
++                        fail('Expected ]');
++                    }
++                    pos++;
++                    node = {
++                        type: 'MemberExpression',
++                        computed: true,
++                        object: node,
++                        property: property
++                    };
++                } else if (ch === '(') {
++                    pos++;
++                    args = [];
++                    skipWhitespace();
++                    if (code.charAt(pos) === ')') {
++                        pos++;
++                    } else {
++                        for (;;) {
++                            args.push(parseAssignment());
++                            skipWhitespace();
++                            ch = code.charAt(pos);
++                            pos++;
++                            if (ch === ')') {
++                                break;
++                            }
++                            if (ch !== ',') {
++                                pos--;
++                                fail('Expected , or )');
++                            }
++                        }
++                    }
++                    node = {
++                        type: 'CallExpression',
++                        callee: node,
++                        arguments: args
++                    };
++                } else {
++                    return node;
++                }
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseUnary () {
++            var ch;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (ch === '-' || ch === '+' || ch === '!' || ch === '~') {
++                if ((ch === '-' || ch === '+') && code.charAt(pos + 1) === ch) {
++                    fail('Increment and decrement operators are not supported');
++                }
++                pos++;
++                return {
++                    type: 'UnaryExpression',
++                    operator: ch,
++                    argument: parseUnary()
++                };
++            }
++            if (peekWord('typeof')) {
++                pos += 'typeof'.length;
++                return {
++                    type: 'UnaryExpression',
++                    operator: 'typeof',
++                    argument: parseUnary()
++                };
++            }
++            return parsePostfix();
++        }
++
++        /**
++         * @returns {string|null}
++         */
++        function peekBinaryOperator () {
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < BINARY_OPERATORS.length; i++) {
++                op = BINARY_OPERATORS[i];
++                if (code.substr(pos, op.length) === op) {
++                    if (COMPOUND_ASSIGNABLE.indexOf(op) > -1 &&
++                        code.charAt(pos + op.length) === '='
++                    ) {
++                        return null; // Assignment operator
++                    }
++                    return op;
++                }
++            }
++            return null;
++        }
++
++        /**
++         * @param {Integer} minPrecedence
++         * @returns {object}
++         */
++        function parseBinary (minPrecedence) {
++            var left = parseUnary();
++            var op, precedence;
++            for (;;) {
++                op = peekBinaryOperator();
++                if (!op) {
++                    return left;
++                }
++                precedence = BINARY_PRECEDENCE[op];
++                if (precedence < minPrecedence) {
++                    return left;
++                }
++                pos += op.length;
++                left = {
++                    type: 'BinaryExpression',
++                    operator: op,
++                    left: left,
++                    right: parseBinary(precedence + 1)
++                };
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseConditional () {
++            var test = parseBinary(1);
++            var consequent, alternate;
++            skipWhitespace();
++            if (code.charAt(pos) !== '?') {
++                return test;
++            }
++            pos++;
++            consequent = parseAssignment();
++            skipWhitespace();
++            if (code.charAt(pos) !== ':') {
++                fail('Expected :');
++            }
++            pos++;
++            alternate = parseAssignment();
++            return {
++                type: 'ConditionalExpression',
++                test: test,
++                consequent: consequent,
++                alternate: alternate
++            };
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseAssignment () {
++            var left = parseConditional();
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < ASSIGNMENT_OPERATORS.length; i++) {
++                op = ASSIGNMENT_OPERATORS[i];
++                if (code.substr(pos, op.length) === op &&
++                    // Not `==`, `===` or `=>`
++                    (op !== '=' ||
++                        (code.charAt(pos + 1) !== '=' &&
++                        code.charAt(pos + 1) !== '>'))
++                ) {
++                    if (left.type !== 'Identifier') {
++                        fail('Invalid left-hand side in assignment');
++                    }
++                    pos += op.length;
++                    return {
++                        type: 'AssignmentExpression',
++                        operator: op,
++                        name: left.name,
++                        right: parseAssignment()
++                    };
++                }
++            }
++            return left;
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseStatement () {
++            var keywords = ['var', 'let', 'const'];
++            var i, saved;
++            skipWhitespace();
++            for (i = 0; i < keywords.length; i++) {
++                if (peekWord(keywords[i])) {
++                    saved = pos;
++                    pos += keywords[i].length;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        // Not a declaration
++                        pos = saved;
++                    }
++                    break;
++                }
++            }
++            return parseAssignment();
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseProgram () {
++            var body = [];
++            for (;;) {
++                skipWhitespace();
++                while (code.charAt(pos) === ';') {
++                    pos++;
++                    skipWhitespace();
++                }
++                if (pos >= len) {
++                    break;
++                }
++                body.push(parseStatement());
++                skipWhitespace();
++                if (pos < len && code.charAt(pos) !== ';') {
++                    fail('Unexpected "' + code.charAt(pos) + '"');
++                }
++            }
++            return {type: 'Program', body: body};
++        }
++
++        return parseProgram();
++    }
++
++    /**
++     * @param {string} op
++     * @param {any} a
++     * @param {any} b
++     * @returns {any}
++     */
++    function applyBinary (op, a, b) {
++        switch (op) {
++        case '|':
++            return a | b;
++        case '^':
++            return a ^ b;
++        case '&':
++            return a & b;
++        case '==':
++            // eslint-disable-next-line eqeqeq
++            return a == b;
++        case '!=':
++            // eslint-disable-next-line eqeqeq
++            return a != b;
++        case '===':
++            return a === b;
++        case '!==':
++            return a !== b;
++        case '<':
++            return a < b;
++        case '>':
++            return a > b;
++        case '<=':
++            return a <= b;
++        case '>=':
++            return a >= b;
++        case '<<':
++            return a << b;
++        case '>>':
++            return a >> b;
++        case '>>>':
++            return a >>> b;
++        case '+':
++            return a + b;
++        case '-':
++            return a - b;
++        case '*':
++            return a * b;
++        case '/':
++            return a / b;
++        case '%':
++            return a % b;
++        default:
++            throw new SyntaxError('Unsupported operator ' + op);
++        }
++    }
++
++    /**
++     * @param {any} obj
++     * @param {any} prop
++     * @returns {any}
++     */
++    function getMember (obj, prop) {
++        var blocked, result;
++        if (typeof prop !== 'symbol') {
++            prop = String(prop);
++        }
++        if (obj === undefined || obj === null) {
++            throw new TypeError(
++                'Cannot read properties of ' + obj +
++                " (reading '" + String(prop) + "')"
++            );
++        }
++        blocked = BLOCKED_PROPS.indexOf(prop) > -1;
++        if (blocked && (typeof obj === 'function' || !hasOwn.call(obj, prop))) {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        result = obj[prop];
++        if (blocked && typeof result === 'function') {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        return result;
++    }
++
++    /**
++     * @param {object} ast
++     * @param {object} subs
++     * @returns {any}
++     */
++    function evalAst (ast, subs) {
++        var i, last, value, current, obj, prop, func, args, name;
++        switch (ast.type) {
++        case 'Program':
++            for (i = 0; i < ast.body.length; i++) {
++                last = evalAst(ast.body[i], subs);
++            }
++            return last;
++        case 'Literal':
++            return ast.value;
++        case 'RegExpLiteral':
++            return new RegExp(ast.pattern, ast.flags);
++        case 'Identifier':
++            if (hasOwn.call(subs, ast.name)) {
++                return subs[ast.name];
++            }
++            throw new ReferenceError(ast.name + ' is not defined');
++        case 'ArrayExpression':
++            return ast.elements.map(function (el) {
++                return evalAst(el, subs);
++            });
++        case 'ConditionalExpression':
++            return evalAst(ast.test, subs)
++                ? evalAst(ast.consequent, subs)
++                : evalAst(ast.alternate, subs);
++        case 'BinaryExpression':
++            value = evalAst(ast.left, subs);
++            if (ast.operator === '&&') {
++                return value && evalAst(ast.right, subs);
++            }
++            if (ast.operator === '||') {
++                return value || evalAst(ast.right, subs);
++            }
++            return applyBinary(ast.operator, value, evalAst(ast.right, subs));
++        case 'UnaryExpression':
++            if (ast.operator === 'typeof') {
++                if (ast.argument.type === 'Identifier' &&
++                    !hasOwn.call(subs, ast.argument.name)
++                ) {
++                    return 'undefined';
++                }
++                return typeof evalAst(ast.argument, subs);
++            }
++            value = evalAst(ast.argument, subs);
++            switch (ast.operator) {
++            case '-':
++                return -value;
++            case '+':
++                return Number(value);
++            case '!':
++                return !value;
++            default: // '~'
++                return ~value;
++            }
++        case 'MemberExpression':
++            obj = evalAst(ast.object, subs);
++            prop = ast.computed
++                ? evalAst(ast.property, subs)
++                : ast.property.value;
++            value = getMember(obj, prop);
++            // Arrow functions aren't affected by bind
++            return typeof value === 'function' ? value.bind(obj) : value;
++        case 'CallExpression':
++            if (ast.callee.type === 'MemberExpression') {
++                obj = evalAst(ast.callee.object, subs);
++                prop = ast.callee.computed
++                    ? evalAst(ast.callee.property, subs)
++                    : ast.callee.property.value;
++                func = getMember(obj, prop);
++                name = String(prop);
++            } else {
++                obj = undefined;
++                func = evalAst(ast.callee, subs);
++                name = ast.callee.type === 'Identifier'
++                    ? ast.callee.name
++                    : 'expression';
++            }
++            args = ast.arguments.map(function (arg) {
++                return evalAst(arg, subs);
++            });
++            if (typeof func !== 'function') {
++                throw new TypeError(name + ' is not a function');
++            }
++            return func.apply(obj, args);
++        case 'AssignmentExpression':
++            value = evalAst(ast.right, subs);
++            if (ast.operator !== '=') {
++                if (!hasOwn.call(subs, ast.name)) {
++                    throw new ReferenceError(ast.name + ' is not defined');
++                }
++                current = subs[ast.name];
++                value = applyBinary(
++                    ast.operator.slice(0, -1), current, value
++                );
++            }
++            subs[ast.name] = value;
++            return value;
++        default:
++            throw new SyntaxError('Unexpected expression');
++        }
++    }
++
++    var cache = Object.create(null);
++    var cacheSize = 0;
++
++    /**
++     * A replacement for NodeJS' `vm.Script` which neither exposes the
++     * global scope nor allows reaching `Function` and is also
++     * Content Security Policy friendly.
++     * @param {string} expr Expression to evaluate
++     */
++    function SafeScript (expr) {
++        this.code = expr;
++        this.ast = parse(String(expr));
++    }
++
++    /**
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.prototype.runInNewContext = function (context) {
++        // A prototype-less object, so that only the supplied keys exist
++        var keyMap = Object.create(null);
++        Object.keys(context || {}).forEach(function (key) {
++            keyMap[key] = context[key];
++        });
++        return evalAst(this.ast, keyMap);
++    };
++
++    /**
++     * @param {string} expr Expression to evaluate
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.runInNewContext = function (expr, context) {
++        var script = cache[expr];
++        if (!script) {
++            script = new SafeScript(expr);
++            if (cacheSize >= 1000) {
++                cache = Object.create(null);
++                cacheSize = 0;
++            }
++            cache[expr] = script;
++            cacheSize++;
++        }
++        return script.runInNewContext(context);
++    };
++
++    return SafeScript;
++}());
++
++JSONPath.prototype.vm = {
++  /**
++   * @param {string} expr Expression to evaluate
++   * @param {PlainObject} context Object whose items will be added
++   *   to evaluation
++   * @returns {any} Result of evaluated code
++   */
++  runInNewContext: function runInNewContext(expr, context) {
++    return SafeScript.runInNewContext(expr, context);
++  }
++};
+ 
+ exports.JSONPath = JSONPath;
+--- a/dist/index-node-esm.js
++++ b/dist/index-node-esm.js
+@@ -1,4 +1,3 @@
+-import vm from 'vm';
+ 
+ const {
+   hasOwnProperty: hasOwnProp
+@@ -722,6 +721,846 @@
+   return cache[expr].concat();
+ };
+ 
+-JSONPath.prototype.vm = vm;
++/**
++ * A dependency-free, restricted JavaScript expression evaluator which
++ * replaces the previous use of Node's `vm` module (and of `new Function`
++ * in the browser build) for filter and script expressions. Expressions
++ * are parsed into an AST and interpreted directly so that nothing can
++ * reach the real global object or the `Function` constructor.
++ *
++ * Supported: literals (numbers, strings, regular expressions, `true`,
++ * `false`, `null`, `undefined`), arrays, identifiers (only those
++ * supplied via the sandbox), member access, calls, unary, binary,
++ * logical and ternary operators, (compound) assignment to identifiers
++ * and `var`/`let`/`const` prefixes in `;`-separated statements.
++ *
++ * Reading `constructor`, `__proto__`, etc. is blocked unless it is an
++ * own, non-function property of a non-function object.
++ */
++var SafeScript = (function () {
++    'use strict';
++
++    var hasOwn = Object.prototype.hasOwnProperty;
++
++    var BLOCKED_PROPS = [
++        'constructor',
++        '__proto__',
++        '__defineGetter__',
++        '__defineSetter__',
++        '__lookupGetter__',
++        '__lookupSetter__',
++        'prototype',
++        'caller',
++        'callee',
++        'arguments'
++    ];
++
++    var BINARY_PRECEDENCE = {
++        '||': 1,
++        '&&': 2,
++        '|': 3,
++        '^': 4,
++        '&': 5,
++        '==': 6,
++        '!=': 6,
++        '===': 6,
++        '!==': 6,
++        '<': 7,
++        '>': 7,
++        '<=': 7,
++        '>=': 7,
++        '<<': 8,
++        '>>': 8,
++        '>>>': 8,
++        '+': 9,
++        '-': 9,
++        '*': 10,
++        '/': 10,
++        '%': 10
++    };
++
++    // Longest first so that e.g. `>>>` wins over `>>` and `>`
++    var BINARY_OPERATORS = [
++        '>>>', '===', '!==',
++        '<<', '>>', '==', '!=', '<=', '>=', '&&', '||',
++        '<', '>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    // Binary operators which may be followed by `=` to form an assignment
++    var COMPOUND_ASSIGNABLE = [
++        '>>>', '<<', '>>', '+', '-', '*', '/', '%', '&', '|', '^'
++    ];
++
++    var ASSIGNMENT_OPERATORS = [
++        '>>>=', '<<=', '>>=', '+=', '-=', '*=', '/=', '%=', '&=', '|=', '^=',
++        '='
++    ];
++
++    var NUMBER_REGEX = new RegExp(
++        '^(?:0[xX][0-9a-fA-F]+|0[bB][01]+|0[oO][0-7]+|' +
++        '(?:\\d+\\.?\\d*|\\.\\d+)(?:[eE][+-]?\\d+)?)'
++    );
++
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierStart (ch) {
++        return (/[A-Za-z_$]/).test(ch) ||
++            (ch > '\u007f' && !(/\s/).test(ch));
++    }
++
++    /**
++     * @param {string} ch
++     * @returns {boolean}
++     */
++    function isIdentifierPart (ch) {
++        return isIdentifierStart(ch) || (/[0-9]/).test(ch);
++    }
++
++    /**
++     * @param {string} code
++     * @returns {object} The AST
++     */
++    function parse (code) {
++        var pos = 0;
++        var len = code.length;
++
++        /**
++         * @param {string} msg
++         * @throws {SyntaxError}
++         * @returns {void}
++         */
++        function fail (msg) {
++            throw new SyntaxError(msg + ' (at character ' + pos + ')');
++        }
++
++        /**
++         * @returns {void}
++         */
++        function skipWhitespace () {
++            while (pos < len && (/\s/).test(code.charAt(pos))) {
++                pos++;
++            }
++        }
++
++        /**
++         * @param {string} word
++         * @returns {boolean}
++         */
++        function peekWord (word) {
++            return code.substr(pos, word.length) === word &&
++                !isIdentifierPart(code.charAt(pos + word.length));
++        }
++
++        /**
++         * @returns {string}
++         */
++        function readIdentifier () {
++            var start = pos;
++            while (pos < len && isIdentifierPart(code.charAt(pos))) {
++                pos++;
++            }
++            return code.slice(start, pos);
++        }
++
++        /**
++         * @param {string} hex
++         * @returns {string}
++         */
++        function fromHex (hex) {
++            if (!(/^[0-9a-fA-F]+$/).test(hex)) {
++                fail('Invalid escape sequence');
++            }
++            return String.fromCharCode(parseInt(hex, 16));
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseString () {
++            var quote = code.charAt(pos++);
++            var out = '';
++            var ch;
++            while (pos < len) {
++                ch = code.charAt(pos++);
++                if (ch === quote) {
++                    return {type: 'Literal', value: out};
++                }
++                if (ch !== '\\') {
++                    out += ch;
++                    continue;
++                }
++                ch = code.charAt(pos++);
++                switch (ch) {
++                case 'n':
++                    out += '\n';
++                    break;
++                case 't':
++                    out += '\t';
++                    break;
++                case 'r':
++                    out += '\r';
++                    break;
++                case 'b':
++                    out += '\b';
++                    break;
++                case 'f':
++                    out += '\f';
++                    break;
++                case 'v':
++                    out += '\v';
++                    break;
++                case '0':
++                    out += '\0';
++                    break;
++                case 'x':
++                    out += fromHex(code.substr(pos, 2));
++                    pos += 2;
++                    break;
++                case 'u':
++                    out += fromHex(code.substr(pos, 4));
++                    pos += 4;
++                    break;
++                case '\r':
++                    if (code.charAt(pos) === '\n') {
++                        pos++;
++                    }
++                    break;
++                case '\n':
++                    break;
++                default:
++                    out += ch;
++                    break;
++                }
++            }
++            return fail('Unterminated string');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseRegex () {
++            var start = ++pos;
++            var inClass = false;
++            var ch;
++            var flagsStart;
++            var pattern;
++            var flags;
++            while (pos < len) {
++                ch = code.charAt(pos);
++                if (ch === '\\') {
++                    pos += 2;
++                } else if (ch === '\n' || ch === '\r') {
++                    break;
++                } else if (ch === '[') {
++                    inClass = true;
++                    pos++;
++                } else if (ch === ']') {
++                    inClass = false;
++                    pos++;
++                } else if (ch === '/' && !inClass) {
++                    break;
++                } else {
++                    pos++;
++                }
++            }
++            if (pos >= len || code.charAt(pos) !== '/') {
++                fail('Unterminated regular expression');
++            }
++            pattern = code.slice(start, pos);
++            pos++;
++            flagsStart = pos;
++            while (pos < len && (/[A-Za-z]/).test(code.charAt(pos))) {
++                pos++;
++            }
++            flags = code.slice(flagsStart, pos);
++            try {
++                new RegExp(pattern, flags); // eslint-disable-line no-new
++            } catch (err) {
++                fail('Invalid regular expression');
++            }
++            return {type: 'RegExpLiteral', pattern: pattern, flags: flags};
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePrimary () {
++            var ch, match, name, elements, node;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (!ch) {
++                return fail('Unexpected end of expression');
++            }
++            if ((/[0-9]/).test(ch) ||
++                (ch === '.' && (/[0-9]/).test(code.charAt(pos + 1)))
++            ) {
++                match = NUMBER_REGEX.exec(code.slice(pos));
++                if (!match) {
++                    fail('Invalid number');
++                }
++                pos += match[0].length;
++                if (isIdentifierStart(code.charAt(pos))) {
++                    fail('Invalid number');
++                }
++                return {type: 'Literal', value: Number(match[0])};
++            }
++            if (ch === '"' || ch === "'") {
++                return parseString();
++            }
++            if (ch === '(') {
++                pos++;
++                node = parseAssignment();
++                skipWhitespace();
++                if (code.charAt(pos) !== ')') {
++                    fail('Expected )');
++                }
++                pos++;
++                return node;
++            }
++            if (ch === '[') {
++                pos++;
++                elements = [];
++                skipWhitespace();
++                if (code.charAt(pos) === ']') {
++                    pos++;
++                    return {type: 'ArrayExpression', elements: elements};
++                }
++                for (;;) {
++                    elements.push(parseAssignment());
++                    skipWhitespace();
++                    ch = code.charAt(pos);
++                    pos++;
++                    if (ch === ']') {
++                        break;
++                    }
++                    if (ch !== ',') {
++                        pos--;
++                        fail('Expected , or ]');
++                    }
++                }
++                return {type: 'ArrayExpression', elements: elements};
++            }
++            if (ch === '/') {
++                return parseRegex();
++            }
++            if (isIdentifierStart(ch)) {
++                name = readIdentifier();
++                switch (name) {
++                case 'true':
++                    return {type: 'Literal', value: true};
++                case 'false':
++                    return {type: 'Literal', value: false};
++                case 'null':
++                    return {type: 'Literal', value: null};
++                case 'undefined':
++                    return {type: 'Literal', value: undefined};
++                default:
++                    return {type: 'Identifier', name: name};
++                }
++            }
++            return fail('Unexpected "' + ch + '"');
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parsePostfix () {
++            var node = parsePrimary();
++            var ch, args, property;
++            for (;;) {
++                skipWhitespace();
++                ch = code.charAt(pos);
++                if (ch === '.') {
++                    pos++;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        fail('Expected property name');
++                    }
++                    node = {
++                        type: 'MemberExpression',
++                        computed: false,
++                        object: node,
++                        property: {type: 'Literal', value: readIdentifier()}
++                    };
++                } else if (ch === '[') {
++                    pos++;
++                    property = parseAssignment();
++                    skipWhitespace();
++                    if (code.charAt(pos) !== ']') {
++                        fail('Expected ]');
++                    }
++                    pos++;
++                    node = {
++                        type: 'MemberExpression',
++                        computed: true,
++                        object: node,
++                        property: property
++                    };
++                } else if (ch === '(') {
++                    pos++;
++                    args = [];
++                    skipWhitespace();
++                    if (code.charAt(pos) === ')') {
++                        pos++;
++                    } else {
++                        for (;;) {
++                            args.push(parseAssignment());
++                            skipWhitespace();
++                            ch = code.charAt(pos);
++                            pos++;
++                            if (ch === ')') {
++                                break;
++                            }
++                            if (ch !== ',') {
++                                pos--;
++                                fail('Expected , or )');
++                            }
++                        }
++                    }
++                    node = {
++                        type: 'CallExpression',
++                        callee: node,
++                        arguments: args
++                    };
++                } else {
++                    return node;
++                }
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseUnary () {
++            var ch;
++            skipWhitespace();
++            ch = code.charAt(pos);
++            if (ch === '-' || ch === '+' || ch === '!' || ch === '~') {
++                if ((ch === '-' || ch === '+') && code.charAt(pos + 1) === ch) {
++                    fail('Increment and decrement operators are not supported');
++                }
++                pos++;
++                return {
++                    type: 'UnaryExpression',
++                    operator: ch,
++                    argument: parseUnary()
++                };
++            }
++            if (peekWord('typeof')) {
++                pos += 'typeof'.length;
++                return {
++                    type: 'UnaryExpression',
++                    operator: 'typeof',
++                    argument: parseUnary()
++                };
++            }
++            return parsePostfix();
++        }
++
++        /**
++         * @returns {string|null}
++         */
++        function peekBinaryOperator () {
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < BINARY_OPERATORS.length; i++) {
++                op = BINARY_OPERATORS[i];
++                if (code.substr(pos, op.length) === op) {
++                    if (COMPOUND_ASSIGNABLE.indexOf(op) > -1 &&
++                        code.charAt(pos + op.length) === '='
++                    ) {
++                        return null; // Assignment operator
++                    }
++                    return op;
++                }
++            }
++            return null;
++        }
++
++        /**
++         * @param {Integer} minPrecedence
++         * @returns {object}
++         */
++        function parseBinary (minPrecedence) {
++            var left = parseUnary();
++            var op, precedence;
++            for (;;) {
++                op = peekBinaryOperator();
++                if (!op) {
++                    return left;
++                }
++                precedence = BINARY_PRECEDENCE[op];
++                if (precedence < minPrecedence) {
++                    return left;
++                }
++                pos += op.length;
++                left = {
++                    type: 'BinaryExpression',
++                    operator: op,
++                    left: left,
++                    right: parseBinary(precedence + 1)
++                };
++            }
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseConditional () {
++            var test = parseBinary(1);
++            var consequent, alternate;
++            skipWhitespace();
++            if (code.charAt(pos) !== '?') {
++                return test;
++            }
++            pos++;
++            consequent = parseAssignment();
++            skipWhitespace();
++            if (code.charAt(pos) !== ':') {
++                fail('Expected :');
++            }
++            pos++;
++            alternate = parseAssignment();
++            return {
++                type: 'ConditionalExpression',
++                test: test,
++                consequent: consequent,
++                alternate: alternate
++            };
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseAssignment () {
++            var left = parseConditional();
++            var i, op;
++            skipWhitespace();
++            for (i = 0; i < ASSIGNMENT_OPERATORS.length; i++) {
++                op = ASSIGNMENT_OPERATORS[i];
++                if (code.substr(pos, op.length) === op &&
++                    // Not `==`, `===` or `=>`
++                    (op !== '=' ||
++                        (code.charAt(pos + 1) !== '=' &&
++                        code.charAt(pos + 1) !== '>'))
++                ) {
++                    if (left.type !== 'Identifier') {
++                        fail('Invalid left-hand side in assignment');
++                    }
++                    pos += op.length;
++                    return {
++                        type: 'AssignmentExpression',
++                        operator: op,
++                        name: left.name,
++                        right: parseAssignment()
++                    };
++                }
++            }
++            return left;
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseStatement () {
++            var keywords = ['var', 'let', 'const'];
++            var i, saved;
++            skipWhitespace();
++            for (i = 0; i < keywords.length; i++) {
++                if (peekWord(keywords[i])) {
++                    saved = pos;
++                    pos += keywords[i].length;
++                    skipWhitespace();
++                    if (!isIdentifierStart(code.charAt(pos))) {
++                        // Not a declaration
++                        pos = saved;
++                    }
++                    break;
++                }
++            }
++            return parseAssignment();
++        }
++
++        /**
++         * @returns {object}
++         */
++        function parseProgram () {
++            var body = [];
++            for (;;) {
++                skipWhitespace();
++                while (code.charAt(pos) === ';') {
++                    pos++;
++                    skipWhitespace();
++                }
++                if (pos >= len) {
++                    break;
++                }
++                body.push(parseStatement());
++                skipWhitespace();
++                if (pos < len && code.charAt(pos) !== ';') {
++                    fail('Unexpected "' + code.charAt(pos) + '"');
++                }
++            }
++            return {type: 'Program', body: body};
++        }
++
++        return parseProgram();
++    }
++
++    /**
++     * @param {string} op
++     * @param {any} a
++     * @param {any} b
++     * @returns {any}
++     */
++    function applyBinary (op, a, b) {
++        switch (op) {
++        case '|':
++            return a | b;
++        case '^':
++            return a ^ b;
++        case '&':
++            return a & b;
++        case '==':
++            // eslint-disable-next-line eqeqeq
++            return a == b;
++        case '!=':
++            // eslint-disable-next-line eqeqeq
++            return a != b;
++        case '===':
++            return a === b;
++        case '!==':
++            return a !== b;
++        case '<':
++            return a < b;
++        case '>':
++            return a > b;
++        case '<=':
++            return a <= b;
++        case '>=':
++            return a >= b;
++        case '<<':
++            return a << b;
++        case '>>':
++            return a >> b;
++        case '>>>':
++            return a >>> b;
++        case '+':
++            return a + b;
++        case '-':
++            return a - b;
++        case '*':
++            return a * b;
++        case '/':
++            return a / b;
++        case '%':
++            return a % b;
++        default:
++            throw new SyntaxError('Unsupported operator ' + op);
++        }
++    }
++
++    /**
++     * @param {any} obj
++     * @param {any} prop
++     * @returns {any}
++     */
++    function getMember (obj, prop) {
++        var blocked, result;
++        if (typeof prop !== 'symbol') {
++            prop = String(prop);
++        }
++        if (obj === undefined || obj === null) {
++            throw new TypeError(
++                'Cannot read properties of ' + obj +
++                " (reading '" + String(prop) + "')"
++            );
++        }
++        blocked = BLOCKED_PROPS.indexOf(prop) > -1;
++        if (blocked && (typeof obj === 'function' || !hasOwn.call(obj, prop))) {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        result = obj[prop];
++        if (blocked && typeof result === 'function') {
++            throw new TypeError(
++                "Access to property '" + prop + "' is not allowed"
++            );
++        }
++        return result;
++    }
++
++    /**
++     * @param {object} ast
++     * @param {object} subs
++     * @returns {any}
++     */
++    function evalAst (ast, subs) {
++        var i, last, value, current, obj, prop, func, args, name;
++        switch (ast.type) {
++        case 'Program':
++            for (i = 0; i < ast.body.length; i++) {
++                last = evalAst(ast.body[i], subs);
++            }
++            return last;
++        case 'Literal':
++            return ast.value;
++        case 'RegExpLiteral':
++            return new RegExp(ast.pattern, ast.flags);
++        case 'Identifier':
++            if (hasOwn.call(subs, ast.name)) {
++                return subs[ast.name];
++            }
++            throw new ReferenceError(ast.name + ' is not defined');
++        case 'ArrayExpression':
++            return ast.elements.map(function (el) {
++                return evalAst(el, subs);
++            });
++        case 'ConditionalExpression':
++            return evalAst(ast.test, subs)
++                ? evalAst(ast.consequent, subs)
++                : evalAst(ast.alternate, subs);
++        case 'BinaryExpression':
++            value = evalAst(ast.left, subs);
++            if (ast.operator === '&&') {
++                return value && evalAst(ast.right, subs);
++            }
++            if (ast.operator === '||') {
++                return value || evalAst(ast.right, subs);
++            }
++            return applyBinary(ast.operator, value, evalAst(ast.right, subs));
++        case 'UnaryExpression':
++            if (ast.operator === 'typeof') {
++                if (ast.argument.type === 'Identifier' &&
++                    !hasOwn.call(subs, ast.argument.name)
++                ) {
++                    return 'undefined';
++                }
++                return typeof evalAst(ast.argument, subs);
++            }
++            value = evalAst(ast.argument, subs);
++            switch (ast.operator) {
++            case '-':
++                return -value;
++            case '+':
++                return Number(value);
++            case '!':
++                return !value;
++            default: // '~'
++                return ~value;
++            }
++        case 'MemberExpression':
++            obj = evalAst(ast.object, subs);
++            prop = ast.computed
++                ? evalAst(ast.property, subs)
++                : ast.property.value;
++            value = getMember(obj, prop);
++            // Arrow functions aren't affected by bind
++            return typeof value === 'function' ? value.bind(obj) : value;
++        case 'CallExpression':
++            if (ast.callee.type === 'MemberExpression') {
++                obj = evalAst(ast.callee.object, subs);
++                prop = ast.callee.computed
++                    ? evalAst(ast.callee.property, subs)
++                    : ast.callee.property.value;
++                func = getMember(obj, prop);
++                name = String(prop);
++            } else {
++                obj = undefined;
++                func = evalAst(ast.callee, subs);
++                name = ast.callee.type === 'Identifier'
++                    ? ast.callee.name
++                    : 'expression';
++            }
++            args = ast.arguments.map(function (arg) {
++                return evalAst(arg, subs);
++            });
++            if (typeof func !== 'function') {
++                throw new TypeError(name + ' is not a function');
++            }
++            return func.apply(obj, args);
++        case 'AssignmentExpression':
++            value = evalAst(ast.right, subs);
++            if (ast.operator !== '=') {
++                if (!hasOwn.call(subs, ast.name)) {
++                    throw new ReferenceError(ast.name + ' is not defined');
++                }
++                current = subs[ast.name];
++                value = applyBinary(
++                    ast.operator.slice(0, -1), current, value
++                );
++            }
++            subs[ast.name] = value;
++            return value;
++        default:
++            throw new SyntaxError('Unexpected expression');
++        }
++    }
++
++    var cache = Object.create(null);
++    var cacheSize = 0;
++
++    /**
++     * A replacement for NodeJS' `vm.Script` which neither exposes the
++     * global scope nor allows reaching `Function` and is also
++     * Content Security Policy friendly.
++     * @param {string} expr Expression to evaluate
++     */
++    function SafeScript (expr) {
++        this.code = expr;
++        this.ast = parse(String(expr));
++    }
++
++    /**
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.prototype.runInNewContext = function (context) {
++        // A prototype-less object, so that only the supplied keys exist
++        var keyMap = Object.create(null);
++        Object.keys(context || {}).forEach(function (key) {
++            keyMap[key] = context[key];
++        });
++        return evalAst(this.ast, keyMap);
++    };
++
++    /**
++     * @param {string} expr Expression to evaluate
++     * @param {object} context Object whose items will be added
++     *   to evaluation
++     * @returns {any} Result of evaluated code
++     */
++    SafeScript.runInNewContext = function (expr, context) {
++        var script = cache[expr];
++        if (!script) {
++            script = new SafeScript(expr);
++            if (cacheSize >= 1000) {
++                cache = Object.create(null);
++                cacheSize = 0;
++            }
++            cache[expr] = script;
++            cacheSize++;
++        }
++        return script.runInNewContext(context);
++    };
++
++    return SafeScript;
++}());
++
++JSONPath.prototype.vm = {
++  /**
++   * @param {string} expr Expression to evaluate
++   * @param {PlainObject} context Object whose items will be added
++   *   to evaluation
++   * @returns {any} Result of evaluated code
++   */
++  runInNewContext: function runInNewContext(expr, context) {
++    return SafeScript.runInNewContext(expr, context);
++  }
++};
+ 
+ export { JSONPath };
+
+--- a/src/jsonpath.js
++++ b/src/jsonpath.js
+@@ -577,9 +577,46 @@
+     return ret;
+ };
+ 
++// Member names used to reach `Function` (and thereby arbitrary code
++//  execution outside of the sandbox), e.g.,
++//  `''[['constructor']][['constructor']]('...')()` (CVE-2025-1302)
++const unsafeEvalMemberRegex =
++    /__proto__|__(?:define|lookup)[GS]etter__|\bconstructor\b|\bprototype\b/u;
++
++/**
++ * Throws if the code contains member names which can be used to escape
++ * the evaluation sandbox. Character escapes (e.g., `\x63onstructor`)
++ * are decoded first so that they cannot be used to hide such names.
++ * @param {string} code The code about to be evaluated
++ * @throws {Error}
++ * @returns {void}
++ */
++const assertSafeEvalCode = function (code) {
++    const decoded = code.replace(
++        /\\(?:u\{([\da-f]+)\}|u([\da-f]{4})|x([\da-f]{2}))/giu,
++        (match, cp, u, x) => {
++            try {
++                return String.fromCodePoint(parseInt(cp || u || x, 16));
++            } catch (err) {
++                return match;
++            }
++        }
++    );
++    if (
++        unsafeEvalMemberRegex.test(code) ||
++        unsafeEvalMemberRegex.test(decoded)
++    ) {
++        throw new Error(
++            'jsonPath: Unsafe member access (constructor, prototype, or ' +
++            '__proto__) is not allowed in evaluated expressions: ' + code
++        );
++    }
++};
++
+ JSONPath.prototype._eval = function (
+     code, _v, _vname, path, parent, parentPropName
+ ) {
++    assertSafeEvalCode(code);
+     if (code.includes('@parentProperty')) {
+         this.currSandbox._$_parentProperty = parentPropName;
+         code = code.replace(/@parentProperty/gu, '_$_parentProperty');
+--- /dev/null
++++ b/test/cve-2025-1302.test.js
+@@ -0,0 +1,47 @@
++import {checkBuiltInVMAndNodeVM} from '../test-helpers/checkVM.js';
++
++checkBuiltInVMAndNodeVM(function (vmType, setBuiltInState) {
++    describe(`JSONPath - CVE-2025-1302 eval RCE (${vmType})`, function () {
++        before(setBuiltInState);
++
++        it('rejects non-string property names reaching `constructor`', () => {
++            const userControlledPath =
++                "$..[?(p=\"console.log(this.process.mainModule.require('child_process').execSync('id').toString())\";a=''[['constructor']][['constructor']](p);a())]";
++            assert.throws(() => {
++                jsonpath({json: {example: true}, path: userControlledPath});
++            }, /Unsafe member access/u);
++        });
++
++        it('rejects escaped `constructor` and `__proto__` in filters', () => {
++            assert.throws(() => {
++                jsonpath({
++                    json: {x: 1},
++                    path: "$[?(''['\\x63onstructor']['constructor']('return 1')())]"
++                });
++            }, /Unsafe member access/u);
++            assert.throws(() => {
++                jsonpath({
++                    json: {x: 1},
++                    path: "$[?(@.__proto__)]"
++                });
++            }, /Unsafe member access/u);
++        });
++
++        it('rejects `constructor` in dynamic property expressions', () => {
++            assert.throws(() => {
++                jsonpath({
++                    json: {x: 1},
++                    path: "$[(this.constructor.constructor('return 1')())]"
++                });
++            }, /Unsafe member access/u);
++        });
++
++        it('still evaluates ordinary filters', () => {
++            const result = jsonpath({
++                json: {a: [{n: 1}, {n: 2}]},
++                path: '$.a[?(@.n === 2)]'
++            });
++            assert.deepEqual(result, [{n: 2}]);
++        });
++    });
++});
