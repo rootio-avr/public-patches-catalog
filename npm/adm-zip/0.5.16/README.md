@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - CVE-2026-39244
 - CVE-2026-77301
+- AIKIDO-2026-363221
+- AIKIDO-2026-327281
 
 ## How to Apply:
 1. Clone or download the source code for adm-zip
