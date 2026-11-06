@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-vjh7-7g9h-fjfh
+- CVE-2024-42461
 
 ## How to Apply:
 1. Clone or download the source code for elliptic
