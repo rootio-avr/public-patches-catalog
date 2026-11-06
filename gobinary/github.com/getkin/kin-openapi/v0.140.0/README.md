@@ -4,6 +4,7 @@ This patch is based on github.com/getkin/kin-openapi version v0.140.0, which is 
 unknown
 
 ## Affected CVEs:
+- GHSA-r277-6w6q-xmqw
 - CVE-2026-76905
 - CVE-2026-77354
 
