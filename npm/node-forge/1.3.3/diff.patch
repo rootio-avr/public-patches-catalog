@@ -230,3 +230,719 @@
      });
    });
  })();
+
+--- a/lib/x509.js
++++ b/lib/x509.js
+@@ -3149,7 +3149,9 @@
+     if(error === null &&
+       (!first || (chain.length === 0 && (!parent || selfSigned)))) {
+       // first check keyUsage extension and then basic constraints
+-      var bcExt = cert.getExtension('basicConstraints');
++      // (by id: deprecated OIDs are also named 'basicConstraints', but only
++      // id-ce-basicConstraints 2.5.29.19 is valid, RFC 5280 4.2.1.9)
++      var bcExt = cert.getExtension({id: '2.5.29.19'});
+       var keyUsageExt = cert.getExtension('keyUsage');
+       if(keyUsageExt !== null) {
+         // keyCertSign must be true and there must be a basic
+--- /dev/null
++++ b/test/cve-2026-119190.test.js
+@@ -0,0 +1,86 @@
++'use strict';
++// Regression test for CVE-2026-119190 / GHSA-5x38-2vff-x55p:
++// chain verification must only honor basicConstraints OID 2.5.29.19 and must
++// reject non-leaf certificates lacking a genuine basicConstraints extension.
++var assert = require('assert');
++var forge = require('../lib/index');
++var pki = forge.pki;
++var asn1 = forge.asn1;
++
++var keys = pki.rsa.generateKeyPair({bits: 1024});
++
++function issue(subject, issuer, serial, extensions) {
++  var cert = pki.createCertificate();
++  cert.publicKey = keys.publicKey;
++  cert.serialNumber = '0' + serial;
++  cert.validity.notBefore = new Date();
++  cert.validity.notAfter = new Date();
++  cert.validity.notAfter.setFullYear(cert.validity.notBefore.getFullYear() + 1);
++  cert.setSubject([{name: 'commonName', value: subject}]);
++  cert.setIssuer([{name: 'commonName', value: issuer}]);
++  cert.setExtensions(extensions);
++  cert.sign(keys.privateKey, forge.md.sha256.create());
++  // round-trip so that the parsed extensions are what gets verified
++  return pki.certificateFromPem(pki.certificateToPem(cert));
++}
++
++// BasicConstraints ::= SEQUENCE { cA TRUE } under a given OID
++function bcExt(id, cA) {
++  return {
++    id: id,
++    critical: false,
++    value: asn1.toDer(
++      asn1.create(asn1.Class.UNIVERSAL, asn1.Type.SEQUENCE, true, [
++        asn1.create(asn1.Class.UNIVERSAL, asn1.Type.BOOLEAN, false,
++          String.fromCharCode(cA ? 0xff : 0x00))
++      ])).getBytes()
++  };
++}
++
++function verifyChain(middleExtensions) {
++  var root = issue('root', 'root', 1, [
++    {name: 'basicConstraints', cA: true},
++    {name: 'keyUsage', keyCertSign: true}
++  ]);
++  var middle = issue('middle', 'root', 2, middleExtensions);
++  var leaf = issue('leaf', 'middle', 3, []);
++  return pki.verifyCertificateChain(pki.createCaStore([root]), [leaf, middle]);
++}
++
++function throwsWith(fn, regex) {
++  assert.throws(fn, function(err) {
++    return regex.test(err.message) && err.error === 'forge.pki.BadCertificate';
++  });
++}
++
++describe('CVE-2026-119190 basicConstraints OID handling', function() {
++  this.timeout(60000);
++
++  it('should ignore forged 2.5.29.10 before genuine cA=false', function() {
++    throwsWith(function() {
++      verifyChain([
++        bcExt('2.5.29.10', true),
++        {name: 'basicConstraints', cA: false}
++      ]);
++    }, /basicConstraints indicates the certificate is not a CA/);
++  });
++
++  it('should reject non-leaf with only a forged 2.5.29.10', function() {
++    throwsWith(function() {
++      verifyChain([bcExt('2.5.29.10', true)]);
++    }, /missing basicConstraints extension/);
++  });
++
++  it('should reject non-leaf with no basicConstraints', function() {
++    throwsWith(function() {
++      verifyChain([]);
++    }, /missing basicConstraints extension/);
++  });
++
++  it('should verify a genuine CA using 2.5.29.19', function() {
++    assert.strictEqual(verifyChain([
++      {name: 'basicConstraints', cA: true},
++      {name: 'keyUsage', keyCertSign: true}
++    ]), true);
++  });
++});
+
+--- a/lib/tls.js
++++ b/lib/tls.js
+@@ -3917,6 +3917,8 @@
+                   tls.Alert.Description.unexpected_message
+               }
+             });
++            // fatal error closed and reset the connection (no record)
++            return rval;
+           }
+         }
+ 
+--- /dev/null
++++ b/test/cve-2026-119188.test.js
+@@ -0,0 +1,87 @@
++// Regression test for CVE-2026-119188 (GHSA-8hrf-8g6f-7xwp):
++// an invalid fragmented record must fail the connection with a fatal
++// unexpected_message alert and stop processing further records.
++var assert = require('assert');
++var forge = require('../lib/forge');
++require('../lib/tls');
++
++// TLS 1.0 record
++function record(type, fragment) {
++  var b = forge.util.createBuffer();
++  b.putByte(type);
++  b.putByte(3);
++  b.putByte(1);
++  b.putInt16(fragment.length);
++  b.putBytes(fragment);
++  return b.getBytes();
++}
++
++function createConnection(server, log) {
++  var c = forge.tls.createConnection({
++    server: server,
++    verify: function() {
++      return true;
++    },
++    tlsDataReady: function(c) {
++      log.sent += c.tlsData.getBytes();
++    },
++    dataReady: function(c) {
++      c.data.getBytes();
++    },
++    closed: function() {},
++    error: function(c, error) {
++      log.errors.push(error.message);
++    }
++  });
++  if(!server) {
++    c.handshake();
++    // drop the ClientHello
++    log.sent = '';
++  }
++  return c;
++}
++
++// start of a handshake message (ClientHello or ServerHello) announcing
++// more bytes than the record holds
++function firstFragment(server) {
++  return record(22, forge.util.hexToBytes(
++    (server ? '01' : '02') + '000010' + '0301'));
++}
++
++var interleaved = {
++  change_cipher_spec: record(20, '\x01'),
++  alert: record(21, forge.util.hexToBytes('0228')),
++  application_data: record(23, 'data'),
++  heartbeat: record(24, forge.util.hexToBytes('010000'))
++};
++
++[true, false].forEach(function(server) {
++  var mode = server ? 'server' : 'client';
++  Object.keys(interleaved).forEach(function(name) {
++    var log = {sent: '', errors: []};
++    var c = createConnection(server, log);
++    assert.doesNotThrow(function() {
++      c.process(firstFragment(server) + interleaved[name]);
++    }, name + ' in a fragmented message (' + mode + ')');
++    assert.deepEqual(log.errors, ['Invalid fragmented record.']);
++    assert.equal(c.fail, true);
++    // fatal unexpected_message alert
++    var alert = forge.util.createBuffer(log.sent);
++    assert.equal(alert.getByte(), 21);
++    alert.getBytes(4);
++    assert.equal(alert.bytes(), forge.util.hexToBytes('020a'));
++    // further input is ignored
++    assert.equal(c.process(interleaved[name]), 0);
++    assert.deepEqual(log.errors, ['Invalid fragmented record.']);
++  });
++
++  // continuation records are still accepted
++  var log = {sent: '', errors: []};
++  var c = createConnection(server, log);
++  assert.equal(c.process(firstFragment(server) + record(22, '\x00')), 0);
++  assert.deepEqual(log.errors, []);
++  assert.equal(c.fail, false);
++  assert.equal(log.sent, '');
++});
++
++console.log('CVE-2026-119188 regression test passed');
+
+--- a/lib/tls.js
++++ b/lib/tls.js
+@@ -4018,23 +4018,23 @@ tls.createConnection = function(options) {
+     }
+   };
+ 
++  // true while c.process() is handling records
++  var _processing = false;
++  // true when c.process() was called again while handling a record
++  var _processNext = false;
++
+   /**
+-   * Called when TLS protocol data has been received from somewhere and should
+-   * be processed by the TLS engine.
++   * Reads the next record and, once it is complete, passes it to its
++   * handler. Handlers call c.process() to continue with the next record.
+    *
+-   * @param data the TLS protocol data, as a string, to process.
++   * @param c the TLS connection.
+    *
+-   * @return 0 if the data could be processed, otherwise the number of bytes
+-   *         required for data to be processed.
++   * @return 0 if the input data could be processed, otherwise the
++   *         number of bytes required for data to be processed.
+    */
+-  c.process = function(data) {
++  var _processRecord = function(c) {
+     var rval = 0;
+ 
+-    // buffer input data
+-    if(data) {
+-      c.input.putBytes(data);
+-    }
+-
+     // process next record if no failure, process will be called after
+     // each record is handled (since handling can be asynchronous)
+     if(!c.fail) {
+@@ -4063,6 +4063,54 @@ tls.createConnection = function(options) {
+     return rval;
+   };
+ 
++  /**
++   * Called when TLS protocol data has been received from somewhere and should
++   * be processed by the TLS engine.
++   *
++   * @param data the TLS protocol data, as a string, to process.
++   *
++   * @return 0 if the data could be processed, otherwise the number of bytes
++   *         required for data to be processed.
++   */
++  c.process = function(data) {
++    var rval = 0;
++
++    // buffer input data
++    if(data) {
++      c.input.putBytes(data);
++    }
++
++    // record handlers call c.process() without data to continue with the
++    // next record; while records are being processed, only flag that the
++    // loop below should continue instead of recursing, which could exhaust
++    // the call stack
++    if(_processing && typeof(data) === 'undefined') {
++      _processNext = true;
++      return rval;
++    }
++
++    // new data is processed right away, as before, even in a nested call
++    // (e.g., from a tlsDataReady handler that passes data synchronously
++    // between two connections)
++    var processing = _processing;
++    var processNext = _processNext;
++    _processing = true;
++    _processNext = false;
++    try {
++      // return value is based on the first record, as before
++      rval = _processRecord(c);
++      while(_processNext) {
++        _processNext = false;
++        _processRecord(c);
++      }
++    } finally {
++      _processing = processing;
++      _processNext = processNext;
++    }
++
++    return rval;
++  };
++
+   /**
+    * Requests that application data be packaged into a TLS record. The
+    * tlsDataReady handler will be called when the TLS record(s) have been
+--- /dev/null
++++ b/test/cve-2026-119187.test.js
+@@ -0,0 +1,69 @@
++// Regression test for CVE-2026-119187 (GHSA-hqq3-7jhf-c5jx):
++// tls c.process() recursed once per record, so a long run of small records
++// in one buffer exhausted the call stack.
++var assert = require('assert');
++var forge = require('../lib/index');
++
++// enough records to exhaust the call stack if each record is handled one
++// call level deeper than the previous one
++var COUNT = 50000;
++
++// heartbeat_response with empty payload, fatal handshake_failure alert
++var HB_RESPONSE = forge.util.hexToBytes('1803010003020000');
++var ALERT = forge.util.hexToBytes('15030100020228');
++
++function repeat(bytes, count) {
++  var b = forge.util.createBuffer();
++  for(var i = 0; i < count; ++i) {
++    b.putBytes(bytes);
++  }
++  return b.getBytes();
++}
++
++function createConnection(log) {
++  return forge.tls.createConnection({
++    server: true,
++    verify: function() {
++      return true;
++    },
++    tlsDataReady: function(c) {
++      c.tlsData.getBytes();
++    },
++    dataReady: function(c) {
++      c.data.getBytes();
++    },
++    heartbeatReceived: function() {
++      log.heartbeats++;
++    },
++    closed: function() {},
++    error: function(c, error) {
++      log.errors.push(error.message);
++    }
++  });
++}
++
++// many records in a single buffer must not overflow the stack
++(function() {
++  var log = {heartbeats: 0, errors: []};
++  var c = createConnection(log);
++  var rval = c.process(repeat(HB_RESPONSE, COUNT) + ALERT);
++  assert.strictEqual(rval, 0);
++  // the alert after all heartbeat records was processed
++  assert.deepStrictEqual(log.errors, ['Handshake failure.']);
++})();
++
++// records split across calls still report the bytes needed
++(function() {
++  var log = {heartbeats: 0, errors: []};
++  var c = createConnection(log);
++  var data = repeat(HB_RESPONSE, 3) + ALERT;
++  var rvals = [];
++  for(var i = 0; i < data.length; ++i) {
++    rvals.push(c.process(data.charAt(i)));
++  }
++  // bytes needed for the next header or fragment, 0 when complete
++  assert.deepStrictEqual(rvals.slice(0, 8), [4, 3, 2, 1, 3, 2, 1, 0]);
++  assert.deepStrictEqual(log.errors, ['Handshake failure.']);
++})();
++
++console.log('cve-2026-119187 regression test passed');
+
+--- a/lib/pbe.js
++++ b/lib/pbe.js
+@@ -642,6 +642,12 @@ pki.decryptRsaPrivateKey = function(pem, password) {
+ pki.pbe.generatePkcs12Key = function(password, salt, id, iter, n, md) {
+   var j, l;
+ 
++  // RFC 7292 B.2: with fewer than 1 iteration no hashing is done and the
++  // derived key would be a constant that does not depend on the password
++  if(!(iter >= 1)) {
++    throw new Error('PKCS#12 key derivation iteration count must be >= 1.');
++  }
++
+   if(typeof md === 'undefined' || md === null) {
+     if(!('sha1' in forge.md)) {
+       throw new Error('"sha1" hash algorithm unavailable.');
+--- a/lib/pkcs12.js
++++ b/lib/pkcs12.js
+@@ -466,6 +466,9 @@ p12.pkcs12FromAsn1 = function(obj, strict, password) {
+     var macSalt = new forge.util.ByteBuffer(capture.macSalt);
+     var macIterations = (('macIterations' in capture) ?
+       parseInt(forge.util.bytesToHex(capture.macIterations), 16) : 1);
++    if(!(macIterations >= 1)) {
++      throw new Error('PKCS#12 MAC iteration count must be >= 1.');
++    }
+     var macKey = p12.generateKey(
+       password, macSalt, 3, macIterations, macKeyBytes, md);
+     var mac = forge.hmac.create();
+--- /dev/null
++++ b/test/cve-2026-118782.test.js
+@@ -0,0 +1,23 @@
++// Regression test for CVE-2026-118782 (GHSA-jc66-7q78-782g): PKCS#12 key
++// derivation must reject iteration counts < 1, which otherwise yield a
++// constant key independent of the password and salt.
++var assert = require('assert');
++var forge = require('../lib/index');
++require('../lib/pkcs12');
++
++var salt = forge.util.createBuffer('salt');
++var re = /PKCS#12 key derivation iteration count must be >= 1/;
++
++[0, -1, NaN, undefined].forEach(function(iterations) {
++  assert.throws(function() {
++    forge.pkcs12.generateKey('123456', salt.copy(), 3, iterations, 20);
++  }, re);
++});
++
++// normal input still works and depends on the password
++var k1 = forge.pkcs12.generateKey('123456', salt.copy(), 3, 1, 20);
++var k2 = forge.pkcs12.generateKey('654321', salt.copy(), 3, 1, 20);
++assert.equal(k1.length(), 20);
++assert.notEqual(k1.toHex(), k2.toHex());
++
++console.log('CVE-2026-118782 regression test passed');
+
+--- a/lib/pem.js
++++ b/lib/pem.js
+@@ -96,12 +96,14 @@ pem.decode = function(str) {
+   var rval = [];
+ 
+   // split string into PEM messages (be lenient w/EOF on BEGIN line)
+-  var rMessage = /\s*-----BEGIN ([A-Z0-9- ]+)-----\r?\n?([\x21-\x7e\s]+?(?:\r?\n\r?\n))?([:A-Za-z0-9+\/=\s]+?)-----END \1-----/g;
+-  var rHeader = /([\x21-\x7e]+):\s*([\x21-\x7e\s^:]+)/;
++  var messages = _pemMessageScanner(str);
++  // the name must start at the beginning of a run of printable chars, which
++  // gives the same match as an unanchored search without quadratic retries
++  var rHeader = /(?:^|[^\x21-\x7e])([\x21-\x7e]+):\s*([\x21-\x7e\s^:]+)/;
+   var rCRLF = /\r?\n/;
+   var match;
+   while(true) {
+-    match = rMessage.exec(str);
++    match = messages.next();
+     if(!match) {
+       break;
+     }
+@@ -133,7 +135,7 @@ pem.decode = function(str) {
+     var li = 0;
+     while(match && li < lines.length) {
+       // get line, trim any rhs whitespace
+-      var line = lines[li].replace(/\s+$/, '');
++      var line = rtrim(lines[li]);
+ 
+       // RFC2822 unfold any following folded lines
+       for(var nl = li + 1; nl < lines.length; ++nl) {
+@@ -235,3 +237,174 @@ function foldHeader(header) {
+ function ltrim(str) {
+   return str.replace(/^\s+/, '');
+ }
++
++// a loop, since /\s+$/ is quadratic on whitespace followed by non-whitespace
++function rtrim(str) {
++  var end = str.length;
++  while(end > 0 && /\s/.test(str.charAt(end - 1))) {
++    --end;
++  }
++  return str.substring(0, end);
++}
++
++/**
++ * Creates a scanner for the PEM messages in a string. It finds the same
++ * matches as this regular expression, except that only the shortest label
++ * followed by '-----' is tried (RFC 7468 labels can't contain '--'):
++ *
++ * /\s*-----BEGIN ([A-Z0-9- ]+)-----\r?\n?([\x21-\x7e\s]+?(?:\r?\n\r?\n))?
++ *   ([:A-Za-z0-9+\/=\s]+?)-----END \1-----/g
++ *
++ * The regular expression takes polynomial time on input without a matching
++ * END line. The scanner indexes the END lines once instead, so each BEGIN
++ * line is matched without rescanning the input.
++ *
++ * @param str the string to scan.
++ *
++ * @return an object whose next() returns the next match as
++ *   [match, label, headers, body] (headers may be undefined), or null.
++ */
++function _pemMessageScanner(str) {
++  var rBody = /[:A-Za-z0-9+\/=\s]/;
++  var rNotBody = /[^:A-Za-z0-9+\/=\s]/g;
++  var rNotHeader = /[^\x21-\x7e\s]/g;
++  var rLabel = /[A-Z0-9- ]/;
++
++  // index of the first char at or after i matched by a global regex
++  function indexOfRegex(regex, i) {
++    regex.lastIndex = i;
++    var match = regex.exec(str);
++    return match ? match.index : str.length;
++  }
++
++  // shortest label at i followed by '-----', or null
++  function labelAt(i) {
++    for(var j = i; j < str.length && rLabel.test(str.charAt(j)); ++j) {
++      if(j > i && str.substr(j, 5) === '-----') {
++        return str.substring(i, j);
++      }
++    }
++    return null;
++  }
++
++  // end of a blank line (\r?\n\r?\n) starting at i, or -1
++  function blankLineEnd(i) {
++    if(str.charAt(i) === '\r') {
++      ++i;
++    }
++    if(str.charAt(i) !== '\n') {
++      return -1;
++    }
++    if(str.charAt(++i) === '\r') {
++      ++i;
++    }
++    return str.charAt(i) === '\n' ? i + 1 : -1;
++  }
++
++  // first i in [start, end) where a blank line ends before end, or -1
++  function firstBlankLine(start, end) {
++    for(var i = start; i < end; ++i) {
++      var v = blankLineEnd(i);
++      if(v !== -1 && v < end) {
++        return i;
++      }
++    }
++    return -1;
++  }
++
++  // the headers group ends at a blank line inside the run of body chars
++  // before an END line; index END lines by label, with the first such
++  // blank line
++  var ends = {};
++  for(var end = str.indexOf('-----END '); end !== -1;
++    end = str.indexOf('-----END ', end + 1)) {
++    var endLabel = labelAt(end + 9);
++    var start = end;
++    while(start > 0 && rBody.test(str.charAt(start - 1))) {
++      --start;
++    }
++    var blank = firstBlankLine(start, end);
++    if(endLabel !== null && blank !== -1) {
++      var key = '$' + endLabel;
++      (ends[key] = ends[key] || []).push({end: end, blank: blank});
++    }
++  }
++
++  var pos = 0;
++  var headerEnd = -1;
++  return {
++    next: function() {
++      var begin;
++      while((begin = str.indexOf('-----BEGIN ', pos)) !== -1) {
++        pos = begin + 1;
++        var label = labelAt(begin + 11);
++        if(label === null) {
++          continue;
++        }
++        var q = begin + 16 + label.length;
++
++        // the body is the run of body chars that ends at a matching END line
++        var bodyEnd = indexOfRegex(rNotBody, q);
++        var bodyEndOk = str.substr(bodyEnd, 9) === '-----END ' &&
++          labelAt(bodyEnd + 9) === label;
++        // headers chars end here (q never decreases between BEGIN lines)
++        if(q > headerEnd) {
++          headerEnd = indexOfRegex(rNotHeader, q);
++        }
++        // first later matching END line with a blank line before it
++        var later = null;
++        var list = ends['$' + label];
++        if(list) {
++          var lo = 0;
++          var hi = list.length;
++          while(lo < hi) {
++            var mid = (lo + hi) >> 1;
++            if(list[mid].end > bodyEnd) {
++              hi = mid;
++            } else {
++              lo = mid + 1;
++            }
++          }
++          later = list[lo] || null;
++        }
++
++        // \r?\n? tries to consume as much as possible first
++        var starts = [];
++        if(str.charAt(q) === '\r') {
++          if(str.charAt(q + 1) === '\n') {
++            starts.push(q + 2);
++          }
++          starts.push(q + 1);
++        } else if(str.charAt(q) === '\n') {
++          starts.push(q + 1);
++        }
++        starts.push(q);
++
++        for(var i = 0; i < starts.length; ++i) {
++          var t = starts[i];
++          // optional headers: up to the first blank line that a non-empty
++          // body and the END line follow
++          var blank = bodyEndOk ? firstBlankLine(t + 1, bodyEnd) : -1;
++          var end = bodyEnd;
++          if(blank === -1 && later) {
++            blank = later.blank;
++            end = later.end;
++          }
++          if(blank !== -1 && blank <= headerEnd) {
++            var v = blankLineEnd(blank);
++            pos = end + 14 + label.length;
++            return [str.substring(begin, pos), label,
++              str.substring(t, v), str.substring(v, end)];
++          }
++          // no headers
++          if(bodyEndOk && t < bodyEnd) {
++            pos = bodyEnd + 14 + label.length;
++            return [str.substring(begin, pos), label,
++              undefined, str.substring(t, bodyEnd)];
++          }
++        }
++      }
++      return null;
++    }
++  };
++}
+new file mode 100644
+--- /dev/null
++++ b/tests/pocs/ghsa-7wch-p9px-956x.js
+@@ -0,0 +1,27 @@
++#!/usr/bin/env node
++'use strict';
++
++// Security Advisory PoC
++//
++// https://github.com/digitalbazaar/forge/security/advisories/GHSA-7wch-p9px-956x
++//
++// Reported by Ahmed Mokhtari (@AhmedMokhtari), @mwlik, and @imenyoo2.
++//
++// pem.decode() used a regular expression that takes polynomial time on
++// input without a matching END line. Before the fix, this input blocked for
++// many seconds, growing roughly with the cube of its length. Inputs from the
++// duplicate reports are in the unit tests.
++
++const forge = require('../../lib/index');
++
++const pemString = ' -----BEGIN I-----G-----END B'.repeat(800) + '\x00';
++
++console.time('ReDoS');
++try {
++  // const pemObjects = forge.pki.privateKeyFromPem(pemString);
++  const pemObjects = forge.pem.decode(pemString);
++  console.log(pemObjects);
++} catch(err) {
++  console.error('PEM decode error:', err.message);
++}
++console.timeEnd('ReDoS');
+--- /dev/null
++++ b/test/cve-2026-118779.test.js
+@@ -0,0 +1,53 @@
++'use strict';
++// Regression test for CVE-2026-118779 (GHSA-7wch-p9px-956x): ReDoS in pem.decode
++var assert = require('assert');
++var pem = require('../lib/pem');
++
++function repeat(str, count) {
++  return new Array(count + 1).join(str);
++}
++
++function checkInvalid(msg) {
++  assert.throws(function() {
++    pem.decode(msg);
++  }, /^Error: Invalid PEM formatted message.$/);
++}
++
++// previously each of these took minutes
++var start = Date.now();
++checkInvalid(repeat(' -----BEGIN I-----G-----END B', 2000) + '\x00');
++checkInvalid('-----BEGIN A-----\n' + repeat('\n', 256 * 1024));
++checkInvalid('-----BEGIN RSA-----\n' + repeat('\n\n', 128 * 1024) + 'ZZZZ');
++
++var msgs = pem.decode('-----BEGIN A-----\n' + repeat('A', 512 * 1024) +
++  '\n\nQUJD\n-----END A-----\n');
++assert.equal(msgs.length, 1);
++assert.equal(msgs[0].body, 'ABC');
++
++msgs = pem.decode('-----BEGIN A-----\n' +
++  'Proc-Type: 4,ENCRYPTED\n' +
++  'DEK-Info: DES-CBC,F8143EDE5960C597\n' +
++  'X-Header: ' + repeat(' ', 512 * 1024) + 'x\n' +
++  '\nQUJD\n-----END A-----\n');
++assert.equal(msgs.length, 1);
++assert.equal(msgs[0].body, 'ABC');
++assert.deepEqual(msgs[0].headers, [{name: 'X-Header', values: ['x']}]);
++
++assert.ok(Date.now() - start < 20000, 'pem.decode took too long (ReDoS)');
++
++// normal inputs still decode
++msgs = pem.decode('-----BEGIN A-----\r\n' +
++  'Proc-Type: 4,ENCRYPTED\r\n' +
++  'DEK-Info: DES-CBC,F8143EDE5960C597\r\n' +
++  'X-Header:  a, b   \r\n\r\nQUJD\r\n-----END A-----\r\n');
++assert.equal(msgs.length, 1);
++assert.equal(msgs[0].type, 'A');
++assert.equal(msgs[0].body, 'ABC');
++assert.deepEqual(msgs[0].dekInfo,
++  {algorithm: 'DES-CBC', parameters: 'F8143EDE5960C597'});
++assert.deepEqual(msgs[0].headers, [{name: 'X-Header', values: ['a', 'b']}]);
++assert.equal(pem.decode('-----BEGIN A-----QUJD-----END A-----')[0].body, 'ABC');
++
++// labels can't contain '--'
++checkInvalid('-----BEGIN A-----B-----\nQUJD\n-----END A-----B-----\n');
++console.log('cve-2026-118779 ok');
