@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-100721
+- CVE-2026-93605
 
 ## How to Apply:
 1. Clone or download the source code for vm2
