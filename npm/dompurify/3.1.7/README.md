@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-mrv2-3pqr-j5jr
+- CVE-2026-49978
 
 ## How to Apply:
 1. Clone or download the source code for dompurify
