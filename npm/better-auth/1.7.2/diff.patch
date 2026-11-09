@@ -168,3 +168,263 @@
  //#endregion
 -export { INTERNAL_STATE_KEYS, StateError, generateGenericState, parseGenericState };
 +export { INTERNAL_STATE_KEYS, StateError, generateGenericState, getAuthStateVerificationIdentifier, parseGenericState };
+
+--- /dev/null
++++ b/dist/crypto/purpose.mjs
+@@ -0,0 +1,19 @@
++import { hkdf } from "@noble/hashes/hkdf.js";
++import { sha256 } from "@noble/hashes/sha2.js";
++import { bytesToHex, utf8ToBytes } from "@noble/hashes/utils.js";
++//#region src/crypto/purpose.ts
++const salt = utf8ToBytes("better-auth:oauth-encryption:v1");
++function deriveSecret(secret, purpose) {
++	return bytesToHex(hkdf(sha256, utf8ToBytes(secret), salt, utf8ToBytes(`better-auth:${purpose}:v1`), 32));
++}
++/** Derive an isolated key for one OAuth ciphertext purpose, retaining rotation versions. */
++function derivePurposeKey(secret, purpose) {
++	if (typeof secret === "string") return deriveSecret(secret, purpose);
++	return {
++		keys: new Map(Array.from(secret.keys, ([version, value]) => [version, deriveSecret(value, purpose)])),
++		currentVersion: secret.currentVersion,
++		...secret.legacySecret && { legacySecret: deriveSecret(secret.legacySecret, purpose) }
++	};
++}
++//#endregion
++export { derivePurposeKey };
+--- /dev/null
++++ b/dist/crypto/purpose.d.mts
+@@ -0,0 +1,8 @@
++import { SecretConfig } from "@better-auth/core";
++
++//#region src/crypto/purpose.d.ts
++type EncryptionPurpose = "oauth-state-cookie" | "oauth-proxy-state" | "oauth-proxy-package" | "oauth-proxy-profile";
++/** Derive an isolated key for one OAuth ciphertext purpose, retaining rotation versions. */
++declare function derivePurposeKey(secret: string | SecretConfig, purpose: EncryptionPurpose): string | SecretConfig;
++//#endregion
++export { EncryptionPurpose, derivePurposeKey };
+--- a/dist/state.mjs
++++ b/dist/state.mjs
+@@ -1,5 +1,6 @@
+ import { generateRandomString } from "./crypto/random.mjs";
+ import { symmetricDecrypt, symmetricEncrypt } from "./crypto/index.mjs";
++import { derivePurposeKey } from "./crypto/purpose.mjs";
+ import { expireCookie } from "./cookies/index.mjs";
+ import { BetterAuthError } from "@better-auth/core/error";
+ import * as z from "zod";
+@@ -63,7 +64,7 @@
+ 			oauthState: state
+ 		};
+ 		const encryptedData = await symmetricEncrypt({
+-			key: c.context.secretConfig,
++			key: derivePurposeKey(c.context.secretConfig, "oauth-state-cookie"),
+ 			data: JSON.stringify(payload)
+ 		});
+ 		const stateCookie = c.context.createAuthCookie(settings?.cookieName ?? "oauth_state", { maxAge: 600 });
+@@ -103,7 +104,7 @@
+ 		});
+ 		try {
+ 			const decryptedData = await symmetricDecrypt({
+-				key: c.context.secretConfig,
++				key: derivePurposeKey(c.context.secretConfig, "oauth-state-cookie"),
+ 				data: encryptedData
+ 			});
+ 			parsedData = stateDataSchema.parse(JSON.parse(decryptedData));
+--- a/dist/plugins/magic-link/index.mjs
++++ b/dist/plugins/magic-link/index.mjs
+@@ -23,6 +23,20 @@
+ 	errorCallbackURL: z.string().meta({ description: "URL to redirect after error." }).optional(),
+ 	newUserCallbackURL: z.string().meta({ description: "URL to redirect after new user signup. Only used if the user is registering for the first time." }).optional()
+ });
++const magicLinkRecordSchema = z.object({
++	type: z.literal("magic-link"),
++	email: z.email(),
++	name: z.string().optional()
++}).strict();
++function parseMagicLinkRecord(value) {
++	try {
++		const parsed = JSON.parse(value);
++		return magicLinkRecordSchema.safeParse(parsed);
++	} catch {
++		return null;
++	}
++}
++const magicLinkIdentifier = (storedToken) => `magic-link:${storedToken}`;
+ const magicLink = (options) => {
+ 	const opts = {
+ 		storeToken: "plain",
+@@ -75,8 +89,9 @@
+ 				const verificationToken = opts?.generateToken ? await opts.generateToken(email) : generateRandomString(32, "a-z", "A-Z");
+ 				const storedToken = await storeToken(ctx, verificationToken);
+ 				await ctx.context.internalAdapter.createVerificationValue({
+-					identifier: storedToken,
++					identifier: magicLinkIdentifier(storedToken),
+ 					value: JSON.stringify({
++						type: "magic-link",
+ 						email,
+ 						name: ctx.body.name
+ 					}),
+@@ -153,9 +168,14 @@
+ 				}
+ 				const newUserCallbackURL = new URL(ctx.query.newUserCallbackURL ? decodeURIComponent(ctx.query.newUserCallbackURL) : callbackURL, ctx.context.baseURL).toString();
+ 				const storedToken = await storeToken(ctx, token);
+-				const tokenValue = await ctx.context.internalAdapter.consumeVerificationValue(storedToken);
++				const identifier = magicLinkIdentifier(storedToken);
++				const pendingValue = await ctx.context.internalAdapter.findVerificationValue(identifier);
++				if (!pendingValue || !parseMagicLinkRecord(pendingValue.value)?.success) redirectWithError("INVALID_TOKEN");
++				const tokenValue = await ctx.context.internalAdapter.consumeVerificationValue(identifier);
+ 				if (!tokenValue) redirectWithError("INVALID_TOKEN");
+-				const { email, name } = JSON.parse(tokenValue.value);
++				const record = parseMagicLinkRecord(tokenValue.value);
++				if (!record?.success) redirectWithError("INVALID_TOKEN");
++				const { email, name } = record.data;
+ 				let isNewUser = false;
+ 				let user = await ctx.context.internalAdapter.findUserByEmail(email).then((res) => res?.user);
+ 				if (!user) if (!opts.disableSignUp) {
+--- a/dist/plugins/oauth-proxy/index.mjs
++++ b/dist/plugins/oauth-proxy/index.mjs
+@@ -3,6 +3,7 @@
+ import { originCheck } from "../../api/middlewares/origin-check.mjs";
+ import { parseSetCookieHeader } from "../../cookies/cookie-utils.mjs";
+ import { symmetricDecrypt, symmetricEncrypt } from "../../crypto/index.mjs";
++import { derivePurposeKey } from "../../crypto/purpose.mjs";
+ import { setSessionCookie } from "../../cookies/index.mjs";
+ import { resolveOAuthAccountKey, toOAuthProfileRecord } from "../../oauth2/account-key.mjs";
+ import { redirectOnError } from "../../oauth2/errors.mjs";
+@@ -37,7 +38,7 @@
+ });
+ const oAuthProxy = (opts) => {
+ 	const maxAge = opts?.maxAge ?? 60;
+-	const getEncryptionKey = (ctx) => opts?.secret ?? ctx.context.secretConfig;
++	const getEncryptionKey = (ctx, purpose) => derivePurposeKey(opts?.secret ?? ctx.context.secretConfig, purpose);
+ 	return {
+ 		id: "oauth-proxy",
+ 		version: PACKAGE_VERSION,
+@@ -80,7 +81,7 @@
+ 			let decryptedPayload;
+ 			try {
+ 				decryptedPayload = await symmetricDecrypt({
+-					key: getEncryptionKey(ctx),
++					key: getEncryptionKey(ctx, "oauth-proxy-profile"),
+ 					data: encryptedProfile
+ 				});
+ 			} catch (e) {
+@@ -165,7 +166,7 @@
+ 					let statePackage;
+ 					try {
+ 						statePackage = parseJSON(await symmetricDecrypt({
+-							key: getEncryptionKey(ctx),
++							key: getEncryptionKey(ctx, "oauth-proxy-package"),
+ 							data: state
+ 						}));
+ 					} catch {
+@@ -185,7 +186,7 @@
+ 					let stateData;
+ 					try {
+ 						stateData = parseJSON(await symmetricDecrypt({
+-							key: getEncryptionKey(ctx),
++							key: getEncryptionKey(ctx, "oauth-proxy-state"),
+ 							data: statePackage.stateCookie
+ 						}));
+ 					} catch (e) {
+@@ -278,7 +279,7 @@
+ 						timestamp: Date.now()
+ 					};
+ 					const encryptedPayload = await symmetricEncrypt({
+-						key: getEncryptionKey(ctx),
++						key: getEncryptionKey(ctx, "oauth-proxy-profile"),
+ 						data: JSON.stringify(payload)
+ 					});
+ 					proxyCallbackURL.searchParams.set("profile", encryptedPayload);
+@@ -306,7 +307,7 @@
+ 								const oauthStateCookie = ctx.context.createAuthCookie("oauth_state");
+ 								const encryptedCookieValue = parseSetCookieHeader(setCookieHeader).get(oauthStateCookie.name)?.value;
+ 								if (encryptedCookieValue) plaintextState = await symmetricDecrypt({
+-									key: ctx.context.secretConfig,
++									key: derivePurposeKey(ctx.context.secretConfig, "oauth-state-cookie"),
+ 									data: encryptedCookieValue
+ 								});
+ 							}
+@@ -318,13 +319,13 @@
+ 						const statePackage = {
+ 							state: originalState,
+ 							stateCookie: await symmetricEncrypt({
+-								key: getEncryptionKey(ctx),
++								key: getEncryptionKey(ctx, "oauth-proxy-state"),
+ 								data: plaintextState
+ 							}),
+ 							isOAuthProxy: true
+ 						};
+ 						const encryptedPackage = await symmetricEncrypt({
+-							key: getEncryptionKey(ctx),
++							key: getEncryptionKey(ctx, "oauth-proxy-package"),
+ 							data: JSON.stringify(statePackage)
+ 						});
+ 						oauthURL.searchParams.set("state", encryptedPackage);
+--- /dev/null
++++ b/test/cve-2026-114607.test.js
+@@ -0,0 +1,65 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import { symmetricDecrypt, symmetricEncrypt } from "../dist/crypto/index.mjs";
++import { derivePurposeKey } from "../dist/crypto/purpose.mjs";
++
++const purposes = [
++	"oauth-state-cookie",
++	"oauth-proxy-state",
++	"oauth-proxy-package",
++	"oauth-proxy-profile",
++];
++
++test("OAuth ciphertexts decrypt only under their own purpose key", async () => {
++	const secret = "shared-secret-at-least-32-characters";
++	for (const purpose of purposes) {
++		const ciphertext = await symmetricEncrypt({
++			key: derivePurposeKey(secret, purpose),
++			data: "synthetic payload",
++		});
++		assert.equal(
++			await symmetricDecrypt({
++				key: derivePurposeKey(secret, purpose),
++				data: ciphertext,
++			}),
++			"synthetic payload",
++		);
++		for (const other of purposes.filter((p) => p !== purpose)) {
++			await assert.rejects(
++				symmetricDecrypt({ key: derivePurposeKey(secret, other), data: ciphertext }),
++			);
++		}
++		await assert.rejects(symmetricDecrypt({ key: secret, data: ciphertext }));
++	}
++});
++
++test("purpose keys preserve secret rotation without accepting the shared key", async () => {
++	const oldSecret = "old-secret-at-least-32-characters!!";
++	const rotated = {
++		keys: new Map([
++			[2, "new-secret-at-least-32-characters!!"],
++			[1, oldSecret],
++		]),
++		currentVersion: 2,
++		legacySecret: oldSecret,
++	};
++	const oldConfig = { keys: new Map([[1, oldSecret]]), currentVersion: 1 };
++	const ciphertext = await symmetricEncrypt({
++		key: derivePurposeKey(oldConfig, "oauth-proxy-profile"),
++		data: "old profile",
++	});
++	assert.equal(
++		await symmetricDecrypt({
++			key: derivePurposeKey(rotated, "oauth-proxy-profile"),
++			data: ciphertext,
++		}),
++		"old profile",
++	);
++	const legacy = await symmetricEncrypt({ key: oldSecret, data: "pre-upgrade" });
++	await assert.rejects(
++		symmetricDecrypt({
++			key: derivePurposeKey(rotated, "oauth-proxy-profile"),
++			data: legacy,
++		}),
++	);
++});
