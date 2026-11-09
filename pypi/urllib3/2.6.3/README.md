@@ -7,7 +7,9 @@ unknown
 - CVE-2026-44431
 - CVE-2026-44432
 - CVE-2026-97689
+- AIKIDO-2026-740601
 - CVE-2026-97687
+- AIKIDO-2026-499214
 
 ## How to Apply:
 1. Clone or download the source code for urllib3
