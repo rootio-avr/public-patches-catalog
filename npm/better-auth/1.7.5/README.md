@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-136329
+- CVE-2026-114607
+- GHSA-r4xp-prcw-77qf
 
 ## How to Apply:
 1. Clone or download the source code for better-auth
