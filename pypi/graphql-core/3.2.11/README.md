@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - CVE-2026-75508
 - CVE-2026-75507
+- AIKIDO-2026-253771
+- AIKIDO-2026-861520
 
 ## How to Apply:
 1. Clone or download the source code for graphql-core
