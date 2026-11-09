@@ -1,0 +1,1095 @@
+--- a/src/urllib3/util/retry.py
++++ b/src/urllib3/util/retry.py
+@@ -187,7 +187,9 @@
+     RETRY_AFTER_STATUS_CODES = frozenset([413, 429, 503])
+
+     #: Default headers to be used for ``remove_headers_on_redirect``
+-    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(["Cookie", "Authorization"])
++    DEFAULT_REMOVE_HEADERS_ON_REDIRECT = frozenset(
++        ["Cookie", "Authorization", "Proxy-Authorization"]
++    )
+
+     #: Default maximum backoff time.
+     DEFAULT_BACKOFF_MAX = 120
+--- a/test/test_retry.py
++++ b/test/test_retry.py
+@@ -334,7 +334,11 @@
+     def test_retry_default_remove_headers_on_redirect(self) -> None:
+         retry = Retry()
+
+-        assert retry.remove_headers_on_redirect == {"authorization", "cookie"}
++        assert retry.remove_headers_on_redirect == {
++            "authorization",
++            "proxy-authorization",
++            "cookie",
++        }
+
+     def test_retry_set_remove_headers_on_redirect(self) -> None:
+         retry = Retry(remove_headers_on_redirect=["X-API-Secret"])
+
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -202,6 +202,22 @@
+         **connection_pool_kw: typing.Any,
+     ) -> None:
+         super().__init__(headers)
++        if "retries" in connection_pool_kw:
++            retries = connection_pool_kw["retries"]
++            if not isinstance(retries, Retry):
++                # When Retry is initialized, raise_on_redirect is based
++                # on a redirect boolean value.
++                # But requests made via a pool manager always set
++                # redirect to False, and raise_on_redirect always ends
++                # up being False consequently.
++                # Here we fix the issue by setting raise_on_redirect to
++                # a value needed by the pool manager without considering
++                # the redirect boolean.
++                raise_on_redirect = retries is not False
++                retries = Retry.from_int(retries, redirect=False)
++                retries.raise_on_redirect = raise_on_redirect
++                connection_pool_kw = connection_pool_kw.copy()
++                connection_pool_kw["retries"] = retries
+         self.connection_pool_kw = connection_pool_kw
+
+         self.pools: RecentlyUsedContainer[PoolKey, HTTPConnectionPool]
+@@ -456,7 +472,7 @@
+             kw["body"] = None
+             kw["headers"] = HTTPHeaderDict(kw["headers"])._prepare_for_method_change()
+
+-        retries = kw.get("retries")
++        retries = kw.get("retries", response.retries)
+         if not isinstance(retries, Retry):
+             retries = Retry.from_int(retries, redirect=redirect)
+
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -192,8 +192,18 @@
+         they were applied.
+     """
+ 
++    # Maximum allowed number of chained HTTP encodings in the
++    # Content-Encoding header.
++    max_decode_links = 5
++
+     def __init__(self, modes: str) -> None:
+-        self._decoders = [_get_decoder(m.strip()) for m in modes.split(",")]
++        encodings = [m.strip() for m in modes.split(",")]
++        if len(encodings) > self.max_decode_links:
++            raise DecodeError(
++                "Too many content encodings in the chain: "
++                f"{len(encodings)} > {self.max_decode_links}"
++            )
++        self._decoders = [_get_decoder(e) for e in encodings]
+ 
+     def flush(self) -> bytes:
+         return self._decoders[0].flush()
+
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -45,6 +45,7 @@ from .connection import BaseSSLError, HTTPConnection, HTTPException
+ from .exceptions import (
+     BodyNotHttplibCompatible,
+     DecodeError,
++    DependencyWarning,
+     HTTPError,
+     IncompleteRead,
+     InvalidChunkLength,
+@@ -66,7 +67,11 @@ log = logging.getLogger(__name__)
+ 
+ 
+ class ContentDecoder:
+-    def decompress(self, data: bytes) -> bytes:
++    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
++        raise NotImplementedError()
++
++    @property
++    def has_unconsumed_tail(self) -> bool:
+         raise NotImplementedError()
+ 
+     def flush(self) -> bytes:
+@@ -76,30 +81,57 @@ class ContentDecoder:
+ class DeflateDecoder(ContentDecoder):
+     def __init__(self) -> None:
+         self._first_try = True
+-        self._data = b""
++        self._first_try_data = b""
++        self._unfed_data = b""
+         self._obj = zlib.decompressobj()
+ 
+-    def decompress(self, data: bytes) -> bytes:
+-        if not data:
++    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
++        data = self._unfed_data + data
++        self._unfed_data = b""
++        if not data and not self._obj.unconsumed_tail:
+             return data
++        original_max_length = max_length
++        if original_max_length < 0:
++            max_length = 0
++        elif original_max_length == 0:
++            # We should not pass 0 to the zlib decompressor because 0 is
++            # the default value that will make zlib decompress without a
++            # length limit.
++            # Data should be stored for subsequent calls.
++            self._unfed_data = data
++            return b""
+ 
++        # Subsequent calls always reuse `self._obj`. zlib requires
++        # passing the unconsumed tail if decompression is to continue.
+         if not self._first_try:
+-            return self._obj.decompress(data)
++            return self._obj.decompress(
++                self._obj.unconsumed_tail + data, max_length=max_length
++            )
+ 
+-        self._data += data
++        # First call tries with RFC 1950 ZLIB format.
++        self._first_try_data += data
+         try:
+-            decompressed = self._obj.decompress(data)
++            decompressed = self._obj.decompress(data, max_length=max_length)
+             if decompressed:
+                 self._first_try = False
+-                self._data = None  # type: ignore[assignment]
++                self._first_try_data = b""
+             return decompressed
++        # On failure, it falls back to RFC 1951 DEFLATE format.
+         except zlib.error:
+             self._first_try = False
+             self._obj = zlib.decompressobj(-zlib.MAX_WBITS)
+             try:
+-                return self.decompress(self._data)
++                return self.decompress(
++                    self._first_try_data, max_length=original_max_length
++                )
+             finally:
+-                self._data = None  # type: ignore[assignment]
++                self._first_try_data = b""
++
++    @property
++    def has_unconsumed_tail(self) -> bool:
++        return bool(self._unfed_data) or (
++            bool(self._obj.unconsumed_tail) and not self._first_try
++        )
+ 
+     def flush(self) -> bytes:
+         return self._obj.flush()
+@@ -115,28 +147,61 @@ class GzipDecoder(ContentDecoder):
+     def __init__(self) -> None:
+         self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+         self._state = GzipDecoderState.FIRST_MEMBER
++        self._unconsumed_tail = b""
+ 
+-    def decompress(self, data: bytes) -> bytes:
++    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+         ret = bytearray()
+-        if self._state == GzipDecoderState.SWALLOW_DATA or not data:
++        if self._state == GzipDecoderState.SWALLOW_DATA:
+             return bytes(ret)
++
++        if max_length == 0:
++            # We should not pass 0 to the zlib decompressor because 0 is
++            # the default value that will make zlib decompress without a
++            # length limit.
++            # Data should be stored for subsequent calls.
++            self._unconsumed_tail += data
++            return b""
++
++        # zlib requires passing the unconsumed tail to the subsequent
++        # call if decompression is to continue.
++        data = self._unconsumed_tail + data
++        if not data and self._obj.eof:
++            return bytes(ret)
++
+         while True:
+             try:
+-                ret += self._obj.decompress(data)
++                ret += self._obj.decompress(
++                    data, max_length=max(max_length - len(ret), 0)
++                )
+             except zlib.error:
+                 previous_state = self._state
+                 # Ignore data after the first error
+                 self._state = GzipDecoderState.SWALLOW_DATA
++                self._unconsumed_tail = b""
+                 if previous_state == GzipDecoderState.OTHER_MEMBERS:
+                     # Allow trailing garbage acceptable in other gzip clients
+                     return bytes(ret)
+                 raise
+-            data = self._obj.unused_data
++
++            self._unconsumed_tail = data = (
++                self._obj.unconsumed_tail or self._obj.unused_data
++            )
++            if max_length > 0 and len(ret) >= max_length:
++                break
++
+             if not data:
+                 return bytes(ret)
++            # When the end of a gzip member is reached, a new decompressor
++            # must be created for unused (possibly future) data.
+             self._state = GzipDecoderState.OTHER_MEMBERS
+             self._obj = zlib.decompressobj(16 + zlib.MAX_WBITS)
+ 
++        return bytes(ret)
++
++    @property
++    def has_unconsumed_tail(self) -> bool:
++        return bool(self._unconsumed_tail)
++
+     def flush(self) -> bytes:
+         return self._obj.flush()
+ 
+@@ -150,9 +215,35 @@ if brotli is not None:
+         def __init__(self) -> None:
+             self._obj = brotli.Decompressor()
+             if hasattr(self._obj, "decompress"):
+-                setattr(self, "decompress", self._obj.decompress)
++                setattr(self, "_decompress", self._obj.decompress)
+             else:
+-                setattr(self, "decompress", self._obj.process)
++                setattr(self, "_decompress", self._obj.process)
++
++        # Requires Brotli >= 1.2.0 for `output_buffer_limit`.
++        def _decompress(self, data: bytes, output_buffer_limit: int = -1) -> bytes:
++            raise NotImplementedError()
++
++        def decompress(self, data: bytes, max_length: int = -1) -> bytes:
++            try:
++                if max_length > 0:
++                    return self._decompress(data, output_buffer_limit=max_length)
++                else:
++                    return self._decompress(data)
++            except TypeError:
++                # Fallback for Brotli/brotlicffi/brotlipy versions without
++                # the `output_buffer_limit` parameter.
++                warnings.warn(
++                    "Brotli >= 1.2.0 is required to prevent decompression bombs.",
++                    DependencyWarning,
++                )
++                return self._decompress(data)
++
++        @property
++        def has_unconsumed_tail(self) -> bool:
++            try:
++                return not self._obj.can_accept_more_data()
++            except AttributeError:
++                return False
+ 
+         def flush(self) -> bytes:
+             if hasattr(self._obj, "flush"):
+@@ -166,16 +257,34 @@ if zstd is not None:
+         def __init__(self) -> None:
+             self._obj = zstd.ZstdDecompressor().decompressobj()
+ 
+-        def decompress(self, data: bytes) -> bytes:
+-            if not data:
++        def decompress(self, data: bytes, max_length: int = -1) -> bytes:
++            if not data and not self.has_unconsumed_tail:
+                 return b""
+-            data_parts = [self._obj.decompress(data)]
++            if self._obj.eof and self._obj.unused_data:
++                unused_data = self._obj.unused_data
++                self._obj = zstd.ZstdDecompressor().decompressobj()
++                data = unused_data + data
++            data_parts = []
++            part = self._obj.decompress(data)
++            if part:
++                data_parts.append(part)
+             while self._obj.eof and self._obj.unused_data:
+                 unused_data = self._obj.unused_data
+                 self._obj = zstd.ZstdDecompressor().decompressobj()
+-                data_parts.append(self._obj.decompress(unused_data))
++                part = self._obj.decompress(unused_data)
++                if part:
++                    data_parts.append(part)
++                else:
++                    break
+             return b"".join(data_parts)
+ 
++        @property
++        def has_unconsumed_tail(self) -> bool:
++            return (self._obj.eof and bool(self._obj.unused_data)) or (
++                not self._obj.eof
++                and not getattr(self._obj, "needs_input", True)
++            )
++
+         def flush(self) -> bytes:
+             ret = self._obj.flush()  # note: this is a no-op
+             if not self._obj.eof:
+@@ -198,10 +307,35 @@ class MultiDecoder(ContentDecoder):
+     def flush(self) -> bytes:
+         return self._decoders[0].flush()
+ 
+-    def decompress(self, data: bytes) -> bytes:
+-        for d in reversed(self._decoders):
+-            data = d.decompress(data)
+-        return data
++    def decompress(self, data: bytes, max_length: int = -1) -> bytes:
++        if max_length <= 0:
++            for d in reversed(self._decoders):
++                data = d.decompress(data)
++            return data
++
++        ret = bytearray()
++        # Every while loop iteration goes through all decoders once.
++        # It exits when enough data is read or no more data can be read.
++        # It is possible that the while loop iteration does not produce
++        # any data because we retrieve up to `max_length` from every
++        # decoder, and the amount of bytes may be insufficient for the
++        # next decoder to produce enough/any output.
++        while True:
++            any_data = False
++            for d in reversed(self._decoders):
++                data = d.decompress(data, max_length=max_length - len(ret))
++                if data:
++                    any_data = True
++                # We should not break when no data is returned because
++                # next decoders may produce data even with empty input.
++            ret += data
++            if not any_data or len(ret) >= max_length:
++                return bytes(ret)
++            data = b""
++
++    @property
++    def has_unconsumed_tail(self) -> bool:
++        return any(d.has_unconsumed_tail for d in self._decoders)
+ 
+ 
+ def _get_decoder(mode: str) -> ContentDecoder:
+@@ -427,7 +561,11 @@ class BaseHTTPResponse(io.IOBase):
+                     self._decoder = _get_decoder(content_encoding)
+ 
+     def _decode(
+-        self, data: bytes, decode_content: bool | None, flush_decoder: bool
++        self,
++        data: bytes,
++        decode_content: bool | None,
++        flush_decoder: bool,
++        max_length: int | None = None,
+     ) -> bytes:
+         """
+         Decode the data passed in and potentially flush the decoder.
+@@ -440,9 +578,12 @@ class BaseHTTPResponse(io.IOBase):
+                 )
+             return data
+ 
++        if max_length is None or flush_decoder:
++            max_length = -1
++
+         try:
+             if self._decoder:
+-                data = self._decoder.decompress(data)
++                data = self._decoder.decompress(data, max_length=max_length)
+                 self._has_decoded_content = True
+         except self.DECODER_ERROR_CLASSES as e:
+             content_encoding = self.headers.get("content-encoding", "").lower()
+@@ -870,9 +1011,20 @@ class HTTPResponse(BaseHTTPResponse):
+         if decode_content is None:
+             decode_content = self.decode_content
+ 
+-        if amt is not None:
++        if amt and amt < 0:
++            # Negative numbers and `None` should be treated the same.
++            amt = None
++        elif amt is not None:
+             cache_content = False
+ 
++            if self._decoder and self._decoder.has_unconsumed_tail:
++                decoded_data = self._decode(
++                    b"",
++                    decode_content,
++                    flush_decoder=False,
++                    max_length=amt - len(self._decoded_buffer),
++                )
++                self._decoded_buffer.put(decoded_data)
+             if len(self._decoded_buffer) >= amt:
+                 return self._decoded_buffer.get(amt)
+ 
+@@ -880,7 +1032,11 @@ class HTTPResponse(BaseHTTPResponse):
+ 
+         flush_decoder = amt is None or (amt != 0 and not data)
+ 
+-        if not data and len(self._decoded_buffer) == 0:
++        if (
++            not data
++            and len(self._decoded_buffer) == 0
++            and not (self._decoder and self._decoder.has_unconsumed_tail)
++        ):
+             return data
+ 
+         if amt is None:
+@@ -897,7 +1053,12 @@ class HTTPResponse(BaseHTTPResponse):
+                     )
+                 return data
+ 
+-            decoded_data = self._decode(data, decode_content, flush_decoder)
++            decoded_data = self._decode(
++                data,
++                decode_content,
++                flush_decoder,
++                max_length=amt - len(self._decoded_buffer),
++            )
+             self._decoded_buffer.put(decoded_data)
+ 
+             while len(self._decoded_buffer) < amt and data:
+@@ -905,7 +1066,12 @@ class HTTPResponse(BaseHTTPResponse):
+                 # For example, the GZ file header takes 10 bytes, we don't want to read
+                 # it one byte at a time
+                 data = self._raw_read(amt)
+-                decoded_data = self._decode(data, decode_content, flush_decoder)
++                decoded_data = self._decode(
++                    data,
++                    decode_content,
++                    flush_decoder,
++                    max_length=amt - len(self._decoded_buffer),
++                )
+                 self._decoded_buffer.put(decoded_data)
+             data = self._decoded_buffer.get(amt)
+ 
+@@ -932,7 +1098,11 @@ class HTTPResponse(BaseHTTPResponse):
+         if self.chunked and self.supports_chunked_reads():
+             yield from self.read_chunked(amt, decode_content=decode_content)
+         else:
+-            while not is_fp_closed(self._fp) or len(self._decoded_buffer) > 0:
++            while (
++                not is_fp_closed(self._fp)
++                or len(self._decoded_buffer) > 0
++                or (self._decoder and self._decoder.has_unconsumed_tail)
++            ):
+                 data = self.read(amt=amt, decode_content=decode_content)
+ 
+                 if data:
+@@ -1075,7 +1245,10 @@ class HTTPResponse(BaseHTTPResponse):
+                     break
+                 chunk = self._handle_chunk(amt)
+                 decoded = self._decode(
+-                    chunk, decode_content=decode_content, flush_decoder=False
++                    chunk,
++                    decode_content=decode_content,
++                    flush_decoder=False,
++                    max_length=amt,
+                 )
+                 if decoded:
+                     yield decoded
+
+* Unmerged path CHANGES.rst
+* Unmerged path dummyserver/app.py
+diff --git a/src/urllib3/response.py b/src/urllib3/response.py
+index 12097ea9..78f91525 100644
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -608,7 +608,11 @@ class HTTPResponse(BaseHTTPResponse):
+         Unread data in the HTTPResponse connection blocks the connection from being released back to the pool.
+         """
+         try:
+-            self.read()
++            self.read(
++                # Do not spend resources decoding the content unless
++                # decoding has already been initiated.
++                decode_content=self._has_decoded_content,
++            )
+         except (HTTPError, OSError, BaseSSLError, HTTPException):
+             pass
+ 
+
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -202,22 +202,20 @@
+         **connection_pool_kw: typing.Any,
+     ) -> None:
+         super().__init__(headers)
+-        if "retries" in connection_pool_kw:
+-            retries = connection_pool_kw["retries"]
+-            if not isinstance(retries, Retry):
+-                # When Retry is initialized, raise_on_redirect is based
+-                # on a redirect boolean value.
+-                # But requests made via a pool manager always set
+-                # redirect to False, and raise_on_redirect always ends
+-                # up being False consequently.
+-                # Here we fix the issue by setting raise_on_redirect to
+-                # a value needed by the pool manager without considering
+-                # the redirect boolean.
+-                raise_on_redirect = retries is not False
+-                retries = Retry.from_int(retries, redirect=False)
+-                retries.raise_on_redirect = raise_on_redirect
+-                connection_pool_kw = connection_pool_kw.copy()
+-                connection_pool_kw["retries"] = retries
+-        self.connection_pool_kw = connection_pool_kw
++        # PoolManager handles redirects itself in PoolManager.urlopen().
++        # It always passes redirect=False to the underlying connection pool to
++        # suppress per-pool redirect handling. If the user supplied a non-Retry
++        # value (int/bool/etc) for retries and we let the pool normalize it
++        # while redirect=False, the resulting Retry object would have redirect
++        # handling disabled, which can interfere with PoolManager's own
++        # redirect logic. Normalize here so redirects remain governed solely by
++        # PoolManager logic.
++        if "retries" in connection_pool_kw:
++            retries = connection_pool_kw["retries"]
++            if not isinstance(retries, Retry):
++                retries = Retry.from_int(retries)
++                connection_pool_kw = connection_pool_kw.copy()
++                connection_pool_kw["retries"] = retries
++        self.connection_pool_kw = connection_pool_kw
+ 
+         self.pools: RecentlyUsedContainer[PoolKey, HTTPConnectionPool]
+         self.pools = RecentlyUsedContainer(num_pools)
+
+--- a/src/urllib3/connection.py
++++ b/src/urllib3/connection.py
+@@ -264,6 +264,13 @@
+         return not wait_for_read(self.sock, timeout=0.0)
+ 
+     @property
++    def proxy_is_forwarding(self) -> bool:
++        """
++        Return True if a forwarding proxy is configured, else return False
++        """
++        return bool(self.proxy) and self._tunnel_host is None
++
++    @property
+     def has_connected_to_proxy(self) -> bool:
+         return self._has_connected_to_proxy
+ 
+@@ -639,26 +646,35 @@
+                 SystemTimeWarning,
+             )
+ 
+-        sock_and_verified = _ssl_wrap_socket_and_match_hostname(
+-            sock=sock,
+-            cert_reqs=self.cert_reqs,
+-            ssl_version=self.ssl_version,
+-            ssl_minimum_version=self.ssl_minimum_version,
+-            ssl_maximum_version=self.ssl_maximum_version,
+-            ca_certs=self.ca_certs,
+-            ca_cert_dir=self.ca_cert_dir,
+-            ca_cert_data=self.ca_cert_data,
+-            cert_file=self.cert_file,
+-            key_file=self.key_file,
+-            key_password=self.key_password,
+-            server_hostname=server_hostname,
+-            ssl_context=self.ssl_context,
+-            tls_in_tls=tls_in_tls,
+-            assert_hostname=self.assert_hostname,
+-            assert_fingerprint=self.assert_fingerprint,
+-        )
+-        self.sock = sock_and_verified.socket
+-        self.is_verified = sock_and_verified.is_verified
++        # Forwarding proxies use the proxy's own TLS policy for the handshake
++        # with the proxy, which is the connection being established here,
++        # whereas tunneling proxies and direct connections use the
++        # connection's TLS settings for the target.
++        wrapped_socket: ssl.SSLSocket | SSLTransport
++        if self.proxy_is_forwarding and self.proxy_config is not None:
++            wrapped_socket = self._connect_tls_proxy(self.host, sock)
++            is_verified = self.proxy_is_verified is True
++        else:
++            wrapped_socket, is_verified = _ssl_wrap_socket_and_match_hostname(
++                sock=sock,
++                cert_reqs=self.cert_reqs,
++                ssl_version=self.ssl_version,
++                ssl_minimum_version=self.ssl_minimum_version,
++                ssl_maximum_version=self.ssl_maximum_version,
++                ca_certs=self.ca_certs,
++                ca_cert_dir=self.ca_cert_dir,
++                ca_cert_data=self.ca_cert_data,
++                cert_file=self.cert_file,
++                key_file=self.key_file,
++                key_password=self.key_password,
++                server_hostname=server_hostname,
++                ssl_context=self.ssl_context,
++                tls_in_tls=tls_in_tls,
++                assert_hostname=self.assert_hostname,
++                assert_fingerprint=self.assert_fingerprint,
++            )
++        self.sock = wrapped_socket
++        self.is_verified = is_verified
+ 
+         # If there's a proxy to be connected to we are fully connected.
+         # This is set twice (once above and here) due to forwarding proxies
+@@ -667,20 +683,43 @@
+ 
+     def _connect_tls_proxy(self, hostname: str, sock: socket.socket) -> ssl.SSLSocket:
+         """
+-        Establish a TLS connection to the proxy using the provided SSL context.
++        Establish a TLS connection to the proxy using proxy-specific policy.
+         """
+-        # `_connect_tls_proxy` is called when self._tunnel_host is truthy.
+         proxy_config = typing.cast(ProxyConfig, self.proxy_config)
+-        ssl_context = proxy_config.ssl_context
++        proxy_ssl_context = proxy_config.ssl_context
++
++        ssl_context: ssl.SSLContext | None
++        cert_reqs: int | str | None
++        if proxy_ssl_context is not None:
++            # Prefer the proxy's cert policy for the proxy connection
++            ssl_context = proxy_ssl_context
++            cert_reqs = proxy_ssl_context.verify_mode
++            ca_certs = None
++            ca_cert_dir = None
++            ca_cert_data = None
++            ssl_version = None
++            ssl_minimum_version = None
++            ssl_maximum_version = None
++        else:
++            # Otherwise we inherit the pool's cert policies
++            ssl_context = self.ssl_context if self.proxy_is_forwarding else None
++            cert_reqs = self.cert_reqs
++            ca_certs = self.ca_certs
++            ca_cert_dir = self.ca_cert_dir
++            ca_cert_data = self.ca_cert_data
++            ssl_version = self.ssl_version
++            ssl_minimum_version = self.ssl_minimum_version
++            ssl_maximum_version = self.ssl_maximum_version
++
+         sock_and_verified = _ssl_wrap_socket_and_match_hostname(
+             sock,
+-            cert_reqs=self.cert_reqs,
+-            ssl_version=self.ssl_version,
+-            ssl_minimum_version=self.ssl_minimum_version,
+-            ssl_maximum_version=self.ssl_maximum_version,
+-            ca_certs=self.ca_certs,
+-            ca_cert_dir=self.ca_cert_dir,
+-            ca_cert_data=self.ca_cert_data,
++            cert_reqs=cert_reqs,
++            ssl_version=ssl_version,
++            ssl_minimum_version=ssl_minimum_version,
++            ssl_maximum_version=ssl_maximum_version,
++            ca_certs=ca_certs,
++            ca_cert_dir=ca_cert_dir,
++            ca_cert_data=ca_cert_data,
+             server_hostname=hostname,
+             ssl_context=ssl_context,
+             assert_hostname=proxy_config.assert_hostname,
+--- a/src/urllib3/poolmanager.py
++++ b/src/urllib3/poolmanager.py
+@@ -565,13 +565,30 @@
+         if proxy.scheme not in ("http", "https"):
+             raise ProxySchemeUnknown(proxy.scheme)
+ 
++        # Keep the deprecated ssl_context fallback on the manager for
++        # compatibility, while passing only explicit proxy policy to connections.
++        self.proxy_ssl_context = proxy_ssl_context
++        if (
++            use_forwarding_for_https
++            and proxy.scheme == "https"
++            and connection_pool_kw.get("ssl_context") is not None
++        ):
++            warnings.warn(
++                "Passing ssl_context when use_forwarding_for_https=True is deprecated "
++                "and will raise an error in urllib3 v3.0. "
++                "Use proxy_ssl_context to configure the TLS connection to the proxy.",
++                FutureWarning,
++                stacklevel=2,
++            )
++            if self.proxy_ssl_context is None:
++                self.proxy_ssl_context = connection_pool_kw.get("ssl_context")
++
+         if not proxy.port:
+             port = port_by_scheme.get(proxy.scheme, 80)
+             proxy = proxy._replace(port=port)
+ 
+         self.proxy = proxy
+         self.proxy_headers = proxy_headers or {}
+-        self.proxy_ssl_context = proxy_ssl_context
+         self.proxy_config = ProxyConfig(
+             proxy_ssl_context,
+             use_forwarding_for_https,
+--- a/test/with_dummyserver/test_proxy_poolmanager.py
++++ b/test/with_dummyserver/test_proxy_poolmanager.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import binascii
++import contextlib
+ import hashlib
+ import ipaddress
+ import os.path
+@@ -9,6 +10,7 @@
+ import socket
+ import ssl
+ import tempfile
++import typing
+ from test import LONG_TIMEOUT, SHORT_TIMEOUT, onlySecureTransport, withPyOpenSSL
+ from test.conftest import ServerConfig
+ 
+@@ -20,7 +22,7 @@
+ from dummyserver.testcase import HTTPDummyProxyTestCase, IPv6HTTPDummyProxyTestCase
+ from urllib3 import HTTPResponse
+ from urllib3._collections import HTTPHeaderDict
+-from urllib3.connection import VerifiedHTTPSConnection
++from urllib3.connection import HTTPSConnection, VerifiedHTTPSConnection
+ from urllib3.connectionpool import connection_from_url
+ from urllib3.exceptions import (
+     ConnectTimeoutError,
+@@ -126,6 +128,43 @@
+             r = https.request("GET", f"{self.https_url}/")
+             assert r.status == 200
+ 
++    @requires_network()
++    @pytest.mark.parametrize(
++        "proxy_ssl_context_kw",
++        [
++            ("ssl_context",),
++            ("proxy_ssl_context",),
++            ("ssl_context", "proxy_ssl_context"),
++        ],
++    )
++    def test_https_proxy_forwarding_for_https_with_custom_context(
++        self, proxy_ssl_context_kw: tuple[str, ...]
++    ) -> None:
++        """
++        Test that an HTTPS request succeeds when using a forwarding HTTPS
++        proxy with an SSL context provided via either
++        ``proxy_ssl_context``, ``ssl_context`` (fallback), or both.
++        """
++
++        proxy_ctx = ssl.create_default_context()
++        proxy_ctx.load_verify_locations(DEFAULT_CA)
++
++        warning_checker: contextlib.AbstractContextManager[typing.Any]
++        if "ssl_context" in proxy_ssl_context_kw:
++            warning_checker = pytest.warns(FutureWarning, match="ssl_context")
++        else:
++            warning_checker = contextlib.nullcontext()
++        with warning_checker:
++            proxy = proxy_from_url(
++                self.https_proxy_url,
++                **{kw: proxy_ctx for kw in proxy_ssl_context_kw},
++                use_forwarding_for_https=True,
++            )
++
++        with proxy:
++            resp = proxy.request("GET", self.https_url)
++            assert resp.status == 200
++
+     def test_nagle_proxy(self) -> None:
+         """Test that proxy connections do not have TCP_NODELAY turned on"""
+         with ProxyManager(self.proxy_url) as http:
+@@ -572,20 +611,8 @@
+             assert type(e.value.reason.original_error) == SSLError
+ 
+     @requires_network()
+-    @pytest.mark.parametrize(
+-        ["proxy_scheme", "use_forwarding_for_https"],
+-        [
+-            ("http", False),
+-            ("https", False),
+-            ("https", True),
+-        ],
+-    )
+-    def test_proxy_https_target_tls_error(
+-        self, proxy_scheme: str, use_forwarding_for_https: str
+-    ) -> None:
+-        if proxy_scheme == "https" and use_forwarding_for_https:
+-            pytest.skip("Test is expected to fail due to urllib3/urllib3#2577")
+-
++    @pytest.mark.parametrize("proxy_scheme", ["http", "https"])
++    def test_proxy_https_target_tls_error(self, proxy_scheme: str) -> None:
+         proxy_url = self.https_proxy_url if proxy_scheme == "https" else self.proxy_url
+         proxy_ctx = ssl.create_default_context()
+         proxy_ctx.load_verify_locations(DEFAULT_CA)
+@@ -595,11 +622,102 @@
+             proxy_url,
+             proxy_ssl_context=proxy_ctx,
+             ssl_context=ctx,
+-            use_forwarding_for_https=use_forwarding_for_https,
+         ) as proxy:
+             with pytest.raises(MaxRetryError) as e:
+                 proxy.request("GET", self.https_url)
+             assert type(e.value.reason) == SSLError
++
++    @requires_network()
++    def test_forwarding_proxy_tls_error_with_fallback(self) -> None:
++        """
++        Test that when only ``ssl_context`` is passed to a forwarding
++        HTTPS proxy, a ``FutureWarning`` is emitted and if the TLS
++        handshake with the proxy fails using that context, the error is
++        a ``ProxyError`` wrapping the original TLS error.
++        """
++        ctx = ssl.create_default_context()
++
++        with pytest.warns(FutureWarning, match="ssl_context"):
++            proxy = proxy_from_url(
++                self.https_proxy_url,
++                ssl_context=ctx,
++                use_forwarding_for_https=True,
++            )
++
++        with proxy:
++            with pytest.raises(MaxRetryError) as e:
++                proxy.request("GET", self.https_url)
++            assert type(e.value.reason) == ProxyError
++            assert type(e.value.reason.original_error) == SSLError
++
++    @requires_network()
++    def test_forwarding_proxy_ssl_context_precedence(self) -> None:
++        """
++        Test that when both ``ssl_context`` and ``proxy_ssl_context``
++        are passed to a forwarding HTTPS proxy, ``proxy_ssl_context`` is
++        used for the proxy connection and ``ssl_context`` is ignored
++        (with a warning).
++        """
++        ssl_context = ssl.create_default_context(cafile=DEFAULT_CA)
++        proxy_ssl_context = ssl.create_default_context(cafile=DEFAULT_CA)
++
++        with pytest.warns(FutureWarning, match="ssl_context"):
++            proxy = proxy_from_url(
++                self.https_proxy_url,
++                proxy_ssl_context=proxy_ssl_context,
++                ssl_context=ssl_context,
++                use_forwarding_for_https=True,
++            )
++
++        with proxy:
++            pool = proxy.connection_from_url(self.https_url)
++            with contextlib.closing(pool._new_conn()) as conn:
++                conn = typing.cast(HTTPSConnection, conn)
++                conn.connect()
++                assert isinstance(conn.sock, ssl.SSLSocket)
++                assert conn.sock.context is proxy_ssl_context
++
++    @requires_network()
++    def test_forwarding_proxy_ssl_context_fallback(self) -> None:
++        """
++        Test that when only ``ssl_context`` is passed to a forwarding
++        HTTPS proxy, a ``FutureWarning`` is emitted and ``ssl_context``
++        is used as the proxy TLS context (fallback).
++        """
++        ssl_context = ssl.create_default_context(cafile=DEFAULT_CA)
++
++        with pytest.warns(FutureWarning, match="ssl_context"):
++            proxy = proxy_from_url(
++                self.https_proxy_url,
++                ssl_context=ssl_context,
++                use_forwarding_for_https=True,
++            )
++
++        with proxy:
++            pool = proxy.connection_from_url(self.https_url)
++            with contextlib.closing(pool._new_conn()) as conn:
++                conn = typing.cast(HTTPSConnection, conn)
++                conn.connect()
++                assert isinstance(conn.sock, ssl.SSLSocket)
++                assert conn.sock.context is ssl_context
++
++    @requires_network()
++    def test_forwarding_non_https_proxy_ssl_context_fallback(self) -> None:
++        """
++        Test that when only ``ssl_context`` is passed to a forwarding
++        non-HTTPS proxy, no warning or error is emitted.
++        """
++        ssl_context = ssl.create_default_context(cafile=DEFAULT_CA)
++        # No warning/error should be emitted even when ``ssl_context``
++        # is provided to a non-HTTPS proxy for some reason.
++        proxy = proxy_from_url(
++            self.proxy_url,
++            ssl_context=ssl_context,
++            use_forwarding_for_https=True,
++        )
++        with proxy:
++            resp = proxy.request("GET", self.https_url)
++            assert resp.status == 200
+ 
+     def test_scheme_host_case_insensitive(self) -> None:
+         """Assert that upper-case schemes and hosts are normalized."""
+
+--- a/src/urllib3/response.py
++++ b/src/urllib3/response.py
+@@ -50,7 +50,14 @@
+ 
+ log = logging.getLogger(__name__)
+ 
++# Maximum length of a chunk-size line (and the trailing CRLF line) when reading a
++# chunked-transfer-encoded response. Matches ``http.client._MAXLINE`` so urllib3's
++# streaming path bounds these reads exactly like the stdlib ``.read()`` path does,
++# preventing a malicious server from forcing unbounded buffering (memory exhaustion)
++# via an unterminated chunk-size line.
++_MAX_CHUNK_LINE_LENGTH = 2**16
+ 
++
+ class ContentDecoder:
+     def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+         raise NotImplementedError()
+@@ -1323,7 +1330,12 @@
+         # we'll try to read it from socket.
+         if self.chunk_left is not None:
+             return None
+-        line = self._fp.fp.readline()  # type: ignore[union-attr]
++        line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)  # type: ignore[union-attr]
++        if len(line) > _MAX_CHUNK_LINE_LENGTH:
++            self.close()
++            raise ProtocolError(
++                "Response chunk size line exceeded maximum allowed length"
++            ) from None
+         line = line.split(b";", 1)[0]
+         try:
+             self.chunk_left = int(line, 16)
+@@ -1427,7 +1439,11 @@
+ 
+             # Chunk content ends with \r\n: discard it.
+             while self._fp is not None:
+-                line = self._fp.fp.readline()
++                line = self._fp.fp.readline(_MAX_CHUNK_LINE_LENGTH + 1)
++                if len(line) > _MAX_CHUNK_LINE_LENGTH:
++                    raise ProtocolError(
++                        "Response chunk trailer line exceeded maximum allowed length"
++                    )
+                 if not line:
+                     # Some sites may not end with '\r\n'.
+                     break
+--- a/test/test_response.py
++++ b/test/test_response.py
+@@ -27,6 +27,7 @@
+     SSLError,
+ )
+ from urllib3.response import (  # type: ignore[attr-defined]
++    _MAX_CHUNK_LINE_LENGTH,
+     BaseHTTPResponse,
+     BytesQueueBuffer,
+     HTTPResponse,
+@@ -1073,6 +1074,63 @@
+         assert isinstance(orig_ex, InvalidChunkLength)
+         assert orig_ex.length == fp.BAD_LENGTH_LINE.encode()
+ 
++    def test_chunk_size_line_too_long(self) -> None:
++        # A malicious server can send a chunk-size line with no newline. urllib3's
++        # streaming path must reject it with a bounded read rather than buffering
++        # the whole line (memory exhaustion).
++        stream = [b"foooo"]
++        fp = MockChunkedEncodingLongChunkSizeLine(stream)
++        r = httplib.HTTPResponse(MockSock)  # type: ignore[arg-type]
++        r.fp = fp  # type: ignore[assignment]
++        r.chunked = True
++        r.chunk_left = None
++        resp = HTTPResponse(
++            r, preload_content=False, headers={"transfer-encoding": "chunked"}
++        )
++        with pytest.raises(ProtocolError) as ctx:
++            next(resp.read_chunked())
++
++        assert "chunk size line exceeded maximum allowed length" in str(ctx.value)
++
++    @pytest.mark.parametrize(
++        "trailer_length",
++        [
++            _MAX_CHUNK_LINE_LENGTH - 1,
++            _MAX_CHUNK_LINE_LENGTH,
++            _MAX_CHUNK_LINE_LENGTH + 1,
++        ],
++    )
++    @pytest.mark.parametrize("line_ending", [b"\r\n", b""])
++    def test_chunk_trailer_line_length(
++        self, trailer_length: int, line_ending: bytes
++    ) -> None:
++        # The line limit includes its CRLF, but not the final blank line.
++        trailer = b"X:" + b"x" * (trailer_length - 2 - len(line_ending)) + line_ending
++        fp = BytesIO(b"3\r\nfoo\r\n0\r\n" + trailer + (b"\r\n" if line_ending else b""))
++        r = httplib.HTTPResponse(MockSock, method="GET")  # type: ignore[arg-type]
++        r.fp = fp  # type: ignore[assignment]
++        resp = HTTPResponse(
++            r,
++            preload_content=False,
++            headers={"transfer-encoding": "chunked"},
++            original_response=r,
++        )
++        chunks = resp.read_chunked()
++        assert next(chunks) == b"foo"
++
++        if trailer_length > _MAX_CHUNK_LINE_LENGTH:
++            with pytest.raises(
++                ProtocolError,
++                match="Response chunk trailer line exceeded maximum allowed length",
++            ):
++                next(chunks)
++        else:
++            assert list(chunks) == []
++
++        assert fp.closed
++        assert r.isclosed()
++        assert resp.closed
++
+     def test_chunked_response_without_crlf_on_end(self) -> None:
+         stream = [b"foo", b"bar", b"baz"]
+         fp = MockChunkedEncodingWithoutCRLFOnEnd(stream)
+@@ -1895,8 +1953,20 @@
+                 self.cur_chunk = self.cur_chunk[amt:]
+             return chunk_part
+ 
+-    def readline(self) -> bytes:
+-        return self.pop_current_chunk(till_crlf=True)
++    def readline(self, amt: int = -1) -> bytes:
++        # Emulate a real file object's readline(size): return bytes up to and
++        # including the first newline, or at most ``amt`` bytes when ``amt >= 0``,
++        # whichever comes first.
++        if len(self.cur_chunk) <= 0:
++            self.cur_chunk = self._pop_new_chunk()
++        line = self.cur_chunk
++        newline_index = line.find(b"\n")
++        if newline_index != -1:
++            line = line[: newline_index + 1]
++        if 0 <= amt < len(line):
++            line = line[:amt]
++        self.cur_chunk = self.cur_chunk[len(line) :]
++        return line
+ 
+     def read(self, amt: int = -1) -> bytes:
+         return self.pop_current_chunk(amt)
+@@ -1922,6 +1992,14 @@
+ 
+     def _encode_chunk(self, chunk: bytes) -> bytes:
+         return f"{self.BAD_LENGTH_LINE}{chunk.decode()}\r\n".encode()
++
++
++class MockChunkedEncodingLongChunkSizeLine(MockChunkedEncodingResponse):
++    def _encode_chunk(self, chunk: bytes) -> bytes:
++        # A chunk-size line far longer than _MAX_CHUNK_LINE_LENGTH with no
++        # newline, simulating a malicious server that never terminates the
++        # size line (memory-exhaustion attack).
++        return b"f" * (2**16 + 1024)
+ 
+ 
+ class MockChunkedEncodingWithoutCRLFOnEnd(MockChunkedEncodingResponse):
+--- a/test/with_dummyserver/test_socketlevel.py
++++ b/test/with_dummyserver/test_socketlevel.py
+@@ -2226,6 +2226,40 @@
+ 
+             done_event.set()
+ 
++    def test_chunked_size_line_too_long_does_not_buffer(self) -> None:
++        # A malicious server can advertise chunked encoding and then send an
++        # unterminated chunk-size line (no newline). The streaming path must
++        # reject it with a bounded read instead of buffering the whole run,
++        # which would exhaust memory.
++        done_event = Event()
++        # Well above the 65536-byte cap, but small enough for a fast test.
++        run_length = 512 * 1024
++
++        def socket_handler(listener: socket.socket) -> None:
++            sock = listener.accept()[0]
++
++            buf = b""
++            while not buf.endswith(b"\r\n\r\n"):
++                buf += sock.recv(65536)
++
++            sock.sendall(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
++            # A chunk-size line that never terminates with a newline.
++            with contextlib.suppress(OSError):
++                sock.sendall(b"f" * run_length)
++
++            done_event.wait(5)
++            sock.close()
++
++        self._start_server(socket_handler)
++
++        with HTTPConnectionPool(self.host, self.port, retries=False) as pool:
++            r = pool.request("GET", "/", timeout=LONG_TIMEOUT, preload_content=False)
++            with pytest.raises(ProtocolError) as ctx:
++                next(r.stream(65536))
++            assert "chunk size line exceeded maximum allowed length" in str(ctx.value)
++
++            done_event.set()
++
+     def test_large_compressed_stream(self) -> None:
+         done_event = Event()
+         expected_total_length = 296085
