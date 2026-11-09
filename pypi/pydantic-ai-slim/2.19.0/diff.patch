@@ -1,0 +1,294 @@
+--- a/pydantic_ai/ui/_web/api.py
++++ b/pydantic_ai/ui/_web/api.py
+@@ -31,7 +31,22 @@
+ # (server + bundled UI). See `VercelAIAdapter.sdk_version`.
+ BUNDLED_UI_SDK_VERSION: Literal[7] = 7
+ 
++# `/chat` requires exactly this content type. This is a CSRF control, not content negotiation: a
++# browser can send the three CORS-safelisted content types (`text/plain`, `multipart/form-data`,
++# `application/x-www-form-urlencoded`) — or no content type at all — cross-origin with no preflight,
++# and every one of them can carry a JSON body. Without this check, a page the developer happens to
++# visit while running the web UI could start an agent run on their machine, and execute whatever
++# tools the served agent exposes. `application/json` is not safelisted, so requiring it forces a
++# preflight, which `options_chat` refuses.
++#
++# Keep this an allowlist. A denylist of the safelisted types would miss the no-content-type case,
++# and would silently stop covering anything added to the safelist later.
++#
++# The bundled UI — and the Vercel AI SDK's `DefaultChatTransport` generally — always sends
++# `application/json`; other clients need to set the header explicitly.
++JSON_MEDIA_TYPE = 'application/json'
+ 
++
+ class ModelInfo(BaseModel, alias_generator=to_camel, populate_by_name=True):
+     """Defines an AI model with its associated built-in tools."""
+ 
+@@ -160,7 +175,17 @@
+     allowed_tool_ids = {tool.unique_id for tool in ui_native_tools}
+ 
+     async def options_chat(request: Request) -> Response:
+-        """Handle CORS preflight requests."""
++        """Answer CORS preflight requests without granting cross-origin access.
++
++        Deliberately carries no `Access-Control-Allow-*` header, so a browser refuses any
++        cross-origin request that needs a preflight. Together with the `application/json`
++        requirement in `post_chat()`, that is what keeps a page the developer visits from reaching
++        the local web UI: requiring a non-safelisted content type forces the preflight, and this
++        response denies it.
++
++        Do not add `Access-Control-Allow-Origin` here without an accompanying CSRF control — on its
++        own it re-opens the endpoint to any website the developer has open.
++        """
+         return Response()
+ 
+     async def configure_frontend(request: Request) -> Response:
+@@ -177,6 +202,15 @@
+ 
+     async def post_chat(request: Request) -> Response:
+         """Handle chat requests via Vercel AI Adapter."""
++        if (media_type := request.headers.get('content-type', '').split(';')[0].strip().lower()) != JSON_MEDIA_TYPE:
++            # Checked up front so a cross-origin-forgeable request is turned away before the body is
++            # parsed and before the agent is dispatched — the attacker never needs to read the
++            # response, so the run itself is the damage.
++            return JSONResponse(
++                {'error': f'Expected `Content-Type: {JSON_MEDIA_TYPE}`, got {media_type or "no content type"}'},
++                status_code=415,
++            )
++
+         adapter = await VercelAIAdapter[AgentDepsT, OutputDataT].from_request(
+             request, agent=agent, sdk_version=sdk_version
+         )
+
+--- a/pydantic_ai/concurrency.py
++++ b/pydantic_ai/concurrency.py
+@@ -70,7 +70,11 @@
+
+     @abstractmethod
+     def release(self) -> None:
+-        """Release a slot."""
++        """Release a slot.
++
++        This can run on a different task than the matching `acquire()`: a streamed model response
++        is iterated and closed on whichever task consumes it.
++        """
+         ...
+
+
+@@ -95,9 +99,13 @@
+ class ConcurrencyLimiter(AbstractConcurrencyLimiter):
+     """A concurrency limiter that tracks waiting operations for observability.
+
+-    This class wraps an anyio.CapacityLimiter and tracks the number of waiting operations.
++    This class wraps an anyio.Semaphore and tracks the number of waiting operations.
+     When an operation has to wait to acquire a slot, a span is created for
+     observability purposes.
++
++    Slots are not owned by tasks. Each successful `acquire()` must be paired with one
++    `release()`, which can run on a different task. Calling `acquire()` again consumes another
++    slot and waits if none is available.
+     """
+
+     def __init__(
+@@ -122,7 +130,10 @@
+         """
+         _validate_max_running(max_running)
+         _validate_max_queued(max_queued)
+-        self._limiter = anyio.CapacityLimiter(max_running)
++        # A semaphore rather than `anyio.CapacityLimiter`, which ties each slot to the task that took it:
++        # `release()` must work from any task.
++        self._limiter = anyio.Semaphore(max_running, max_value=max_running)
++        self._max_running = max_running
+         self._max_queued = max_queued
+         self._name = name
+         self._tracer = tracer
+@@ -171,17 +182,17 @@
+     @property
+     def running_count(self) -> int:
+         """Number of operations currently running."""
+-        return self._limiter.statistics().borrowed_tokens
++        return self._max_running - self._limiter.value
+
+     @property
+     def available_count(self) -> int:
+         """Number of slots available."""
+-        return int(self._limiter.available_tokens)
++        return self._limiter.value
+
+     @property
+     def max_running(self) -> int:
+         """Maximum concurrent operations allowed."""
+-        return int(self._limiter.total_tokens)
++        return self._max_running
+
+     def _get_tracer(self) -> Tracer:
+         """Get the tracer, falling back to global tracer if not set."""
+@@ -227,7 +238,7 @@
+             attributes: dict[str, str | int] = {
+                 'source': source,
+                 'waiting_count': self._waiting_count,
+-                'max_running': int(self._limiter.total_tokens),
++                'max_running': self._max_running,
+             }
+             if self._name is not None:
+                 attributes['limiter_name'] = self._name
+--- a/pydantic_ai/models/concurrency.py
++++ b/pydantic_ai/models/concurrency.py
+@@ -2,12 +2,13 @@
+
+ from __future__ import annotations
+
+-from collections.abc import AsyncGenerator
+-from contextlib import asynccontextmanager
++from collections.abc import AsyncGenerator, Generator
++from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
++from contextvars import ContextVar
+ from dataclasses import dataclass
+ from typing import Any
+
+-from .._run_context import RunContext
++from .._run_context import RunContext, get_current_run_context
+ from ..concurrency import (
+     AbstractConcurrencyLimiter,
+     AnyConcurrencyLimit,
+@@ -16,13 +17,27 @@
+     get_concurrency_context,
+     normalize_to_limiter,
+ )
++from ..exceptions import UserError
+ from ..messages import ModelMessage, ModelResponse
+ from ..settings import ModelSettings
+ from ..usage import RequestUsage
+ from . import KnownModelName, Model, ModelRequestParameters, StreamedResponse
+ from .wrapper import WrapperModel
+
++_ACTIVE_MODEL_LIMITERS: ContextVar[tuple[AbstractConcurrencyLimiter, ...]] = ContextVar(
++    'pydantic_ai.active_model_limiters', default=()
++)
+
++
++@contextmanager
++def _active_model_limiter(limiter: AbstractConcurrencyLimiter) -> Generator[None]:
++    token = _ACTIVE_MODEL_LIMITERS.set((*_ACTIVE_MODEL_LIMITERS.get(), limiter))
++    try:
++        yield
++    finally:
++        _ACTIVE_MODEL_LIMITERS.reset(token)
++
++
+ @dataclass(init=False)
+ class ConcurrencyLimitedModel(WrapperModel):
+     """A model wrapper that limits concurrent requests to the underlying model.
+@@ -75,6 +90,20 @@
+         else:
+             self._limiter = ConcurrencyLimiter.from_limit(limiter)
+
++    def _ensure_distinct_limiter(self, run_context: RunContext[Any] | None = None) -> None:
++        if any(limiter is self._limiter for limiter in _ACTIVE_MODEL_LIMITERS.get()):
++            raise UserError(
++                'Nested `ConcurrencyLimitedModel` wrappers use the same concurrency limiter, which can deadlock '
++                'a request. Use separate limiters or wrap the model only once.'
++            )
++        run_context = run_context or get_current_run_context()
++        agent = run_context.agent if run_context is not None else None
++        if agent is not None and agent._concurrency_limiter is self._limiter:  # pyright: ignore[reportPrivateUsage]
++            raise UserError(
++                'The agent and a `ConcurrencyLimitedModel` use the same concurrency limiter, which can deadlock '
++                'a request. Use separate limiters or apply concurrency limiting at only one layer.'
++            )
++
+     async def request(
+         self,
+         messages: list[ModelMessage],
+@@ -82,8 +111,10 @@
+         model_request_parameters: ModelRequestParameters,
+     ) -> ModelResponse:
+         """Make a request to the model with concurrency limiting."""
++        self._ensure_distinct_limiter()
+         async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+-            return await self.wrapped.request(messages, model_settings, model_request_parameters)
++            with _active_model_limiter(self._limiter):
++                return await self.wrapped.request(messages, model_settings, model_request_parameters)
+
+     async def count_tokens(
+         self,
+@@ -92,8 +123,10 @@
+         model_request_parameters: ModelRequestParameters,
+     ) -> RequestUsage:
+         """Count tokens with concurrency limiting."""
++        self._ensure_distinct_limiter()
+         async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+-            return await self.wrapped.count_tokens(messages, model_settings, model_request_parameters)
++            with _active_model_limiter(self._limiter):
++                return await self.wrapped.count_tokens(messages, model_settings, model_request_parameters)
+
+     @asynccontextmanager
+     async def request_stream(
+@@ -104,10 +137,15 @@
+         run_context: RunContext[Any] | None = None,
+     ) -> AsyncGenerator[StreamedResponse]:
+         """Make a streaming request to the model with concurrency limiting."""
++        self._ensure_distinct_limiter(run_context)
+         async with get_concurrency_context(self._limiter, f'model:{self.model_name}'):
+-            async with self.wrapped.request_stream(
+-                messages, model_settings, model_request_parameters, run_context
+-            ) as response_stream:
++            async with AsyncExitStack() as stack:
++                # Open nested wrappers while the limiter is visible, then restore this task's context
++                # before yielding: the stream may be closed on another task.
++                with _active_model_limiter(self._limiter):
++                    response_stream = await stack.enter_async_context(
++                        self.wrapped.request_stream(messages, model_settings, model_request_parameters, run_context)
++                    )
+                 yield response_stream
+
+
+--- a/pydantic_ai/_agent_graph.py
++++ b/pydantic_ai/_agent_graph.py
+@@ -1481,7 +1481,8 @@
+             # Copy to avoid modifying the original usage object with the counted usage
+             usage = deepcopy(usage)
+
+-            counted_usage = await model.count_tokens(messages, model_settings, model_request_parameters)
++            with set_current_run_context(run_context):
++                counted_usage = await model.count_tokens(messages, model_settings, model_request_parameters)
+             usage.incr(counted_usage)
+
+         ctx.deps.usage_limits.check_before_request(usage)
+--- a/pydantic_ai/agent/__init__.py
++++ b/pydantic_ai/agent/__init__.py
+@@ -140,7 +140,11 @@
+     'ToolsPrepareFunc',
+ )
+
++_ACTIVE_AGENT_LIMITERS: ContextVar[tuple[tuple[int, _concurrency.ConcurrencyLimiter], ...]] = ContextVar(
++    'pydantic_ai.active_agent_limiters', default=()
++)
+
++
+ @dataclasses.dataclass(frozen=True)
+ class _ResolvedAgentRetries:
+     """Fully resolved retry budgets used internally."""
+@@ -1636,9 +1640,23 @@
+
+         async with AsyncExitStack() as stack:
+             model_stack = stack
++            task_id = anyio.get_current_task().id
++            if isinstance(self._concurrency_limiter, _concurrency.ConcurrencyLimiter) and any(
++                active_task_id == task_id and limiter is self._concurrency_limiter
++                for active_task_id, limiter in _ACTIVE_AGENT_LIMITERS.get()
++            ):
++                raise RuntimeError(
++                    'This task already holds a slot for this agent concurrency limiter. '
++                    'Use a separate limiter for the nested run.'
++                )
+             await stack.enter_async_context(
+                 _concurrency.get_concurrency_context(self._concurrency_limiter, f'agent:{agent_name}')
+             )
++            if isinstance(self._concurrency_limiter, _concurrency.ConcurrencyLimiter):
++                limiter_token = _ACTIVE_AGENT_LIMITERS.set(
++                    (*_ACTIVE_AGENT_LIMITERS.get(), (task_id, self._concurrency_limiter))
++                )
++                stack.callback(_ACTIVE_AGENT_LIMITERS.reset, limiter_token)
+             if capability_owns_current_model:
+                 await enter_model(model_used)
+             graph_run = await stack.enter_async_context(
