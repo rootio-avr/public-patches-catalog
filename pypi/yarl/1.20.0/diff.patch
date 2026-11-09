@@ -1,0 +1,441 @@
+--- a/yarl/_parse.py
++++ b/yarl/_parse.py
+@@ -58,6 +58,14 @@
+                 delim = wdelim  # use earliest delim position
+         netloc = url[2:delim]
+         url = url[delim:]
++        # Backslash is not valid in the authority component per RFC 3986.
++        # WHATWG parsers treat \ as a path separator for special schemes, so
++        # accepting it in the authority can cause host parsing ambiguity.
++        if "\\" in netloc:
++            raise ValueError(
++                "Invalid URL: backslash ('\\') is not allowed in the authority "
++                "component per RFC 3986."
++            )
+         has_left_bracket = "[" in netloc
+         has_right_bracket = "]" in netloc
+         if (has_left_bracket and not has_right_bracket) or (
+@@ -65,7 +73,22 @@
+         ):
+             raise ValueError("Invalid IPv6 URL")
+         if has_left_bracket:
+-            bracketed_host = netloc.partition("[")[2].partition("]")[0]
++            # Per RFC 3986, brackets are only valid at the START of the host
++            # for IP-literal addresses. Text before '[' (e.g. '127.0.0.1[::1]')
++            # is invalid and must be rejected to prevent SSRF bypasses. The
++            # count checks reject URLs with more than one bracket pair in the
++            # host subcomponent (e.g. 'http://[:localhost[]].google:80'),
++            # which would otherwise resolve to an unintended host.
++            hostinfo = netloc.rpartition("@")[2]
++            if hostinfo[:1] != "[" or hostinfo.count("[") > 1 or hostinfo.count("]") > 1:
++                raise ValueError("Invalid IPv6 URL")
++            bracketed_host, _, after_bracket = hostinfo[1:].partition("]")
++            # Per RFC 3986 §3.2.2, after the closing ']' of an IP-literal
++            # only ":" <port> or end-of-authority is valid. Any other text
++            # (e.g. '[::1]allowed.example:1') must be rejected to prevent
++            # host-confusion where the suffix is silently dropped.
++            if after_bracket and after_bracket[0] != ":":
++                raise ValueError("Invalid IPv6 URL")
+             # Valid bracketed hosts are defined in
+             # https://www.rfc-editor.org/rfc/rfc3986#page-49
+             # https://url.spec.whatwg.org/
+@@ -121,8 +144,15 @@
+             password = None
+ 
+     if "[" in hostinfo:
++        if hostinfo[0] != "[" or hostinfo.count("[") > 1 or hostinfo.count("]") > 1:
++            raise ValueError("Invalid IPv6 URL")
+         _, _, bracketed = hostinfo.partition("[")
+         hostname, _, port_str = bracketed.partition("]")
++        # Defense-in-depth: after ']' only ':port' or empty is valid.
++        # split_url() should have already rejected invalid suffixes,
++        # but guard here too for callers that use split_netloc() directly.
++        if port_str and port_str[0] != ":":
++            raise ValueError("Invalid IPv6 URL")
+         _, _, port_str = port_str.partition(":")
+     else:
+         hostname, _, port_str = hostinfo.partition(":")
+--- a/yarl/_url.py
++++ b/yarl/_url.py
+@@ -6,7 +6,7 @@
+ from functools import _CacheInfo, lru_cache
+ from ipaddress import ip_address
+ from typing import TYPE_CHECKING, Any, NoReturn, TypedDict, TypeVar, Union, overload
+-from urllib.parse import SplitResult, uses_relative
++from urllib.parse import SplitResult, scheme_chars, uses_relative
+ 
+ import idna
+ from multidict import MultiDict, MultiDictProxy
+@@ -48,6 +48,7 @@
+ 
+ DEFAULT_PORTS = {"http": 80, "https": 443, "ws": 80, "wss": 443, "ftp": 21}
+ USES_RELATIVE = frozenset(uses_relative)
++_SCHEME_CHARS = frozenset(scheme_chars)
+ 
+ # Special schemes https://url.spec.whatwg.org/#special-scheme
+ # are not allowed to have an empty host https://url.spec.whatwg.org/#url-representation
+@@ -141,6 +142,17 @@
+     return obj
+ 
+ 
++def _encode_relative_scheme_colon(path: str) -> str:
++    """Re-encode a scheme-shaped leading ``:`` in a relative path to ``%3A``."""
++    colon_pos = path.find(":")
++    if colon_pos <= 0:
++        return path
++    for c in path[:colon_pos]:
++        if c not in _SCHEME_CHARS:
++            return path
++    return path[:colon_pos] + "%3A" + path[colon_pos + 1 :]
++
++
+ @lru_cache
+ def encode_url(url_str: str) -> "URL":
+     """Parse unencoded URL."""
+@@ -185,6 +197,8 @@
+         path = PATH_REQUOTER(path)
+         if netloc and "." in path:
+             path = normalize_path(path)
++        elif not scheme and not netloc:
++            path = _encode_relative_scheme_colon(path)
+     if query:
+         query = QUERY_REQUOTER(query)
+     if fragment:
+@@ -1445,13 +1459,15 @@
+ 
+     def human_repr(self) -> str:
+         """Return decoded human readable string for URL representation."""
+-        user = human_quote(self.user, "#/:?@[]")
+-        password = human_quote(self.password, "#/:?@[]")
++        user = human_quote(self.user, "#/:?@[]\\")
++        password = human_quote(self.password, "#/:?@[]\\")
+         if (host := self.host) and ":" in host:
+             host = f"[{host}]"
+         path = human_quote(self.path, "#?")
+         if TYPE_CHECKING:
+             assert path is not None
++        if not self._scheme and not self._netloc:
++            path = _encode_relative_scheme_colon(path)
+         query_string = "&".join(
+             "{}={}".format(human_quote(k, "#&+;="), human_quote(v, "#&+;="))
+             for k, v in self.query.items()
+--- a/tests/test_url.py
++++ b/tests/test_url.py
+@@ -343,11 +343,115 @@
+         URL("http://[127.0.0.1]/")
+ 
+ 
++def test_ipv6_brackets_in_reversed_order() -> None:
++    with pytest.raises(ValueError, match="Invalid IPv6 URL"):
++        URL("http://]1dec:0:0:0::1[/")
++
++
++@pytest.mark.parametrize(
++    "url",
++    (
++        "http://127.0.0.1[aa::ff]",
++        "http://127.0.0.1[aa::ff]/",
++        "http://127.0.0.1[aa::ff]:8080/",
++        "http://user@127.0.0.1[aa::ff]/",
++        "http://example.com[::1]/",
++    ),
++    ids=(
++        "ipv4-before-bracket",
++        "ipv4-before-bracket-with-path",
++        "ipv4-before-bracket-with-port",
++        "userinfo-ipv4-before-bracket",
++        "hostname-before-bracket",
++    ),
++)
++def test_host_with_text_before_bracket_is_invalid(url: str) -> None:
++    with pytest.raises(ValueError, match="Invalid IPv6 URL"):
++        URL(url)
++
++
++@pytest.mark.parametrize(
++    "url",
++    (
++        "http://[::1]allowed.example:1/",
++        "http://[::1]evil.com/",
++        "http://[::1]evil.com:8080/",
++        "http://user@[::1]evil.com:1/",
++        "http://[::1]evil/",
++        "http://[::1].:80/",
++    ),
++    ids=(
++        "suffix-with-port",
++        "suffix-no-port",
++        "suffix-with-explicit-port",
++        "userinfo-suffix-with-port",
++        "short-suffix-no-port",
++        "dot-suffix-with-port",
++    ),
++)
++def test_host_with_text_after_bracket_is_invalid(url: str) -> None:
++    """Text after the closing bracket of an IP-literal is invalid.
++
++    Per RFC 3986 §3.2.2, after the closing ']' of an IP-literal only
++    ':' <port> or end-of-authority is valid. Previously yarl silently
++    dropped the suffix (e.g. '[::1]allowed.example:1' -> '[::1]:1'),
++    changing the effective host identity.
++    """
++    with pytest.raises(ValueError, match="Invalid IPv6 URL"):
++        URL(url)
++
++
++def test_build_authority_with_text_after_bracket_is_invalid() -> None:
++    """URL.build(authority=...) must also reject text after ']'."""
++    with pytest.raises(ValueError, match="Invalid IPv6 URL"):
++        URL.build(scheme="http", authority="[::1]allowed.example:1", path="/")
++
++
+ def test_ipfuture_brackets_not_allowed() -> None:
+     with pytest.raises(ValueError, match="IPvFuture address is invalid"):
+         URL("http://[v10]/")
+ 
+ 
++@pytest.mark.parametrize(
++    "url",
++    (
++        "http://[:localhost[]].google:80",
++        "http://[:localhost[]].google",
++        "http://[:attacker.com[]]:80",
++        "http://[:evil.com[]].bank.com:443",
++        "http://[:127.0.0.1[]]:80",
++        "http://[v1.:attacker[]].bank.com:80",
++    ),
++    ids=(
++        "host-confusion-with-port",
++        "host-confusion-without-port",
++        "attacker-host-injection",
++        "domain-allowlist-bypass",
++        "private-ip-injection",
++        "ipvfuture-bracket-abuse",
++    ),
++)
++def test_malformed_bracketed_host_rejected(url: str) -> None:
++    """Reject URLs with multiple brackets to prevent host confusion (SSRF)."""
++    with pytest.raises(ValueError, match="Invalid IPv6 URL"):
++        URL(url)
++
++
++def test_malformed_bracketed_host_in_authority() -> None:
++    """Reject malformed brackets via URL.build(authority=...) path."""
++    with pytest.raises(ValueError, match="Invalid IPv6 URL"):
++        URL.build(scheme="http", authority="[:localhost[]].google:80")
++
++
++def test_userinfo_with_bracketed_host_is_valid() -> None:
++    """Ensure the multi-bracket check still accepts userinfo + IP-literal host."""
++    url = URL("http://user:pass@[::1]:8080/")
++    assert url.user == "user"
++    assert url.password == "pass"
++    assert url.raw_host == "::1"
++    assert url.port == 8080
++
++
+ def test_ipv4_zone() -> None:
+     # I'm unsure if it is correct.
+     url = URL("http://1.2.3.4%тест%42:123")
+@@ -2243,8 +2347,8 @@
+     s = url.human_repr()
+     assert URL(s) == url
+     assert (
+-        s == "http:// !\"%23$%25&'()*+,-.%2F%3A;<=>%3F%40%5B\\%5D^_`{|}~"
+-        ": !\"%23$%25&'()*+,-.%2F%3A;<=>%3F%40%5B\\%5D^_`{|}~"
++        s == "http:// !\"%23$%25&'()*+,-.%2F%3A;<=>%3F%40%5B%5C%5D^_`{|}~"
++        ": !\"%23$%25&'()*+,-.%2F%3A;<=>%3F%40%5B%5C%5D^_`{|}~"
+         "@хост.домен:8080"
+         "/ !\"%23$%25&'()*+,-./:;<=>%3F@[\\]^_`{|}~"
+         "? !\"%23$%25%26'()*%2B,-./:%3B<%3D>?@[\\]^_`{|}~"
+@@ -2422,6 +2526,34 @@
+ def test_build_with_invalid_ipv6_host(host: str, is_authority: bool) -> None:
+     with pytest.raises(ValueError, match="Invalid IPv6 URL"):
+         URL(f"http://{host}/")
++
++
++@pytest.mark.parametrize(
++    "url",
++    [
++        r"http://vulndetector.com\admin\api",
++        r"http://example.com\path",
++        r"http://example.com\../",
++        r"http://\example.com",
++        r"http://example.com\foo@evil.com/",
++        r"http://user:pass@example.com\path",
++        r"http://example.com:80\foo/",
++        r"http://[::1]\path",
++    ],
++)
++def test_url_with_backslash_in_netloc(url: str) -> None:
++    with pytest.raises(
++        ValueError, match=r"backslash \('\\'\) is not allowed in the authority"
++    ):
++        URL(url)
++
++
++def test_url_with_backslash_in_path_after_ipv6_host() -> None:
++    url = URL(r"http://[::1]/\path")
++
++    assert str(url) == r"http://[::1]/%5Cpath"
++    assert url.host == "::1"
++    assert url.path == r"/\path"
+ 
+ 
+ @pytest.mark.parametrize("byte", ["\r", "\n", "\t"])
+--- a/tests/test_url_parsing.py
++++ b/tests/test_url_parsing.py
+@@ -623,3 +623,153 @@
+     assert parsed.host_subcomponent == hostname
+     assert str(parsed) == url
+     assert str(URL(str(parsed))) == url
++
++
++class TestPercentEncodedSchemeBypass:
++    """Regression tests for parser/serializer inconsistency with percent-encoded schemes.
++
++    When a URL contains a percent-encoded character in what would otherwise be a
++    scheme (e.g. ``ht%74p://...``), the parser correctly treats it as a relative
++    URL with no scheme. However, the requoter could decode the percent-encoding
++    and materialize a scheme in the serialized output, creating a mismatch between
++    parsed properties and ``str(url)`` / ``human_repr()``.
++
++    See: https://github.com/aio-libs/yarl/issues/1661
++    """
++
++    @pytest.mark.parametrize(
++        "input_url",
++        [
++            "ht%74p://127.0.0.1:8000/private",
++            "ht%74ps://evil.example/path",
++            "ja%76ascript:alert(1)",
++            "data%3Atext/html,xss",
++            "fi%6Ce:///etc/passwd",
++            "HT%54P://example.com",
++            "f%74p://files.example.com/pub",
++        ],
++        ids=[
++            "http-pct-encoded-t",
++            "https-pct-encoded-t",
++            "javascript-pct-encoded-v",
++            "data-pct-encoded-colon",
++            "file-pct-encoded-l",
++            "HTTP-uppercase-pct-encoded-T",
++            "ftp-pct-encoded-t",
++        ],
++    )
++    def test_str_does_not_introduce_scheme(self, input_url: str) -> None:
++        """str(URL(x)) must not introduce a scheme absent from parsed components."""
++        u = URL(input_url)
++        assert u.scheme == ""
++        assert u.host is None
++
++        reparsed = URL(str(u))
++        assert reparsed.scheme == u.scheme
++        assert reparsed.host == u.host
++
++    @pytest.mark.parametrize(
++        "input_url",
++        [
++            "ht%74p://127.0.0.1:8000/private",
++            "ht%74ps://evil.example/path",
++            "ja%76ascript:alert(1)",
++            "data%3Atext/html,xss",
++            "fi%6Ce:///etc/passwd",
++        ],
++        ids=[
++            "http-pct-encoded-t",
++            "https-pct-encoded-t",
++            "javascript-pct-encoded-v",
++            "data-pct-encoded-colon",
++            "file-pct-encoded-l",
++        ],
++    )
++    def test_human_repr_does_not_introduce_scheme(self, input_url: str) -> None:
++        """human_repr() must not introduce a scheme absent from parsed components."""
++        u = URL(input_url)
++        assert u.scheme == ""
++        assert u.host is None
++
++        reparsed = URL(u.human_repr())
++        assert reparsed.scheme == u.scheme
++        assert reparsed.host == u.host
++
++    def test_reparse_consistency(self) -> None:
++        """URL(str(URL(x))) must have the same security properties as URL(x)."""
++        u = URL("ht%74p://127.0.0.1:8000/private")
++        v = URL(str(u))
++
++        assert u.scheme == v.scheme == ""
++        assert u.host == v.host
++        assert u.host is None
++        assert u.raw_host == v.raw_host
++        assert u.absolute == v.absolute is False
++
++    def test_legitimate_scheme_not_affected(self) -> None:
++        """Legitimate URLs with real schemes must not be affected."""
++        u = URL("http://example.com/path")
++        assert u.scheme == "http"
++        assert u.host == "example.com"
++        assert str(u) == "http://example.com/path"
++        assert u.human_repr() == "http://example.com/path"
++
++    def test_relative_path_with_colon_not_affected(self) -> None:
++        """Relative paths with colons that aren't scheme-like must be preserved."""
++        # "not_scheme:path"; underscore is not in scheme_chars, so not a scheme
++        u = URL("not_scheme:path")
++        assert u.scheme == ""
++        assert str(u) == "not_scheme:path"
++
++    def test_relative_path_no_colon_not_affected(self) -> None:
++        """Simple relative paths without colons must be unaffected."""
++        u = URL("relative/path")
++        assert u.scheme == ""
++        assert str(u) == "relative/path"
++        assert u.human_repr() == "relative/path"
++
++    def test_colon_in_later_segment_not_affected(self) -> None:
++        """A colon in a later path segment (after /) is not a scheme delimiter."""
++        u = URL("/path/with:colon")
++        assert u.scheme == ""
++        assert str(u) == "/path/with:colon"
++
++    @pytest.mark.parametrize(
++        "input_url",
++        [
++            "0t%65st:foo",
++            "+ht%74p:foo",
++            "-ht%74p:foo",
++            ".ht%74p:foo",
++        ],
++        ids=[
++            "digit-start",
++            "plus-start",
++            "minus-start",
++            "dot-start",
++        ],
++    )
++    def test_non_alpha_start_pct_encoded_does_not_materialize_scheme(
++        self, input_url: str
++    ) -> None:
++        """split_url() accepts any scheme_chars in the first position, not just
++        ALPHA, so digit / "+" / "-" / "." starts must also be guarded against
++        scheme materialization on requote."""
++        u = URL(input_url)
++        assert u.scheme == ""
++        assert u.host is None
++
++        reparsed = URL(str(u))
++        assert reparsed.scheme == u.scheme
++        assert reparsed.host == u.host
++        assert reparsed.absolute is False
++
++    def test_relative_path_with_underscore_prefix_not_affected(self) -> None:
++        """Prefixes that cannot form a scheme (contain chars outside
++        scheme_chars) are left alone; the colon stays literal."""
++        # underscore is not in scheme_chars, so "no_scheme:" cannot form a
++        # scheme regardless of decoding.
++        u = URL("no_sch%65me:foo")
++        assert u.scheme == ""
++        assert ":" in str(u)
++        assert "%3A" not in str(u)
