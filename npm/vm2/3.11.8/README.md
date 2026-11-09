@@ -5,6 +5,10 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-100721
+- GHSA-7rr2-8fr3-fjqx
+- CVE-2026-100722
+- GHSA-9hxx-m5g2-2q3h
+- GHSA-c9wr-qm7p-p6vc
 - CVE-2026-93605
 
 ## How to Apply:

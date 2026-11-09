@@ -410,9 +410,571 @@
 +	});
 +});
 
+--- a/lib/bridge.js
++++ b/lib/bridge.js
+@@ -990,6 +990,15 @@ function createBridge(otherInit, registerProxy) {
+ 	let otherPromiseThen;
+ 	let otherPromiseCatch;
+ 	let otherPromiseFinally;
++	// SECURITY (GHSA-2v2p-6j97-cjg9): cache the OTHER realm's `Promise.prototype`
++	// itself so the delivery chokepoint can brand-check a host value as a genuine
++	// promise WITHOUT invoking `.then` on it (which would mean a throw/catch per
++	// non-promise object crossing the bridge). `Object.prototype` is cached
++	// alongside it so the same walk can tell a same-realm chain terminus from a
++	// foreign-realm one (a second host realm's promises match neither cached
++	// prototype) — see `isOtherPromise`.
++	let otherPromisePrototype;
++	let otherObjectPrototype;
+ 	// SECURITY (GHSA-647f-g98j-qq25): cache host `Function.prototype.call` /
+ 	// `Function.prototype.apply` *individually* (they are also in the shared
+ 	// `applyIndirectionPrimitives` weakmap). The promise-boundary normalizer
+@@ -989,6 +998,8 @@ function createBridge(otherInit, registerProxy) {
+ 	let otherFunctionApply;
+ 	try {
+ 		if (otherGlobalPrototypes.Promise) {
++			otherPromisePrototype = otherGlobalPrototypes.Promise; // SECURITY (GHSA-2v2p-6j97-cjg9)
++			otherObjectPrototype = otherGlobalPrototypes.Object; // SECURITY (GHSA-2v2p-6j97-cjg9)
+ 			const dt = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Promise, 'then');
+ 			if (dt) otherPromiseThen = dt.value;
+ 			const dc = otherSafeGetOwnPropertyDescriptor(otherGlobalPrototypes.Promise, 'catch');
+@@ -1766,6 +1777,58 @@ function createBridge(otherInit, registerProxy) {
+ 		}
+ 	}
+ 
++	// SECURITY (GHSA-2v2p-6j97-cjg9): cheap brand check — is this host value a
++	// promise? Used to gate the delivery-side mark below so we never invoke
++	// `.then` on the (overwhelmingly common) non-promise host object: that would
++	// throw, and a per-object throw/catch on the hot host->sandbox delivery path
++	// is unacceptable. Walking the OTHER realm's prototype chain to the cached
++	// host `Promise.prototype` covers native promises and promise subclasses
++	// alike, reads no attacker-reachable property, and cannot invoke sandbox
++	// code. `Object.prototype.toString` is deliberately NOT used as the brand:
++	// it reads `Symbol.toStringTag` off the value and so fires host `get` traps
++	// and accessors — a host `Proxy` with a `get` trap returning a fresh rejected
++	// promise would then be crashed by the brand check itself.
++	//
++	// A promise minted in a SECOND host realm (`vm.runInNewContext`, nested
++	// contextify) never matches the cached `Promise.prototype`, so a chain that
++	// terminates at a non-null object which is NOT the cached host
++	// `Object.prototype` is treated as a possible promise: it belongs to a
++	// foreign realm, whose `Promise.prototype` we can never have cached.
++	// `markHostPromiseHandled` then settles it — the built-in
++	// `Promise.prototype.then` brand-checks the `[[PromiseState]]` slot, which is
++	// realm-independent, so a cross-realm promise gets marked and a cross-realm
++	// non-promise or thenable never has its own `then` invoked. Same-realm
++	// objects (chain ends at the cached `Object.prototype`) and null-prototype
++	// objects never reach that branch, so the hot path keeps its no-throw
++	// property. Still conservative by design: a host promise whose chain was
++	// manipulated host-side so the walk stops early is not recognized, which is
++	// why `apply` and `construct` keep their unconditional mark.
++	const OTHER_PROMISE_PROTO_WALK_LIMIT = 100;
++	function isOtherPromise(value) {
++		if (otherPromisePrototype === undefined) return false;
++		if (value === null || typeof value !== 'object') return false;
++		let last = null;
++		try {
++			let proto = otherReflectGetPrototypeOf(value);
++			// SECURITY (GHSA-2v2p-6j97-cjg9): bounded walk. An embedder-authored
++			// Proxy whose `getPrototypeOf` returns a fresh Proxy every time would
++			// otherwise spin here forever; a chain this long is never a promise.
++			for (let i = 0; i < OTHER_PROMISE_PROTO_WALK_LIMIT; i++) {
++				// SECURITY (GHSA-2v2p-6j97-cjg9): the foreign-realm terminus test is
++				// only meaningful when we hold this realm's `Object.prototype`; if we
++				// never captured it, fall back to "not a promise" rather than sending
++				// every plain host object through the throwing mark.
++				if (!proto) return otherObjectPrototype !== undefined && last !== null && last !== otherObjectPrototype;
++				if (proto === otherPromisePrototype) return true;
++				last = proto;
++				proto = otherReflectGetPrototypeOf(proto);
++			}
++		} catch (e) {
++			return false;
++		}
++		return false;
++	}
++
+ 	function thisSetHostPromiseSanitizers(sanitizeReject, sanitizeFulfill) {
+ 		if (typeof sanitizeReject !== 'function' || typeof sanitizeFulfill !== 'function') {
+ 			throw new VMError('setHostPromiseSanitizers requires two functions');
+@@ -2565,6 +2628,14 @@ function createBridge(otherInit, registerProxy) {
+ 			// that wrap arrays (e.g. TypedArray from iterable) may return containers
+ 			// with dangerous symbol elements/keys; strip before wrapping.
+ 			stripDangerousSymbolsFromHostResult(ret);
++			// SECURITY (GHSA-2v2p-6j97-cjg9): a host constructor may RETURN a host
++			// promise (an explicit object return overrides `this`), which the
++			// sandbox can drop unhandled — the `apply` counterpart of this call
++			// (GHSA-gjq8-xm47-88rc) never saw it. Unconditional, mirroring `apply`:
++			// it covers even a host promise whose prototype chain was detached
++			// host-side, which the brand-gated delivery mark in `thisProxyOther`
++			// deliberately does not recognize.
++			markHostPromiseHandled(ret);
+ 			return thisFromOtherWithFactory(getHandlerFactory(this), ret, thisFromOther(object));
+ 		}
+ 
+@@ -3129,6 +3200,25 @@ function createBridge(otherInit, registerProxy) {
+ 			// `constructor` backlink) and stay writable.
+ 			if (looksLikeHostPrototype(other)) markHostObjectUsedAsPrototype(other);
+ 			thisReflectApply(thisWeakMapSet, mappingOtherToThis, [other, proxy]);
++			// SECURITY (GHSA-2v2p-6j97-cjg9): every host promise handed to the
++			// sandbox carries a benign rejection reaction before sandbox code can
++			// ignore it. GHSA-gjq8-xm47-88rc marked only the `apply` trap's return
++			// value; a host promise also reaches the sandbox as a `construct`
++			// result, as an accessor/`get` value, and as an argument to a sandbox
++			// callback. `thisProxyOther` is the single place a host object is
++			// given its sandbox proxy — every one of those routes funnels through
++			// here — so marking at this delivery chokepoint closes the class
++			// rather than one route. Runs exactly once per host object (later
++			// deliveries hit the `mappingOtherToThis` cache), so an ignored
++			// rejection can never trip Node's unhandledRejection policy and tear
++			// down the host process. Idempotent: promises multicast, so the
++			// sandbox's own (GHSA-55hx-sanitized) reaction still observes the
++			// rejection independently. Placed AFTER the `mappingOtherToThis` write:
++			// the walk and `then` can run embedder host code (a `getPrototypeOf`
++			// trap; `SpeciesConstructor` reading `constructor`/`@@species`), and a
++			// re-entrant read of the same host object must find this proxy in the
++			// cache rather than mint a second one.
++			if (isOtherPromise(other)) markHostPromiseHandled(other);
+ 			return proxy;
+ 		}
+ 		const proxy2 = new ThisProxy(proxy, emptyFrozenObject);
+--- /dev/null
++++ b/test/ghsa/GHSA-2v2p-6j97-cjg9/host-promise-child.js
+@@ -0,0 +1,161 @@
++'use strict';
++
++/**
++ * GHSA-2v2p-6j97-cjg9 — child helper.
++ *
++ * Runs one scenario in its OWN process so the test can observe whether a host
++ * promise delivered into the sandbox and then ignored aborts the host. Prints
++ * the marker `ALIVE` and exits 0 only if the process was NOT torn down by
++ * Node's unhandledRejection policy.
++ *
++ * IMPORTANT: this helper deliberately installs NO process-level
++ * `unhandledRejection` handler — doing so would mask the very crash we are
++ * testing for. The only thing that may keep the process alive is the bridge
++ * attaching a benign reaction to the underlying host promise at the boundary.
++ *
++ * Node 8 compatible.
++ */
++
++var path = require('path');
++
++// Only execute when forked/run directly. The test runner (`mocha test
++// --recursive`) also `require`s this file; without this guard it would run the
++// scenario logic with mocha's argv and exit the whole test process.
++if (require.main !== module) return;
++
++var VM = require(path.join(__dirname, '..', '..', '..', 'lib', 'main.js')).VM;
++
++// Host constructor whose body RETURNS a rejected host promise. `new` on it
++// therefore evaluates to that promise, which the bridge construct trap hands
++// to the sandbox.
++function HostRejectCtor() {
++	return Promise.reject(new Error('ctor-boom'));
++}
++
++// Same, but the rejection happens a tick LATER — the promise is already in the
++// sandbox by the time it rejects.
++function HostLateCtor() {
++	return new Promise(function (_resolve, reject) {
++		setTimeout(function () {
++			reject(new Error('late-boom'));
++		}, 10);
++	});
++}
++
++// Class form: an explicit object return from a constructor overrides `this`.
++class HostRejectClass {
++	constructor() {
++		return Promise.reject(new Error('class-boom'));
++	}
++}
++
++// A host promise whose prototype chain the HOST detached before returning it.
++// The delivery-side brand check cannot recognize it, so this case is carried
++// solely by the unconditional mark in the construct trap.
++function HostDetachedCtor() {
++	var p = Promise.reject(new Error('detached-boom'));
++	Object.setPrototypeOf(p, null);
++	return p;
++}
++
++// Host accessor handing a FRESH rejected host promise to the sandbox on read.
++var hostAccessorObject = {};
++Object.defineProperty(hostAccessorObject, 'p', {
++	get: function () {
++		return Promise.reject(new Error('getter-boom'));
++	},
++	enumerable: true,
++	configurable: true
++});
++
++// Host function that passes a rejected host promise as an ARGUMENT to a
++// sandbox callback — a host->sandbox delivery that is neither a call nor a
++// construct return.
++function hostCallsBack(cb) {
++	cb(Promise.reject(new Error('callback-boom')));
++}
++
++var scenario = process.argv[2];
++
++var sandbox = {
++	HostRejectCtor: HostRejectCtor,
++	HostLateCtor: HostLateCtor,
++	HostRejectClass: HostRejectClass,
++	HostDetachedCtor: HostDetachedCtor,
++	hostAccessorObject: hostAccessorObject,
++	hostCallsBack: hostCallsBack
++};
++
++// Cross-realm host promises: minted in a SECOND host realm, so their prototype
++// chain ends at THAT realm's `Promise.prototype` / `Object.prototype` and can
++// never match the identities the bridge cached from this realm. Built only for
++// the scenarios that use them: the data-property object holds an
++// already-rejected cross-realm promise from the moment it is created, and a
++// rejection the sandbox is never handed is the embedder's own problem, not this
++// advisory's.
++if (scenario === 'xrealm-getter' || scenario === 'xrealm-data' || scenario === 'xrealm-callback') {
++	var nodeVm = require('vm');
++	// A cross-realm factory: calling it returns a promise of the OTHER realm.
++	var makeForeignReject = nodeVm.runInNewContext(
++		'(function (msg) { return Promise.reject(new Error(msg)); })', {});
++
++	var xrealmAccessorObject = {};
++	Object.defineProperty(xrealmAccessorObject, 'p', {
++		get: function () {
++			return makeForeignReject('xrealm-getter-boom');
++		},
++		enumerable: true,
++		configurable: true
++	});
++	sandbox.xrealmAccessorObject = xrealmAccessorObject;
++
++	sandbox.xrealmCallsBack = function (cb) {
++		cb(makeForeignReject('xrealm-callback-boom'));
++	};
++
++	// A cross-realm OBJECT carrying the promise as a plain data property. Built
++	// only for its own scenario: unlike the two lazy shapes above, its promise is
++	// rejected the moment the object exists, so in a run that never delivers it
++	// the rejection is the embedder's own and would abort the child for an
++	// unrelated reason.
++	if (scenario === 'xrealm-data') {
++		sandbox.xrealmDataObject = nodeVm.runInNewContext(
++			'({p: Promise.reject(new Error("xrealm-data-boom"))})', {});
++	}
++}
++
++var vm = new VM({sandbox: sandbox});
++
++var codes = {
++	// The sandbox constructs and simply drops the result.
++	construct: 'new HostRejectCtor(); 1',
++	'construct-late': 'new HostLateCtor(); 1',
++	'class-new': 'new HostRejectClass(); 1',
++	'class-reflect': 'Reflect.construct(HostRejectClass, []); 1',
++	'construct-detached': 'new HostDetachedCtor(); 1',
++	// Delivery through the `get` trap.
++	getter: 'hostAccessorObject.p; 1',
++	// Delivery as a callback argument.
++	'callback-arg': 'hostCallsBack(function (p) { return p; }); 1',
++	// Same three delivery routes, but the promise belongs to a second host realm.
++	'xrealm-getter': 'xrealmAccessorObject.p; 1',
++	'xrealm-data': 'xrealmDataObject.p; 1',
++	'xrealm-callback': 'xrealmCallsBack(function (p) { return p; }); 1'
++};
++
++var code = codes[scenario];
++if (!code) {
++	console.error('unknown scenario: ' + scenario);
++	process.exit(2);
++}
++
++vm.run(code);
++
++// If the ignored host rejection is going to abort the process, Node does it
++// while draining microtasks — well before this timer fires. Reaching here and
++// printing the marker means the host survived. The timeout also outlives the
++// 10 ms late rejection above.
++setTimeout(function () {
++	console.log('ALIVE');
++	process.exit(0);
++}, 300);
+--- /dev/null
++++ b/test/ghsa/GHSA-2v2p-6j97-cjg9/repro.js
+@@ -0,0 +1,267 @@
++'use strict';
++
++/**
++ * GHSA-2v2p-6j97-cjg9 — an unhandled host promise delivered through the
++ * construct trap (and every other non-call delivery path) aborts the host
++ * process.
++ *
++ * ## Vulnerability
++ * GHSA-gjq8-xm47-88rc hardened ONE host->sandbox delivery path: the bridge
++ * `apply` trap marks a host promise returned by a host FUNCTION call as
++ * handled, so a sandbox that ignores it cannot trip Node's unhandledRejection
++ * policy. Every other delivery path was left bare. A host constructor whose
++ * body returns a rejected host promise:
++ *
++ *     function HostRejectCtor() { return Promise.reject(new Error('ctor-boom')); }
++ *     new VM({sandbox: {HostRejectCtor}}).run('new HostRejectCtor(); 1');
++ *
++ * hands the sandbox a wrapped promise whose UNDERLYING host promise has no
++ * rejection reaction. Node's default policy (`throw`, Node 15+; `strict` when
++ * requested explicitly) then TERMINATES THE HOST PROCESS. The same holds for a
++ * host getter returning a fresh rejected promise, and for a rejected host
++ * promise passed as an ARGUMENT to a sandbox callback — neither transits the
++ * `apply` return path. So sandbox code that merely touches an
++ * embedder-exposed host constructor or property is a host DoS.
++ *
++ * ## Fix
++ * `lib/bridge.js` marks the host promise at the host->sandbox DELIVERY
++ * chokepoint (`thisProxyOther`, the single place a host object is given a
++ * sandbox proxy), gated on a cheap prototype brand check against the cached
++ * host `Promise.prototype` so no `.then` is invoked on non-promises. The
++ * `apply` trap keeps its unconditional mark and `construct` gains the matching
++ * one, so a promise returned from a host call is covered even if its prototype
++ * chain was detached host-side.
++ *
++ * ## How this test proves it
++ * The abort is process-level, so each attack case runs in a forked child
++ * (`host-promise-child.js`) that installs NO unhandledRejection handler and
++ * prints `ALIVE` + exits 0 only if the process was not torn down. Without the
++ * fix the child aborts with a non-zero exit and never prints the marker.
++ * Delivery/over-block scenarios (the sandbox still observes the sanitized
++ * rejection; non-promise and fulfilled results are unaffected) run in-process.
++ */
++
++const assert = require('assert');
++const path = require('path');
++const {fork} = require('child_process');
++const {VM} = require('../../../lib/main.js');
++
++const CHILD = path.join(__dirname, 'host-promise-child.js');
++const NODE_MAJOR = parseInt(process.versions.node.split('.')[0], 10);
++// `--unhandled-rejections` landed in Node 12; before that an ignored rejection
++// only warns, so there is no host DoS to observe (and passing the unknown flag
++// through NODE_OPTIONS would stop the child from starting at all).
++const HAS_STRICT_REJECTIONS = NODE_MAJOR >= 12;
++
++const itCond = typeof it.cond === 'function' ? it.cond : function (name, cond, fn) {
++	if (cond) it(name, fn); else it.skip(name, fn);
++};
++
++// Fork the child for `scenario` under a strict unhandledRejection policy and
++// resolve with {code, stdout}. The child is SIGKILLed if it ever hangs, so no
++// child process outlives the suite.
++function runChild(scenario) {
++	return new Promise(function (resolve, reject) {
++		let stdout = '';
++		let stderr = '';
++		const child = fork(CHILD, [scenario], {
++			stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
++			env: Object.assign({}, process.env, {NODE_OPTIONS: '--unhandled-rejections=strict'})
++		});
++		// Both pipes are drained: an undrained stderr would block a chatty child
++		// on a full pipe, and the captured text is what makes a failure
++		// diagnosable (the abort prints the rejection there).
++		child.stdout.on('data', function (d) {
++			stdout += String(d);
++		});
++		child.stderr.on('data', function (d) {
++			stderr += String(d);
++		});
++		const timer = setTimeout(function () {
++			try { child.kill('SIGKILL'); } catch (e) { /* ignore */ }
++			reject(new Error('child timed out for scenario ' + scenario + '; stderr=' + stderr));
++		}, 8000);
++		child.on('error', function (e) {
++			clearTimeout(timer);
++			try { child.kill('SIGKILL'); } catch (e2) { /* ignore */ }
++			reject(e);
++		});
++		child.on('exit', function (code) {
++			clearTimeout(timer);
++			resolve({code: code, stdout: stdout, stderr: stderr});
++		});
++	});
++}
++
++// Trim the child's stderr to the first lines that identify the abort, so a
++// failing assertion names the rejection instead of a bare exit code.
++function briefly(text) {
++	const trimmed = String(text).replace(/\s+$/, '');
++	if (trimmed.length <= 800) return trimmed;
++	return trimmed.slice(0, 800) + ' […]';
++}
++
++function assertSurvived(scenario) {
++	return runChild(scenario).then(function (res) {
++		const detail = '; stdout=' + JSON.stringify(res.stdout) + '; stderr=' + briefly(res.stderr);
++		assert.strictEqual(res.code, 0,
++			'host process must exit 0 (survive) for scenario ' + scenario + '; got exit ' + res.code + detail);
++		assert.ok(/ALIVE/.test(res.stdout),
++			'child must print ALIVE marker for scenario ' + scenario + detail);
++	});
++}
++
++describe('GHSA-2v2p-6j97-cjg9 (unhandled host promise delivered outside the apply trap)', function () {
++	this.timeout(20000);
++
++	itCond('canonical PoC: host constructor returns a rejected promise, sandbox ignores it — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('construct');
++		});
++
++	itCond('host constructor returns a promise that rejects LATER — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('construct-late');
++		});
++
++	itCond('host class constructor returning a rejected promise via `new` — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('class-new');
++		});
++
++	itCond('host class constructor returning a rejected promise via Reflect.construct — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('class-reflect');
++		});
++
++	itCond('host constructor returning a prototype-detached rejected promise — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('construct-detached');
++		});
++
++	itCond('host getter returning a fresh rejected promise, read once and ignored — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('getter');
++		});
++
++	itCond('rejected host promise passed as an argument to a sandbox callback — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('callback-arg');
++		});
++
++	// A promise minted in a SECOND host realm matches neither cached prototype
++	// identity, so the brand check has to recognize it by where its prototype
++	// chain terminates. The `apply` route already survived this pre-fix (that
++	// mark is unconditional), so only the non-call routes are pinned here.
++	itCond('cross-realm host promise delivered through a host getter — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('xrealm-getter');
++		});
++
++	itCond('cross-realm host promise read as a plain data property — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('xrealm-data');
++		});
++
++	itCond('cross-realm host promise passed as an argument to a sandbox callback — host survives',
++		HAS_STRICT_REJECTIONS, function () {
++			return assertSurvived('xrealm-callback');
++		});
++
++	it('sandbox that DOES .catch a constructed host promise still receives the sanitized rejection', function () {
++		function HostRejectCtor() {
++			return Promise.reject(new Error('ctor-boom'));
++		}
++		const vm = new VM({sandbox: {HostRejectCtor}});
++		const out = vm.run(`
++			new HostRejectCtor().catch(function (e) {
++				return {
++					message: String(e && e.message),
++					isSandboxError: e instanceof Error,
++					ctorIsSandbox: e && e.constructor === Error
++				};
++			});
++		`);
++		return out.then(function (info) {
++			assert.strictEqual(info.message, 'ctor-boom', 'sandbox .catch must observe the rejection value');
++			assert.strictEqual(info.isSandboxError, true, 'delivered error must be an Error in the sandbox realm');
++			assert.strictEqual(info.ctorIsSandbox, true, 'delivered error constructor must be the sandbox Error (sanitized)');
++		});
++	});
++
++	it('sandbox that DOES .catch a getter-delivered host promise still receives the sanitized rejection', function () {
++		const hostAccessorObject = {};
++		Object.defineProperty(hostAccessorObject, 'p', {
++			get: function () {
++				return Promise.reject(new Error('getter-boom'));
++			},
++			enumerable: true,
++			configurable: true
++		});
++		const vm = new VM({sandbox: {hostAccessorObject}});
++		const out = vm.run(`
++			hostAccessorObject.p.catch(function (e) {
++				return {message: String(e && e.message), ctorIsSandbox: e && e.constructor === Error};
++			});
++		`);
++		return out.then(function (info) {
++			assert.strictEqual(info.message, 'getter-boom', 'sandbox .catch must observe the getter rejection');
++			assert.strictEqual(info.ctorIsSandbox, true, 'delivered error constructor must be the sandbox Error (sanitized)');
++		});
++	});
++
++	it('host constructor returning a NON-promise object is unaffected', function () {
++		function HostPlain() {
++			this.tag = 'plain';
++			return {tag: 'returned', nested: {deep: 1}};
++		}
++		const vm = new VM({sandbox: {HostPlain}});
++		const out = vm.run(`
++			var o = new HostPlain();
++			[o.tag, o.nested.deep, typeof o.then];
++		`);
++		assert.strictEqual(out[0], 'returned', 'explicit constructor return must still win');
++		assert.strictEqual(out[1], 1, 'nested host properties must still be readable');
++		assert.strictEqual(out[2], 'undefined', 'a plain host object must not gain a then');
++	});
++
++	it('host constructor returning a FULFILLED promise still resolves normally to the sandbox', function () {
++		function HostResolveCtor() {
++			return Promise.resolve(42);
++		}
++		const vm = new VM({sandbox: {HostResolveCtor}});
++		const out = vm.run(`new HostResolveCtor().then(function (v) { return v + 1; });`);
++		return out.then(function (v) {
++			assert.strictEqual(v, 43, 'fulfilled host promise must resolve unchanged');
++		});
++	});
++
++	it('a host constructor building a normal instance keeps prototype methods working', function () {
++		function HostThing(n) {
++			this.n = n;
++		}
++		HostThing.prototype.double = function () {
++			return this.n * 2;
++		};
++		const vm = new VM({sandbox: {HostThing}});
++		const out = vm.run(`var t = new HostThing(21); [t.n, t.double()];`);
++		assert.strictEqual(out[0], 21);
++		assert.strictEqual(out[1], 42);
++	});
++
++	it('a late sandbox .catch on a constructed host promise still observes the rejection', function () {
++		function HostRejectCtor() {
++			return Promise.reject(new Error('late-catch-boom'));
++		}
++		const vm = new VM({sandbox: {HostRejectCtor}});
++		const out = vm.run(`
++			var p = new HostRejectCtor();
++			Promise.resolve().then(function () {}).then(function () {
++				return p.catch(function (e) { return String(e && e.message); });
++			});
++		`);
++		return out.then(function (msg) {
++			assert.strictEqual(msg, 'late-catch-boom', 'late sandbox .catch must still observe the rejection');
++		});
++	});
++});
+
 --- a/lib/builtin.js
 +++ b/lib/builtin.js
-@@ -84,6 +84,16 @@
+@@ -88,6 +88,16 @@
  	'module',
  	'worker_threads',
  	'cluster',
@@ -429,6 +991,18 @@
  	'vm',
  	'repl',
  	'inspector',
+--- a/lib/nodevm.js
++++ b/lib/nodevm.js
+@@ -275,7 +275,8 @@
+ 		// object, `makeResolverFromLegacyOptions` produces a resolver whose ONLY
+ 		// builtin is `vm2` — a pure escape primitive (sandbox does
+ 		// `require('vm2')`, builds an inner NodeVM with attacker-chosen
+-		// `require` config, reaches `child_process` for host RCE).
++		// `require` config, reaches host `fs` or host-context externals —
++		// any capability the outer config denied).
+ 		//
+ 		// The guard mirrors the actual reachability of that insecure resolver
+ 		// on two axes:
 --- /dev/null
 +++ b/test/ghsa/GHSA-pq68-rvw4-xp4r/repro.js
 @@ -0,0 +1,119 @@
