@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-555424
 - AIKIDO-2026-380962
+- CVE-2026-107286
+- CVE-2026-107295
 
 ## How to Apply:
 1. Clone or download the source code for pydantic-ai-slim
