@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-96749
+- AIKIDO-2026-814334
+- AIKIDO-2026-506971
 
 ## How to Apply:
 1. Clone or download the source code for pymongo
