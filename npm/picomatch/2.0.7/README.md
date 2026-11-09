@@ -4,7 +4,9 @@ This patch is based on picomatch version 2.0.7, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-33671
 - CVE-2026-33672
+- CVE-2026-112366
 
 ## How to Apply:
 1. Clone or download the source code for picomatch
