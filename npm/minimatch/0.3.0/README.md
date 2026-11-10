@@ -5,7 +5,10 @@ unknown
 
 ## Affected CVEs:
 - CVE-2016-10540
+- CVE-2026-27904
 - NSWG-ECO-118
+- CVE-2026-26996
+- CVE-2026-27903
 
 ## How to Apply:
 1. Clone or download the source code for minimatch
