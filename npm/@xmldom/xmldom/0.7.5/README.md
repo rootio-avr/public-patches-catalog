@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - GHSA-4w3w-2rp5-g8jm
 - CVE-2022-39353
+- CVE-2026-83613
 - CVE-2026-83614
 - CVE-2026-83615
 - CVE-2026-83616
@@ -18,6 +19,7 @@ unknown
 - CVE-2026-83608
 - CVE-2026-34601
 - CVE-2026-41675
+- CVE-2026-83605
 
 ## How to Apply:
 1. Clone or download the source code for @xmldom/xmldom
