@@ -16,6 +16,7 @@ unknown
 - CVE-2026-115570
 - CVE-2026-102675
 - CVE-2026-102673
+- CVE-2026-34774
 
 ## How to Apply:
 1. Clone or download the source code for electron
