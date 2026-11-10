@@ -940,10 +940,10 @@ index e2e90f6..d38a028 100644
          const options = {};
  
          ['status', 'statusText', 'headers'].forEach(prop => {
-@@ -218,7 +271,24 @@ const factory = (env) => {
+@@ -218,7 +271,23 @@ const factory = (env) => {
          ) || [];
  
-         response = new Response(
+-        response = new Response(
 -          trackStream(response.body, DEFAULT_CHUNK_SIZE, onProgress, () => {
 +        let bytesRead = 0;
 +        const onChunkProgress = (loadedBytes) => {
@@ -2066,3 +2066,494 @@ Description:
 +    );
 +  });
 +});
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -61,7 +61,7 @@
+   }
+ 
+   getSession(authority, options) {
+-    options = Object.assign({
++    options = Object.assign(Object.create(null), {
+       sessionTimeout: 1000
+     }, options);
+ 
+@@ -136,6 +136,7 @@
+     }
+ 
+     session.once('close', removeSession);
++    session.once('error', removeSession);
+ 
+     let entry = [
+         session,
+--- /dev/null
++++ b/test/unit/regression/cve-2026-101901.js
+@@ -0,0 +1,65 @@
++// Regression test for CVE-2026-101901 (GHSA-542g-h47m-68v8, CWE-400)
++// With httpVersion: 2 the HTTP/2 session pool only listened for 'close' on
++// the session, so a session 'error' (connection refused, non-HTTP/2 or
++// malicious peer) was an uncaught exception that could crash the process.
++// The fix attaches an 'error' listener that evicts the failed session.
++
++import assert from 'assert';
++import net from 'net';
++import axios from '../../../index.js';
++
++describe('CVE-2026-101901 http2 session error handling', () => {
++  let uncaught;
++  let listeners;
++
++  beforeEach(() => {
++    uncaught = [];
++    // mocha installs its own uncaughtException handler; swap it out so we can
++    // observe whether the session error escaped.
++    listeners = process.listeners('uncaughtException');
++    process.removeAllListeners('uncaughtException');
++    process.on('uncaughtException', (err) => uncaught.push(err));
++  });
++
++  afterEach(() => {
++    process.removeAllListeners('uncaughtException');
++    listeners.forEach((l) => process.on('uncaughtException', l));
++  });
++
++  it('should reject instead of crashing when the http2 session errors (connection refused)', async () => {
++    const probe = net.createServer();
++    await new Promise((resolve) => probe.listen(0, '127.0.0.1', resolve));
++    const {port} = probe.address();
++    await new Promise((resolve) => probe.close(resolve));
++
++    await assert.rejects(
++      axios.get(`http://127.0.0.1:${port}/`, {httpVersion: 2, timeout: 5000})
++    );
++
++    await new Promise((resolve) => setTimeout(resolve, 50));
++
++    assert.deepStrictEqual(uncaught.map((e) => e.message), []);
++  });
++
++  it('should reject instead of crashing when the peer is not an http2 server', async () => {
++    const server = net.createServer((socket) => {
++      socket.on('error', () => {});
++      socket.write('HTTP/1.1 400 Bad Request\r\n\r\ngarbage-not-http2');
++      socket.end();
++    });
++    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
++    const {port} = server.address();
++
++    try {
++      await assert.rejects(
++        axios.get(`http://127.0.0.1:${port}/`, {httpVersion: 2, timeout: 5000})
++      );
++
++      await new Promise((resolve) => setTimeout(resolve, 50));
++
++      assert.deepStrictEqual(uncaught.map((e) => e.message), []);
++    } finally {
++      await new Promise((resolve) => server.close(resolve));
++    }
++  });
++});
+--- a/dist/node/axios.cjs
++++ b/dist/node/axios.cjs
+@@ -2762,7 +2762,7 @@
+   }
+ 
+   getSession(authority, options) {
+-    options = Object.assign({
++    options = Object.assign(Object.create(null), {
+       sessionTimeout: 1000
+     }, options);
+ 
+@@ -2837,6 +2837,7 @@
+     }
+ 
+     session.once('close', removeSession);
++    session.once('error', removeSession);
+ 
+     let entry = [
+         session,
+
+--- a/lib/adapters/http.js
++++ b/lib/adapters/http.js
+@@ -206,12 +206,13 @@
+  * @param {http.ClientRequestArgs} options
+  * @param {AxiosProxyConfig} configProxy configuration from Axios options object
+  * @param {string} location
++ * @param {boolean} [allowEnvProxy=true] whether environment proxy configuration can be used
+  *
+- * @returns {http.ClientRequestArgs}
++ * @returns {boolean} whether a proxy applies to the selected transport
+  */
+-function setProxy(options, configProxy, location, isRedirect, configHttpsAgent) {
++function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, allowEnvProxy = true) {
+   let proxy = configProxy;
+-  if (!proxy && proxy !== false) {
++  if (!proxy && proxy !== false && allowEnvProxy) {
+     const proxyUrl = proxyFromEnv.getProxyForUrl(location);
+     if (proxyUrl) {
+       if (!shouldBypassProxy(location)) {
+@@ -338,8 +339,10 @@
+   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
+     // Configure proxy for redirected request, passing the original config proxy to apply
+     // the exact same logic as if the redirected request was performed by axios directly.
+-    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent);
++    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent, allowEnvProxy);
+   };
++
++  return Boolean(proxy);
+ }
+ 
+ const isHttpAdapterSupported = typeof process !== 'undefined' && utils.kindOf(process) === 'process';
+@@ -420,6 +423,35 @@
+   return agent;
+ }
+ 
++const normalizedLookupCache = new WeakMap();
++
++const normalizeLookup = (lookup) => {
++  let normalized = normalizedLookupCache.get(lookup);
++
++  if (normalized) {
++    return normalized;
++  }
++
++  const callbackLookup = callbackify(lookup, (value) => utils.isArray(value) ? value : [value]);
++
++  // hotfix to support opt.all option which is required for node 20.x
++  normalized = (hostname, opt, cb) => {
++    callbackLookup(hostname, opt, (err, arg0, arg1) => {
++      if (err) {
++        return cb(err);
++      }
++
++      const addresses = utils.isArray(arg0) ? arg0.map(addr => buildAddressEntry(addr)) : [buildAddressEntry(arg0, arg1)];
++
++      opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
++    });
++  };
++
++  normalizedLookupCache.set(lookup, normalized);
++
++  return normalized;
++};
++
+ const http2Transport = {
+   request(options, cb) {
+       const authority = options.protocol + '//' + options.hostname + ':' + (options.port || 80);
+@@ -491,19 +523,7 @@
+     const isHttp2 = httpVersion === 2;
+ 
+     if (lookup) {
+-      const _lookup = callbackify(lookup, (value) => utils.isArray(value) ? value : [value]);
+-      // hotfix to support opt.all option which is required for node 20.x
+-      lookup = (hostname, opt, cb) => {
+-        _lookup(hostname, opt, (err, arg0, arg1) => {
+-          if (err) {
+-            return cb(err);
+-          }
+-
+-          const addresses = utils.isArray(arg0) ? arg0.map(addr => buildAddressEntry(addr)) : [buildAddressEntry(arg0, arg1)];
+-
+-          opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
+-        });
+-      }
++      lookup = normalizeLookup(lookup);
+     }
+ 
+     const abortEmitter = new EventEmitter();
+@@ -763,6 +783,12 @@
+       'gzip, compress, deflate' + (isBrotliSupported ? ', br' : ''), false
+       );
+ 
++    // The HTTP/2 transport connects through http2.connect(), so the user-supplied
++    // lookup must be forwarded via http2Options or DNS controls are bypassed.
++    if (isHttp2 && lookup) {
++      http2Options = Object.assign(Object.create(null), http2Options, {lookup});
++    }
++
+     // Null-prototype to block prototype pollution gadgets on properties read
+     // directly by Node's http.request (e.g. insecureHTTPParser, lookup).
+     // See GHSA-q8qp-cvcw-x6jj.
+@@ -781,6 +807,8 @@
+ 
+     // cacheable-lookup integration hotfix
+     !utils.isUndefined(lookup) && (options.lookup = lookup);
++
++    let proxyApplied = false;
+ 
+     if (config.socketPath) {
+       if (typeof config.socketPath !== 'string') {
+@@ -814,7 +842,17 @@
+     } else {
+       options.hostname = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+       options.port = parsed.port;
+-      setProxy(options, config.proxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path, false, config.httpsAgent);
++      proxyApplied = setProxy(
++        options,
++        config.proxy,
++        protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path,
++        false,
++        config.httpsAgent,
++        // The HTTP/2 transport connects independently of HTTP/1 agents, so it
++        // cannot apply environment proxies. Explicit proxy config is still
++        // processed and rejected below.
++        !isHttp2
++      );
+     }
+ 
+     let transport;
+@@ -826,6 +864,14 @@
+     }
+ 
+     if (isHttp2) {
++      if (proxyApplied) {
++        return reject(new AxiosError(
++          'HTTP/2 requests with a proxy are not supported',
++          AxiosError.ERR_NOT_SUPPORT,
++          config
++        ));
++      }
++
+       // HTTP/2 sessions are opened directly by http2.connect() and ignore
+       // options.agent, so a CONNECT tunnel cannot be established. Fail closed
+       // instead of silently bypassing the configured proxy.
+--- /dev/null
++++ b/test/unit/regression/CVE-2026-101898.js
+@@ -0,0 +1,93 @@
++// Regression test for CVE-2026-101898: the HTTP/2 adapter path passed only
++// http2Options to http2.connect(), silently dropping the configured DNS
++// `lookup` and bypassing proxy handling (SSRF controls).
++
++import assert from 'assert';
++import http2 from 'http2';
++import axios from '../../../index.js';
++import AxiosError from '../../../lib/core/AxiosError.js';
++
++describe('CVE-2026-101898 HTTP/2 lookup and proxy handling', () => {
++  let server;
++  let port;
++  const envKeys = ['http_proxy', 'HTTP_PROXY', 'no_proxy', 'NO_PROXY'];
++  const savedEnv = {};
++
++  beforeEach(async () => {
++    envKeys.forEach((key) => {
++      savedEnv[key] = process.env[key];
++      delete process.env[key];
++    });
++
++    server = http2.createServer();
++    server.on('request', (req, res) => {
++      res.end('OK');
++    });
++    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
++    port = server.address().port;
++  });
++
++  afterEach(async () => {
++    envKeys.forEach((key) => {
++      if (savedEnv[key] === undefined) {
++        delete process.env[key];
++      } else {
++        process.env[key] = savedEnv[key];
++      }
++    });
++
++    await new Promise((resolve) => {
++      server.close(resolve);
++      server.closeAllConnections && server.closeAllConnections();
++    });
++  });
++
++  it('should use the configured lookup for HTTP/2 connections', async () => {
++    const hosts = [];
++
++    const {data} = await axios.get(`http://fake-name.axios:${port}/`, {
++      httpVersion: 2,
++      lookup: (hostname, opt, cb) => {
++        hosts.push(hostname);
++        opt && opt.all ? cb(null, [{address: '127.0.0.1', family: 4}]) : cb(null, '127.0.0.1', 4);
++      }
++    });
++
++    assert.strictEqual(data, 'OK');
++    assert.ok(hosts.includes('fake-name.axios'), 'custom lookup must be invoked for HTTP/2');
++  });
++
++  it('should honor a lookup that rejects the host for HTTP/2', async () => {
++    await assert.rejects(
++      axios.get(`http://fake-name.axios:${port}/`, {
++        httpVersion: 2,
++        lookup: (hostname, opt, cb) => cb(new Error('blocked by lookup policy'))
++      }),
++      /blocked by lookup policy/
++    );
++  });
++
++  it('should reject an explicit proxy for HTTP/2 requests', async () => {
++    await assert.rejects(
++      axios.get(`http://127.0.0.1:${port}/`, {
++        httpVersion: 2,
++        proxy: {protocol: 'http', host: '127.0.0.1', port: 9}
++      }),
++      (err) => {
++        assert.ok(err instanceof AxiosError);
++        assert.strictEqual(err.code, AxiosError.ERR_NOT_SUPPORT);
++        return true;
++      }
++    );
++  });
++
++  it('should not route HTTP/2 requests through an environment proxy', async () => {
++    process.env.http_proxy = 'http://127.0.0.1:9';
++
++    const {data} = await axios.get(`http://127.0.0.1:${port}/`, {
++      httpVersion: 2
++    });
++
++    assert.strictEqual(data, 'OK');
++  });
++});
+--- a/dist/node/axios.cjs
++++ b/dist/node/axios.cjs
+@@ -2876,12 +2876,13 @@
+  * @param {http.ClientRequestArgs} options
+  * @param {AxiosProxyConfig} configProxy configuration from Axios options object
+  * @param {string} location
++ * @param {boolean} [allowEnvProxy=true] whether environment proxy configuration can be used
+  *
+- * @returns {http.ClientRequestArgs}
++ * @returns {boolean} whether a proxy applies to the selected transport
+  */
+-function setProxy(options, configProxy, location, isRedirect, configHttpsAgent) {
++function setProxy(options, configProxy, location, isRedirect, configHttpsAgent, allowEnvProxy = true) {
+   let proxy = configProxy;
+-  if (!proxy && proxy !== false) {
++  if (!proxy && proxy !== false && allowEnvProxy) {
+     const proxyUrl = proxyFromEnv__default["default"].getProxyForUrl(location);
+     if (proxyUrl) {
+       proxy = new URL(proxyUrl);
+@@ -2970,8 +2971,10 @@
+   options.beforeRedirects.proxy = function beforeRedirect(redirectOptions) {
+     // Configure proxy for redirected request, passing the original config proxy to apply
+     // the exact same logic as if the redirected request was performed by axios directly.
+-    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent);
++    setProxy(redirectOptions, configProxy, redirectOptions.href, true, configHttpsAgent, allowEnvProxy);
+   };
++
++  return Boolean(proxy);
+ }
+ 
+ const isHttpAdapterSupported = typeof process !== 'undefined' && utils$1.kindOf(process) === 'process';
+@@ -3049,6 +3052,35 @@
+   return agent;
+ }
+ 
++const normalizedLookupCache = new WeakMap();
++
++const normalizeLookup = (lookup) => {
++  let normalized = normalizedLookupCache.get(lookup);
++
++  if (normalized) {
++    return normalized;
++  }
++
++  const callbackLookup = callbackify$1(lookup, (value) => utils$1.isArray(value) ? value : [value]);
++
++  // hotfix to support opt.all option which is required for node 20.x
++  normalized = (hostname, opt, cb) => {
++    callbackLookup(hostname, opt, (err, arg0, arg1) => {
++      if (err) {
++        return cb(err);
++      }
++
++      const addresses = utils$1.isArray(arg0) ? arg0.map(addr => buildAddressEntry(addr)) : [buildAddressEntry(arg0, arg1)];
++
++      opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
++    });
++  };
++
++  normalizedLookupCache.set(lookup, normalized);
++
++  return normalized;
++};
++
+ const http2Transport = {
+   request(options, cb) {
+       const authority = options.protocol + '//' + options.hostname + ':' + (options.port || 80);
+@@ -3119,19 +3151,7 @@
+     const isHttp2 = httpVersion === 2;
+ 
+     if (lookup) {
+-      const _lookup = callbackify$1(lookup, (value) => utils$1.isArray(value) ? value : [value]);
+-      // hotfix to support opt.all option which is required for node 20.x
+-      lookup = (hostname, opt, cb) => {
+-        _lookup(hostname, opt, (err, arg0, arg1) => {
+-          if (err) {
+-            return cb(err);
+-          }
+-
+-          const addresses = utils$1.isArray(arg0) ? arg0.map(addr => buildAddressEntry(addr)) : [buildAddressEntry(arg0, arg1)];
+-
+-          opt.all ? cb(err, addresses) : cb(err, addresses[0].address, addresses[0].family);
+-        });
+-      };
++      lookup = normalizeLookup(lookup);
+     }
+ 
+     const abortEmitter = new events.EventEmitter();
+@@ -3385,6 +3405,12 @@
+       'gzip, compress, deflate' + (isBrotliSupported ? ', br' : ''), false
+       );
+ 
++    // The HTTP/2 transport connects through http2.connect(), so the user-supplied
++    // lookup must be forwarded via http2Options or DNS controls are bypassed.
++    if (isHttp2 && lookup) {
++      http2Options = Object.assign(Object.create(null), http2Options, {lookup});
++    }
++
+     const options = {
+       path,
+       method: method,
+@@ -3400,13 +3426,25 @@
+ 
+     // cacheable-lookup integration hotfix
+     !utils$1.isUndefined(lookup) && (options.lookup = lookup);
++
++    let proxyApplied = false;
+ 
+     if (config.socketPath) {
+       options.socketPath = config.socketPath;
+     } else {
+       options.hostname = parsed.hostname.startsWith("[") ? parsed.hostname.slice(1, -1) : parsed.hostname;
+       options.port = parsed.port;
+-      setProxy(options, config.proxy, protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path, false, config.httpsAgent);
++      proxyApplied = setProxy(
++        options,
++        config.proxy,
++        protocol + '//' + parsed.hostname + (parsed.port ? ':' + parsed.port : '') + options.path,
++        false,
++        config.httpsAgent,
++        // The HTTP/2 transport connects independently of HTTP/1 agents, so it
++        // cannot apply environment proxies. Explicit proxy config is still
++        // processed and rejected below.
++        !isHttp2
++      );
+     }
+ 
+     let transport;
+@@ -3417,6 +3455,14 @@
+     }
+ 
+     if (isHttp2) {
++      if (proxyApplied) {
++        return reject(new AxiosError(
++          'HTTP/2 requests with a proxy are not supported',
++          AxiosError.ERR_NOT_SUPPORT,
++          config
++        ));
++      }
++
+       // HTTP/2 sessions ignore options.agent, so a CONNECT tunnel cannot be
+       // established. Fail closed instead of silently bypassing the proxy.
+       if (options.agent && options.agent[kAxiosInstalledTunnel]) {

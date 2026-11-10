@@ -33,6 +33,8 @@ unknown
 - GHSA-7q8q-rj6j-mhjq
 - AIKIDO-2026-291630
 - AIKIDO-2026-10823
+- CVE-2026-101901
+- CVE-2026-101898
 
 ## How to Apply:
 1. Clone or download the source code for axios
