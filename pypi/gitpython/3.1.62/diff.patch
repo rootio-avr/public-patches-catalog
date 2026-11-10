@@ -89,3 +89,577 @@
 +        remote.pull("refs/heads/topic", upload_pack="helper with spaces", allow_unsafe_options=True)
 +    assert run.call_args[0] == ("pull", "--", remote, ["refs/heads/topic"])
 +    assert run.call_args[1]["upload_pack"] == "helper with spaces"
+
+--- a/git/util.py
++++ b/git/util.py
+@@ -34,6 +34,7 @@
+ from functools import wraps
+ import getpass
+ import logging
++import ntpath
+ import os
+ import os.path as osp
+ from pathlib import Path
+@@ -377,6 +378,33 @@
+     if path_str.endswith(separators) and relative_path != "." and not relative_path.endswith("/"):
+         relative_path += "/"
+     return relative_path
++
++
++_HFS_IGNORABLES = str.maketrans(
++    "", "", "\u200c\u200d\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u206a\u206b\u206c\u206d\u206e\u206f\ufeff"
++)
++
++
++def _validate_repo_path(path: PathLike) -> None:
++    """Reject unsafe tree/index paths without normalizing away their components.
++
++    Protect Git metadata aliases on NTFS and HFS even when writing on another
++    platform. Other POSIX filename characters, including newlines, remain valid.
++    """
++    name = os.fspath(path)
++    if not name or "\0" in name or ntpath.splitdrive(name)[0] or name.startswith("/"):
++        raise ValueError("Invalid repository path %r" % name)
++    if os.name == "nt" and "\\" in name:
++        raise ValueError("Index paths must use '/' separators: %r" % name)
++    for component in name.split("/"):
++        if component in ("", ".", ".."):
++            raise ValueError("Invalid repository path %r" % name)
++        # NTFS recognizes backslashes and alternate data streams in metadata names.
++        for part in component.split("\\"):
++            ntfs_name = part.split(":", 1)[0].rstrip(" .").lower()
++            hfs_name = part.translate(_HFS_IGNORABLES).lower()
++            if ntfs_name in (".git", "git~1") or hfs_name == ".git":
++                raise ValueError("Repository path aliases Git metadata: %r" % name)
+ 
+ 
+ def assure_directory_exists(path: PathLike, is_file: bool = False) -> bool:
+--- a/git/objects/submodule/base.py
++++ b/git/objects/submodule/base.py
+@@ -9,6 +9,8 @@
+ import ntpath
+ import os
+ import os.path as osp
++from pathlib import Path
++import re
+ import shlex
+ import stat
+ import sys
+@@ -31,6 +33,7 @@
+     IterableList,
+     RemoteProgress,
+     _to_relative_path,
++    _validate_repo_path,
+     join_path_native,
+     rmtree,
+     to_native_path_linux,
+@@ -309,19 +312,69 @@
+     def _validated_name(cls, name: str) -> str:
+         if (
+             not name
++            or "\0" in name
+             or name.startswith(("/", "\\"))
+             or ntpath.splitdrive(name)[0]
+             or ".." in name.replace("\\", "/").split("/")
+         ):
+             raise ValueError("Invalid submodule name %r" % name)
++        cls._validate_windows_path(name)
+         return name
+ 
++    @staticmethod
++    def _validate_windows_path(path: PathLike) -> None:
++        """Apply Git for Windows' filename checks before creating directories."""
++        if sys.platform == "win32":
++            for component in ntpath.splitdrive(os.fspath(path))[1].replace("\\", "/").split("/"):
++                if component in (".", ".."):
++                    continue
++                stem = component.split(".", 1)[0].rstrip(" ").upper()
++                if (
++                    component.endswith((" ", "."))
++                    or any(ord(char) < 32 or char in '<>:"|?*' for char in component)
++                    or re.fullmatch(r"CON(?:IN\$|OUT\$)?|PRN|AUX|NUL|COM[1-9]|LPT[1-9]", stem)
++                ):
++                    raise ValueError("Invalid submodule path on Windows: %r" % path)
++
+     @classmethod
+-    def _module_abspath(cls, parent_repo: "Repo", path: PathLike, name: str) -> PathLike:
++    def _reject_git_dir_alias(
++        cls, root: Union[PathLike, None], relative_path: PathLike, git_dirs: Sequence[PathLike]
++    ) -> None:
++        """Reject checkout paths that alias one of the given Git directories."""
++        if root is None:
++            raise NotADirectoryError("Submodules require a working tree")
++        path = os.fspath(root)
++        metadata_dirs = set(git_dirs)
++        for component in to_native_path_linux(relative_path).split("/"):
++            path = os.fspath(join_path_native(path, component))
++            if metadata_dirs and osp.exists(path) and any(osp.samefile(path, directory) for directory in metadata_dirs):
++                raise ValueError("Submodule checkout path aliases Git metadata: %r" % relative_path)
++
++    @classmethod
++    def _module_abspath(
++        cls, parent_repo: "Repo", path: PathLike, name: str, *, moving_from: Union[PathLike, None] = None
++    ) -> PathLike:
++        """Reject nested Git directories, allowing the source of a pending rename."""
++        from git.repo.fun import is_git_dir
++
+         name = cls._validated_name(name)
+         if cls._need_gitfile_submodules(parent_repo.git):
++            directory = osp.join(parent_repo.git_dir, "modules")
++            for component in to_native_path_linux(name).split("/")[:-1]:
++                directory = osp.join(directory, component)
++                if is_git_dir(directory) and (
++                    moving_from is None or Path(directory).resolve() != Path(moving_from).resolve()
++                ):
++                    raise ValueError(
++                        "Submodule metadata for %r is inside another Git directory: %r" % (name, directory)
++                    )
+             return osp.join(parent_repo.git_dir, "modules", name)
+         if parent_repo.working_tree_dir:
++            cls._reject_git_dir_alias(
++                parent_repo.working_tree_dir,
++                cls._to_relative_path(parent_repo, path),
++                (parent_repo.git_dir, parent_repo.common_dir),
++            )
+             return osp.join(parent_repo.working_tree_dir, path)
+         raise NotADirectoryError()
+ 
+@@ -361,6 +414,8 @@
+         :param kwargs:
+             Additional arguments given to :manpage:`git-clone(1)`.
+         """
++        path = cls._to_relative_path(repo, path)
++        cls._reject_git_dir_alias(repo.working_tree_dir, path, (repo.git_dir, repo.common_dir))
+         module_abspath = cls._module_abspath(repo, path, name)
+         module_checkout_path = module_abspath
+         if cls._need_gitfile_submodules(repo.git):
+@@ -392,6 +447,16 @@
+             **kwargs,
+         )
+         if cls._need_gitfile_submodules(repo.git):
++            # A concurrent clone may have turned a leading directory into a repository.
++            try:
++                cls._module_abspath(repo, path, name)
++            except ValueError:
++                clone.close()
++                try:
++                    os.remove(osp.join(clone.git_dir, "HEAD"))
++                except FileNotFoundError:
++                    pass
++                raise
+             cls._write_git_file_and_module_config(module_checkout_path, module_abspath)
+ 
+         return clone
+@@ -401,8 +466,9 @@
+         """:return: A path guaranteed to be relative to the given parent repository
+ 
+         :raise ValueError:
+-            If path is not contained in the parent repository's working tree.
++            If path is outside the working tree or is unsafe as a submodule checkout.
+         """
++        cls._validate_windows_path(path)
+         if parent_repo.working_tree_dir:
+             path = _to_relative_path(parent_repo.working_tree_dir, path)
+         else:
+@@ -412,6 +478,7 @@
+         if not path or path == ".":
+             raise ValueError("Submodule checkout path must not be the repository root")
+ 
++        _validate_repo_path(path)
+         return path
+ 
+     @property
+@@ -424,6 +491,9 @@
+             path = join_path_native(path, component)
+             if osp.islink(path):
+                 raise ValueError("Submodule checkout path %r contains a symbolic link" % self.path)
++        self._reject_git_dir_alias(
++            root, self._to_relative_path(self.repo, self.path), (self.repo.git_dir, self.repo.common_dir)
++        )
+         return path
+ 
+     @classmethod
+@@ -1057,6 +1127,16 @@
+             return self
+         # END handle no change
+ 
++        # Validate the source and destination before touching the filesystem.
++        cur_path = self.abspath
++        module_abspath = self._module_abspath(self.repo, self.path, self.name)
++        if self.path == self.name:
++            self._module_abspath(
++                self.repo, module_checkout_path, os.fspath(module_checkout_path), moving_from=module_abspath
++            )
++        self._reject_git_dir_alias(
++            self.repo.working_tree_dir, module_checkout_path, (self.repo.git_dir, self.repo.common_dir)
++        )
+         module_checkout_abspath = join_path_native(str(self.repo.working_tree_dir), module_checkout_path)
+         if osp.isfile(module_checkout_abspath):
+             raise ValueError("Cannot move repository onto a file: %s" % module_checkout_abspath)
+@@ -1089,14 +1169,12 @@
+         # END handle module
+ 
+         # Move the module into place if possible.
+-        cur_path = self.abspath
+         renamed_module = False
+         if module and osp.exists(cur_path):
+             os.renames(cur_path, module_checkout_abspath)
+             renamed_module = True
+ 
+             if osp.isfile(osp.join(module_checkout_abspath, ".git")):
+-                module_abspath = self._module_abspath(self.repo, self.path, self.name)
+                 self._write_git_file_and_module_config(module_checkout_abspath, module_abspath)
+             # END handle git file rewrite
+         # END move physical module
+@@ -1450,6 +1528,8 @@
+ 
+         self._validated_name(self.name)
+         self._validated_name(new_name)
++        mod = self.module()
++        destination_module_abspath = self._module_abspath(self.repo, self.path, new_name, moving_from=mod.git_dir)
+ 
+         # .git/config
+         with self.repo.config_writer() as pw:
+@@ -1466,9 +1546,7 @@
+         self._name = new_name
+ 
+         # .git/modules
+-        mod = self.module()
+         if mod.has_separate_working_tree():
+-            destination_module_abspath = self._module_abspath(self.repo, self.path, new_name)
+             source_dir = mod.git_dir
+             # Let's be sure the submodule name is not so obviously tied to a directory.
+             if str(destination_module_abspath).startswith(str(mod.git_dir)):
+@@ -1500,6 +1578,7 @@
+         """
+         self._validated_name(self.name)
+         module_checkout_abspath = self.abspath
++        self._module_abspath(self.repo, self.path, self.name)
+         try:
+             repo = git.Repo(module_checkout_abspath)
+             if repo != self.repo:
+
+--- a/doc/source/changes.rst
++++ b/doc/source/changes.rst
+@@ -8,6 +8,7 @@
+ Security fixes for
+ 
+ * https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-59cr-6r3x-644w
++* https://github.com/gitpython-developers/GitPython/security/advisories/GHSA-f9j4-qggq-h239
+ 
+ If you can, also try and provide feedback on the upcoming v4 branch
+ https://github.com/gitpython-developers/GitPython/pull/2177 - patches welcome.
+
+--- a/git/cmd.py
++++ b/git/cmd.py
+@@ -645,7 +645,8 @@ class Git(metaclass=_GitMeta):
+         "_version_info_token",
+     )
+ 
+-    re_unsafe_protocol = re.compile(r"(.+)::.+")
++    # Match Git's leading transport selector, including an empty helper name.
++    re_unsafe_protocol = re.compile(r"([A-Za-z0-9][A-Za-z0-9+.-]*|)::")
+ 
+     unsafe_git_ls_remote_options = [
+         # This option allows arbitrary command execution in git-ls-remote.
+@@ -1129,16 +1130,28 @@ class Git(metaclass=_GitMeta):
+         self,
+         *args: Any,
+         allow_unsafe_options: bool = False,
++        allow_unsafe_protocols: bool = False,
+         **kwargs: Any,
+     ) -> Union[str, bytes, Tuple[int, Union[str, bytes], str], "Git.AutoInterrupt"]:
+         """List references in a remote repository.
+ 
+         :param allow_unsafe_options:
+             Allow unsafe options, like ``--upload-pack`` or ``--exec``.
++
++        :param allow_unsafe_protocols:
++            Allow unsafe protocols to be used, like ``ext``. Positional arguments
++            and split short-option values are checked.
+         """
+         if not allow_unsafe_options:
+             candidate_options = self._option_candidates(args, kwargs)
+             Git.check_unsafe_options(options=candidate_options, unsafe_options=self.unsafe_git_ls_remote_options)
++        if not allow_unsafe_protocols:
++            protocol_args = list(args)
++            if kwargs.get("split_single_char_options", True):
++                # Split short-option values can become the URL after parsing earlier options.
++                protocol_args.extend(value for key, value in kwargs.items() if len(key) == 1)
++            for arg in self._unpack_args(protocol_args):
++                self.check_unsafe_protocols(arg)
+         return self._call_process("ls_remote", *args, **kwargs)
+ 
+     @property
+--- a/git/index/base.py
++++ b/git/index/base.py
+@@ -1093,6 +1093,7 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
+         self,
+         items: Union[PathLike, Sequence[Union[PathLike, Blob, BaseIndexEntry, "Submodule"]]],
+         skip_errors: bool = False,
++        allow_unsafe_options: bool = False,
+         **kwargs: Any,
+     ) -> List[Tuple[str, str]]:
+         """Rename/move the items, whereas the last item is considered the destination of
+@@ -1113,6 +1114,10 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
+             If ``True``, errors such as ones resulting from missing source files will be
+             skipped.
+ 
++        :param allow_unsafe_options:
++            Allow unsafe options such as ``--pathspec-from-file`` to be passed to
++            :manpage:`git-mv(1)`.
++
+         :param kwargs:
+             Additional arguments you would like to pass to :manpage:`git-mv(1)`, such as
+             ``dry_run`` or ``force``.
+@@ -1129,6 +1134,11 @@ class IndexFile(LazyMixin, git_diff.Diffable, Serializable):
+         :raise git.exc.GitCommandError:
+             If git could not handle your request.
+         """
++        if not allow_unsafe_options:
++            Git.check_unsafe_options(
++                options=Git._option_candidates([], kwargs),
++                unsafe_options=Git.unsafe_git_pathspec_from_file_options,
++            )
+         args = []
+         if skip_errors:
+             args.append("-k")
+--- a/git/repo/base.py
++++ b/git/repo/base.py
+@@ -892,7 +892,7 @@ class Repo:
+             **kwargs,
+         )
+ 
+-    def merge_base(self, *rev: TBD, **kwargs: Any) -> List[Commit]:
++    def merge_base(self, *rev: TBD, allow_unsafe_options: bool = False, **kwargs: Any) -> List[Commit]:
+         R"""Find the closest common ancestor for the given revision
+         (:class:`~git.objects.commit.Commit`\s, :class:`~git.refs.tag.Tag`\s,
+         :class:`~git.refs.reference.Reference`\s, etc.).
+@@ -900,6 +900,9 @@ class Repo:
+         :param rev:
+             At least two revs to find the common ancestor for.
+ 
++        :param allow_unsafe_options:
++            Allow unsafe options in the revision arguments, like ``--output``.
++
+         :param kwargs:
+             Additional arguments to be passed to the ``repo.git.merge_base()`` command
+             which does all the work.
+@@ -912,18 +915,25 @@ class Repo:
+ 
+         :raise ValueError:
+             If fewer than two revisions are provided.
++
++        :raise git.exc.GitCommandError:
++            If git fails for a reason other than having no common merge base.
+         """
+         if len(rev) < 2:
+             raise ValueError("Please specify at least two revs, got only %i" % len(rev))
+         # END handle input
+ 
++        if not allow_unsafe_options:
++            Git.check_unsafe_options(
++                options=Git._option_candidates(rev, kwargs), unsafe_options=self.unsafe_git_revision_options
++            )
++
+         res: List[Commit] = []
+         try:
+             lines: List[str] = self.git.merge_base(*rev, **kwargs).splitlines()
+         except GitCommandError as err:
+-            if err.status == 128:
++            if err.status != 1:
+                 raise
+-            # END handle invalid rev
+             # Status code 1 is returned if there is no merge-base.
+             # (See: https://github.com/git/git/blob/v2.44.0/builtin/merge-base.c#L19)
+             return res
+new file mode 100644
+--- /dev/null
++++ b/test/test_command_guards.py
+@@ -0,0 +1,151 @@
++"""Command wrappers apply safety checks before starting Git."""
++
++from pathlib import Path
++from unittest import mock
++
++import pytest
++
++from git import Actor, Git, GitCommandError, Repo
++from git.exc import UnsafeOptionError, UnsafeProtocolError
++
++
++@pytest.mark.parametrize("allow_unsafe_options", [False, True])
++@pytest.mark.parametrize(
++    "args, kwargs",
++    [
++        (("ext::helper",), {}),
++        (("ext::",), {}),
++        (("custom::address",), {}),
++        (("1custom+v2.test-name::address",), {}),
++        (("::address",), {}),
++        (("custom::\naddress",), {}),
++        ((["--refs", ("ext::helper",)],), {}),
++        ((None, "--", "ext::helper", "HEAD"), {}),
++        ((Path("ext::helper"),), {}),
++        ((), {"q": "ext::helper"}),
++        ((), {"h": ["ext::helper"]}),
++        ((), {"-": "ext::helper"}),
++        ((), {"o": [True, "ext::helper"]}),
++        (("--server-option",), {"o": "ext::helper", "insert_kwargs_after": "--server-option"}),
++    ],
++)
++def test_ls_remote_rejects_unsafe_protocols(args, kwargs, allow_unsafe_options):
++    with mock.patch.object(Git, "execute", side_effect=AssertionError("Git must not run")) as run:
++        with pytest.raises(UnsafeProtocolError):
++            Git().ls_remote(*args, allow_unsafe_options=allow_unsafe_options, **kwargs)
++        run.assert_not_called()
++
++
++@pytest.mark.parametrize(
++    "args, kwargs",
++    [
++        ((), {}),
++        ((None,), {}),
++        (("origin", "HEAD"), {"h": True}),
++        (("https://example.com/repo.git",), {}),
++        (("git@example.com:repo.git",), {}),
++        (("origin",), {"o": "key=value"}),
++        (("origin",), {"server_option": "key::value"}),
++    ],
++)
++def test_ls_remote_preserves_safe_arguments(args, kwargs):
++    with mock.patch.object(Git, "execute", return_value="refs") as run:
++        assert Git().ls_remote(*args, **kwargs) == "refs"
++        run.assert_called_once()
++
++
++@pytest.mark.parametrize(
++    "url",
++    [
++        "https://[::1]/repo.git",
++        "ssh://git@[2001:db8::1]/repo.git",
++        "https://example.com/repo::name",
++        "git@example.com:repo::name",
++        "./repo::name",
++    ],
++)
++def test_ls_remote_preserves_double_colons_outside_helper_selector(url):
++    assert Git().ls_remote(url, get_url=True) == url
++
++
++def test_ls_remote_unsafe_opt_ins_are_independent():
++    with mock.patch.object(Git, "execute", return_value="refs") as run:
++        with pytest.raises(UnsafeOptionError):
++            Git().ls_remote("origin", upload_pack="helper", allow_unsafe_protocols=True)
++        run.assert_not_called()
++        assert (
++            Git().ls_remote("ext::helper", upload_pack="helper", allow_unsafe_protocols=True, allow_unsafe_options=True)
++            == "refs"
++        )
++        run.assert_called_once_with([Git.GIT_PYTHON_GIT_EXECUTABLE, "ls-remote", "--upload-pack=helper", "ext::helper"])
++
++
++@pytest.mark.parametrize("allow_unsafe_options", [False, True])
++@pytest.mark.parametrize(
++    "revs, kwargs",
++    [
++        (("HEAD", "--output=unused"), {}),
++        (("HEAD", ["--out=unused"]), {}),
++        (("HEAD", "-ounused"), {}),
++        (("HEAD", "HEAD"), {"output": "unused"}),
++        (("HEAD", "HEAD"), {"out": "unused"}),
++        (("HEAD", "HEAD"), {"o": "unused"}),
++    ],
++)
++def test_merge_base_checks_unsafe_options(tmp_path, revs, kwargs, allow_unsafe_options):
++    repo = Repo.init(tmp_path)
++    with mock.patch.object(Git, "execute", return_value="") as run:
++        if allow_unsafe_options:
++            assert repo.merge_base(*revs, allow_unsafe_options=True, **kwargs) == []
++            run.assert_called_once()
++            assert "--allow-unsafe-options" not in run.call_args[0][0]
++        else:
++            with pytest.raises(UnsafeOptionError):
++                repo.merge_base(*revs, **kwargs)
++            run.assert_not_called()
++
++
++@pytest.mark.parametrize("status", [-9, 2, 128, 129])
++def test_merge_base_propagates_errors(tmp_path, status):
++    repo = Repo.init(tmp_path)
++    error = GitCommandError("git merge-base", status)
++    with mock.patch.object(Git, "execute", side_effect=error):
++        with pytest.raises(GitCommandError) as raised:
++            repo.merge_base("HEAD", "HEAD")
++        assert raised.value is error
++
++
++def test_merge_base_distinguishes_unrelated_history_from_invalid_options(tmp_path):
++    repo = Repo.init(tmp_path)
++    actor = Actor("Test", "test@example.com")
++    first = repo.index.commit("first", author=actor, committer=actor)
++    second = repo.index.commit("second", parent_commits=[], head=False, author=actor, committer=actor)
++    assert repo.merge_base(first, first) == [first]
++    assert repo.merge_base(first, second) == []
++    with pytest.raises(GitCommandError) as raised:
++        repo.merge_base(first, second, invalid_option=True)
++    assert raised.value.status == 129
++
++
++@pytest.mark.parametrize("allow_unsafe_options", [False, True])
++@pytest.mark.parametrize("option", ["pathspec_from_file", "pathspec-from-file", "pathspec_from"])
++@pytest.mark.parametrize("dry_run", [False, True])
++def test_move_checks_unsafe_options(tmp_path, option, dry_run, allow_unsafe_options):
++    repo = Repo.init(tmp_path)
++    with mock.patch.object(Git, "execute", return_value="Renaming source to destination\n") as run:
++        kwargs = {option: "unused", "dry_run": dry_run}
++        if allow_unsafe_options:
++            assert repo.index.move(["source", "destination"], True, allow_unsafe_options=True, **kwargs) == [
++                ("source", "destination")
++            ]
++            assert run.call_count == (1 if dry_run else 2)
++            for call in run.call_args_list:
++                argv = call[0][0]
++                assert "-k" in argv
++                assert f"--{option.replace('_', '-')}=unused" in argv
++                assert "--allow-unsafe-options" not in argv
++                assert argv[-3:] == ["--", "source", "destination"]
++        else:
++            with pytest.raises(UnsafeOptionError):
++                repo.index.move(["source", "destination"], **kwargs)
++            run.assert_not_called()
+
+--- /dev/null
++++ b/test/test_ghsa_23mf_xhv8_69c2.py
+@@ -0,0 +1,31 @@
++"""Head.checkout must validate the reference it passes to Git as a positional operand."""
++
++from unittest import mock
++
++import pytest
++
++from git import Git, Head, Repo
++from git.exc import UnsafeOptionError
++
++
++@pytest.mark.parametrize("option_name", ["--pathspec-from-file", "--pathspec-from"])
++def test_head_checkout_rejects_option_shaped_reference(tmp_path, option_name):
++    repo = Repo.init(tmp_path)
++    branch = Head(repo, f"refs/heads/{option_name}=pathspecs")
++    with mock.patch.object(Git, "_call_process", side_effect=AssertionError("Git must not run")) as run:
++        with pytest.raises(UnsafeOptionError):
++            branch.checkout()
++        run.assert_not_called()
++
++
++def test_head_checkout_rejects_option_shaped_reference_with_keywords(tmp_path):
++    repo = Repo.init(tmp_path)
++    branch = Head(repo, "refs/heads/--pathspec-from-file=pathspecs")
++    with pytest.raises(UnsafeOptionError):
++        branch.checkout(force=True)
++
++
++def test_head_checkout_ordinary_reference_is_not_rejected(tmp_path):
++    repo = Repo.init(tmp_path)
++    branch = Head(repo, "refs/heads/main")
++    Git.check_unsafe_options(options=Git._option_candidates([branch], {}), unsafe_options=Git.unsafe_git_pathspec_from_file_options)

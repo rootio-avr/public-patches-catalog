@@ -6,6 +6,10 @@ unknown
 ## Affected CVEs:
 - AIKIDO-2026-137233
 - AIKIDO-2026-760814
+- CVE-2026-114145
+- GHSA-f9j4-qggq-h239
+- GHSA-w8jc-g24h-crhw
+- GHSA-23mf-xhv8-69c2
 
 ## How to Apply:
 1. Clone or download the source code for gitpython
