@@ -7,6 +7,12 @@ unknown
 - CVE-2025-61795
 - CVE-2025-66614
 - CVE-2026-29145
+- CVE-2026-41284
+- CVE-2026-41293
+- CVE-2026-42498
+- CVE-2026-43512
+- CVE-2026-43513
+- CVE-2026-43515
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.tomcat:tomcat
