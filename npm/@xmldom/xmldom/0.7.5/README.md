@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - GHSA-4w3w-2rp5-g8jm
 - CVE-2022-39353
+- CVE-2022-37616
 - CVE-2026-41674
 - CVE-2026-41672
 - CVE-2026-83608
