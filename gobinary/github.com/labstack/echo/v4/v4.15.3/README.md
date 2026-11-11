@@ -6,8 +6,13 @@ unknown
 ## Affected CVEs:
 - GHSA-9969-6676-49h5
 - GHSA-cxf3-9h37-7rr8
+- CVE-2026-118262
+- CVE-2026-118264
 - GHSA-f48p-c9v4-h7xv
+- CVE-2026-118260
 - GHSA-h7wr-284f-5qvc
+- CVE-2026-118261
+- CVE-2026-118650
 
 ## How to Apply:
 1. Clone or download the source code for github.com/labstack/echo/v4
