@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2020-28502
+- CVE-2021-31597
 
 ## How to Apply:
 1. Clone or download the source code for xmlhttprequest-ssl
