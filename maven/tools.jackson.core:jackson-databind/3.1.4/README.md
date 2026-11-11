@@ -7,6 +7,7 @@ unknown
 - CVE-2026-91776
 - CVE-2026-91777
 - CVE-2026-68497
+- AIKIDO-2026-829966
 
 ## How to Apply:
 1. Clone or download the source code for tools.jackson.core:jackson-databind
