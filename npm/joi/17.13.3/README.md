@@ -8,6 +8,7 @@ unknown
 - GHSA-6h2x-m376-mqjq
 - AIKIDO-2026-912310
 - CVE-2026-92599
+- CVE-2026-118772
 
 ## How to Apply:
 1. Clone or download the source code for joi
