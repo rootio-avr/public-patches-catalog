@@ -1,0 +1,148 @@
+--- a/java/org/apache/catalina/realm/JNDIRealm.java
++++ b/java/org/apache/catalina/realm/JNDIRealm.java
+@@ -149,6 +149,7 @@ public class JNDIRealm extends RealmBase {
+     private static final String NULL_USER_ROLE_ATTRIBUTE_PLACEHOLDER = "tomcat-unset-ignore";
+ 
+     private static final String AUTHENTICATION_NAME_GSSAPI = "GSSAPI";
++    private static final String AUTHENTICATION_NAME_SIMPLE = "simple";
+ 
+ 
+     /**
+@@ -1980,10 +1981,8 @@ public class JNDIRealm extends RealmBase {
+         // Elicit an LDAP bind operation using the provided user credentials
+         try {
+             userCredentialsAdd(context, dn, credentials);
+-            // Need to make sure GSSAPI SASL authentication is not used if configured
+-            if (AUTHENTICATION_NAME_GSSAPI.equals(preservedEnvironment.get(Context.SECURITY_AUTHENTICATION))) {
+-                context.removeFromEnvironment(Context.SECURITY_AUTHENTICATION);
+-            }
++            // Check credentials by performing a simple bind
++            context.addToEnvironment(Context.SECURITY_AUTHENTICATION, AUTHENTICATION_NAME_SIMPLE);
+             if (containerLog.isTraceEnabled()) {
+                 containerLog.trace("  binding as " + dn);
+             }
+@@ -1994,7 +1993,7 @@ public class JNDIRealm extends RealmBase {
+                 containerLog.trace("  bind attempt failed", e);
+             }
+         } finally {
+-            // Restore GSSAPI SASL if previously configured
++            // Restore any previously configured authentication mechanism
+             restoreEnvironmentParameter(context, Context.SECURITY_AUTHENTICATION, preservedEnvironment);
+             userCredentialsRemove(context);
+         }
+
+--- a/java/org/apache/coyote/AsyncStateMachine.java
++++ b/java/org/apache/coyote/AsyncStateMachine.java
+@@ -217,7 +217,7 @@
+     }
+ 
+     boolean isAsyncError() {
+-        return state == AsyncState.ERROR;
++        return state == AsyncState.ERROR || state == AsyncState.MUST_ERROR;
+     }
+ 
+     boolean isCompleting() {
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -939,10 +939,14 @@
+      *
+      * - this method is called once the StreamProcessor considers the Stream closed
+      *
++     * - the request and response are only added to the pool for re-use if the StreamProcessor considers the Stream to
++     * have completed cleanly. If the Stream was closed due to an error, an application thread may still be using the
++     * request and/or response (e.g. blocked in a write when an asynchronous timeout fired) so they must not be re-used.
++     *
+      * In theory, the protection against duplicate calls is not required in this method (the code in StreamProcessor
+      * should be sufficient) but it is implemented as precaution along with the WARN level logging.
+      */
+-    final void recycle() {
++    final void recycle(boolean reuseRequestAndResponse) {
+         if (recycled) {
+             log.warn(sm.getString("stream.recycle.duplicate", getConnectionId(), getIdAsString()));
+             return;
+@@ -959,7 +963,9 @@
+         }
+         coyoteRequest.recycle();
+         coyoteResponse.recycle();
+-        handler.getProtocol().pushRequestAndResponse(coyoteRequest);
++        if (reuseRequestAndResponse) {
++            handler.getProtocol().pushRequestAndResponse(coyoteRequest);
++        }
+     }
+ 
+ 
+--- a/java/org/apache/coyote/http2/StreamProcessor.java
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -98,8 +98,20 @@
+                 // HTTP/2 equivalent of AbstractConnectionHandler#process() without the
+                 // socket <-> processor mapping
+                 SocketState state = SocketState.CLOSED;
++                boolean reuseRequestAndResponse = false;
+                 try {
+                     state = process(socketWrapper, event);
++                    /*
++                     * The request and response may only be returned to the pool for re-use if the stream ended cleanly.
++                     * If the stream ended with either a timeout or an error that prevents further I/O (e.g. an
++                     * asynchronous timeout or error while an application thread was blocked in a write), a
++                     * non-container thread may still be using the request and/or response. Re-using them in that case
++                     * could result in the remaining data being written to a different stream, possibly on a different
++                     * connection.
++                     */
++                    if (SocketEvent.TIMEOUT != event) {
++                        reuseRequestAndResponse = getErrorState().isIoAllowed();
++                    }
+ 
+                     if (state == SocketState.LONG) {
+                         handler.getProtocol().getHttp11Protocol().addWaitingProcessor(this);
+@@ -145,6 +157,7 @@
+                     ConnectionException ce = new ConnectionException(msg, Http2Error.INTERNAL_ERROR, e);
+                     stream.close(ce);
+                     state = SocketState.CLOSED;
++                    reuseRequestAndResponse = false;
+                 } finally {
+                     if (state == SocketState.CLOSED) {
+                         /*
+@@ -156,7 +169,7 @@
+                         // Notes are not reset when request is recycled but this is a per request note
+                         request.setNote(Request.NOTE_BAD_REQUEST, null);
+                         recycle();
+-                        stream.recycle();
++                        stream.recycle(reuseRequestAndResponse);
+                     }
+                 }
+             } finally {
+
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -440,11 +440,15 @@ public class OutputBuffer extends Writer {
+         /*
+          * Handle the requirements of section 5.7 of the Servlet specification - Closure of the Response Object.
+          *
+-         * Currently, this just handles the simple case. There is work in progress to better define what should happen
+-         * if an attempt is made to write > content-length bytes. When that work is complete, this is likely where the
+-         * implementation will end up.
++         * For the blocking case, the output is closed once content-length bytes have been written.
++         *
++         * For the non-blocking case, there may be bytes buffered at the SocketWrapper so only close the output if an
++         * attempt is made to write more the content-length bytes.
++         *
++         * There is work in progress to better define what should happen if an attempt is made to write > content-length
++         * bytes. When that work is complete, this is likely where the implementation will end up.
+          */
+-        if (contentLength != -1 && bytesWritten >= contentLength) {
++        if (contentLength != -1 && (bytesWritten == contentLength && isBlocking() || bytesWritten > contentLength)) {
+             close();
+         }
+     }
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -1059,6 +1059,9 @@ protected final void finishResponse() throws IOException {
+             return;
+         }
+ 
++        // Make sure the non-blocking write buffer is empty before sending the end message.
++        socketWrapper.flush(true);
++
+         if (getErrorState().isError()) {
+             // Write the end and close message
+             socketWrapper.write(true, endAndCloseMessageArray, 0, endAndCloseMessageArray.length);
