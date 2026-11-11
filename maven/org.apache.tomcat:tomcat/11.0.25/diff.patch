@@ -1,0 +1,1219 @@
+--- a/java/org/apache/coyote/AsyncStateMachine.java
++++ b/java/org/apache/coyote/AsyncStateMachine.java
+@@ -217,7 +217,7 @@
+     }
+ 
+     boolean isAsyncError() {
+-        return state == AsyncState.ERROR;
++        return state == AsyncState.ERROR || state == AsyncState.MUST_ERROR;
+     }
+ 
+     boolean isCompleting() {
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -882,10 +882,14 @@
+      *
+      * - this method is called once the StreamProcessor considers the Stream closed
+      *
++     * - the request and response are only added to the pool for re-use if the StreamProcessor considers the Stream to
++     * have completed cleanly. If the Stream was closed due to an error, an application thread may still be using the
++     * request and/or response (e.g. blocked in a write when an asynchronous timeout fired) so they must not be re-used.
++     *
+      * In theory, the protection against duplicate calls is not required in this method (the code in StreamProcessor
+      * should be sufficient) but it is implemented as precaution along with the WARN level logging.
+      */
+-    final void recycle() {
++    final void recycle(boolean reuseRequestAndResponse) {
+         if (recycled) {
+             log.warn(sm.getString("stream.recycle.duplicate", getConnectionId(), getIdAsString()));
+             return;
+@@ -901,7 +905,9 @@
+         }
+         coyoteRequest.recycle();
+         coyoteResponse.recycle();
+-        handler.getProtocol().pushRequestAndResponse(coyoteRequest);
++        if (reuseRequestAndResponse) {
++            handler.getProtocol().pushRequestAndResponse(coyoteRequest);
++        }
+     }
+ 
+ 
+--- a/java/org/apache/coyote/http2/StreamProcessor.java
++++ b/java/org/apache/coyote/http2/StreamProcessor.java
+@@ -98,8 +98,20 @@
+                 // HTTP/2 equivalent of AbstractConnectionHandler#process() without the
+                 // socket <-> processor mapping
+                 SocketState state = SocketState.CLOSED;
++                boolean reuseRequestAndResponse = false;
+                 try {
+                     state = process(socketWrapper, event);
++                    /*
++                     * The request and response may only be returned to the pool for re-use if the stream ended cleanly.
++                     * If the stream ended with either a timeout or an error that prevents further I/O (e.g. an
++                     * asynchronous timeout or error while an application thread was blocked in a write), a
++                     * non-container thread may still be using the request and/or response. Re-using them in that case
++                     * could result in the remaining data being written to a different stream, possibly on a different
++                     * connection.
++                     */
++                    if (SocketEvent.TIMEOUT != event) {
++                        reuseRequestAndResponse = getErrorState().isIoAllowed();
++                    }
+ 
+                     if (state == SocketState.LONG) {
+                         handler.getProtocol().getHttp11Protocol().addWaitingProcessor(this);
+@@ -145,6 +157,7 @@
+                     ConnectionException ce = new ConnectionException(msg, Http2Error.INTERNAL_ERROR, e);
+                     stream.close(ce);
+                     state = SocketState.CLOSED;
++                    reuseRequestAndResponse = false;
+                 } finally {
+                     if (state == SocketState.CLOSED) {
+                         /*
+@@ -154,7 +167,7 @@
+                          * response are added to the pool to avoid concurrency issues corrupting the statistics.
+                          */
+                         recycle();
+-                        stream.recycle();
++                        stream.recycle(reuseRequestAndResponse);
+                     }
+                 }
+             } finally {
+
+--- a/java/org/apache/coyote/http2/HPackHuffman.java
++++ b/java/org/apache/coyote/http2/HPackHuffman.java
+@@ -22,7 +22,6 @@ import java.util.HashSet;
+ import java.util.Locale;
+ import java.util.Set;
+ 
+-import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -376,44 +375,44 @@ public class HPackHuffman {
+         DECODING_TABLE = codingTree;
+     }
+ 
++
+     /**
+      * Decodes a huffman encoded string into the target StringBuilder. There must be enough space left in the buffer for
+      * this method to succeed.
+      *
+-     * @param data   The byte buffer
+-     * @param length The length of data from the buffer to decode
+-     * @param target The target for the decompressed data
++     * @param data        The byte buffer
++     * @param length      The length of data from the buffer to decode
++     * @param target      The target for the decompressed data
++     * @param isFieldName {@code true} if a field name is being decoded (names have a more restrictive set of allowed
++     *                        characters than field values)
+      *
+      * @throws HpackException If the Huffman encoded value in HPACK headers did not end with EOS padding
+      *
+      * @deprecated Will be removed in Tomcat 12. Use {@link #decode(ByteBuffer, int, StringBuilder, boolean)}
+      */
+     @Deprecated
+-    public static void decode(ByteBuffer data, int length, StringBuilder target) throws HpackException {
+-        decode(data, length, target, false);
++    public static void decode(ByteBuffer data, int length, StringBuilder target, boolean isFieldName)
++            throws HpackException {
++        decode(data, length, target);
+     }
+ 
++
+     /**
+      * Decodes a huffman encoded string into the target StringBuilder. There must be enough space left in the buffer for
+      * this method to succeed.
+      *
+-     * @param data        The byte buffer
+-     * @param length      The length of data from the buffer to decode
+-     * @param target      The target for the decompressed data
+-     * @param isFieldName {@code true} if a field name is being decoded (names have a more restrictive set of allowed
+-     *                        characters than field values)
++     * @param data   The byte buffer
++     * @param length The length of data from the buffer to decode
++     * @param target The target for the decompressed data
+      *
+      * @throws HpackException If the Huffman encoded value in HPACK headers did not end with EOS padding
+      */
+-    public static void decode(ByteBuffer data, int length, StringBuilder target, boolean isFieldName)
+-            throws HpackException {
++    public static void decode(ByteBuffer data, int length, StringBuilder target) throws HpackException {
+ 
+         assert data.remaining() >= length;
+         int treePos = 0;
+         boolean eosBits = true;
+         int eosBitCount = 0;
+-        boolean firstChar = true;
+-        char c = 'a';
+         for (int i = 0; i < length; ++i) {
+             byte b = data.get();
+             int bitPos = 7;
+@@ -427,27 +426,7 @@ public class HPackHuffman {
+                         // Found a zero, can't be counting EOS bits
+                         eosBitCount = 0;
+                     } else {
+-                        c = (char) (val & LOW_MASK);
+-                        if (isFieldName) {
+-                            if (!HttpParser.isToken(c) || Character.isUpperCase(c)) {
+-                                throw new IllegalArgumentException(sm
+-                                        .getString("hpackhuffman.decode.illegalCharacterName", Character.toString(c)));
+-                            }
+-                        } else {
+-                            if (firstChar) {
+-                                if (!HttpParser.isFieldVChar(c)) {
+-                                    throw new IllegalArgumentException(sm.getString(
+-                                            "hpackhuffman.decode.illegalCharacterValue.start", Character.toString(c)));
+-                                }
+-                                firstChar = false;
+-                            } else {
+-                                if (!HttpParser.isFieldContent(c)) {
+-                                    throw new IllegalArgumentException(sm.getString(
+-                                            "hpackhuffman.decode.illegalCharacterValue", Character.toString(c)));
+-                                }
+-                            }
+-                        }
+-                        target.append(c);
++                        target.append((char) (val & LOW_MASK));
+                         treePos = 0;
+                         eosBits = true;
+                         // Output a character, reset eosBitCount
+@@ -466,27 +445,7 @@ public class HPackHuffman {
+                             // as an error
+                             throw new HpackException(sm.getString("hpackhuffman.stringLiteralEOS"));
+                         }
+-                        c = (char) ((val >> 16) & LOW_MASK);
+-                        if (isFieldName) {
+-                            if (!HttpParser.isToken(c) || Character.isUpperCase(c)) {
+-                                throw new IllegalArgumentException(sm
+-                                        .getString("hpackhuffman.decode.illegalCharacterName", Character.toString(c)));
+-                            }
+-                        } else {
+-                            if (firstChar) {
+-                                if (!HttpParser.isFieldVChar(c)) {
+-                                    throw new IllegalArgumentException(sm.getString(
+-                                            "hpackhuffman.decode.illegalCharacterValue.start", Character.toString(c)));
+-                                }
+-                                firstChar = false;
+-                            } else {
+-                                if (!HttpParser.isFieldContent(c)) {
+-                                    throw new IllegalArgumentException(sm.getString(
+-                                            "hpackhuffman.decode.illegalCharacterValue", Character.toString(c)));
+-                                }
+-                            }
+-                        }
+-                        target.append(c);
++                        target.append((char) ((val >> 16) & LOW_MASK));
+                         treePos = 0;
+                         eosBits = true;
+                         // Output a character, reset eosBitCount
+@@ -502,10 +461,6 @@ public class HPackHuffman {
+         if (!eosBits) {
+             throw new HpackException(sm.getString("hpackhuffman.huffmanEncodedHpackValueDidNotEndWithEOS"));
+         }
+-        if (!isFieldName && !HttpParser.isFieldVChar(c)) {
+-            throw new IllegalArgumentException(
+-                    sm.getString("hpackhuffman.decode.illegalCharacterValue.end", Character.toString(c)));
+-        }
+     }
+ 
+ 
+--- a/java/org/apache/coyote/http2/HpackDecoder.java
++++ b/java/org/apache/coyote/http2/HpackDecoder.java
+@@ -21,7 +21,6 @@ import java.util.concurrent.atomic.AtomicReference;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+-import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.res.StringManager;
+ 
+ /**
+@@ -116,7 +115,7 @@ public class HpackDecoder {
+                     buffer.position(originalPos);
+                     return;
+                 }
+-                String headerValue = readHpackString(buffer, false);
++                String headerValue = readHpackString(buffer);
+                 if (headerValue == null) {
+                     buffer.position(originalPos);
+                     return;
+@@ -130,7 +129,7 @@ public class HpackDecoder {
+                     buffer.position(originalPos);
+                     return;
+                 }
+-                String headerValue = readHpackString(buffer, false);
++                String headerValue = readHpackString(buffer);
+                 if (headerValue == null) {
+                     buffer.position(originalPos);
+                     return;
+@@ -143,7 +142,7 @@ public class HpackDecoder {
+                     buffer.position(originalPos);
+                     return;
+                 }
+-                String headerValue = readHpackString(buffer, false);
++                String headerValue = readHpackString(buffer);
+                 if (headerValue == null) {
+                     buffer.position(originalPos);
+                     return;
+@@ -205,11 +204,11 @@ public class HpackDecoder {
+         } else if (index != 0) {
+             return handleIndexedHeaderName(index);
+         } else {
+-            return readHpackString(buffer, true);
++            return readHpackString(buffer);
+         }
+     }
+ 
+-    private String readHpackString(ByteBuffer buffer, boolean isFieldName) throws HpackException {
++    private String readHpackString(ByteBuffer buffer) throws HpackException {
+         if (!buffer.hasRemaining()) {
+             return null;
+         }
+@@ -221,34 +220,18 @@ public class HpackDecoder {
+         }
+         boolean huffman = (data & 0b10000000) != 0;
+         if (huffman) {
+-            return readHuffmanString(length, buffer, isFieldName);
++            return readHuffmanString(length, buffer);
+         }
+         StringBuilder stringBuilder = new StringBuilder(length);
+         for (int i = 0; i < length; ++i) {
+-            char c = (char) (buffer.get() & 0xFF);
+-            if (isFieldName) {
+-                if (HttpParser.isToken(c) && !Character.isUpperCase(c)) {
+-                    stringBuilder.append(c);
+-                } else {
+-                    throw new IllegalArgumentException(
+-                            sm.getString("hpackdecoder.illegalCharacterName", Character.toString(c)));
+-                }
+-            } else {
+-                if ((i == 0 || i == length - 1) && HttpParser.isFieldVChar(c) ||
+-                        i > 0 && i < length - 1 && HttpParser.isFieldContent(c)) {
+-                    stringBuilder.append(c);
+-                } else {
+-                    throw new IllegalArgumentException(
+-                            sm.getString("hpackdecoder.illegalCharacterValue", Character.toString(c)));
+-                }
+-            }
++            stringBuilder.append((char) (buffer.get() & 0xFF));
+         }
+         return stringBuilder.toString();
+     }
+ 
+-    private String readHuffmanString(int length, ByteBuffer buffer, boolean isFieldName) throws HpackException {
++    private String readHuffmanString(int length, ByteBuffer buffer) throws HpackException {
+         StringBuilder stringBuilder = new StringBuilder(length);
+-        HPackHuffman.decode(buffer, length, stringBuilder, isFieldName);
++        HPackHuffman.decode(buffer, length, stringBuilder);
+         return stringBuilder.toString();
+     }
+ 
+--- a/java/org/apache/coyote/http2/Http2Parser.java
++++ b/java/org/apache/coyote/http2/Http2Parser.java
+@@ -553,8 +553,6 @@ class Http2Parser {
+             } catch (HpackException hpe) {
+                 throw new ConnectionException(sm.getString("http2Parser.processFrameHeaders.decodingFailed"),
+                         Http2Error.COMPRESSION_ERROR, hpe);
+-            } catch (IllegalArgumentException iae) {
+-                throw new StreamException("Invalid headers", Http2Error.PROTOCOL_ERROR, streamId, iae);
+             }
+ 
+             // switches to write mode
+--- a/java/org/apache/coyote/http2/LocalStrings.properties
++++ b/java/org/apache/coyote/http2/LocalStrings.properties
+@@ -46,8 +46,6 @@ hpackdecoder.addDynamic=Adding header to index [{0}] of dynamic table with name
+ hpackdecoder.clearDynamic=Emptying dynamic table
+ hpackdecoder.emitHeader=Emitting header with name [{0}] and value [{1}]
+ hpackdecoder.headerTableIndexInvalid=The header table index [{0}] is not valid as there are [{1}] static entries and [{2}] dynamic entries
+-hpackdecoder.illegalCharacterName=The illegal [{0}] character was found when decoding an HTTP/2 header field name
+-hpackdecoder.illegalCharacterValue=The illegal [{0}] character was found when decoding an HTTP/2 header field value
+ hpackdecoder.maxMemorySizeExceeded=The header table size [{0}] exceeds the maximum size [{1}]
+ hpackdecoder.notImplemented=Not yet implemented
+ hpackdecoder.nullHeader=Null header at index [{0}]
+@@ -56,10 +54,6 @@ hpackdecoder.useDynamic=Using header from index [{0}] of dynamic table
+ hpackdecoder.useStatic=Using header from index [{0}] of static table
+ hpackdecoder.zeroNotValidHeaderTableIndex=Zero is not a valid header table index
+ 
+-hpackhuffman.decode.illegalCharacterName=The illegal [{0}] character was found when decoding an HTTP/2 header field name
+-hpackhuffman.decode.illegalCharacterValue=The illegal [{0}] character was found when decoding an HTTP/2 header field value
+-hpackhuffman.decode.illegalCharacterValue.end=The illegal [{0}] character was found when decoding the final character in an HTTP/2 header field value
+-hpackhuffman.decode.illegalCharacterValue.start=The illegal [{0}] character was found when decoding the first character in an HTTP/2 header field value
+ hpackhuffman.huffmanEncodedHpackValueDidNotEndWithEOS=Huffman encoded value in HPACK headers did not end with EOS padding
+ hpackhuffman.stringLiteralEOS=Huffman encoded value in HPACK headers contained the EOS symbol
+ hpackhuffman.stringLiteralTooMuchPadding=More than 7 bits of EOS padding were provided at the end of an Huffman encoded string literal
+@@ -108,11 +102,15 @@ stream.header.empty=Connection [{0}], Stream [{1}], Invalid empty header name
+ stream.header.inconsistentScheme=Connection [{0}], Stream [{1}], The scheme [{2}] is not consistent with the TLS enabled setting of [{3}]
+ stream.header.invalid=Connection [{0}], Stream [{1}], The header [{2}] contained invalid value [{3}]
+ stream.header.invalidConnect=Connection [{0}], Stream [{1}], The CONNECT request was invalid as neither :scheme nor :path should be present
++stream.header.name.invalidCharacter=Connection [{0}], Stream [{1}], The illegal character [{2}] was found when decoding an HTTP/2 header field name [{3}]
+ stream.header.noPath=Connection [{0}], Stream [{1}], The [:path] pseudo header was empty
+ stream.header.required=Connection [{0}], Stream [{1}], One or more required headers was missing
+ stream.header.te=Connection [{0}], Stream [{1}], HTTP header [te] is not permitted to have the value [{2}] in an HTTP/2 request
+ stream.header.unexpectedPseudoHeader=Connection [{0}], Stream [{1}], Pseudo header [{2}] received after a regular header
+ stream.header.unknownPseudoHeader=Connection [{0}], Stream [{1}], Unknown pseudo header [{2}] received
++stream.header.value.invalidCharacter=Connection [{0}], Stream [{1}], The illegal character [{2}] was found when decoding an HTTP/2 header field value [{3}]
++stream.header.value.invalidCharacter.end=Connection [{0}], Stream [{1}], The illegal final character [{2}] was found when decoding an HTTP/2 header field value [{3}]
++stream.header.value.invalidCharacter.start=Connection [{0}], Stream [{1}], The illegal first character [{2}] was found when decoding an HTTP/2 header field value [{3}]
+ stream.host.inconsistent=Connection [{0}], Stream [{1}], The host header [{2}] is inconsistent with previously provided values for host [{3}] and/or port [{4}]
+ stream.host.sni=Connection [{0}], Stream [{1}], The host header [{2}] does not match the SNI host [{3}]
+ stream.inputBuffer.copy=Copying [{0}] bytes from inBuffer to outBuffer
+--- a/java/org/apache/coyote/http2/Stream.java
++++ b/java/org/apache/coyote/http2/Stream.java
+@@ -49,6 +49,7 @@ import org.apache.tomcat.util.http.HeaderUtil;
+ import org.apache.tomcat.util.http.Method;
+ import org.apache.tomcat.util.http.MimeHeaders;
+ import org.apache.tomcat.util.http.parser.Host;
++import org.apache.tomcat.util.http.parser.HttpParser;
+ import org.apache.tomcat.util.http.parser.Priority;
+ import org.apache.tomcat.util.net.ApplicationBufferHandler;
+ import org.apache.tomcat.util.net.WriteBuffer;
+@@ -325,7 +326,63 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+             log.trace(sm.getString("stream.header.debug", getConnectionId(), getIdAsString(), name, value));
+         }
+ 
+-        // Field header names being all lower case is enforced in HpackDecoder.
++        // Validate field name
++        if (name.isEmpty()) {
++            headerException =
++                    new StreamException(sm.getString("stream.header.empty", getConnectionId(), getIdAsString()),
++                            Http2Error.PROTOCOL_ERROR, getIdAsInt());
++            // No need for further processing. The stream will be reset.
++            return;
++        }
++        for (int i = 0; i < name.length(); i++) {
++            char c = name.charAt(i);
++            // Skip pseudo headers
++            if (i == 0 && c == ':') {
++                continue;
++            }
++            if (!HttpParser.isToken(c) || Character.isUpperCase(c)) {
++                headerException =
++                        new StreamException(sm.getString("stream.header.name.invalidCharacter", getConnectionId(),
++                                getIdAsString(), Character.toString(c), name), Http2Error.PROTOCOL_ERROR, getIdAsInt());
++                // No need for further processing. The stream will be reset.
++                return;
++            }
++        }
++
++        // Validate field value
++        for (int i = 0; i < value.length(); i++) {
++            char c = value.charAt(i);
++            if (i == 0) {
++                if (!HttpParser.isFieldVChar(c)) {
++                    headerException = new StreamException(
++                            sm.getString("stream.header.value.invalidCharacter.start", getConnectionId(),
++                                    getIdAsString(), Character.toString(c), value),
++                            Http2Error.PROTOCOL_ERROR, getIdAsInt());
++                    // No need for further processing. The stream will be reset.
++                    return;
++                }
++            } else if (i == value.length() - 1) {
++                if (!HttpParser.isFieldVChar(c)) {
++                    headerException = new StreamException(
++                            sm.getString("stream.header.value.invalidCharacter.end", getConnectionId(),
++                                    getIdAsString(), Character.toString(c), value),
++                            Http2Error.PROTOCOL_ERROR, getIdAsInt());
++                    // No need for further processing. The stream will be reset.
++                    return;
++                }
++            } else {
++                if (!HttpParser.isFieldContent(c)) {
++                    headerException =
++                            new StreamException(
++                                    sm.getString("stream.header.value.invalidCharacter", getConnectionId(),
++                                            getIdAsString(), Character.toString(c), value),
++                                    Http2Error.PROTOCOL_ERROR, getIdAsInt());
++                    // No need for further processing. The stream will be reset.
++                    return;
++                }
++            }
++        }
++
+ 
+         if (HTTP_CONNECTION_SPECIFIC_HEADERS.contains(name)) {
+             headerException = new StreamException(
+@@ -351,14 +408,6 @@ class Stream extends AbstractNonZeroStream implements HeaderEmitter {
+             return;
+         }
+ 
+-        if (name.isEmpty()) {
+-            headerException =
+-                    new StreamException(sm.getString("stream.header.empty", getConnectionId(), getIdAsString()),
+-                            Http2Error.PROTOCOL_ERROR, getIdAsInt());
+-            // No need for further processing. The stream will be reset.
+-            return;
+-        }
+-
+         boolean pseudoHeader = name.charAt(0) == ':';
+ 
+         if (pseudoHeader && headerState != HEADER_STATE_PSEUDO) {
+--- a/test/org/apache/coyote/http2/TestHPackHuffman.java
++++ b/test/org/apache/coyote/http2/TestHPackHuffman.java
+@@ -38,7 +38,7 @@ public class TestHPackHuffman {
+         buf.get();
+ 
+         StringBuilder target = new StringBuilder();
+-        HPackHuffman.decode(buf, buf.remaining(), target, false);
++        HPackHuffman.decode(buf, buf.remaining(), target);
+ 
+         Assert.assertEquals("Value changed after encode/decode roundtrip", data, target.toString());
+     }
+--- a/test/org/apache/coyote/http2/TestHttp2Section_4_3.java
++++ b/test/org/apache/coyote/http2/TestHttp2Section_4_3.java
+@@ -17,16 +17,23 @@
+ package org.apache.coyote.http2;
+ 
+ import java.nio.ByteBuffer;
++import java.util.ArrayList;
++import java.util.List;
+ 
+ import org.junit.Assert;
+ import org.junit.Test;
+ 
++import org.apache.tomcat.util.http.Method;
++
+ /**
+  * Unit tests for Section 4.3 of <a href="https://tools.ietf.org/html/rfc7540">RFC 7540</a>. <br>
+  * The order of tests in this class is aligned with the order of the requirements in the RFC.
+  */
+ public class TestHttp2Section_4_3 extends Http2TestBase {
+ 
++    private static final String MARKER_HEADER_NAME = "x-marker";
++    private static final String MARKER_HEADER_VALUE = "marker-value";
++
+     @Test
+     public void testHeaderDecodingError() throws Exception {
+         // HTTP2 upgrade
+@@ -47,6 +54,160 @@ public class TestHttp2Section_4_3 extends Http2TestBase {
+     }
+ 
+ 
++    /*
++     * HTTP/2 field validation rejects invalid characters in field names and field values. The field name check has two
++     * distinct ways to fail (not a token character; a valid but upper case token character) and the field value check
++     * has three distinct ways to fail depending on the position of the invalid character (first, middle, last). Each
++     * of those five triggers has tests below for both the non-Huffman and Huffman code paths. HpackEncoder uses Huffman
++     * encoding for strings longer than five characters, provided that the encoded form is not longer than the original.
++     */
++
++    @Test
++    public void testHeaderDecodingErrorFieldNameInvalidCharacter() throws Exception {
++        // ':' is a separator so is not a valid token character.
++        doTestHeaderDecodingErrorKeepsTableInSync("x:y", "ok");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorFieldNameUpperCase() throws Exception {
++        // Upper case letters are valid token characters but are not permitted in HTTP/2 header field names.
++        doTestHeaderDecodingErrorKeepsTableInSync("Xy", "ok");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorFieldValueLeadingInvalidCharacter() throws Exception {
++        // The first character of a field value must be a field-vchar. Space is not.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-bad", " x");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorFieldValueTrailingInvalidCharacter() throws Exception {
++        // The last character of a field value must be a field-vchar. Space is not.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-bad", "x ");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorFieldValueMiddleInvalidCharacter() throws Exception {
++        // A character in the middle of a field value must be field-content. A control character is not.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-bad", "a\u0001b");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorHuffmanFieldNameTrailingSpace() throws Exception {
++        // Space is not a valid token character in a field name.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-bad ", "ok");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorHuffmanFieldNameInvalidCharacter() throws Exception {
++        // ':' is a separator so is not a valid token character.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-te:st", "ok");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorHuffmanFieldNameUpperCase() throws Exception {
++        // Upper case letters are valid token characters but are not permitted in HTTP/2 header field names.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-Te-st", "ok");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorHuffmanFieldValueLeadingInvalidCharacter() throws Exception {
++        // The first character of a field value must be a field-vchar. Space is not.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-bad", " x-value");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorHuffmanFieldValueTrailingInvalidCharacter() throws Exception {
++        // The last character of a field value must be a field-vchar. Space is not.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-bad", "x-value ");
++    }
++
++
++    @Test
++    public void testHeaderDecodingErrorHuffmanFieldValueMiddleInvalidCharacter() throws Exception {
++        // A character in the middle of a field value must be field-content. A control character is not.
++        doTestHeaderDecodingErrorKeepsTableInSync("x-bad", "x-value-test-\u0001-value-test");
++    }
++
++
++    /**
++     * A header field ({@code badHeaderName} / {@code badHeaderValue}) that {@link Stream#emitHeader(String, String)}
++     * rejects is a stream error (RFC 9113, section 8.2.1), not a connection error, so the connection must remain open
++     * and usable. However, the invalid field is followed, in the same header block, by another header
++     * ({@link #MARKER_HEADER_NAME}) that adds an entry to the HPACK dynamic table. The decoder must still process that
++     * later header (i.e. keep going after detecting the invalid field) so its dynamic table stays in sync with the
++     * encoder used by the client. This is verified with a second, otherwise unrelated, request that references that
++     * dynamic table entry.
++     *
++     * @param badHeaderName  The (possibly invalid) name to use for the invalid header
++     * @param badHeaderValue The (possibly invalid) value to use for the invalid header
++     */
++    private void doTestHeaderDecodingErrorKeepsTableInSync(String badHeaderName, String badHeaderValue)
++            throws Exception {
++        // HTTP2 upgrade
++        http2Connect();
++
++        byte[] frameHeader = new byte[9];
++        ByteBuffer headersPayload = ByteBuffer.allocate(128);
++
++        List<Header> headers = new ArrayList<>(6);
++        headers.add(new Header(":method", Method.GET));
++        headers.add(new Header(":scheme", "http"));
++        headers.add(new Header(":path", "/simple"));
++        headers.add(new Header(":authority", "localhost:" + getPort()));
++        headers.add(new Header(badHeaderName, badHeaderValue));
++        // Valid header that follows the invalid one in the same header
++        // block. It must still be added to the dynamic table.
++        headers.add(new Header(MARKER_HEADER_NAME, MARKER_HEADER_VALUE));
++
++        buildGetRequest(frameHeader, headersPayload, null, headers, 3);
++        writeFrame(frameHeader, headersPayload);
++
++        // The stream must be reset. The connection must remain open.
++        parser.readFrame();
++        Assert.assertEquals("Stream (not connection) error expected for an invalid header field",
++                "3-RST-[" + Http2Error.PROTOCOL_ERROR.getCode() + "]\n", output.getTrace());
++        output.clearTrace();
++
++        // A second, unrelated request on a new stream. Because it uses the
++        // same name/value pair as the marker header above, the test's
++        // HpackEncoder (correctly simulating a real HTTP/2 client) will
++        // reference its dynamic table entry rather than re-sending it as a
++        // literal. This will only decode correctly on the server if the
++        // HPACK decoder kept processing the earlier header block far enough
++        // to add that entry to its own dynamic table, despite the stream
++        // being reset.
++        byte[] frameHeader2 = new byte[9];
++        ByteBuffer headersPayload2 = ByteBuffer.allocate(128);
++
++        List<Header> headers2 = new ArrayList<>(5);
++        headers2.add(new Header(":method", Method.GET));
++        headers2.add(new Header(":scheme", "http"));
++        headers2.add(new Header(":path", "/simple"));
++        headers2.add(new Header(":authority", "localhost:" + getPort()));
++        headers2.add(new Header(MARKER_HEADER_NAME, MARKER_HEADER_VALUE));
++
++        buildGetRequest(frameHeader2, headersPayload2, null, headers2, 5);
++        writeFrame(frameHeader2, headersPayload2);
++
++        parser.readFrame();
++        Assert.assertFalse(output.getTrace(), output.getTrace().contains("RST"));
++        parser.readFrame();
++
++        Assert.assertEquals("HPACK dynamic table should still be in sync with the client",
++                getSimpleResponseTrace(5), output.getTrace());
++    }
++
++
+     @Test
+     public void testHeaderContinuationContiguous() throws Exception {
+         // HTTP2 upgrade
+@@ -65,6 +226,7 @@ public class TestHttp2Section_4_3 extends Http2TestBase {
+ 
+         // headers, body
+         parser.readFrame();
++        Assert.assertFalse(output.getTrace(), output.getTrace().contains("RST"));
+         parser.readFrame();
+ 
+         Assert.assertEquals(getSimpleResponseTrace(3), output.getTrace());
+
+--- a/java/org/apache/catalina/realm/JNDIRealm.java
++++ b/java/org/apache/catalina/realm/JNDIRealm.java
+@@ -149,6 +149,7 @@
+     private static final String NULL_USER_ROLE_ATTRIBUTE_PLACEHOLDER = "tomcat-unset-ignore";
+ 
+     private static final String AUTHENTICATION_NAME_GSSAPI = "GSSAPI";
++    private static final String AUTHENTICATION_NAME_SIMPLE = "simple";
+ 
+ 
+     /**
+@@ -1980,10 +1981,8 @@
+         // Elicit an LDAP bind operation using the provided user credentials
+         try {
+             userCredentialsAdd(context, dn, credentials);
+-            // Need to make sure GSSAPI SASL authentication is not used if configured
+-            if (AUTHENTICATION_NAME_GSSAPI.equals(preservedEnvironment.get(Context.SECURITY_AUTHENTICATION))) {
+-                context.removeFromEnvironment(Context.SECURITY_AUTHENTICATION);
+-            }
++            // Check credentials by performing a simple bind
++            context.addToEnvironment(Context.SECURITY_AUTHENTICATION, AUTHENTICATION_NAME_SIMPLE);
+             if (containerLog.isTraceEnabled()) {
+                 containerLog.trace("  binding as " + dn);
+             }
+@@ -1994,7 +1993,7 @@
+                 containerLog.trace("  bind attempt failed", e);
+             }
+         } finally {
+-            // Restore GSSAPI SASL if previously configured
++            // Restore any previously configured authentication mechanism
+             restoreEnvironmentParameter(context, Context.SECURITY_AUTHENTICATION, preservedEnvironment);
+             userCredentialsRemove(context);
+         }
+
+--- a/java/org/apache/catalina/connector/OutputBuffer.java
++++ b/java/org/apache/catalina/connector/OutputBuffer.java
+@@ -440,11 +440,15 @@
+         /*
+          * Handle the requirements of section 5.7 of the Servlet specification - Closure of the Response Object.
+          *
+-         * Currently, this just handles the simple case. There is work in progress to better define what should happen
+-         * if an attempt is made to write > content-length bytes. When that work is complete, this is likely where the
+-         * implementation will end up.
++         * For the blocking case, the output is closed once content-length bytes have been written.
++         *
++         * For the non-blocking case, there may be bytes buffered at the SocketWrapper so only close the output if an
++         * attempt is made to write more the content-length bytes.
++         *
++         * There is work in progress to better define what should happen if an attempt is made to write > content-length
++         * bytes. When that work is complete, this is likely where the implementation will end up.
+          */
+-        if (contentLength != -1 && bytesWritten >= contentLength) {
++        if (contentLength != -1 && (bytesWritten == contentLength && isBlocking() || bytesWritten > contentLength)) {
+             close();
+         }
+     }
+--- a/java/org/apache/coyote/ajp/AjpProcessor.java
++++ b/java/org/apache/coyote/ajp/AjpProcessor.java
+@@ -1028,6 +1028,9 @@
+             refillReadBuffer(true);
+         }
+ 
++        // Make sure the non-blocking write buffer is empty before sending the end message.
++        socketWrapper.flush(true);
++
+         // Add the end message
+         if (getErrorState().isError()) {
+             socketWrapper.write(true, endAndCloseMessageArray, 0, endAndCloseMessageArray.length);
+
+--- a/java/org/apache/tomcat/websocket/server/LocalStrings.properties
++++ b/java/org/apache/tomcat/websocket/server/LocalStrings.properties
+@@ -26,6 +26,7 @@ serverContainer.servletContextMissing=No ServletContext was specified
+ upgradeUtil.incompatibleRsv=Extensions were specified that have incompatible RSV bit usage
+ upgradeUtil.pojoMapFail=Unable to complete method mapping for POJO class [{0}]
+ 
++uriTemplate.candidateParameters=Candidate URIs are not permitted to contain URI template parameters
+ uriTemplate.duplicateParameter=The parameter [{0}] appears more than once in the path which is not permitted
+ uriTemplate.invalidPath=The path [{0}] is not valid.
+ uriTemplate.invalidSegment=The segment [{0}] is not valid in the provided path [{1}]
+--- a/java/org/apache/tomcat/websocket/server/UriTemplate.java
++++ b/java/org/apache/tomcat/websocket/server/UriTemplate.java
+@@ -48,6 +48,10 @@ public class UriTemplate {
+      * @throws DeploymentException if the path is invalid
+      */
+     public UriTemplate(String path) throws DeploymentException {
++        this(path, true);
++    }
++
++    public UriTemplate(String path, boolean parseParameters) throws DeploymentException {
+ 
+         if (path == null || !path.startsWith("/") || path.contains("/../") || path.contains("/./") ||
+                 path.contains("//")) {
+@@ -74,19 +78,23 @@ public class UriTemplate {
+             }
+             normalized.append('/');
+             int index = -1;
+-            if (segment.startsWith("{") && segment.endsWith("}")) {
+-                index = segmentCount;
+-                segment = segment.substring(1, segment.length() - 1);
+-                normalized.append('{');
+-                normalized.append(paramCount++);
+-                normalized.append('}');
+-                if (!paramNames.add(segment)) {
+-                    throw new DeploymentException(sm.getString("uriTemplate.duplicateParameter", segment));
++            if (parseParameters) {
++                if (segment.startsWith("{") && segment.endsWith("}")) {
++                    index = segmentCount;
++                    segment = segment.substring(1, segment.length() - 1);
++                    normalized.append('{');
++                    normalized.append(paramCount++);
++                    normalized.append('}');
++                    if (!paramNames.add(segment)) {
++                        throw new DeploymentException(sm.getString("uriTemplate.duplicateParameter", segment));
++                    }
++                } else {
++                    if (segment.contains("{") || segment.contains("}")) {
++                        throw new DeploymentException(sm.getString("uriTemplate.invalidSegment", segment, path));
++                    }
++                    normalized.append(segment);
+                 }
+             } else {
+-                if (segment.contains("{") || segment.contains("}")) {
+-                    throw new DeploymentException(sm.getString("uriTemplate.invalidSegment", segment, path));
+-                }
+                 normalized.append(segment);
+             }
+             this.segments.add(new Segment(index, segment));
+@@ -106,6 +114,11 @@ public class UriTemplate {
+      */
+     public Map<String,String> match(UriTemplate candidate) {
+ 
++        // Candidate URIs should not contain parameters.
++        if (candidate.hasParameters) {
++            throw new IllegalStateException(sm.getString("uriTemplate.candidateParameters"));
++        }
++
+         Map<String,String> result = new HashMap<>();
+ 
+         // Should not happen but for safety
+--- a/java/org/apache/tomcat/websocket/server/WsServerContainer.java
++++ b/java/org/apache/tomcat/websocket/server/WsServerContainer.java
+@@ -294,7 +294,7 @@ public class WsServerContainer extends WsWebSocketContainer implements ServerCon
+         // No exact match. Need to look for template matches.
+         UriTemplate pathUriTemplate;
+         try {
+-            pathUriTemplate = new UriTemplate(path);
++            pathUriTemplate = new UriTemplate(path, false);
+         } catch (DeploymentException e) {
+             // Path is not valid so can't be matched to a WebSocketEndpoint
+             return null;
+--- a/test/org/apache/tomcat/websocket/server/TestUriTemplate.java
++++ b/test/org/apache/tomcat/websocket/server/TestUriTemplate.java
+@@ -227,4 +227,72 @@ public class TestUriTemplate {
+         @SuppressWarnings("unused")
+         UriTemplate t = new UriTemplate("//b");
+     }
++
++
++    @Test
++    public void testCandidateBraces01() throws Exception {
++        UriTemplate t = new UriTemplate("/a/b/{c}");
++        Map<String, String> result = t.match(new UriTemplate("/a/{b}/other", false));
++        Assert.assertNull(result);
++    }
++
++
++    @Test
++    public void testCandidateBraces02() throws Exception {
++        UriTemplate t = new UriTemplate("/a/b/{c}");
++        Map<String, String> result = t.match(new UriTemplate("/a/b/{other}", false));
++        Assert.assertNotNull(result);
++        Assert.assertEquals(1, result.size());
++        Assert.assertEquals("{other}", result.get("c"));
++    }
++
++
++    @Test
++    public void testCandidateBraces03() throws Exception {
++        UriTemplate t = new UriTemplate("/a/b/{c}");
++        Map<String, String> result = t.match(new UriTemplate("/a/b/ot{h}er", false));
++        Assert.assertNotNull(result);
++        Assert.assertEquals(1, result.size());
++        Assert.assertEquals("ot{h}er", result.get("c"));
++    }
++
++
++    @Test
++    public void testCandidateBraces04() throws Exception {
++        UriTemplate t = new UriTemplate("/a/b/{c}");
++        Map<String, String> result = t.match(new UriTemplate("/a/b/{other", false));
++        Assert.assertNotNull(result);
++        Assert.assertEquals(1, result.size());
++        Assert.assertEquals("{other", result.get("c"));
++    }
++
++
++    @Test
++    public void testCandidateBraces05() throws Exception {
++        UriTemplate t = new UriTemplate("/a/b/{c}");
++        Map<String, String> result = t.match(new UriTemplate("/a/b/ot{her", false));
++        Assert.assertNotNull(result);
++        Assert.assertEquals(1, result.size());
++        Assert.assertEquals("ot{her", result.get("c"));
++    }
++
++
++    @Test
++    public void testCandidateBraces06() throws Exception {
++        UriTemplate t = new UriTemplate("/a/b/{c}");
++        Map<String, String> result = t.match(new UriTemplate("/a/b/other}", false));
++        Assert.assertNotNull(result);
++        Assert.assertEquals(1, result.size());
++        Assert.assertEquals("other}", result.get("c"));
++    }
++
++
++    @Test
++    public void testCandidateBraces07() throws Exception {
++        UriTemplate t = new UriTemplate("/a/b/{c}");
++        Map<String, String> result = t.match(new UriTemplate("/a/b/oth}er", false));
++        Assert.assertNotNull(result);
++        Assert.assertEquals(1, result.size());
++        Assert.assertEquals("oth}er", result.get("c"));
++    }
+ }
+
+--- a/java/org/apache/coyote/http2/HpackDecoder.java
++++ b/java/org/apache/coyote/http2/HpackDecoder.java
+@@ -17,6 +17,7 @@
+ package org.apache.coyote.http2;
+ 
+ import java.nio.ByteBuffer;
++import java.util.concurrent.atomic.AtomicReference;
+ 
+ import org.apache.juli.logging.Log;
+ import org.apache.juli.logging.LogFactory;
+@@ -36,7 +37,7 @@ public class HpackDecoder {
+     /**
+      * The object that receives the headers that are emitted from this decoder
+      */
+-    private HeaderEmitter headerEmitter;
++    private final AtomicReference<HeaderEmitter> headerEmitter = new AtomicReference<>();
+ 
+     /**
+      * The header table
+@@ -409,12 +410,12 @@ public class HpackDecoder {
+ 
+ 
+     HeaderEmitter getHeaderEmitter() {
+-        return headerEmitter;
++        return headerEmitter.get();
+     }
+ 
+ 
+     void setHeaderEmitter(HeaderEmitter headerEmitter) {
+-        this.headerEmitter = headerEmitter;
++        this.headerEmitter.set(headerEmitter);
+         // Reset limit tracking
+         headerCount = 0;
+         countedCookie = false;
+@@ -422,8 +423,14 @@ public class HpackDecoder {
+     }
+ 
+ 
++    void compareAndSetHeaderEmitter(HeaderEmitter expectedValue, HeaderEmitter newValue) {
++        // Only used in stream replacement so should not reset limits
++        this.headerEmitter.compareAndSet(expectedValue, newValue);
++    }
++
++
+     void clearHeaderEmitter() {
+-        headerEmitter = null;
++        headerEmitter.set(null);
+     }
+ 
+ 
+@@ -458,7 +465,7 @@ public class HpackDecoder {
+             if (log.isTraceEnabled()) {
+                 log.trace(sm.getString("hpackdecoder.emitHeader", name, value));
+             }
+-            headerEmitter.emitHeader(name, value);
++            headerEmitter.get().emitHeader(name, value);
+         }
+     }
+ 
+--- a/java/org/apache/coyote/http2/Http2UpgradeHandler.java
++++ b/java/org/apache/coyote/http2/Http2UpgradeHandler.java
+@@ -1984,6 +1984,7 @@ class Http2UpgradeHandler extends AbstractStream implements InternalHttpUpgradeH
+                 log.trace(sm.getString("upgradeHandler.replace.first", getConnectionId(), original.getIdAsString()));
+             }
+             streams.put(original.getIdentifier(), replacement);
++            getHpackDecoder().compareAndSetHeaderEmitter((Stream) current, HEADER_SINK);
+ 
+             int made;
+             original.windowAllocationLock.lock();
+
+--- a/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
++++ b/java/org/apache/tomcat/util/net/openssl/panama/OpenSSLEngine.java
+@@ -1198,7 +1198,9 @@
+     private static int processOCSP(EngineState state, MemorySegment /* X509_STORE_CTX */ x509ctx) {
+         int ocspResponse = V_OCSP_CERTSTATUS_UNKNOWN();
+         MemorySegment x509 = X509_STORE_CTX_get_current_cert(x509ctx);
+-        if (!MemorySegment.NULL.equals(x509)) {
++        if (MemorySegment.NULL.equals(x509)) {
++            X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
++        } else {
+             // No need to check cert->valid, because ssl_verify_OCSP() only
+             // is called if OpenSSL already successfully verified the certificate
+             // (parameter "ok" in SSL_callback_SSL_verify() must be true).
+@@ -1220,9 +1222,12 @@
+                                 issuer = x509IssuerPointer.get(ValueLayout.ADDRESS, 0);
+                             }
+                         }
+-                        if (!MemorySegment.NULL.equals(issuer)) {
++                        if (MemorySegment.NULL.equals(issuer)) {
++                            X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
++                        } else {
+                             // sslutils.c ssl_ocsp_request(x509, issuer, x509ctx);
+                             int nid = X509_get_ext_by_NID(x509, NID_info_access(), -1);
++                            boolean requestAttempted = false;
+                             if (nid >= 0) {
+                                 MemorySegment ext = X509_get_ext(x509, nid);
+                                 MemorySegment os = X509_EXTENSION_get_data(ext);
+@@ -1241,9 +1246,11 @@
+                                 }
+                                 if (!urls.isEmpty()) {
+                                     // Use OpenSSL to build OCSP request
++                                    int errorStatusForUnknownResponse = X509_V_ERR_UNABLE_TO_GET_CRL();
+                                     for (String urlString : urls) {
+                                         try {
+                                             URL url = (new URI(urlString)).toURL();
++                                            requestAttempted = true;
+                                             ocspResponse =
+                                                     processOCSPRequest(state, url, issuer, x509, x509ctx, localArena);
+                                             if (log.isDebugEnabled()) {
+@@ -1252,13 +1259,39 @@
+                                             }
+                                         } catch (MalformedURLException | URISyntaxException e) {
+                                             log.warn(sm.getString("engine.invalidOCSPURL", urlString));
++                                            // No response to process so skip to next URL
++                                            continue;
+                                         }
+-                                        if (ocspResponse != V_OCSP_CERTSTATUS_UNKNOWN()) {
++                                        if (ocspResponse == V_OCSP_CERTSTATUS_GOOD()) {
++                                            // Clear any error associated with an unknown response from a previous URL
++                                            X509_STORE_CTX_set_error(x509ctx, X509_V_OK());
+                                             break;
++                                        } else if (ocspResponse == V_OCSP_CERTSTATUS_REVOKED()) {
++                                            // Error will reflect this failure
++                                            break;
++                                        } else {
++                                            /*
++                                             * Unknown.
++                                             *
++                                             * Should only soft-fail if all the errors from unknown responses are
++                                             * soft-failable. If there is more than one non-soft-failable error, the
++                                             * first one is reported.
++                                             */
++                                            if (errorStatusForUnknownResponse != X509_V_ERR_UNABLE_TO_GET_CRL()) {
++                                                // Prior non-soft-failable error. Reset error status
++                                                X509_STORE_CTX_set_error(x509ctx, errorStatusForUnknownResponse);
++                                            } else {
++                                                errorStatusForUnknownResponse = X509_STORE_CTX_get_error(x509ctx);
++                                            }
+                                         }
+                                     }
+                                 }
+                             }
++                            if (!requestAttempted) {
++                                // The AIA extension is not present, no URLs were found, or none of the URLs found
++                                // could be used to make an OCSP request.
++                                X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
++                            }
+                         }
+                     } finally {
+                         if (!openssl_h_Compatibility.OPENSSL || openssl_h_Compatibility.OPENSSL3) {
+@@ -1307,6 +1340,7 @@
+             return V_OCSP_CERTSTATUS_UNKNOWN();
+         }
+         MemorySegment ocspRequest = MemorySegment.NULL;
++        MemorySegment ocspRequestDer = MemorySegment.NULL;
+         MemorySegment ocspResponse = MemorySegment.NULL;
+         MemorySegment id;
+         MemorySegment ocspOneReq;
+@@ -1330,19 +1364,19 @@
+                 return V_OCSP_CERTSTATUS_UNKNOWN();
+             }
+             OCSP_request_add1_nonce(ocspRequest, (char) 0, -1);
+-            MemorySegment bufPointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
+-            int requestLength = i2d_OCSP_REQUEST(ocspRequest, bufPointer);
++            MemorySegment ocspRequestDerPointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
++            int requestLength = i2d_OCSP_REQUEST(ocspRequest, ocspRequestDerPointer);
+             if (requestLength <= 0) {
+                 X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
+                 return V_OCSP_CERTSTATUS_UNKNOWN();
+             }
+-            MemorySegment buf = bufPointer.get(ValueLayout.ADDRESS, 0);
++            ocspRequestDer = ocspRequestDerPointer.get(ValueLayout.ADDRESS, 0);
+             // HTTP request with the following header:
+             // POST urlPath HTTP/1.1
+             // Host: urlHost:urlPort
+             // Content-Type: application/ocsp-request
+             // Content-Length: ocspRequestData.length
+-            byte[] ocspRequestData = buf.reinterpret(requestLength, localArena, null).toArray(ValueLayout.JAVA_BYTE);
++            byte[] ocspRequestDerData = ocspRequestDer.reinterpret(requestLength, localArena, null).toArray(ValueLayout.JAVA_BYTE);
+             connection = (HttpURLConnection) url.openConnection();
+             connection.setConnectTimeout(state.ocspTimeout);
+             connection.setReadTimeout(state.ocspTimeout);
+@@ -1352,7 +1386,7 @@
+             connection.setFixedLengthStreamingMode(requestLength);
+             connection.setRequestProperty("Content-Type", "application/ocsp-request");
+             connection.connect();
+-            connection.getOutputStream().write(ocspRequestData);
++            connection.getOutputStream().write(ocspRequestDerData);
+             int responseCode = connection.getResponseCode();
+             if (responseCode != HttpURLConnection.HTTP_OK) {
+                 X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
+@@ -1362,8 +1396,8 @@
+             int read;
+             byte[] responseBuf = new byte[1024];
+             while ((read = is.read(responseBuf)) > 0) {
+-                if (baos.size() > OCSP_MAX_RESPONSE_SIZE) {
+-                    X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
++                if (read > OCSP_MAX_RESPONSE_SIZE - baos.size()) {
++                    X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_RESP_INVALID());
+                     return V_OCSP_CERTSTATUS_UNKNOWN();
+                 }
+                 baos.write(responseBuf, 0, read);
+@@ -1376,8 +1410,13 @@
+                 // Failed to get a valid response
+                 X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
+             } else {
+-                if (OCSP_response_status(ocspResponse) == OCSP_RESPONSE_STATUS_SUCCESSFUL()) {
++                int ocspResponseStatus = OCSP_response_status(ocspResponse);
++                if (ocspResponseStatus == OCSP_RESPONSE_STATUS_SUCCESSFUL()) {
+                     basicResponse = OCSP_response_get1_basic(ocspResponse);
++                    if (MemorySegment.NULL.equals(basicResponse)) {
++                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_RESP_INVALID());
++                        return V_OCSP_CERTSTATUS_UNKNOWN();
++                    }
+                     if (OCSP_check_nonce(ocspRequest, basicResponse) == 0) {
+                         X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_RESP_INVALID());
+                         return V_OCSP_CERTSTATUS_UNKNOWN();
+@@ -1400,6 +1439,10 @@
+                     MemorySegment nextUpdatePointer = localArena.allocateFrom(ValueLayout.ADDRESS, MemorySegment.NULL);
+                     int status = OCSP_single_get0_status(singleResponse, MemorySegment.NULL, MemorySegment.NULL,
+                             thisUpdatePointer, nextUpdatePointer);
++                    if (status == -1) {
++                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_RESP_INVALID());
++                        return V_OCSP_CERTSTATUS_UNKNOWN();
++                    }
+                     if (OCSP_check_validity(thisUpdatePointer.get(ValueLayout.ADDRESS, 0),
+                             nextUpdatePointer.get(ValueLayout.ADDRESS, 0), OCSP_MAX_SKEW, -1) <= 0) {
+                         X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_NOT_YET_VALID());
+@@ -1410,9 +1453,17 @@
+                         X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_OCSP_HAS_EXPIRED());
+                         return V_OCSP_CERTSTATUS_UNKNOWN();
+                     }
++                    if (status == V_OCSP_CERTSTATUS_UNKNOWN()) {
++                        X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
++                    }
+                     return status;
+-                } else {
++                } else if (ocspResponseStatus == OCSP_RESPONSE_STATUS_TRYLATER() ||
++                        ocspResponseStatus == OCSP_RESPONSE_STATUS_INTERNALERROR()) {
++                    // Soft-failable: consistent with JSSE
+                     X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_UNABLE_TO_GET_CRL());
++                } else {
++                    // Not soft-failable: consistent with JSSE
++                    X509_STORE_CTX_set_error(x509ctx, X509_V_ERR_APPLICATION_VERIFICATION());
+                 }
+             }
+         } catch (IOException ioe) {
+@@ -1427,6 +1478,7 @@
+             OCSP_BASICRESP_free(basicResponse);
+             OCSP_RESPONSE_free(ocspResponse);
+             OCSP_REQUEST_free(ocspRequest);
++            OPENSSL_free(ocspRequestDer);
+             if (connection != null) {
+                 connection.disconnect();
+             }
+--- a/java/org/apache/tomcat/util/openssl/openssl_h.java
++++ b/java/org/apache/tomcat/util/openssl/openssl_h.java
+@@ -896,6 +896,56 @@
+         return OCSP_RESPONSE_STATUS_SUCCESSFUL;
+     }
+ 
++    private static final int OCSP_RESPONSE_STATUS_MALFORMEDREQUEST = (int) 1L;
++
++    /**
++     * {@snippet lang = c : * #define OCSP_RESPONSE_STATUS_MALFORMEDREQUEST 1
++     * }
++     */
++    public static int OCSP_RESPONSE_STATUS_MALFORMEDREQUEST() {
++        return OCSP_RESPONSE_STATUS_MALFORMEDREQUEST;
++    }
++
++    private static final int OCSP_RESPONSE_STATUS_INTERNALERROR = (int) 2L;
++
++    /**
++     * {@snippet lang = c : * #define OCSP_RESPONSE_STATUS_INTERNALERROR 2
++     * }
++     */
++    public static int OCSP_RESPONSE_STATUS_INTERNALERROR() {
++        return OCSP_RESPONSE_STATUS_INTERNALERROR;
++    }
++
++    private static final int OCSP_RESPONSE_STATUS_TRYLATER = (int) 3L;
++
++    /**
++     * {@snippet lang = c : * #define OCSP_RESPONSE_STATUS_TRYLATER 3
++     * }
++     */
++    public static int OCSP_RESPONSE_STATUS_TRYLATER() {
++        return OCSP_RESPONSE_STATUS_TRYLATER;
++    }
++
++    private static final int OCSP_RESPONSE_STATUS_SIGREQUIRED = (int) 5L;
++
++    /**
++     * {@snippet lang = c : * #define OCSP_RESPONSE_STATUS_SIGREQUIRED 5
++     * }
++     */
++    public static int OCSP_RESPONSE_STATUS_SIGREQUIRED() {
++        return OCSP_RESPONSE_STATUS_SIGREQUIRED;
++    }
++
++    private static final int OCSP_RESPONSE_STATUS_UNAUTHORIZED = (int) 6L;
++
++    /**
++     * {@snippet lang = c : * #define OCSP_RESPONSE_STATUS_UNAUTHORIZED 6
++     * }
++     */
++    public static int OCSP_RESPONSE_STATUS_UNAUTHORIZED() {
++        return OCSP_RESPONSE_STATUS_UNAUTHORIZED;
++    }
++
+     private static final int V_OCSP_CERTSTATUS_GOOD = (int) 0L;
+ 
+     /**
+--- a/webapps/docs/config/http.xml
++++ b/webapps/docs/config/http.xml
+@@ -1495,13 +1495,15 @@
+     </attribute>
+ 
+     <attribute name="ocspSoftFail" required="false">
+-      <p>If an OCSP responder returns an error, the TLS handshake will always
+-      fail and a TLS connection will not be established. If the OCSP responder
+-      is unreachable or otherwise unavailable, this setting determines whether
+-      the handshake completes or fails. If <code>true</code>, the handskahe will
+-      complete and a TLS connection will be established when the OCSP responder
+-      is unavailable. If <code>false</code>, the handshake will fail and no TLS
+-      connection will be established.</p>
++      <p>If an OCSP responder reports that the certificate is invalid, the TLS
++      handshake will always fail and a TLS connection will not be established.
++      If Tomcat is unable to create the OCSP request, the OCSP responder is
++      unreachable (network timeout or non HTTP 200 response), the OCSP
++      responder is unavailable (try later response) or the OCSP responder
++      reports an internal error this setting determines whether the handshake
++      completes or fails. If <code>true</code>, the handshake will complete and
++      a TLS connection will be established. If <code>false</code>, the handshake
++      will fail and no TLS connection will be established.</p>
+       <p>If not specified, the default value of <code>true</code> will be
+       used.</p>
+     </attribute>
