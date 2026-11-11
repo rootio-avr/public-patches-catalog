@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-45019
+- CVE-2026-45018
 
 ## How to Apply:
 1. Clone or download the source code for chainlit
