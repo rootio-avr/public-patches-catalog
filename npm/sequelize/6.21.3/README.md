@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-30951
+- GHSA-8mwq-mj73-qv68
 - CVE-2023-22578
 - CVE-2026-69240
 - CVE-2023-22579
