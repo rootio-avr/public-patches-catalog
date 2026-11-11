@@ -7,6 +7,7 @@ unknown
 - CVE-2023-25813
 - CVE-2019-10748
 - CVE-2019-10752
+- GHSA-8mwq-mj73-qv68
 
 ## How to Apply:
 1. Clone or download the source code for sequelize
