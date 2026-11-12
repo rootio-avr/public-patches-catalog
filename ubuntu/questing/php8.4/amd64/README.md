@@ -1,6 +1,6 @@
-# php8.4 : 8.4.11-1ubuntu1.2.aikido.1
+# php8.4 : 8.4.11-1ubuntu1.2.aikido.2
 
-This patch is based on php8.4 version 8.4.11-1ubuntu1.2.aikido.1, which is available at:
+This patch is based on php8.4 version 8.4.11-1ubuntu1.2.aikido.2, which is available at:
 https://sources.debian.org/src/php8.4/8.4.11-1ubuntu1.2/
 
 ## Affected CVEs:
