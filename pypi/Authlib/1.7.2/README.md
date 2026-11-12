@@ -8,6 +8,7 @@ unknown
 - CVE-2026-114615
 - CVE-2026-114616
 - CVE-2026-116672
+- GHSA-6m87-8wg6-hh8w
 
 ## How to Apply:
 1. Clone or download the source code for Authlib
