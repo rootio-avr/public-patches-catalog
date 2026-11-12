@@ -6,6 +6,8 @@ unknown
 ## Affected CVEs:
 - CVE-2026-30951
 - CVE-2023-25813
+- CVE-2026-69240
+- CVE-2023-22579
 
 ## How to Apply:
 1. Clone or download the source code for sequelize
