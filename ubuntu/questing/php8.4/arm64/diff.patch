@@ -1,0 +1,783 @@
+Description: CVE-2026-109619 - Reset request-owned global state that can survive a bailout
+ PHP2Shell (GHSA-6wmf-4rv5-p3rp, same upstream fix as CVE-2026-109618 /
+ GHSA-w8hw-w9fx-j79w): a request that is aborted during startup (for example
+ by an out-of-memory bailout while the multipart body is parsed) skips the
+ normal request shutdown and leaves pointers into the freed request heap in
+ persistent globals. The next request handled by the same worker reads them
+ before RINIT (session upload progress, early INI diagnostics), giving a heap
+ use-after-free.
+ .
+ Scoped backport of the state-reset core of php-src 506e87fa for 8.4.11:
+  - zend_execute_API.c: reset user error/exception handlers, recorded errors,
+    EG(exception), error_handling and the object store after shutdown.
+  - main.c: clear http_globals, the last error and PG(modules_activated) at
+    request shutdown, reset serialize/unserialize/URL rewriter state in
+    php_request_startup() (php_basic_early_rinit()), and do not discard
+    output buffers while a handler is running.
+  - session: re-initialise the session globals when an upload starts, ignore
+    request_parse_body(), stop on a failed session initialisation, never run
+    user code (autoload, __wakeup, __unserialize) while the upload progress
+    handler decodes the session and drop the $_SESSION it registers.
+  - opcache: publish CE cache slots in interned strings only once
+    ZCSG(map_ptr_last) covers them, so a bailout cannot leave slots that
+    other processes will re-allocate.
+ The fallible-allocation / UnwindExit machinery of the full upstream commit is
+ not backported.
+ .
+ Adds ext/session/tests/rfc1867_no_user_code.phpt and updates
+ rfc1867_sid_invalid.phpt for the changed failure handling.
+
+Origin: backport, https://github.com/php/php-src/commit/506e87fa7dcdd306975e5b8f8265ee03527aacbf
+Bug: https://github.com/php/php-src/security/advisories/GHSA-6wmf-4rv5-p3rp
+Author: Root.io Patch Bot <patches@root.io>
+Last-Update: 2026-10-25
+---
+--- a/Zend/zend_execute_API.c
++++ b/Zend/zend_execute_API.c
+@@ -419,10 +419,24 @@
+ 		}
+ #endif
+ 	} else {
++		/* may be used by zend_error_zstr_at before init_executor */
++		ZVAL_UNDEF(&EG(user_error_handler));
++		ZVAL_UNDEF(&EG(user_exception_handler));
++		memset(&EG(user_error_handlers_error_reporting), 0, sizeof(EG(user_error_handlers_error_reporting)));
++		memset(&EG(user_error_handlers), 0, sizeof(EG(user_error_handlers)));
++		memset(&EG(user_exception_handlers), 0, sizeof(EG(user_exception_handlers)));
++
+ 		zend_hash_discard(EG(zend_constants), EG(persistent_constants_count));
+ 	}
+ 
+ 	zend_objects_store_free_object_storage(&EG(objects_store), fast_shutdown);
++
++	/* may be used by zend_error_zstr_at before init_executor */
++	EG(record_errors) = false;
++	EG(num_errors) = 0;
++	EG(errors) = NULL;
++	EG(error_handling) = EH_NORMAL;
++	EG(exception) = NULL;
+ }
+ 
+ void shutdown_executor(void) /* {{{ */
+@@ -457,6 +471,8 @@
+ 		 */
+ 		zend_hash_discard(EG(function_table), EG(persistent_functions_count));
+ 		zend_hash_discard(EG(class_table), EG(persistent_classes_count));
++		EG(objects_store).object_buckets = NULL;
++		EG(objects_store).top = 1;
+ 	} else {
+ 		zend_vm_stack_destroy();
+ 
+--- a/ext/opcache/ZendAccelerator.c
++++ b/ext/opcache/ZendAccelerator.c
+@@ -2405,6 +2405,7 @@
+ 	}
+ 
+ 	zend_map_ptr_extend(ZCSG(map_ptr_last));
++	zend_accel_pending_ce_cache_begin();
+ 
+ #if ZEND_MM_NEED_EIGHT_BYTE_REALIGNMENT
+ 	/* Align to 8-byte boundary */
+@@ -2464,6 +2465,7 @@
+ 	EG(errors) = NULL;
+ 
+ 	ZCSG(map_ptr_last) = CG(map_ptr_last);
++	zend_accel_pending_ce_cache_commit();
+ 
+ 	zend_shared_alloc_destroy_xlat_table();
+ 
+@@ -2784,6 +2786,9 @@
+ 		zend_string_release_ex(ZCG(cwd), 0);
+ 		ZCG(cwd) = NULL;
+ 	}
++
++	/* A persist window left through a bailout never published its slots */
++	zend_accel_pending_ce_cache_discard();
+ 
+ 	if (!ZCG(enabled) || !accel_startup_ok) {
+ 		return SUCCESS;
+--- a/ext/opcache/ZendAccelerator.h
++++ b/ext/opcache/ZendAccelerator.h
+@@ -227,6 +227,12 @@
+ 	zend_persistent_script *cache_persistent_script;
+ 	/* preallocated buffer for keys */
+ 	zend_string            *key;
++
++	/* CE cache slots allocated during the current persist window, keyed by the
++	 * address of the shared class name string. They are written into the
++	 * strings by zend_accel_pending_ce_cache_commit() once ZCSG(map_ptr_last)
++	 * covers them. NULL outside a persist window. */
++	HashTable              *pending_ce_cache;
+ } zend_accel_globals;
+ 
+ typedef struct _zend_string_table {
+@@ -333,7 +339,10 @@
+ 
+ zend_string* ZEND_FASTCALL accel_new_interned_string(zend_string *str);
+ 
+-uint32_t zend_accel_get_class_name_map_ptr(zend_string *type_name);
++void zend_accel_get_class_name_map_ptr(zend_string *type_name);
++void zend_accel_pending_ce_cache_begin(void);
++void zend_accel_pending_ce_cache_commit(void);
++void zend_accel_pending_ce_cache_discard(void);
+ 
+ END_EXTERN_C()
+ 
+--- a/ext/opcache/zend_file_cache.c
++++ b/ext/opcache/zend_file_cache.c
+@@ -1821,6 +1821,7 @@
+ 	bool cache_it = true;
+ 	unsigned int actual_checksum;
+ 	bool ok;
++	size_t orig_map_ptr_last = 0;
+ 
+ 	if (!full_path) {
+ 		return NULL;
+@@ -1950,6 +1951,8 @@
+ 		}
+ 		memcpy(buf, mem, info.mem_size);
+ 		zend_map_ptr_extend(ZCSG(map_ptr_last));
++		orig_map_ptr_last = CG(map_ptr_last);
++		zend_accel_pending_ce_cache_begin();
+ 	} else {
+ use_process_mem:
+ 		buf = mem;
+@@ -1968,6 +1971,10 @@
+ 	} zend_end_try();
+ 	if (!ok) {
+ 		if (cache_it) {
++			/* The slots allocated by the failed unserialization are referenced
++			 * only by the abandoned buffer, so they can be reclaimed. */
++			zend_accel_pending_ce_cache_discard();
++			CG(map_ptr_last) = orig_map_ptr_last;
+ 			zend_shared_alloc_unlock();
+ 			goto use_process_mem;
+ 		} else {
+@@ -1981,6 +1988,7 @@
+ 
+ 	if (cache_it) {
+ 		ZCSG(map_ptr_last) = CG(map_ptr_last);
++		zend_accel_pending_ce_cache_commit();
+ 		script->dynamic_members.last_used = ZCG(request_time);
+ 
+ 		zend_accel_hash_update(&ZCSG(hash), script->script.filename, 0, script);
+--- a/ext/opcache/zend_persist.c
++++ b/ext/opcache/zend_persist.c
+@@ -314,31 +314,78 @@
+ 	return ptr;
+ }
+ 
+-uint32_t zend_accel_get_class_name_map_ptr(zend_string *type_name)
++/* We delay the publishing of CE cache slots until after ZCSG(map_ptr_last) is
++ * published.
++ * CE cache slots stored in interned strings are immediately visible to other
++ * processes, so if we fail to update ZCSG(map_ptr_last) after publishing a
++ * slot (due to a bailout/exit), that slot may be re-allocated for something
++ * else by other processes. */
++void zend_accel_pending_ce_cache_begin(void)
+ {
++	ZEND_ASSERT(ZCG(locked));
++
++	/* A persist window left through a bailout caught by the caller (e.g.
++	 * opcache_compile_file()) never published its slots. Drop them. */
++	zend_accel_pending_ce_cache_discard();
++
++	ZCG(pending_ce_cache) = emalloc(sizeof(HashTable));
++	zend_hash_init(ZCG(pending_ce_cache), 8, NULL, NULL, 0);
++}
++
++void zend_accel_pending_ce_cache_commit(void)
++{
++	ZEND_ASSERT(ZCG(pending_ce_cache));
++	/* Every pending slot must be covered by ZCSG(map_ptr_last) */
++	ZEND_ASSERT(ZCSG(map_ptr_last) == CG(map_ptr_last));
++
++	ZEND_HASH_FOREACH_NUM_KEY_VAL(ZCG(pending_ce_cache), zend_ulong h, zval *zv) {
++		zend_string *type_name = (zend_string*)(uintptr_t)h;
++
++		ZEND_ASSERT(!ZSTR_HAS_CE_CACHE(type_name));
++		GC_SET_REFCOUNT(type_name, (uint32_t)Z_LVAL_P(zv));
++		GC_ADD_FLAGS(type_name, IS_STR_CLASS_NAME_MAP_PTR);
++	} ZEND_HASH_FOREACH_END();
++
++	zend_accel_pending_ce_cache_discard();
++}
++
++void zend_accel_pending_ce_cache_discard(void)
++{
++	if (ZCG(pending_ce_cache)) {
++		zend_hash_destroy(ZCG(pending_ce_cache));
++		efree(ZCG(pending_ce_cache));
++		ZCG(pending_ce_cache) = NULL;
++	}
++}
++
++void zend_accel_get_class_name_map_ptr(zend_string *type_name)
++{
+ 	uint32_t ret;
++	zval *slot;
+ 
+ 	if (zend_string_equals_literal_ci(type_name, "self") ||
+ 			zend_string_equals_literal_ci(type_name, "parent")) {
+-		return 0;
++		return;
+ 	}
+ 
+ 	/* We use type.name.gc.refcount to keep map_ptr of corresponding type */
+ 	if (ZSTR_HAS_CE_CACHE(type_name)) {
+-		return GC_REFCOUNT(type_name);
++		return;
+ 	}
+ 
+ 	if ((GC_FLAGS(type_name) & GC_IMMUTABLE)
+ 	 && (GC_FLAGS(type_name) & IS_STR_PERMANENT)) {
++		ZEND_ASSERT(ZCG(pending_ce_cache) && "Must be called inside a persist window");
++		slot = zend_hash_index_lookup(ZCG(pending_ce_cache), (zend_ulong)(uintptr_t)type_name);
++		if (Z_TYPE_P(slot) != IS_NULL) {
++			/* Already allocated earlier in this window */
++			return;
++		}
+ 		do {
+ 			ret = ZEND_MAP_PTR_NEW_OFFSET();
+ 		} while (ret <= 2);
+-		GC_SET_REFCOUNT(type_name, ret);
+-		GC_ADD_FLAGS(type_name, IS_STR_CLASS_NAME_MAP_PTR);
+-		return ret;
++		ZVAL_LONG(slot, ret);
+ 	}
+-
+-	return 0;
+ }
+ 
+ static void zend_persist_type(zend_type *type) {
+@@ -1430,6 +1477,9 @@
+ #endif
+ 
+ 	zend_map_ptr_extend(ZCSG(map_ptr_last));
++	if (for_shm) {
++		zend_accel_pending_ce_cache_begin();
++	}
+ 
+ 	zend_accel_persist_class_table(&script->script.class_table);
+ 	zend_hash_persist(&script->script.function_table);
+@@ -1457,6 +1507,7 @@
+ 	if (for_shm) {
+ 		ZCSG(map_ptr_last) = CG(map_ptr_last);
+ 		ZCSG(map_ptr_static_last) = zend_map_ptr_static_last;
++		zend_accel_pending_ce_cache_commit();
+ 	}
+ 
+ #ifdef HAVE_JIT
+--- a/ext/session/php_session.h
++++ b/ext/session/php_session.h
+@@ -203,6 +203,8 @@
+ 	bool in_save_handler; /* state if session is in save handler or not */
+ 	bool set_handler;     /* state if session module i setting handler or not */
+ 	zend_string *session_vars; /* serialized original session data */
++
++	bool in_rfc1867_update;    /* php_session_rfc1867_update() is running */
+ } php_ps_globals;
+ 
+ typedef php_ps_globals zend_ps_globals;
+--- a/ext/session/session.c
++++ b/ext/session/session.c
+@@ -108,7 +108,6 @@
+ static inline void php_rinit_session_globals(void) /* {{{ */
+ {
+ 	/* Do NOT init PS(mod_user_names) here! */
+-	/* TODO: These could be moved to MINIT and removed. These should be initialized by php_rshutdown_session_globals() always when execution is finished. */
+ 	PS(id) = NULL;
+ 	PS(session_status) = php_session_none;
+ 	PS(in_save_handler) = 0;
+@@ -118,6 +117,7 @@
+ 	PS(define_sid) = 1;
+ 	PS(session_vars) = NULL;
+ 	PS(module_number) = my_module_number;
++	PS(in_rfc1867_update) = false;
+ 	ZVAL_UNDEF(&PS(http_session_vars));
+ }
+ /* }}} */
+@@ -943,6 +943,21 @@
+ /* ***************
+    * Serializers *
+    *************** */
++
++/* The upload progress handler (php_session_rfc1867_update()) decodes and
++ * re-encodes the session during request startup, before RINIT, when no user
++ * code may run. Objects are then kept as __PHP_Incomplete_Class: no
++ * autoloading, no unserialize_callback_func, no __wakeup() or __unserialize(),
++ * and they are written back with their original class name. */
++static void php_session_unserialize_init(php_unserialize_data_t *var_hash)
++{
++	PHP_VAR_UNSERIALIZE_INIT(*var_hash);
++	if (PS(in_rfc1867_update)) {
++		/* An empty list of allowed classes disallows every class */
++		php_var_unserialize_set_allowed_classes(*var_hash, (HashTable *) &zend_empty_array);
++	}
++}
++
+ PS_SERIALIZER_ENCODE_FUNC(php_serialize) /* {{{ */
+ {
+ 	smart_str buf = {0};
+@@ -966,7 +981,7 @@
+ 	zend_string *var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
+ 
+ 	ZVAL_NULL(&session_vars);
+-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	php_session_unserialize_init(&var_hash);
+ 	result = php_var_unserialize(
+ 		&session_vars, (const unsigned char **)&val, (const unsigned char *)endptr, &var_hash);
+ 	PHP_VAR_UNSERIALIZE_DESTROY(var_hash);
+@@ -1023,7 +1038,7 @@
+ 	php_unserialize_data_t var_hash;
+ 	zval *current, rv;
+ 
+-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	php_session_unserialize_init(&var_hash);
+ 
+ 	for (p = val; p < endptr; ) {
+ 		size_t namelen = ((unsigned char)(*p)) & (~PS_BIN_UNDEF);
+@@ -1100,7 +1115,7 @@
+ 	php_unserialize_data_t var_hash;
+ 	zval *current, rv;
+ 
+-	PHP_VAR_UNSERIALIZE_INIT(var_hash);
++	php_session_unserialize_init(&var_hash);
+ 
+ 	p = val;
+ 
+@@ -2959,6 +2974,7 @@
+ 	ps_globals->mod = NULL;
+ 	ps_globals->serializer = NULL;
+ 	ps_globals->mod_data = NULL;
++	ps_globals->in_rfc1867_update = false;
+ 	ps_globals->session_status = php_session_none;
+ 	ps_globals->default_mod = NULL;
+ 	ps_globals->mod_user_implemented = 0;
+@@ -3179,8 +3195,12 @@
+ 		progress->next_update = Z_LVAL_P(progress->post_bytes_processed) + progress->update_step;
+ 	}
+ 
+-	php_session_initialize();
+-	PS(session_status) = php_session_active;
++	/* Runs before RINIT: no user code may be invoked, see php_session_unserialize_init() */
++	PS(in_rfc1867_update) = true;
++	if (php_session_initialize() == FAILURE || PS(session_status) != php_session_active) {
++		PS(in_rfc1867_update) = false;
++		return;
++	}
+ 	IF_SESSION_VARS() {
+ 		zval *sess_var = Z_REFVAL(PS(http_session_vars));
+ 		SEPARATE_ARRAY(sess_var);
+@@ -3190,18 +3210,23 @@
+ 		zend_hash_update(Z_ARRVAL_P(sess_var), progress->key.s, &progress->data);
+ 	}
+ 	php_session_flush(1);
++	PS(in_rfc1867_update) = false;
+ } /* }}} */
+ 
+ static void php_session_rfc1867_cleanup(php_session_rfc1867_progress *progress) /* {{{ */
+ {
+-	php_session_initialize();
+-	PS(session_status) = php_session_active;
++	PS(in_rfc1867_update) = true;
++	if (php_session_initialize() == FAILURE || PS(session_status) != php_session_active) {
++		PS(in_rfc1867_update) = false;
++		return;
++	}
+ 	IF_SESSION_VARS() {
+ 		zval *sess_var = Z_REFVAL(PS(http_session_vars));
+ 		SEPARATE_ARRAY(sess_var);
+ 		zend_hash_del(Z_ARRVAL_P(sess_var), progress->key.s);
+ 	}
+ 	php_session_flush(1);
++	PS(in_rfc1867_update) = false;
+ } /* }}} */
+ 
+ static zend_result php_session_rfc1867_callback(unsigned int event, void *event_data, void **extra) /* {{{ */
+@@ -3215,12 +3240,20 @@
+ 	if (!PS(rfc1867_enabled)) {
+ 		return retval;
+ 	}
++	if (PG(modules_activated)) {
++		/* request_parse_body(). Do not run here as it corrupts the session. */
++		return retval;
++	}
+ 
+ 	progress = PS(rfc1867_progress);
+ 
+ 	switch(event) {
+ 		case MULTIPART_EVENT_START: {
+ 			multipart_event_start *data = (multipart_event_start *) event_data;
++
++			/* This runs before RINIT, so we need to clear these early */
++			php_rinit_session_globals();
++
+ 			progress = ecalloc(1, sizeof(php_session_rfc1867_progress));
+ 			progress->content_length = data->content_length;
+ 			progress->sname_len  = strlen(PS(session_name));
+@@ -3378,6 +3411,11 @@
+ 			efree(progress);
+ 			progress = NULL;
+ 			PS(rfc1867_progress) = NULL;
++
++			/* $_SESSION was populated in incomplete_classes_only mode */
++			zend_string *session_var_name = ZSTR_INIT_LITERAL("_SESSION", 0);
++			zend_delete_global_variable(session_var_name);
++			zend_string_release_ex(session_var_name, 0);
+ 		}
+ 		break;
+ 	}
+--- /dev/null
++++ b/ext/session/tests/rfc1867_no_user_code.phpt
+@@ -0,0 +1,192 @@
++--TEST--
++session rfc1867: the upload progress update resolves no classes, keeps the session data intact and leaves no $_SESSION behind
++--EXTENSIONS--
++session
++--SKIPIF--
++<?php
++include('skipif.inc');
++if (!getenv('TEST_PHP_CGI_EXECUTABLE')) {
++    die('skip CGI not available');
++}
++?>
++--FILE--
++<?php
++
++$dir = __DIR__ . '/rfc1867_no_user_code';
++@mkdir($dir);
++$sid = 'rfc1867nousercode';
++$file = "$dir/sess_$sid";
++$worker = "$dir/worker.php";
++
++/* A hand-written record, as session_encode() produces it for the `php` handler:
++ * an object with __wakeup(), one with __unserialize() and a class that does not
++ * exist. Writing it directly leaves the session module untouched until the
++ * upload progress handler runs, as in a real request. */
++$record = 'w|O:1:"W":1:{s:1:"a";i:1;}'
++        . 'u|O:1:"U":1:{s:1:"a";i:2;}'
++        . 'm|O:7:"Missing":1:{s:1:"x";i:3;}';
++file_put_contents($file, $record);
++
++/* The upload progress handler runs before RINIT, while the request script is not
++ * even compiled yet. It has to keep every object as __PHP_Incomplete_Class and
++ * write it back unchanged, without autoloading or calling __wakeup() and
++ * __unserialize(). */
++file_put_contents($worker, <<<'PHP'
++<?php
++$record = getenv('TEST_SESSION_RECORD');
++$file = getenv('TEST_SESSION_FILE');
++
++spl_autoload_register(function ($class) { echo "autoload($class)\n"; });
++
++class W {
++    public $a = 1;
++    function __wakeup() {
++        echo "W::__wakeup\n";
++    }
++}
++
++class U {
++    public $a = 2;
++    function __unserialize(array $d) {
++        echo "U::__unserialize\n";
++        $this->a = $d['a'];
++    }
++    function __serialize(): array {
++        echo "U::__serialize\n";
++        return ['a' => $this->a];
++    }
++}
++
++/* The handler needs a $_SESSION to decode the record into, and registers it in
++ * the global symbol table. This script has not called session_start(), so it
++ * must not be left behind: it would otherwise expose the session data of
++ * whatever id the request body carried. */
++var_dump(array_key_exists('_SESSION', $GLOBALS));
++var_dump(session_status() === PHP_SESSION_NONE);
++
++echo "--- record after the update:\n";
++$after = file_get_contents($file);
++var_dump(substr($after, 0, strlen($record)) === $record);
++var_dump(substr($after, strlen($record), strlen('upload_progress_key|')));
++
++echo "--- session_start():\n";
++session_start();
++var_dump(session_id());
++var_dump($_SESSION['w']->a, $_SESSION['u']->a);
++var_dump($_SESSION['m']);
++var_dump(isset($_SESSION['upload_progress_key']['bytes_processed']));
++session_destroy();
++PHP);
++
++$boundary = '---------------------------20896060251896012921717172737';
++$body = "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"PHPSESSID\"\r\n\r\n$sid\r\n"
++      . "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"PHP_SESSION_UPLOAD_PROGRESS\"\r\n\r\nkey\r\n"
++      . "--$boundary\r\n"
++      . "Content-Disposition: form-data; name=\"file1\"; filename=\"file1.txt\"\r\n\r\n1\r\n"
++      . "--$boundary--\r\n";
++
++$ini = [
++    'error_reporting' => 'E_ALL',
++    'file_uploads' => '1',
++    'upload_max_filesize' => '1024',
++    'session.save_path' => $dir,
++    'session.name' => 'PHPSESSID',
++    'session.use_strict_mode' => '0',
++    'session.use_cookies' => '0',
++    'session.use_only_cookies' => '0',
++    'session.cache_limiter' => '',
++    'session.save_handler' => 'files',
++    'session.serialize_handler' => 'php',
++    'session.upload_progress.enabled' => '1',
++    'session.upload_progress.cleanup' => '0',
++    'session.upload_progress.prefix' => 'upload_progress_',
++    'session.upload_progress.name' => 'PHP_SESSION_UPLOAD_PROGRESS',
++    'session.upload_progress.freq' => '1%',
++    'session.upload_progress.min_freq' => '0.000000001',
++];
++
++/* php-cgi is started with -n, so a shared session module has to be named again. */
++$extension_dir = ini_get('extension_dir');
++foreach (['session.' . PHP_SHLIB_SUFFIX, 'php_session.' . PHP_SHLIB_SUFFIX] as $module) {
++    if ($extension_dir !== false && file_exists("$extension_dir/$module")) {
++        $ini['extension_dir'] = $extension_dir;
++        $ini['extension'] = $module;
++        break;
++    }
++}
++
++$cmd = [getenv('TEST_PHP_CGI_EXECUTABLE'), '-n', '-q'];
++foreach ($ini as $name => $value) {
++    $cmd[] = '-d';
++    $cmd[] = "$name=$value";
++}
++$cmd[] = '-f';
++$cmd[] = $worker;
++
++$env = getenv();
++$env['REDIRECT_STATUS'] = '1';
++$env['REQUEST_METHOD'] = 'POST';
++$env['CONTENT_TYPE'] = "multipart/form-data; boundary=$boundary";
++$env['CONTENT_LENGTH'] = (string) strlen($body);
++$env['SCRIPT_FILENAME'] = $worker;
++$env['PATH_TRANSLATED'] = $worker;
++$env['QUERY_STRING'] = '';
++$env['TEST_SESSION_RECORD'] = $record;
++$env['TEST_SESSION_FILE'] = $file;
++
++$pipes = [];
++$proc = proc_open(
++    $cmd,
++    [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']],
++    $pipes,
++    $dir,
++    $env
++);
++fwrite($pipes[0], $body);
++fclose($pipes[0]);
++$out = stream_get_contents($pipes[1]);
++$err = stream_get_contents($pipes[2]);
++fclose($pipes[1]);
++fclose($pipes[2]);
++proc_close($proc);
++
++echo $out;
++if ($err !== '') {
++    echo "--- stderr:\n$err";
++}
++
++?>
++--CLEAN--
++<?php
++$dir = __DIR__ . '/rfc1867_no_user_code';
++@unlink("$dir/worker.php");
++foreach (glob("$dir/sess_*") as $f) {
++    unlink($f);
++}
++@rmdir($dir);
++?>
++--EXPECTF--
++X-Powered-By: PHP/%s
++Content-type: text/html; charset=UTF-8
++
++bool(false)
++bool(true)
++--- record after the update:
++bool(true)
++string(20) "upload_progress_key|"
++--- session_start():
++autoload(Missing)
++W::__wakeup
++U::__unserialize
++string(17) "rfc1867nousercode"
++int(1)
++int(2)
++object(__PHP_Incomplete_Class)#%d (2) {
++  ["__PHP_Incomplete_Class_Name"]=>
++  string(7) "Missing"
++  ["x"]=>
++  int(3)
++}
++bool(true)
+--- a/ext/session/tests/rfc1867_sid_invalid.phpt
++++ b/ext/session/tests/rfc1867_sid_invalid.phpt
+@@ -43,7 +43,7 @@
+ var_dump(session_id());
+ var_dump(basename(__FILE__) == $_POST[ini_get("session.upload_progress.name")]);
+ var_dump($_FILES);
+-var_dump($_SESSION["upload_progress_" . basename(__FILE__)]);
++var_dump($_SESSION);
+ session_destroy();
+ ?>
+ --CLEAN--
+@@ -55,13 +55,9 @@
+ 
+ Warning: PHP Request Startup: Failed to read session data: files (path: ) in Unknown on line 0
+ 
+-Warning: PHP Request Startup: Failed to write session data (files). Please verify that the current setting of session.save_path is correct () in Unknown on line 0
+-
+ Warning: PHP Request Startup: Session ID is too long or contains illegal characters. Only the A-Z, a-z, 0-9, "-", and "," characters are allowed in Unknown on line 0
+ 
+ Warning: PHP Request Startup: Failed to read session data: files (path: ) in Unknown on line 0
+-
+-Warning: PHP Request Startup: Failed to write session data (files). Please verify that the current setting of session.save_path is correct () in Unknown on line 0
+ string(%d) ""
+ bool(true)
+ array(2) {
+@@ -96,50 +92,4 @@
+     int(1)
+   }
+ }
+-array(5) {
+-  ["start_time"]=>
+-  int(%d)
+-  ["content_length"]=>
+-  int(469)
+-  ["bytes_processed"]=>
+-  int(469)
+-  ["done"]=>
+-  bool(true)
+-  ["files"]=>
+-  array(2) {
+-    [0]=>
+-    array(7) {
+-      ["field_name"]=>
+-      string(5) "file1"
+-      ["name"]=>
+-      string(9) "file1.txt"
+-      ["tmp_name"]=>
+-      string(%d) "%s"
+-      ["error"]=>
+-      int(0)
+-      ["done"]=>
+-      bool(true)
+-      ["start_time"]=>
+-      int(%d)
+-      ["bytes_processed"]=>
+-      int(1)
+-    }
+-    [1]=>
+-    array(7) {
+-      ["field_name"]=>
+-      string(5) "file2"
+-      ["name"]=>
+-      string(9) "file2.txt"
+-      ["tmp_name"]=>
+-      string(%d) "%s"
+-      ["error"]=>
+-      int(0)
+-      ["done"]=>
+-      bool(true)
+-      ["start_time"]=>
+-      int(%d)
+-      ["bytes_processed"]=>
+-      int(1)
+-    }
+-  }
+-}
++NULL
+--- a/ext/standard/basic_functions.c
++++ b/ext/standard/basic_functions.c
+@@ -486,6 +486,19 @@
+ }
+ /* }}} */
+ 
++/* Called from php_request_startup(), before any request data is processed. */
++PHPAPI void php_basic_early_rinit(void)
++{
++	/* The session upload progress handler (un)serializes the session and
++	 * registers the session id with the URL rewriter from
++	 * php_hash_environment(), before RINIT. */
++	BG(serialize_lock) = 0;
++	memset(&BG(serialize), 0, sizeof(BG(serialize)));
++	memset(&BG(unserialize), 0, sizeof(BG(unserialize)));
++	memset(&BG(url_adapt_session_ex), 0, XtOffsetOf(url_adapt_state_ex_t, tags));
++	memset(&BG(url_adapt_output_ex), 0, XtOffsetOf(url_adapt_state_ex_t, tags));
++}
++
+ PHP_MINFO_FUNCTION(basic) /* {{{ */
+ {
+ 	php_info_print_table_start();
+--- a/ext/standard/basic_functions.h
++++ b/ext/standard/basic_functions.h
+@@ -131,6 +131,7 @@
+ PHPAPI extern bool remove_user_shutdown_function(const char *function_name, size_t function_len);
+ PHPAPI extern bool append_user_shutdown_function(php_shutdown_function_entry *shutdown_function_entry);
+ 
++PHPAPI void php_basic_early_rinit(void);
+ PHPAPI void php_call_shutdown_functions(void);
+ PHPAPI void php_free_shutdown_functions(void);
+ 
+--- a/main/main.c
++++ b/main/main.c
+@@ -1331,7 +1331,10 @@
+ 		PG(last_error_lineno) = error_lineno;
+ 	}
+ 
+-	if (zend_alloc_in_memory_limit_error_reporting()) {
++	/* Discarding the output buffers frees every handler on the stack, which is
++	 * not safe while one of them is running */
++	if (zend_alloc_in_memory_limit_error_reporting()
++			&& !(php_output_get_status() & PHP_OUTPUT_LOCKED)) {
+ 		php_output_discard_all();
+ 	}
+ 
+@@ -1832,6 +1835,7 @@
+ 		PG(in_user_include) = 0;
+ 
+ 		zend_activate();
++		php_basic_early_rinit();
+ 		sapi_activate();
+ 
+ #ifdef ZEND_SIGNALS
+@@ -1943,6 +1947,8 @@
+ 
+ 		for (i=0; i<NUM_TRACK_VARS; i++) {
+ 			zval_ptr_dtor(&PG(http_globals)[i]);
++			/* May be accessed before php_request_startup() */
++			ZVAL_UNDEF(&PG(http_globals)[i]);
+ 		}
+ 	} zend_end_try();
+ 
+@@ -1975,6 +1981,7 @@
+ 	/* 15. Free Willy (here be crashes) */
+ 	zend_arena_destroy(CG(arena));
+ 	zend_interned_strings_deactivate();
++	clear_last_error();
+ 	zend_try {
+ 		shutdown_memory_manager(CG(unclean_shutdown) || !report_memleaks, 0);
+ 	} zend_end_try();
+@@ -1998,6 +2005,9 @@
+ #ifdef HAVE_DTRACE
+ 	DTRACE_REQUEST_SHUTDOWN(SAFE_FILENAME(SG(request_info).path_translated), SAFE_FILENAME(SG(request_info).request_uri), (char *)SAFE_FILENAME(SG(request_info).request_method));
+ #endif /* HAVE_DTRACE */
++
++	/* May be accessed before php_request_startup() */
++	PG(modules_activated) = 0;
+ }
+ /* }}} */
+ 
