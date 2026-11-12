@@ -1,11 +1,10 @@
-# webkit2gtk : 2.52.6-1~deb13u1.aikido.1
+# webkit2gtk : 2.54.0-1~deb13u3.aikido.3
 
-This patch is based on webkit2gtk version 2.52.6-1~deb13u1.aikido.1, which is available at:
-https://sources.debian.org/src/webkit2gtk/2.52.6-1~deb13u1/
+This patch is based on webkit2gtk version 2.54.0-1~deb13u3.aikido.3, which is available at:
+https://sources.debian.org/src/webkit2gtk/2.54.0-1~deb13u3/
 
 ## Affected CVEs:
-- CVE-2026-78376
-- CVE-2026-83596
+- CVE-2026-79020
 
 ## How to Apply:
 1. Obtain the source package: `apt source webkit2gtk`
