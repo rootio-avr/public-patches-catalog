@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2022-38900
+- CVE-2026-118664
 
 ## How to Apply:
 1. Clone or download the source code for decode-uri-component
