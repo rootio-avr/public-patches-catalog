@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-103921
+- CVE-2026-118665
 
 ## How to Apply:
 1. Clone or download the source code for @graphql-tools/executor-legacy-ws
