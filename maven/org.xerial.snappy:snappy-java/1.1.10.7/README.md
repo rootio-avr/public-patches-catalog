@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-93451
 - CVE-2026-108106
+- GHSA-94x4-5g3f-jjxp
 
 ## How to Apply:
 1. Clone or download the source code for org.xerial.snappy:snappy-java
