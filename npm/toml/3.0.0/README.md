@@ -9,6 +9,7 @@ unknown
 - CVE-2026-114141
 - CVE-2026-114143
 - CVE-2026-114144
+- CVE-2026-114142
 
 ## How to Apply:
 1. Clone or download the source code for toml
