@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - GHSA-6v7p-g79w-8964
+- CVE-2026-114613
 
 ## How to Apply:
 1. Clone or download the source code for msgpack
