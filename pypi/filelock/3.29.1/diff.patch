@@ -1,0 +1,237 @@
+--- a/src/filelock/_read_write.py
++++ b/src/filelock/_read_write.py
+@@ -5,9 +5,12 @@
+ import os
+ import pathlib
+ import sqlite3
++import stat
++import sys
+ import threading
+ import time
+ from contextlib import contextmanager, suppress
++from itertools import count
+ from typing import TYPE_CHECKING, Literal
+ from weakref import WeakValueDictionary
+ 
+@@ -37,6 +40,89 @@
+ _MAX_SQLITE_TIMEOUT_MS = 2_000_000_000 - 1
+ 
+ 
++_DB_OPEN_FLAGS = (
++    os.O_RDWR
++    | os.O_CREAT
++    | getattr(os, "O_NOFOLLOW", 0)
++    | getattr(os, "O_NONBLOCK", 0)
++    | getattr(os, "O_CLOEXEC", 0)
++    | getattr(os, "O_BINARY", 0)
++)
++_SIDE_FILE_SUFFIXES = ("-journal", "-wal", "-shm")
++_SCHEMA_STEP_BUDGET = 10  # progress-handler calls (1000 VM steps each) allowed while the schema loads
++_SCHEMA_MAX_LENGTH = 4096
++
++
++def _open_lock_database(database: str) -> tuple[int, int] | None:
++    """
++    Create (if needed) and vet the lock database, returning its ``(st_dev, st_ino)`` identity.
++
++    The name is opened without following a symlink and must be a regular file, so SQLite is never pointed at a
++    redirected or special file. The identity is ``None`` on Windows, where SQLite's open handle already pins the name.
++
++    """
++    fd = os.open(database, _DB_OPEN_FLAGS, 0o644)
++    try:
++        info = os.fstat(fd)
++    finally:
++        os.close(fd)
++    if not stat.S_ISREG(info.st_mode):
++        msg = f"refusing a non-regular lock database: {database!r}"
++        raise OSError(msg)
++    return None if sys.platform == "win32" else (info.st_dev, info.st_ino)
++
++
++def _raise_if_unsafe_side_files(database: str) -> None:
++    # SQLite derives -journal/-wal/-shm names from the database name and acts on whatever those names hold: a hot
++    # journal is replayed into the database and a symlink is followed. None of them exists for a healthy lock database.
++    for suffix in _SIDE_FILE_SUFFIXES:
++        side = f"{database}{suffix}"
++        try:
++            info = os.lstat(side)
++        except FileNotFoundError:
++            continue
++        if not stat.S_ISREG(info.st_mode) or (suffix != "-shm" and info.st_size > 0):
++            msg = f"refusing lock database {database!r}: unexpected SQLite side file {side!r}"
++            raise OSError(msg)
++
++
++def _raise_if_database_replaced(database: str, identity: tuple[int, int] | None) -> None:
++    if identity is None:
++        return
++    try:
++        current = os.lstat(database)
++    except FileNotFoundError:
++        current = None
++    # The lock lives on the inode, so one taken after the name moved on excludes no later opener.
++    if current is None or (current.st_dev, current.st_ino) != identity:
++        msg = f"lock database {database!r} was unlinked or replaced; leave it in place"
++        raise OSError(msg)
++
++
++@contextmanager
++def _bounded_schema(connection: sqlite3.Connection, database: str) -> Generator[None]:
++    # The first statement loads the file's complete schema, which no timeout bounds, and a lock database has none.
++    # Waiting for a lock runs no virtual machine steps, so a step budget bounds only that load.
++    calls = count()
++    # Connection.setlimit is 3.11+; the progress handler alone still bounds the load on 3.10.
++    if hasattr(connection, "setlimit"):
++        connection.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, _SCHEMA_MAX_LENGTH)
++    connection.set_progress_handler(lambda: next(calls) >= _SCHEMA_STEP_BUDGET, 1000)
++    try:
++        yield
++    except sqlite3.DatabaseError as error:
++        # An interrupted schema load reports a malformed schema rather than the interrupt.
++        if isinstance(error, sqlite3.DataError) or next(calls) > _SCHEMA_STEP_BUDGET:
++            msg = (
++                f"refusing a lock database whose schema is too large to load: {database!r}; "
++                "give ReadWriteLock a file of its own"
++            )
++            raise ValueError(msg) from error
++        raise
++    finally:
++        connection.set_progress_handler(None, 0)
++
++
+ def timeout_for_sqlite(timeout: float, *, blocking: bool, already_waited: float) -> int:
+     if blocking is False:
+         return 0
+@@ -154,7 +240,14 @@
+         self._lock_level = 0
+         self._current_mode: Literal["read", "write"] | None = None
+         self._write_thread_id: int | None = None
++        self._database_identity = _open_lock_database(self.lock_file)
++        _raise_if_unsafe_side_files(self.lock_file)
+         self._con = sqlite3.connect(self.lock_file, check_same_thread=False)
++        try:
++            _raise_if_database_replaced(self.lock_file, self._database_identity)
++        except OSError:
++            self._con.close()
++            raise
+         with _all_connections_lock:
+             _all_connections.add(self._con)
+ 
+@@ -187,6 +280,19 @@
+     def _configure_and_begin(
+         self, mode: Literal["read", "write"], timeout: float, *, blocking: bool, start_time: float
+     ) -> None:
++        # SQLite opened the file the name held at connect time, and its first statement would replay a journal beside
++        # that file, so the name is checked before any statement runs.
++        _raise_if_database_replaced(self.lock_file, self._database_identity)
++        _raise_if_unsafe_side_files(self.lock_file)
++        with _bounded_schema(self._con, self.lock_file):
++            self._run_begin(mode, timeout, blocking=blocking, start_time=start_time)
++        try:
++            _raise_if_database_replaced(self.lock_file, self._database_identity)
++        except OSError:
++            self._con.rollback()
++            raise
++
++    def _run_begin(self, mode: Literal["read", "write"], timeout: float, *, blocking: bool, start_time: float) -> None:
+         waited = time.perf_counter() - start_time
+         timeout_ms = timeout_for_sqlite(timeout, blocking=blocking, already_waited=waited)
+         self._con.execute(f"PRAGMA busy_timeout={timeout_ms};").close()
+--- /dev/null
++++ b/tests/test_cve_2026_112940.py
+@@ -0,0 +1,94 @@
++from __future__ import annotations
++
++import os
++import sqlite3
++import sys
++from typing import TYPE_CHECKING
++
++import pytest
++
++pytest.importorskip("sqlite3")
++
++from filelock._read_write import ReadWriteLock
++
++if TYPE_CHECKING:
++    from pathlib import Path
++
++posix_only = pytest.mark.skipif(sys.platform == "win32", reason="symlinks and inode identity are POSIX-specific")
++
++
++@pytest.fixture(autouse=True)
++def _clear_singleton_cache() -> None:
++    ReadWriteLock._instances.clear()
++
++
++@posix_only
++def test_symlinked_lock_database_is_refused(tmp_path: Path) -> None:
++    victim = tmp_path / "victim.txt"
++    victim.write_text("precious")
++    link = tmp_path / "lock.db"
++    link.symlink_to(victim)
++    with pytest.raises(OSError):  # noqa: PT011
++        ReadWriteLock(str(link), is_singleton=False)
++    assert victim.read_text() == "precious"
++
++
++@posix_only
++def test_non_regular_lock_database_is_refused(tmp_path: Path) -> None:
++    fifo = tmp_path / "lock.db"
++    os.mkfifo(fifo)
++    with pytest.raises(OSError):  # noqa: PT011
++        ReadWriteLock(str(fifo), is_singleton=False)
++
++
++@posix_only
++def test_symlinked_journal_side_file_is_refused(tmp_path: Path) -> None:
++    victim = tmp_path / "victim.txt"
++    victim.write_text("precious")
++    db = tmp_path / "lock.db"
++    (tmp_path / "lock.db-journal").symlink_to(victim)
++    with pytest.raises(OSError):  # noqa: PT011
++        ReadWriteLock(str(db), is_singleton=False)
++    assert victim.read_text() == "precious"
++
++
++@posix_only
++def test_replaced_lock_database_is_refused_on_acquire(tmp_path: Path) -> None:
++    db = tmp_path / "lock.db"
++    lock = ReadWriteLock(str(db), is_singleton=False)
++    try:
++        db.unlink()
++        db.write_bytes(b"")
++        with pytest.raises(OSError, match="replaced"):
++            lock.acquire_write(timeout=1)
++        assert lock._lock_level == 0
++    finally:
++        lock.close()
++
++
++def test_regular_lock_database_still_works(tmp_path: Path) -> None:
++    lock = ReadWriteLock(str(tmp_path / "lock.db"), is_singleton=False)
++    try:
++        with lock.read_lock():
++            assert lock._current_mode == "read"
++        with lock.write_lock():
++            assert lock._current_mode == "write"
++    finally:
++        lock.close()
++
++
++def test_oversized_schema_is_refused(tmp_path: Path) -> None:
++    db = tmp_path / "lock.db"
++    con = sqlite3.connect(db)
++    con.execute("CREATE TABLE t (a)")
++    for i in range(2000):
++        con.execute(f"CREATE TABLE table_with_a_long_name_{i} (column_one, column_two, column_three)")
++    con.commit()
++    con.close()
++    lock = ReadWriteLock(str(db), is_singleton=False)
++    try:
++        with pytest.raises(ValueError, match="schema is too large"):
++            lock.acquire_read(timeout=5)
++        assert lock._lock_level == 0
++    finally:
++        lock.close()
