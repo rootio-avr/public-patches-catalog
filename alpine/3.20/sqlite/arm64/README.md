@@ -1,6 +1,6 @@
-# sqlite : 3.45.3-r30073
+# sqlite : 3.45.3-r30074
 
-This patch is based on sqlite version 3.45.3-r30073, which is available at:
+This patch is based on sqlite version 3.45.3-r30074, which is available at:
 unknown
 
 ## Affected CVEs:
@@ -8,6 +8,7 @@ unknown
 - CVE-2026-11824
 - CVE-2026-11822
 - CVE-2025-3277
+- CVE-2026-119586
 - CVE-2026-119373
 - CVE-2026-119374
 - CVE-2026-119379
