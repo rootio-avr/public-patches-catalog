@@ -4,7 +4,7 @@ This patch is based on pyjwt version 2.11.0, which is available at:
 unknown
 
 ## Affected CVEs:
-- GHSA-pxh4-856f-4h89
+- CVE-2026-48522
 
 ## How to Apply:
 1. Clone or download the source code for pyjwt
