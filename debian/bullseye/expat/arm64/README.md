@@ -1,6 +1,6 @@
-# expat : 2.2.10-2+deb11u7.aikido.21
+# expat : 2.2.10-2+deb11u7.aikido.22
 
-This patch is based on expat version 2.2.10-2+deb11u7.aikido.21, which is available at:
+This patch is based on expat version 2.2.10-2+deb11u7.aikido.22, which is available at:
 https://sources.debian.org/src/expat/2.2.10-2+deb11u7/
 
 ## Affected CVEs:
@@ -28,6 +28,7 @@ https://sources.debian.org/src/expat/2.2.10-2+deb11u7/
 - CVE-2026-76957
 - CVE-2026-66046
 - CVE-2025-59375
+- CVE-2026-41080
 
 ## How to Apply:
 1. Obtain the source package: `apt source expat`
