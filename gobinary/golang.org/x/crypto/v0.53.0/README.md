@@ -4,6 +4,7 @@ This patch is based on golang.org/x/crypto version v0.53.0, which is available a
 unknown
 
 ## Affected CVEs:
+- FIPS-VARIANT
 - CVE-2026-56854
 - CVE-2026-56855
 - CVE-2026-78662
