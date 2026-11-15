@@ -1,9 +1,10 @@
-# mariadb : 1:11.8.6-0+deb13u1.aikido.12
+# mariadb : 1:11.8.6-0+deb13u1.aikido.13
 
-This patch is based on mariadb version 1:11.8.6-0+deb13u1.aikido.12, which is available at:
+This patch is based on mariadb version 1:11.8.6-0+deb13u1.aikido.13, which is available at:
 https://sources.debian.org/src/mariadb/1:11.8.6-0+deb13u1/
 
 ## Affected CVEs:
+- CVE-2026-102523
 - CVE-2026-107815
 - CVE-2026-107818
 - CVE-2026-107821
