@@ -1,6 +1,6 @@
-# samba : 4.18.11-r00073
+# samba : 4.18.11-r00074
 
-This patch is based on samba version 4.18.11-r00073, which is available at:
+This patch is based on samba version 4.18.11-r00074, which is available at:
 unknown
 
 ## Affected CVEs:
