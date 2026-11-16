@@ -4,6 +4,7 @@ This patch is based on moment version 2.19.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2022-24785
 - CVE-2022-31129
 
 ## How to Apply:
