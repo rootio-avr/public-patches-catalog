@@ -7,6 +7,10 @@ unknown
 - CVE-2026-49476
 - CVE-2026-49477
 - AIKIDO-2026-11057
+- AIKIDO-2026-18287
+- CVE-2026-126191
+- CVE-2026-126190
+- AIKIDO-2026-552858
 
 ## How to Apply:
 1. Clone or download the source code for soupsieve
