@@ -1,0 +1,162 @@
+--- a/docs/src/markdown/about/changelog.md
++++ b/docs/src/markdown/about/changelog.md
+@@ -7,6 +7,8 @@
+ 
+ -   **FIX**: Fix another inefficient attribute pattern (@mauriceng98).
+ -   **FIX**: Limit total number of selectors processed in a pattern to prevent massive selector requests (@mauriceng98).
++-   **FIX**: Cache whether an element is or has a matching ancestor when matching the descendant combinator (`a b`) to
++    avoid time that grows with the depth of the document to the power of the number of combinators.
+ 
+ ## 2.8.3
+ 
+--- a/soupsieve/css_match.py
++++ b/soupsieve/css_match.py
+@@ -558,6 +558,7 @@
+         self.cached_meta_lang = []  # type: list[tuple[str, str]]
+         self.cached_default_forms = []  # type: list[tuple[bs4.Tag, bs4.Tag]]
+         self.cached_indeterminate_forms = []  # type: list[tuple[bs4.Tag, str, bool]]
++        self.cached_ancestors = {}  # type: dict[tuple[int, int, bool], bool]
+         self.selectors = selectors
+         self.namespaces = {} if namespaces is None else namespaces  # type: ct.Namespaces | dict[str, str]
+         self.flags = flags
+@@ -838,10 +839,21 @@
+             return found
+ 
+         if relation[0].rel_type == REL_PARENT:
++            # A selector with several descendant combinators tries every ancestor for each one, which grows
++            # polynomially with the depth of the document. Every element visited on the walk shares the result,
++            # so cache whether each one is, or has, an ancestor matching the relation.
++            visited = []  # type: list[tuple[int, int, bool]]
+             parent = self.get_parent(el, no_iframe=self.iframe_restrict)
+             while not found and parent:
++                key = (id(parent), id(relation), self.iframe_restrict)
++                if key in self.cached_ancestors:
++                    found = self.cached_ancestors[key]
++                    break
++                visited.append(key)
+                 found = self.match_selectors(parent, relation)
+                 parent = self.get_parent(parent, no_iframe=self.iframe_restrict)
++            for key in visited:
++                self.cached_ancestors[key] = found
+         elif relation[0].rel_type == REL_CLOSE_PARENT:
+             parent = self.get_parent(el, no_iframe=self.iframe_restrict)
+             if parent:
+--- a/tests/test_level1/test_descendant.py
++++ b/tests/test_level1/test_descendant.py
+@@ -20,3 +20,35 @@
+             ["1"],
+             flags=util.HTML
+         )
++
++    def test_shared_ancestors(self):
++        """Test that the result for an ancestor does not leak into elements that have other ancestors."""
++
++        markup = """
++        <section id="1">
++          <div id="2"><p id="3"><span id="4"></span></p></div>
++          <p id="5"></p>
++        </section>
++        <div id="6"><p id="7"><span id="8"></span></p></div>
++        <div id="9"><section id="10"><p id="11"><span id="12"></span></p></section></div>
++        """
++
++        self.assert_selector(markup, "section div p", ["3"], flags=util.HTML)
++        self.assert_selector(markup, "section p span", ["4", "12"], flags=util.HTML)
++        self.assert_selector(markup, "div p, section span", ["3", "4", "7", "11", "12"], flags=util.HTML)
++        self.assert_selector(markup, "div section p span", ["12"], flags=util.HTML)
++        self.assert_selector(markup, "section :not(div p)", ["2", "4", "5", "12"], flags=util.HTML)
++
++    def test_many_descendant_combinators(self):
++        """Test that every combinator tries each ancestor once in a deeply nested document."""
++
++        import soupsieve as sv
++        from bs4 import BeautifulSoup
++        from unittest import mock
++
++        n = 32
++        soup = BeautifulSoup("<div>" * n, "html.parser")
++        match = sv.css_match.CSSMatch.match_selectors
++        with mock.patch.object(sv.css_match.CSSMatch, "match_selectors", autospec=True, side_effect=match) as patched:
++            self.assertEqual(len(sv.select("section div div div div", soup)), 0)
++        self.assertLessEqual(patched.call_count, 8 * n)
+
+--- a/soupsieve/css_parser.py
++++ b/soupsieve/css_parser.py
+@@ -110,11 +110,13 @@
+ # Whitespace with comments included
+ WSC = fr'(?:{WS}|{COMMENTS})'
+ # CSS escapes
+-CSS_ESCAPES = fr'(?:\\(?:[a-f0-9]{{1,6}}{WS}?|[^\r\n\f]|$))'
+-CSS_STRING_ESCAPES = fr'(?:\\(?:[a-f0-9]{{1,6}}{WS}?|[^\r\n\f]|$|{NEWLINE}))'
++# The hex and non-hex alternatives are mutually exclusive, and a hex escape can only end after 6 digits or before a
++# non-hex character, so each escape can be matched in exactly one way (this avoids catastrophic backtracking).
++CSS_ESCAPES = fr'(?:\\(?:(?:[a-f0-9]{{6}}|[a-f0-9]{{1,5}}(?![a-f0-9])){WS}?|[^\r\n\f0-9a-fA-F]|$))'
++CSS_STRING_ESCAPES = fr'(?:\\(?:(?:[a-f0-9]{{6}}|[a-f0-9]{{1,5}}(?![a-f0-9])){WS}?|[^\r\n\f0-9a-fA-F]|$|{NEWLINE}))'
+ # CSS Identifier
+ IDENTIFIER = fr'''
+-(?:(?:-?(?:[^\x00-\x2f\x30-\x40\x5B-\x5E\x60\x7B-\x9f]|{CSS_ESCAPES})+|--)
++(?:(?:-?(?:[^\x00-\x2f\x30-\x40\x5B-\x5E\x60\x7B-\x9f]|{CSS_ESCAPES})|--)
+ (?:[^\x00-\x2c\x2e\x2f\x3A-\x40\x5B-\x5E\x60\x7B-\x9f]|{CSS_ESCAPES})*)
+ '''
+ # `nth` content
+--- a/tests/test_level1/test_escapes.py
++++ b/tests/test_level1/test_escapes.py
+@@ -22,3 +22,43 @@
+             ["1"],
+             flags=util.HTML
+         )
++
++    def test_escape_backtracking(self):
++        """Test that runs of ambiguous escapes do not cause catastrophic backtracking (ReDoS)."""
++
++        import time
++        import soupsieve as sv
++
++        for selector in (
++            '[' + '\\9' * 40 + '!',
++            '\\9' * 40 + '!',
++            '\\1' * 40 + '!',
++            '.' + '\\a' * 40 + '!',
++            '[' + '\\9' * 40,
++        ):
++            start = time.time()
++            with self.assertRaises(sv.SelectorSyntaxError):
++                sv.compile(selector)
++            self.assertLess(time.time() - start, 5)
++
++        # Hex escapes still consume at most 6 digits followed by an optional whitespace.
++        markup = """
++        <div>
++        <p id="0" class="bar1">Text</p>
++        <p id="1" class="barz">Text</p>
++        </div>
++        """
++
++        self.assert_selector(
++            markup,
++            ".\\000062ar1",
++            ["0"],
++            flags=util.HTML
++        )
++
++        self.assert_selector(
++            markup,
++            ".\\62 arz",
++            ["1"],
++            flags=util.HTML
++        )
+
+diff --git a/tests/test_level1/test_escapes.py b/tests/test_level1/test_escapes.py
+index 04add53..13cb4ac 100644
+--- a/tests/test_level1/test_escapes.py
++++ b/tests/test_level1/test_escapes.py
+@@ -35,6 +35,9 @@ class TestEscapes(util.TestCase):
+             '\\1' * 40 + '!',
+             '.' + '\\a' * 40 + '!',
+             '[' + '\\9' * 40,
++            '[a=' + '\\a' * 40 + '!',
++            '[a=\\' + 'a' * 5000 + '!',
++            '#' + '\\1 ' * 2000 + '!',
+         ):
+             start = time.time()
+             with self.assertRaises(sv.SelectorSyntaxError):
