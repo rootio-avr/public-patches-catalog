@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-49476
 - CVE-2026-49477
+- AIKIDO-2026-11057
 
 ## How to Apply:
 1. Clone or download the source code for soupsieve
