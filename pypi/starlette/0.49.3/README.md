@@ -9,6 +9,7 @@ unknown
 - CVE-2026-48818
 - CVE-2026-54282
 - CVE-2026-54283
+- AIKIDO-2026-10923
 
 ## How to Apply:
 1. Clone or download the source code for starlette
