@@ -1,0 +1,328 @@
+--- a/lib/Sender.js
++++ b/lib/Sender.js
+@@ -82,11 +82,11 @@ Sender.prototype.ping = function(data, options) {
+  * @api public
+  */
+ 
+-Sender.prototype.pong = function(data, options) {
++Sender.prototype.pong = function(data, options, cb) {
+   var mask = options && options.mask;
+   var self = this;
+   this.messageHandlers.push(function() {
+-    self.frameAndSend(0xa, data || '', true, mask);
++    self.frameAndSend(0xa, data || '', true, mask, undefined, cb);
+   });
+   this.flush();
+ };
+--- a/lib/WebSocket.js
++++ b/lib/WebSocket.js
+@@ -72,6 +72,9 @@ function WebSocket(address, protocols, options) {
+   this.supports = {};
+   this.extensions = {};
+   this._binaryType = 'nodebuffer';
++  this._pendingAutoPongs = 0;
++  this._maxPendingAutoPongs = 0;
++  this._autoPongComplete = autoPongComplete.bind(null, this);
+ 
+   if (Array.isArray(address)) {
+     initAsServerClient.apply(this, address.concat(options));
+@@ -548,7 +551,8 @@ function initAsServerClient(req, socket, upgradeHead, options) {
+     protocolVersion: protocolVersion,
+     protocol: null,
+     extensions: {},
+-    maxPayload: 0
++    maxPayload: 0,
++    maxPendingAutoPongs: 60
+   }).merge(options);
+ 
+   // expose state properties
+@@ -560,6 +564,7 @@ function initAsServerClient(req, socket, upgradeHead, options) {
+   this.readyState = WebSocket.CONNECTING;
+   this._isServer = true;
+   this.maxPayload = options.value.maxPayload;
++  this._maxPendingAutoPongs = options.value.maxPendingAutoPongs | 0;
+   // establish connection
+   if (options.value.protocolVersion === 'hixie-76') {
+     establishConnection.call(this, ReceiverHixie, SenderHixie, socket, upgradeHead);
+@@ -586,9 +591,12 @@ function initAsClient(address, protocols, options) {
+     ciphers: null,
+     rejectUnauthorized: null,
+     perMessageDeflate: true,
+-    localAddress: null
++    localAddress: null,
++    maxPendingAutoPongs: 60
+   }).merge(options);
+ 
++  this._maxPendingAutoPongs = options.value.maxPendingAutoPongs | 0;
++
+   if (options.value.protocolVersion !== 8 && options.value.protocolVersion !== 13) {
+     throw new Error('unsupported protocol version');
+   }
+@@ -851,10 +859,21 @@ function establishConnection(ReceiverClass, SenderClass, socket, upgradeHead) {
+   self._receiver.onping = function onping(data, flags) {
+     flags = flags || {};
+ 
+-    self.pong(data, {
+-      mask: !self._isServer,
+-      binary: flags.binary === true
+-    }, true);
++    if (self.readyState === WebSocket.OPEN) {
++      if (
++        self._maxPendingAutoPongs > 0 &&
++        self._pendingAutoPongs >= self._maxPendingAutoPongs
++      ) {
++        // The peer is flooding us with pings while not reading the pongs.
++        self.terminate();
++      } else {
++        self._pendingAutoPongs++;
++        self._sender.pong(data, {
++          mask: !self._isServer,
++          binary: flags.binary === true
++        }, self._autoPongComplete);
++      }
++    }
+ 
+     self.emit('ping', data, flags);
+   };
+@@ -887,6 +906,16 @@ function establishConnection(ReceiverClass, SenderClass, socket, upgradeHead) {
+   this.emit('open');
+ }
+ 
++/**
++ * The callback for automatic pong responses.
++ *
++ * @param {WebSocket} websocket The WebSocket instance
++ * @api private
++ */
++function autoPongComplete(websocket) {
++  websocket._pendingAutoPongs--;
++}
++
+ function startQueue(instance) {
+   instance._queue = instance._queue || [];
+ }
+--- a/lib/WebSocketServer.js
++++ b/lib/WebSocketServer.js
+@@ -37,7 +37,8 @@ function WebSocketServer(options, callback) {
+     disableHixie: false,
+     clientTracking: true,
+     perMessageDeflate: true,
+-    maxPayload: 100 * 1024 * 1024
++    maxPayload: 100 * 1024 * 1024,
++    maxPendingAutoPongs: 60
+   }).merge(options);
+ 
+   if (!options.isDefinedAndNonNull('port') && !options.isDefinedAndNonNull('server') && !options.value.noServer) {
+@@ -266,7 +267,8 @@ function handleHybiUpgrade(req, socket, upgradeHead, cb) {
+       protocolVersion: version,
+       protocol: protocol,
+       extensions: extensions,
+-      maxPayload: self.options.maxPayload
++      maxPayload: self.options.maxPayload,
++      maxPendingAutoPongs: self.options.maxPendingAutoPongs
+     });
+ 
+     if (self.options.clientTracking) {
+
+--- a/lib/Receiver.js
++++ b/lib/Receiver.js
+@@ -15,11 +15,13 @@
+  * HyBi Receiver implementation
+  */
+ 
+-function Receiver (extensions,maxPayload) {
++function Receiver (extensions,maxPayload,maxBufferedChunks,maxFragments) {
+   if (this instanceof Receiver === false) {
+     throw new TypeError("Classes can't be function-called");
+   }
+   if(typeof extensions==='number'){
++    maxFragments=maxBufferedChunks;
++    maxBufferedChunks=maxPayload;
+     maxPayload=extensions;
+     extensions={};
+   }
+@@ -46,6 +48,8 @@
+   });
+   this.extensions = extensions || {};
+   this.maxPayload = maxPayload || 0;
++  this.maxBufferedChunks = maxBufferedChunks | 0;
++  this.maxFragments = maxFragments | 0;
+   this.currentPayloadLength = 0;
+   this.state = {
+     activeFragmentedOperation: null,
+@@ -86,6 +90,10 @@
+   if (this.dead) return;
+   var dataLength = data.length;
+   if (dataLength == 0) return;
++  if (this.maxBufferedChunks > 0 && this.overflow.length >= this.maxBufferedChunks) {
++    this.tooManyParts('Too many buffered chunks');
++    return;
++  }
+   if (this.expectBuffer == null) {
+     this.overflow.push(data);
+     return;
+@@ -330,6 +338,35 @@
+ };
+ 
+ /**
++ * Handles a peer that makes the receiver retain too many message parts
++ * (buffered data chunks or message fragments).
++ *
++ * @api private
++ */
++
++Receiver.prototype.tooManyParts = function(reason) {
++  var err = new Error(reason);
++  err.code = 'WS_ERR_TOO_MANY_BUFFERED_PARTS';
++  this.error(err, 1008);
++  this.cleanup();
++  return true;
++};
++
++/**
++ * Checks whether another message fragment may be retained
++ *
++ * @api private
++ */
++
++Receiver.prototype.tooManyFragments = function() {
++  if (this.maxFragments > 0 &&
++      this.currentMessage.length + this.messageHandlers.length >= this.maxFragments) {
++    return this.tooManyParts('Too many message fragments');
++  }
++  return false;
++};
++
++/**
+  * Execute message handler buffers
+  *
+  * @api private
+@@ -502,6 +539,7 @@
+     },
+     finish: function(mask, data) {
+       var self = this;
++      if (this.tooManyFragments()) return;
+       var packet = this.unmask(mask, data, true) || new Buffer(0);
+       var state = clone(this.state);
+       this.messageHandlers.push(function(callback) {
+@@ -598,6 +636,7 @@
+     },
+     finish: function(mask, data) {
+       var self = this;
++      if (this.tooManyFragments()) return;
+       var packet = this.unmask(mask, data, true) || new Buffer(0);
+       var state = clone(this.state);
+       this.messageHandlers.push(function(callback) {
+--- a/lib/WebSocket.js
++++ b/lib/WebSocket.js
+@@ -551,6 +551,8 @@ function initAsServerClient(req, socket, upgradeHead, options) {
+     protocolVersion: protocolVersion,
+     protocol: null,
+     extensions: {},
+-    maxPayload: 0,
+-    maxPendingAutoPongs: 60
++    maxPayload: 0,
++    maxPendingAutoPongs: 60,
++    maxBufferedChunks: 0,
++    maxFragments: 0
+   }).merge(options);
+@@ -566,5 +568,7 @@ function initAsServerClient(req, socket, upgradeHead, options) {
+   this.maxPayload = options.value.maxPayload;
+   this._maxPendingAutoPongs = options.value.maxPendingAutoPongs | 0;
++  this.maxBufferedChunks = options.value.maxBufferedChunks;
++  this.maxFragments = options.value.maxFragments;
+   // establish connection
+   if (options.value.protocolVersion === 'hixie-76') {
+     establishConnection.call(this, ReceiverHixie, SenderHixie, socket, upgradeHead);
+@@ -592,7 +596,9 @@ function initAsClient(address, protocols, options) {
+     rejectUnauthorized: null,
+     perMessageDeflate: true,
+-    localAddress: null,
+-    maxPendingAutoPongs: 60
++    localAddress: null,
++    maxPendingAutoPongs: 60,
++    maxBufferedChunks: 1024 * 1024,
++    maxFragments: 128 * 1024
+   }).merge(options);
+ 
+   this._maxPendingAutoPongs = options.value.maxPendingAutoPongs | 0;
+@@ -620,6 +626,8 @@ function initAsClient(address, protocols, options) {
+ 
+   // expose state properties
+   this._isServer = false;
++  this.maxBufferedChunks = options.value.maxBufferedChunks;
++  this.maxFragments = options.value.maxFragments;
+   this.url = address;
+   this.protocolVersion = options.value.protocolVersion;
+   this.supports.binary = (this.protocolVersion !== 'hixie-76');
+@@ -803,7 +811,7 @@ function establishConnection(ReceiverClass, SenderClass, socket, upgradeHead) {
+   socket.setTimeout(0);
+   socket.setNoDelay(true);
+ 
+-  this._receiver = new ReceiverClass(this.extensions,this.maxPayload);
++  this._receiver = new ReceiverClass(this.extensions, this.maxPayload, this.maxBufferedChunks, this.maxFragments);
+   this._socket = socket;
+ 
+   // socket cleanup handlers
+--- a/lib/WebSocketServer.js
++++ b/lib/WebSocketServer.js
+@@ -37,6 +37,8 @@ function WebSocketServer(options, callback) {
+     disableHixie: false,
+     clientTracking: true,
+     perMessageDeflate: true,
+-    maxPayload: 100 * 1024 * 1024,
+-    maxPendingAutoPongs: 60
++    maxPayload: 100 * 1024 * 1024,
++    maxPendingAutoPongs: 60,
++    maxBufferedChunks: 1024 * 1024,
++    maxFragments: 128 * 1024
+   }).merge(options);
+@@ -267,8 +269,10 @@ function handleHybiUpgrade(req, socket, upgradeHead, cb) {
+       protocolVersion: version,
+       protocol: protocol,
+       extensions: extensions,
+-      maxPayload: self.options.maxPayload,
+-      maxPendingAutoPongs: self.options.maxPendingAutoPongs
++      maxPayload: self.options.maxPayload,
++      maxPendingAutoPongs: self.options.maxPendingAutoPongs,
++      maxBufferedChunks: self.options.maxBufferedChunks,
++      maxFragments: self.options.maxFragments
+     });
+ 
+     if (self.options.clientTracking) {
+
+--- a/lib/Extensions.js
++++ b/lib/Extensions.js
+@@ -20,7 +20,13 @@
+   value.split(',').forEach(function(v) {
+     var params = v.split(';');
+     var token = params.shift().trim();
+-    var paramsList = extensions[token] = extensions[token] || [];
++
++    if (extensions[token] === undefined) {
++      extensions[token] = [];
++    } else if (!extensions.hasOwnProperty(token)) {
++      return;
++    }
++
+     var parsedParams = {};
+ 
+     params.forEach(function(param) {
+@@ -38,10 +44,15 @@
+           value = value.slice(0, value.length - 1);
+         }
+       }
+-      (parsedParams[key] = parsedParams[key] || []).push(value);
++
++      if (parsedParams[key] === undefined) {
++        parsedParams[key] = [value];
++      } else if (parsedParams.hasOwnProperty(key)) {
++        parsedParams[key].push(value);
++      }
+     });
+ 
+-    paramsList.push(parsedParams);
++    extensions[token].push(parsedParams);
+   });
+ 
+   return extensions;
