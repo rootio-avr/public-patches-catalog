@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-48779
 - CVE-2024-37890
+- AIKIDO-2026-661622
 
 ## How to Apply:
 1. Clone or download the source code for ws
