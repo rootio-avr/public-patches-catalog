@@ -1,3 +1,706 @@
+--- a/lib/go/thrift/binary_protocol.go
++++ b/lib/go/thrift/binary_protocol.go
+@@ -356,7 +356,7 @@
+ 		return
+ 	}
+ 	minElemSize := p.getMinSerializedSize(kType) + p.getMinSerializedSize(vType)
+-	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.cfg)
++	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.trans.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return
+ 	}
+@@ -381,7 +381,7 @@
+ 		return
+ 	}
+ 	minElemSize := p.getMinSerializedSize(elemType)
+-	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.cfg)
++	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.trans.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return
+ 	}
+@@ -407,7 +407,7 @@
+ 		return
+ 	}
+ 	minElemSize := p.getMinSerializedSize(elemType)
+-	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.cfg)
++	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.trans.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return
+ 	}
+--- a/lib/go/thrift/buffered_transport.go
++++ b/lib/go/thrift/buffered_transport.go
+@@ -87,8 +87,11 @@
+ 	return p.tp.Flush(ctx)
+ }
+ 
++// RemainingBytes returns the bytes still buffered here plus whatever the
++// underlying transport still has. The bytes already pulled into the read buffer
++// have to be added back, because the underlying transport no longer counts them.
+ func (p *TBufferedTransport) RemainingBytes() (num_bytes uint64) {
+-	return p.tp.RemainingBytes()
++	return addRemainingBytes(p.tp.RemainingBytes(), uint64(p.Reader.Buffered()))
+ }
+ 
+ // SetTConfiguration implements TConfigurationSetter for propagation.
+--- a/lib/go/thrift/compact_protocol.go
++++ b/lib/go/thrift/compact_protocol.go
+@@ -499,7 +499,7 @@
+ 	valueType, _ = p.getTType(tCompactType(keyAndValueType & 0xf))
+ 
+ 	minElemSize := p.getMinSerializedSize(keyType) + p.getMinSerializedSize(valueType)
+-	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.cfg)
++	err = checkContainerSizeForProtocol(int64(size32), minElemSize, p.trans.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return
+ 	}
+@@ -533,7 +533,7 @@
+ 	}
+ 
+ 	minElemSize := p.getMinSerializedSize(elemType)
+-	err = checkContainerSizeForProtocol(int64(size), minElemSize, p.cfg)
++	err = checkContainerSizeForProtocol(int64(size), minElemSize, p.trans.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return
+ 	}
+--- a/lib/go/thrift/configuration.go
++++ b/lib/go/thrift/configuration.go
+@@ -110,6 +110,15 @@
+ 	// MaxMessageSize will be used instead.
+ 	MaxFrameSize int32
+ 
++	// The maximum number of elements in a single list, set or map read by a
++	// TProtocol. THeaderTransport holds the transform count of a frame header
++	// to it as well.
++	//
++	// If <= 0, the element count is not limited on its own. It is still
++	// bounded by MaxMessageSize and, where the transport knows it, by the
++	// number of bytes left to read.
++	MaxContainerSize int32
++
+ 	// Connect and socket timeouts to be used by TSocket and TSSLSocket.
+ 	//
+ 	// 0 means no timeout.
+@@ -174,6 +183,18 @@
+ 	return maxFrameSize
+ }
+ 
++// GetMaxContainerSize returns the max number of elements in a single list, set
++// or map an implementation should follow.
++//
++// It's nil-safe. math.MaxInt32, which leaves the element count without a limit
++// of its own, will be returned if tc is nil or tc.MaxContainerSize is <= 0.
++func (tc *TConfiguration) GetMaxContainerSize() int32 {
++	if tc == nil || tc.MaxContainerSize <= 0 {
++		return math.MaxInt32
++	}
++	return tc.MaxContainerSize
++}
++
+ // GetConnectTimeout returns the connect timeout should be used by TSocket and
+ // TSSLSocket.
+ //
+@@ -337,8 +358,15 @@
+ // container with the given wire-supplied element count, where each element
+ // occupies at least minElemSize bytes. The count is range-checked and the
+ // product is computed in 64-bit arithmetic, so the value handed to
+-// checkSizeForProtocol always stays within int32 range.
+-func checkContainerSizeForProtocol(size int64, minElemSize int32, cfg *TConfiguration) error {
++// checkSizeForProtocol always stays within int32 range. A count above
++// cfg.GetMaxContainerSize() is rejected as well.
++//
++// remaining is the transport's ReadSizeProvider.RemainingBytes value. When the
++// transport knows how much is left, a count whose elements cannot fit in that
++// many bytes is rejected here, before the caller uses it to size an allocation.
++// This mirrors the checkReadBytesAvailable step the Java and C++ protocols
++// perform on the same three headers.
++func checkContainerSizeForProtocol(size int64, minElemSize int32, remaining uint64, cfg *TConfiguration) error {
+ 	if size < 0 {
+ 		return NewTProtocolExceptionWithType(
+ 			NEGATIVE_SIZE,
+@@ -351,11 +379,26 @@
+ 			fmt.Errorf("size exceeded max allowed: %d", size),
+ 		)
+ 	}
++	if limit := cfg.GetMaxContainerSize(); size > int64(limit) {
++		return NewTProtocolExceptionWithType(
++			SIZE_LIMIT,
++			fmt.Errorf("container of %d elements exceeds the limit of %d", size, limit),
++		)
++	}
+ 	totalMinSize := size * int64(minElemSize)
+ 	if totalMinSize > math.MaxInt32 {
+ 		return NewTProtocolExceptionWithType(
+ 			SIZE_LIMIT,
+ 			fmt.Errorf("size exceeded max allowed: %d", totalMinSize),
++		)
++	}
++	if remaining != UnknownRemainingBytes && uint64(totalMinSize) > remaining {
++		return NewTProtocolExceptionWithType(
++			SIZE_LIMIT,
++			fmt.Errorf(
++				"container of %d elements needs at least %d bytes, only %d remaining",
++				size, totalMinSize, remaining,
++			),
+ 		)
+ 	}
+ 	return checkSizeForProtocol(int32(totalMinSize), cfg)
+--- /dev/null
++++ b/lib/go/thrift/container_size_test.go
+@@ -0,0 +1,185 @@
++/*
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements. See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership. The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License. You may obtain a copy of the License at
++ *
++ *   http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing,
++ * software distributed under the License is distributed on an
++ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++ * KIND, either express or implied. See the License for the
++ * specific language governing permissions and limitations
++ * under the License.
++ */
++
++package thrift
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"testing"
++)
++
++// writeTruncatedListHeader writes a complete message and struct field header
++// followed by a list header that declares count elements, and nothing else.
++// The declared count is therefore not backed by any element bytes.
++func writeTruncatedListHeader(t *testing.T, p TProtocol, count int) {
++	t.Helper()
++	ctx := context.Background()
++	if err := p.WriteMessageBegin(ctx, "m", CALL, 1); err != nil {
++		t.Fatal(err)
++	}
++	if err := p.WriteFieldBegin(ctx, "f", LIST, 1); err != nil {
++		t.Fatal(err)
++	}
++	if err := p.WriteListBegin(ctx, STRUCT, count); err != nil {
++		t.Fatal(err)
++	}
++	if err := p.Flush(ctx); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func readListHeader(t *testing.T, p TProtocol) (int, error) {
++	t.Helper()
++	ctx := context.Background()
++	if _, _, _, err := p.ReadMessageBegin(ctx); err != nil {
++		t.Fatalf("ReadMessageBegin: %v", err)
++	}
++	if _, _, _, err := p.ReadFieldBegin(ctx); err != nil {
++		t.Fatalf("ReadFieldBegin: %v", err)
++	}
++	_, size, err := p.ReadListBegin(ctx)
++	return size, err
++}
++
++func requireSizeLimit(t *testing.T, err error) {
++	t.Helper()
++	var te TProtocolException
++	if !errors.As(err, &te) || te.TypeId() != SIZE_LIMIT {
++		t.Errorf("expected a SIZE_LIMIT TProtocolException, got %#v", err)
++	}
++}
++
++// A wire-declared element count that the remaining bytes cannot possibly back
++// must be rejected before it is handed to the caller, which uses it to size an
++// allocation.
++func TestContainerSizeExceedsRemainingBytes(t *testing.T) {
++	const bogusCount = 1000000
++
++	for _, c := range []struct {
++		name    string
++		factory TProtocolFactory
++	}{
++		{"binary", NewTBinaryProtocolFactoryConf(&TConfiguration{})},
++		{"compact", NewTCompactProtocolFactoryConf(&TConfiguration{})},
++		{"json", NewTJSONProtocolFactory()},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			trans := NewTMemoryBuffer()
++			writeTruncatedListHeader(t, c.factory.GetProtocol(trans), bogusCount)
++
++			read := NewTMemoryBuffer()
++			read.Write(trans.Bytes())
++			size, err := readListHeader(t, c.factory.GetProtocol(read))
++			if err == nil {
++				t.Fatalf("ReadListBegin accepted size %d with only %d bytes of payload",
++					size, len(trans.Bytes()))
++			}
++			requireSizeLimit(t, err)
++		})
++	}
++}
++
++// The same count must still be accepted when the transport cannot report how
++// many bytes remain: rejecting there would break streaming transports.
++func TestContainerSizeUnknownRemainingBytes(t *testing.T) {
++	const count = 1000000
++
++	buf := NewTMemoryBuffer()
++	writeTruncatedListHeader(t, NewTBinaryProtocolConf(buf, &TConfiguration{}), count)
++
++	trans := NewStreamTransportR(bytes.NewReader(buf.Bytes()))
++	if got := trans.RemainingBytes(); got != UnknownRemainingBytes {
++		t.Fatalf("precondition: StreamTransport.RemainingBytes() = %d, want UnknownRemainingBytes", got)
++	}
++	size, err := readListHeader(t, NewTBinaryProtocolConf(trans, &TConfiguration{}))
++	if err != nil {
++		t.Fatalf("ReadListBegin rejected size on an unknown-size transport: %v", err)
++	}
++	if size != count {
++		t.Errorf("size = %d, want %d", size, count)
++	}
++}
++
++// Layered transports must report their own readable bytes, or unknown, but
++// never the (stale) value of the transport below them.
++func TestLayeredTransportRemainingBytes(t *testing.T) {
++	payload := bytes.Repeat([]byte{1}, 64)
++
++	zlibTrans, err := NewTZlibTransport(NewTMemoryBuffer(), 6)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := zlibTrans.RemainingBytes(); got != UnknownRemainingBytes {
++		t.Errorf("TZlibTransport.RemainingBytes() = %d, want UnknownRemainingBytes", got)
++	}
++
++	buffered := NewTBufferedTransport(NewTMemoryBuffer(), 128)
++	if _, err := buffered.tp.Write(payload); err != nil {
++		t.Fatal(err)
++	}
++	one := make([]byte, 1)
++	if _, err := buffered.Read(one); err != nil {
++		t.Fatal(err)
++	}
++	// One byte consumed; the other 63 sit in the bufio.Reader, not in the
++	// underlying memory buffer, and must still be counted.
++	if got, want := buffered.RemainingBytes(), uint64(len(payload)-1); got != want {
++		t.Errorf("TBufferedTransport.RemainingBytes() = %d, want %d", got, want)
++	}
++}
++
++// MaxContainerSize caps the element count of a single container even on a
++// transport that cannot report its remaining bytes.
++func TestMaxContainerSize(t *testing.T) {
++	const count = 1000
++
++	buf := NewTMemoryBuffer()
++	writeTruncatedListHeader(t, NewTBinaryProtocolConf(buf, &TConfiguration{}), count)
++
++	for _, c := range []struct {
++		name      string
++		max       int32
++		wantError bool
++	}{
++		{"unlimited", 0, false},
++		{"above-count", count, false},
++		{"below-count", count - 1, true},
++	} {
++		t.Run(c.name, func(t *testing.T) {
++			cfg := &TConfiguration{MaxContainerSize: c.max}
++			trans := NewStreamTransportR(bytes.NewReader(buf.Bytes()))
++			size, err := readListHeader(t, NewTBinaryProtocolConf(trans, cfg))
++			if c.wantError {
++				if err == nil {
++					t.Fatalf("ReadListBegin accepted size %d with MaxContainerSize %d", size, c.max)
++				}
++				requireSizeLimit(t, err)
++				return
++			}
++			if err != nil {
++				t.Fatalf("unexpected error: %v", err)
++			}
++			if size != count {
++				t.Errorf("size = %d, want %d", size, count)
++			}
++		})
++	}
++}
+--- a/lib/go/thrift/header_transport.go
++++ b/lib/go/thrift/header_transport.go
+@@ -469,6 +469,15 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	// transformCount is an element count read straight off the wire, not a
++	// buffer length, so the frame-size and header-length checks above do not
++	// bound it. Validate it the same way every other wire-supplied container
++	// count (list/set/map sizes) is validated, before it sizes any allocation.
++	if err = checkContainerSizeForProtocol(
++		int64(transformCount), 1, headerBuf.RemainingBytes(), t.cfg,
++	); err != nil {
++		return err
++	}
+ 	if transformCount > 0 {
+ 		reader := NewTransformReaderWithCapacity(
+ 			t.frameBuffer,
+@@ -723,15 +732,24 @@
+ 	return t.transport.Close()
+ }
+ 
+-// RemainingBytes calls underlying transport's RemainingBytes.
++// RemainingBytes returns the number of bytes left in the current frame.
+ //
+-// Even in framed cases, because of all the possible compression transforms
+-// involved, the remaining frame size is likely to be different from the actual
+-// remaining readable bytes, so we don't bother to keep tracking the remaining
+-// frame size by ourselves and just use the underlying transport's
+-// RemainingBytes directly.
++// The underlying transport's value cannot be used here: the frame has already
++// been copied out of it into frameBuffer, so it no longer accounts for the
++// bytes this transport can still deliver.
++//
++// When a compression transform is in play the frame buffer holds transformed
++// bytes, which say nothing about how many bytes the transform will produce, so
++// the answer is UnknownRemainingBytes. The same applies outside a frame, where
++// reads come from a bufio.Reader over the underlying transport.
+ func (t *THeaderTransport) RemainingBytes() uint64 {
+-	return t.transport.RemainingBytes()
++	if t.frameReader == nil || t.frameBuffer == nil {
++		return UnknownRemainingBytes
++	}
++	if _, transformed := t.frameReader.(*TransformReader); transformed {
++		return UnknownRemainingBytes
++	}
++	return uint64(t.frameBuffer.Len())
+ }
+ 
+ // GetReadHeaders returns the THeaderMap read from transport.
+--- a/lib/go/thrift/http_client.go
++++ b/lib/go/thrift/http_client.go
+@@ -230,8 +230,7 @@
+ 		return uint64(len)
+ 	}
+ 
+-	const maxSize = ^uint64(0)
+-	return maxSize // the truth is, we just don't know unless framed is used
++	return UnknownRemainingBytes
+ }
+ 
+ // Deprecated: Use NewTHttpClientTransportFactory instead.
+--- a/lib/go/thrift/http_transport.go
++++ b/lib/go/thrift/http_transport.go
+@@ -34,6 +34,10 @@
+ 		w.Header().Add("Content-Type", "application/x-thrift")
+ 
+ 		transport := NewStreamTransport(r.Body, w)
++		// A request that declares its length tells the decoder how much it can
++		// possibly read; without this the transport reports unknown and the
++		// container element-count check has nothing to bound against.
++		transport.setKnownSize(r.ContentLength)
+ 		processor.Process(r.Context(), inPfactory.GetProtocol(transport), outPfactory.GetProtocol(transport))
+ 	})
+ }
+--- a/lib/go/thrift/iostream_transport.go
++++ b/lib/go/thrift/iostream_transport.go
+@@ -31,8 +31,24 @@
+ 	io.Writer
+ 	isReadWriter bool
+ 	closed       bool
++
++	// knownSize is the number of bytes the caller knows the reader holds, or
++	// zero when it does not know. See setKnownSize.
++	knownSize int64
+ }
+ 
++// setKnownSize records how many bytes the reader is known to hold, for callers
++// that are told the length up front - an HTTP request with a Content-Length,
++// for example. A value of zero or less means unknown and is ignored.
++//
++// The recorded value is an upper bound and is deliberately not decremented as
++// bytes are consumed: over-reporting only makes the container check accept a
++// count it could have rejected, while under-reporting would reject a message
++// that is in fact complete.
++func (p *StreamTransport) setKnownSize(size int64) {
++	p.knownSize = size
++}
++
+ type StreamTransportFactory struct {
+ 	Reader       io.Reader
+ 	Writer       io.Writer
+@@ -209,8 +225,10 @@
+ }
+ 
+ func (p *StreamTransport) RemainingBytes() (num_bytes uint64) {
+-	const maxSize = ^uint64(0)
+-	return maxSize // the truth is, we just don't know unless framed is used
++	if p.knownSize > 0 {
++		return uint64(p.knownSize)
++	}
++	return UnknownRemainingBytes
+ }
+ 
+ // SetTConfiguration implements TConfigurationSetter for propagation.
+--- a/lib/go/thrift/json_protocol.go
++++ b/lib/go/thrift/json_protocol.go
+@@ -317,7 +317,7 @@
+ 	size = int(iSize)
+ 
+ 	minElemSize := p.getMinSerializedSize(keyType) + p.getMinSerializedSize(valueType)
+-	err = checkContainerSizeForProtocol(iSize, minElemSize, p.cfg)
++	err = checkContainerSizeForProtocol(iSize, minElemSize, p.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return keyType, valueType, 0, err
+ 	}
+@@ -497,7 +497,7 @@
+ 	size = int(nSize)
+ 
+ 	minElemSize := p.getMinSerializedSize(elemType)
+-	err = checkContainerSizeForProtocol(nSize, minElemSize, p.cfg)
++	err = checkContainerSizeForProtocol(nSize, minElemSize, p.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return elemType, 0, err
+ 	}
+@@ -566,42 +566,6 @@
+ 
+ 	e := fmt.Errorf("Unknown type identifier: %s", fieldType)
+ 	return TType(STOP), NewTProtocolExceptionWithType(INVALID_DATA, e)
+-}
+-
+-// Return the minimum number of bytes a type will consume on the wire
+-func (p *TJSONProtocol) getMinSerializedSize(ttype TType) int32 {
+-	switch ttype {
+-	case STOP:
+-		return 1 // T_STOP needs to count itself
+-	case VOID:
+-		return 1 // T_VOID needs to count itself
+-	case BOOL:
+-		return 1 // written as int
+-	case BYTE:
+-		return 1
+-	case DOUBLE:
+-		return 1
+-	case I16:
+-		return 1
+-	case I32:
+-		return 1
+-	case I64:
+-		return 1
+-	case STRING:
+-		return 2 // empty string
+-	case STRUCT:
+-		return 2 // empty struct
+-	case MAP:
+-		return 2 // empty map
+-	case SET:
+-		return 2 // empty set
+-	case LIST:
+-		return 2 // empty list
+-	case UUID:
+-		return 16 // empty UUID
+-	default:
+-		return 1 // unknown type
+-	}
+ }
+ 
+ var _ TConfigurationSetter = (*TJSONProtocol)(nil)
+--- a/lib/go/thrift/protocol_test.go
++++ b/lib/go/thrift/protocol_test.go
+@@ -753,21 +753,27 @@
+ 		label     string
+ 		size      int64
+ 		minElem   int32
++		remaining uint64
+ 		wantError bool
+ 	}{
+-		{"small", 10, 8, false},
++		{"small", 10, 8, UnknownRemainingBytes, false},
+ 		{"negative", -1, 8, true},
+ 		// 0x20000000 * 8 == 1<<32, i.e. 0 taken as a signed 32-bit product.
+-		{"int32-product", 0x20000000, 8, true},
++		{"int32-product", 0x20000000, 8, UnknownRemainingBytes, true},
+ 		// JSON reads the count as int64; a count past int32 must be rejected
+ 		// rather than reduced to a small product.
+-		{"int64-count", 0x100000000, 2, true},
++		{"int64-count", 0x100000000, 2, UnknownRemainingBytes, true},
+ 		// A count near math.MaxInt64/minElem keeps the 64-bit product itself
+ 		// outside int32 range; it must be rejected by the count range check.
+-		{"int64-product", 0x4000000000000000, 2, true},
++		{"int64-product", 0x4000000000000000, 2, UnknownRemainingBytes, true},
++		// A known remaining size bounds the count on top of the above.
++		{"fits-remaining", 10, 8, 80, false},
++		{"exceeds-remaining", 11, 8, 80, true},
++		{"nothing-remaining", 1, 1, 0, true},
++		{"empty-container", 0, 1, 0, false},
+ 	} {
+ 		t.Run(c.label, func(t *testing.T) {
+-			err := checkContainerSizeForProtocol(c.size, c.minElem, &TConfiguration{})
++			err := checkContainerSizeForProtocol(c.size, c.minElem, c.remaining, &TConfiguration{})
+ 			if c.wantError && err == nil {
+ 				t.Errorf("size=%d minElem=%d: expected error, got nil", c.size, c.minElem)
+ 			}
+--- a/lib/go/thrift/simple_json_protocol.go
++++ b/lib/go/thrift/simple_json_protocol.go
+@@ -113,6 +113,14 @@
+ 	})
+ }
+ 
++// RemainingBytes implements ReadSizeProvider.
++//
++// The protocol reads through a bufio.Reader, so the bytes already pulled out of
++// the transport have to be added back to what the transport still reports.
++func (p *TSimpleJSONProtocol) RemainingBytes() uint64 {
++	return addRemainingBytes(p.trans.RemainingBytes(), uint64(p.reader.Buffered()))
++}
++
+ func NewTSimpleJSONProtocolConf(t TTransport, conf *TConfiguration) *TSimpleJSONProtocol {
+ 	PropagateTConfiguration(t, conf)
+ 	v := &TSimpleJSONProtocol{
+@@ -438,7 +446,8 @@
+ 			fmt.Errorf("size exceeded max allowed: %d", iSize),
+ 		)
+ 	}
+-	err = checkSizeForProtocol(int32(iSize), p.cfg)
++	minElemSize := p.getMinSerializedSize(keyType) + p.getMinSerializedSize(valueType)
++	err = checkContainerSizeForProtocol(iSize, minElemSize, p.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return keyType, valueType, 0, err
+ 	}
+@@ -1104,6 +1113,42 @@
+ 	return isNull, NewTProtocolExceptionWithType(INVALID_DATA, err)
+ }
+ 
++// Return the minimum number of bytes a type will consume on the wire
++func (p *TSimpleJSONProtocol) getMinSerializedSize(ttype TType) int32 {
++	switch ttype {
++	case STOP:
++		return 1 // T_STOP needs to count itself
++	case VOID:
++		return 1 // T_VOID needs to count itself
++	case BOOL:
++		return 1 // written as int
++	case BYTE:
++		return 1
++	case DOUBLE:
++		return 1
++	case I16:
++		return 1
++	case I32:
++		return 1
++	case I64:
++		return 1
++	case STRING:
++		return 2 // empty string
++	case STRUCT:
++		return 2 // empty struct
++	case MAP:
++		return 2 // empty map
++	case SET:
++		return 2 // empty set
++	case LIST:
++		return 2 // empty list
++	case UUID:
++		return 16 // empty UUID
++	default:
++		return 1 // unknown type
++	}
++}
++
+ func (p *TSimpleJSONProtocol) ParseElemListBegin() (elemType TType, size int, e error) {
+ 	if isNull, e := p.ParseListBegin(); isNull || e != nil {
+ 		return VOID, 0, e
+@@ -1123,7 +1168,8 @@
+ 			fmt.Errorf("size exceeded max allowed: %d", nSize),
+ 		)
+ 	}
+-	err = checkSizeForProtocol(int32(nSize), p.cfg)
++	minElemSize := p.getMinSerializedSize(elemType)
++	err = checkContainerSizeForProtocol(nSize, minElemSize, p.RemainingBytes(), p.cfg)
+ 	if err != nil {
+ 		return elemType, 0, err
+ 	}
+--- a/lib/go/thrift/socket.go
++++ b/lib/go/thrift/socket.go
+@@ -234,8 +234,7 @@
+ }
+ 
+ func (p *TSocket) RemainingBytes() (num_bytes uint64) {
+-	const maxSize = ^uint64(0)
+-	return maxSize // the truth is, we just don't know unless framed is used
++	return UnknownRemainingBytes
+ }
+ 
+ var _ TConfigurationSetter = (*TSocket)(nil)
+--- a/lib/go/thrift/ssl_socket.go
++++ b/lib/go/thrift/ssl_socket.go
+@@ -255,8 +255,7 @@
+ }
+ 
+ func (p *TSSLSocket) RemainingBytes() (num_bytes uint64) {
+-	const maxSize = ^uint64(0)
+-	return maxSize // the truth is, we just don't know unless framed is used
++	return UnknownRemainingBytes
+ }
+ 
+ var _ TConfigurationSetter = (*TSSLSocket)(nil)
+--- a/lib/go/thrift/transport.go
++++ b/lib/go/thrift/transport.go
+@@ -35,8 +35,32 @@
+ 	Flush(ctx context.Context) (err error)
+ }
+ 
++// UnknownRemainingBytes is returned by RemainingBytes implementations that
++// cannot tell how many bytes are still readable, for example an unframed
++// socket.
++const UnknownRemainingBytes = ^uint64(0)
++
+ type ReadSizeProvider interface {
++	// RemainingBytes returns the number of bytes that can still be read,
++	// or UnknownRemainingBytes when the transport has no way of knowing.
++	//
++	// The value is used as an upper bound when validating element counts
++	// read off the wire, so it must never be smaller than the number of
++	// bytes a well formed peer can still deliver for the current message,
++	// or valid messages will be rejected. A layered transport that cannot
++	// express its own readable bytes in terms of the transport below it
++	// (because it decompresses, or because it buffers ahead) must return
++	// UnknownRemainingBytes rather than pass the lower value through.
+ 	RemainingBytes() (num_bytes uint64)
++}
++
++// addRemainingBytes adds extra to a RemainingBytes value, saturating at
++// UnknownRemainingBytes rather than wrapping around.
++func addRemainingBytes(remaining, extra uint64) uint64 {
++	if remaining >= UnknownRemainingBytes-extra {
++		return UnknownRemainingBytes
++	}
++	return remaining + extra
+ }
+ 
+ // Encapsulates the I/O layer
+--- a/lib/go/thrift/zlib_transport.go
++++ b/lib/go/thrift/zlib_transport.go
+@@ -136,8 +136,12 @@
+ 
+ // RemainingBytes returns the size in bytes of the data that is still to be
+ // read.
++//
++// The underlying transport counts compressed bytes, which are no bound on the
++// bytes this transport can still produce, so the answer is always
++// UnknownRemainingBytes.
+ func (z *TZlibTransport) RemainingBytes() uint64 {
+-	return z.transport.RemainingBytes()
++	return UnknownRemainingBytes
+ }
+ 
+ func (z *TZlibTransport) Write(p []byte) (int, error) {
+
 --- a/lib/go/thrift/simple_json_protocol.go
 +++ b/lib/go/thrift/simple_json_protocol.go
 @@ -924,11 +924,37 @@ func (p *TSimpleJSONProtocol) readNonSignificantWhitespace() error {

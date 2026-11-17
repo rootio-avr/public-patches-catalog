@@ -4,6 +4,7 @@ This patch is based on github.com/apache/thrift version v0.24.0, which is availa
 unknown
 
 ## Affected CVEs:
+- CVE-2026-82458
 - CVE-2026-66055
 
 ## How to Apply:
