@@ -1,3 +1,587 @@
+--- a/lib/go/thrift/framed_transport.go
++++ b/lib/go/thrift/framed_transport.go
+@@ -140,30 +140,32 @@
+ 		}
+ 	}()
+ 
+-	if p.readBuf != nil {
++	// Loop rather than recurse: an empty frame yields no bytes, so a peer
++	// can drive one iteration per 4 bytes it sends, and a stack frame per
++	// iteration would not be bounded by anything.
++	for {
++		if p.readBuf != nil {
++			read, err = p.readBuf.Read(buf)
++			if err != io.EOF {
++				return
++			}
+ 
+-		read, err = p.readBuf.Read(buf)
+-		if err != io.EOF {
+-			return
++			// For bytes.Buffer.Read, EOF would only happen when read is zero,
++			// but still, do a sanity check,
++			// in case that behavior is changed in a future version of go stdlib.
++			// When that happens, just return nil error,
++			// and let the caller call Read again to read the next frame.
++			if read > 0 {
++				return read, nil
++			}
+ 		}
+ 
+-		// For bytes.Buffer.Read, EOF would only happen when read is zero,
+-		// but still, do a sanity check,
+-		// in case that behavior is changed in a future version of go stdlib.
+-		// When that happens, just return nil error,
+-		// and let the caller call Read again to read the next frame.
+-		if read > 0 {
+-			return read, nil
++		// Reaching here means that the last Read finished the last frame,
++		// so we need to read the next frame into readBuf now.
++		if err = p.readFrame(); err != nil {
++			return read, err
+ 		}
+ 	}
+-
+-	// Reaching here means that the last Read finished the last frame,
+-	// so we need to read the next frame into readBuf now.
+-	if err = p.readFrame(); err != nil {
+-		return read, err
+-	}
+-	newRead, err := p.Read(buf[read:])
+-	return read + newRead, err
+ }
+ 
+ func (p *TFramedTransport) ReadByte() (c byte, err error) {
+--- a/lib/go/thrift/framed_transport_test.go
++++ b/lib/go/thrift/framed_transport_test.go
+@@ -20,8 +20,11 @@
+ package thrift
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/binary"
+ 	"io"
++	"runtime"
+ 	"strings"
+ 	"testing"
+ 	"testing/iotest"
+@@ -100,4 +103,68 @@
+ 			}
+ 		}
+ 	})
++}
++
++// stackDepthTransport records the call-stack depth observed on every Read of
++// the underlying transport, so that a test can tell whether TFramedTransport
++// consumes successive frames iteratively or by re-entering itself once per
++// frame.
++type stackDepthTransport struct {
++	TTransport
++
++	depths []int
++}
++
++func (s *stackDepthTransport) Read(p []byte) (int, error) {
++	var pcs [8192]uintptr
++	s.depths = append(s.depths, runtime.Callers(0, pcs[:]))
++	return s.TTransport.Read(p)
++}
++
++func TestTFramedTransportEmptyFrames(t *testing.T) {
++	// An empty frame carries no payload, so Read has to move on to the next
++	// frame to satisfy its caller. It must do so without adding a stack
++	// frame per empty frame: a peer can send them 4 bytes at a time.
++	const (
++		emptyFrames = 100000
++		content     = "hello, world!"
++	)
++
++	var raw bytes.Buffer
++	for range emptyFrames {
++		raw.Write([]byte{0, 0, 0, 0})
++	}
++	binary.Write(&raw, binary.BigEndian, uint32(len(content)))
++	raw.WriteString(content)
++
++	base := &stackDepthTransport{TTransport: NewStreamTransportR(&raw)}
++	trans := NewTFramedTransport(base)
++
++	buf := make([]byte, len(content))
++	n, err := io.ReadFull(trans, buf)
++	if err != nil {
++		t.Fatalf("Failed to read after %d empty frames: %v", emptyFrames, err)
++	}
++	if got := string(buf[:n]); got != content {
++		t.Errorf("Read after %d empty frames: want %q, got %q", emptyFrames, content, got)
++	}
++
++	if len(base.depths) < 2 {
++		t.Fatalf(
++			"Expected the underlying transport to be read more than once, got %d reads",
++			len(base.depths),
++		)
++	}
++	first := base.depths[0]
++	last := base.depths[len(base.depths)-1]
++	// An iterative implementation reads every frame from the same depth, so
++	// the difference is 0. Allow a small margin for the runtime rather than
++	// pinning an exact number.
++	if delta := last - first; delta > 16 {
++		t.Errorf(
++			"Stack depth grew by %d (from %d to %d) over %d reads of the underlying transport, "+
++				"which means one empty frame costs one stack frame",
++			delta, first, last, len(base.depths),
++		)
++	}
+ }
+--- a/lib/go/thrift/header_transport.go
++++ b/lib/go/thrift/header_transport.go
+@@ -558,11 +558,18 @@
+ 	// Then, 99% of the case when calling this Read frame is already read
+ 	// into frameReader. ReadFrame here is more of preventing bugs that
+ 	// didn't call ReadFrame before calling Read.
+-	err = t.ReadFrame(context.Background())
+-	if err != nil {
+-		return
+-	}
+-	if t.frameReader != nil {
++	// Loop rather than recurse: a frame whose header block fills it yields no
++	// payload bytes, so a peer can drive one iteration per 18 bytes it sends,
++	// and a stack frame per iteration would not be bounded by anything.
++	for {
++		err = t.ReadFrame(context.Background())
++		if err != nil {
++			return
++		}
++		if t.frameReader == nil {
++			return t.reader.Read(p)
++		}
++
+ 		read, err = t.frameReader.Read(p)
+ 		if err == nil && t.frameBuffer.Len() <= 0 {
+ 			// the last Read finished the frame, do endOfFrame
+@@ -583,12 +590,11 @@
+ 				// as otherwise we would return 0 and nil,
+ 				// which is a case not handled well by most
+ 				// protocol implementations.
+-				return t.Read(p)
++				continue
+ 			}
+ 		}
+ 		return
+ 	}
+-	return t.reader.Read(p)
+ }
+ 
+ // Write writes data to the write buffer.
+--- a/lib/go/thrift/header_transport_test.go
++++ b/lib/go/thrift/header_transport_test.go
+@@ -20,9 +20,12 @@
+ package thrift
+ 
+ import (
++	"bytes"
+ 	"context"
++	"encoding/binary"
+ 	"fmt"
+ 	"io"
++	"runtime"
+ 	"strings"
+ 	"testing"
+ 	"testing/iotest"
+@@ -374,4 +377,87 @@
+ 			}
+ 		}
+ 	})
++}
++
++// headerDepthTransport records the call-stack depth observed on every Read of
++// the underlying transport, so that a test can tell whether THeaderTransport
++// consumes successive frames iteratively or by re-entering itself once per
++// frame.
++type headerDepthTransport struct {
++	TTransport
++
++	depths []int
++}
++
++func (h *headerDepthTransport) Read(p []byte) (int, error) {
++	var pcs [8192]uintptr
++	h.depths = append(h.depths, runtime.Callers(0, pcs[:]))
++	return h.TTransport.Read(p)
++}
++
++// emptyPayloadHeaderFrame builds a THeader frame whose header block fills the
++// whole frame, so that it carries no payload at all.
++func emptyPayloadHeaderFrame(payload []byte) []byte {
++	// One word of header block: protocol id 0 (binary) and a transform count
++	// of 0, as varints, then padding.
++	headerBlock := []byte{0x00, 0x00, 0x00, 0x00}
++
++	var frame bytes.Buffer
++	binary.Write(&frame, binary.BigEndian, THeaderHeaderMagic)
++	binary.Write(&frame, binary.BigEndian, int32(0)) // sequence id
++	binary.Write(&frame, binary.BigEndian, uint16(len(headerBlock)/4))
++	frame.Write(headerBlock)
++	frame.Write(payload)
++
++	var out bytes.Buffer
++	binary.Write(&out, binary.BigEndian, uint32(frame.Len()))
++	out.Write(frame.Bytes())
++	return out.Bytes()
++}
++
++func TestTHeaderTransportEmptyPayloadFrames(t *testing.T) {
++	// A frame whose header block fills it carries no payload, so Read has to
++	// move on to the next frame to satisfy its caller. It must do so without
++	// adding a stack frame per empty frame: such a frame costs a peer 18 bytes.
++	const (
++		emptyFrames = 50000
++		content     = "hello, world!"
++	)
++
++	var raw bytes.Buffer
++	for range emptyFrames {
++		raw.Write(emptyPayloadHeaderFrame(nil))
++	}
++	raw.Write(emptyPayloadHeaderFrame([]byte(content)))
++
++	base := &headerDepthTransport{TTransport: NewStreamTransportR(&raw)}
++	trans := NewTHeaderTransport(base)
++
++	buf := make([]byte, len(content))
++	n, err := io.ReadFull(trans, buf)
++	if err != nil {
++		t.Fatalf("Failed to read after %d empty frames: %v", emptyFrames, err)
++	}
++	if got := string(buf[:n]); got != content {
++		t.Errorf("Read after %d empty frames: want %q, got %q", emptyFrames, content, got)
++	}
++
++	if len(base.depths) < 2 {
++		t.Fatalf(
++			"Expected the underlying transport to be read more than once, got %d reads",
++			len(base.depths),
++		)
++	}
++	first := base.depths[0]
++	last := base.depths[len(base.depths)-1]
++	// An iterative implementation reads every frame from the same depth, so
++	// the difference is 0. Allow a small margin for the runtime rather than
++	// pinning an exact number.
++	if delta := last - first; delta > 16 {
++		t.Errorf(
++			"Stack depth grew by %d (from %d to %d) over %d reads of the underlying transport, "+
++				"which means one empty frame costs one stack frame",
++			delta, first, last, len(base.depths),
++		)
++	}
+ }
+
+--- a/lib/go/thrift/header_transport.go
++++ b/lib/go/thrift/header_transport.go
+@@ -110,6 +110,11 @@
+ 	TransformZlib                           // 1, zlib
+ )
+ 
++// maxTransforms is the number of transforms one frame may carry. ZLIB is the
++// only transform applied here, and no sender lists it more than once, so one
++// is the whole of what a well-formed frame needs.
++const maxTransforms = 1
++
+ var supportedTransformIDs = map[THeaderTransformID]bool{
+ 	TransformNone: true,
+ 	TransformZlib: true,
+@@ -177,6 +182,38 @@
+ 	return nil
+ }
+ 
++// limitedTransformReader reads the output of a read transform, and fails the
++// read that would take that output past limit bytes.
++type limitedTransformReader struct {
++	r     io.Reader
++	limit int64
++	read  int64
++	err   error
++}
++
++func (l *limitedTransformReader) Read(p []byte) (int, error) {
++	if l.err != nil {
++		return 0, l.err
++	}
++	// Read at most one byte past the limit: output that ends right at the
++	// limit is read to its end, and the extra byte shows output that goes on.
++	if left := l.limit - l.read; int64(len(p)) > left+1 {
++		p = p[:left+1]
++	}
++	n, err := l.r.Read(p)
++	if l.read+int64(n) > l.limit {
++		l.err = NewTProtocolExceptionWithType(
++			SIZE_LIMIT,
++			fmt.Errorf("frame too large after transform: more than %d bytes", l.limit),
++		)
++		n = int(l.limit - l.read)
++		l.read = l.limit
++		return n, l.err
++	}
++	l.read += int64(n)
++	return n, err
++}
++
+ // TransformWriter is an io.WriteCloser that handles transforms writing.
+ type TransformWriter struct {
+ 	io.Writer
+@@ -469,6 +506,12 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	if transformCount > maxTransforms {
++		return NewTProtocolExceptionWithType(
++			SIZE_LIMIT,
++			fmt.Errorf("frame declares %d transforms; at most %d is supported", transformCount, maxTransforms),
++		)
++	}
+ 	if transformCount > 0 {
+ 		reader := NewTransformReaderWithCapacity(
+ 			t.frameBuffer,
+@@ -498,6 +541,15 @@
+ 			id := transformIDs[i]
+ 			if err := reader.AddTransform(id); err != nil {
+ 				return err
++			}
++			if id == TransformZlib {
++				// ReadFrame held the frame to the maximum frame
++				// size as it came off the wire. Hold what each
++				// inflate makes of it to the same size.
++				reader.Reader = &limitedTransformReader{
++					r:     reader.Reader,
++					limit: int64(t.cfg.GetMaxFrameSize()),
++				}
+ 			}
+ 		}
+ 	}
+--- /dev/null
++++ b/lib/go/thrift/header_transport_zlib_limit_test.go
+@@ -0,0 +1,113 @@
++package thrift
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"errors"
++	"io"
++	"testing"
++)
++
++func zlibLimitHeaderFrames(t *testing.T, payloads ...[]byte) *TMemoryBuffer {
++	t.Helper()
++	trans := NewTMemoryBuffer()
++	writer := NewTHeaderTransportConf(trans, &TConfiguration{
++		THeaderTransforms: []THeaderTransformID{TransformZlib},
++	})
++	for _, payload := range payloads {
++		if _, err := writer.Write(payload); err != nil {
++			t.Fatal(err)
++		}
++		if err := writer.Flush(context.Background()); err != nil {
++			t.Fatal(err)
++		}
++	}
++	return trans
++}
++
++func requireZlibLimitSizeLimit(t *testing.T, err error) {
++	t.Helper()
++	var pe TProtocolException
++	if !errors.As(err, &pe) || pe.TypeId() != SIZE_LIMIT {
++		t.Fatalf("read returned %v, want a TProtocolException of type SIZE_LIMIT", err)
++	}
++}
++
++// The payload the ZLIB transform inflates a frame to is held to the maximum
++// frame size: a read that would go past it fails instead of returning more.
++func TestTHeaderTransportZlibFrameSizeLimit(t *testing.T) {
++	const limit = 64 * 1024
++	conf := &TConfiguration{MaxFrameSize: limit}
++
++	for _, tc := range []struct {
++		name string
++		size int
++	}{
++		{name: "at-limit", size: limit},
++		{name: "one-over", size: limit + 1},
++		{name: "far-over", size: 1024 * 1024},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			payload := bytes.Repeat([]byte("x"), tc.size)
++			trans := zlibLimitHeaderFrames(t, payload)
++			wire := trans.Len()
++			if wire > limit {
++				t.Fatalf("frame on the wire is %d bytes, want it within the limit of %d", wire, limit)
++			}
++
++			reader := NewTHeaderTransportConf(trans, conf)
++			var read bytes.Buffer
++			n, err := io.Copy(&read, reader)
++			if tc.size <= limit {
++				if err != nil {
++					t.Fatalf("read of a %d byte payload failed after %d bytes: %v", tc.size, n, err)
++				}
++				if !bytes.Equal(read.Bytes(), payload) {
++					t.Fatalf("read back %d bytes, want the %d bytes written", n, tc.size)
++				}
++				return
++			}
++			if n > limit {
++				t.Errorf("read %d bytes of a %d byte payload, want at most %d", n, tc.size, limit)
++			}
++			requireZlibLimitSizeLimit(t, err)
++		})
++	}
++
++	// Every frame gets the whole limit.
++	t.Run("per-frame", func(t *testing.T) {
++		payload := bytes.Repeat([]byte("x"), limit)
++		trans := zlibLimitHeaderFrames(t, payload, payload, payload)
++		reader := NewTHeaderTransportConf(trans, conf)
++		read, err := io.ReadAll(reader)
++		if err != nil {
++			t.Fatalf("read of three frames failed after %d bytes: %v", len(read), err)
++		}
++		if want := 3 * limit; len(read) != want {
++			t.Fatalf("read %d bytes, want %d", len(read), want)
++		}
++	})
++}
++
++// A frame carries at most one transform.
++func TestTHeaderTransportRejectsStackedTransforms(t *testing.T) {
++	// Protocol id 0 (binary) and two ZLIB transforms, as varints.
++	headerBlock := []byte{0x00, 0x02, byte(TransformZlib), byte(TransformZlib)}
++	var frame bytes.Buffer
++	binary.Write(&frame, binary.BigEndian, THeaderHeaderMagic)
++	binary.Write(&frame, binary.BigEndian, int32(0)) // sequence id
++	binary.Write(&frame, binary.BigEndian, uint16(len(headerBlock)/4))
++	frame.Write(headerBlock)
++
++	trans := NewTMemoryBuffer()
++	binary.Write(trans, binary.BigEndian, uint32(frame.Len()))
++	trans.Write(frame.Bytes())
++
++	reader := NewTHeaderTransportConf(trans, &TConfiguration{})
++	read, err := io.ReadAll(reader)
++	if len(read) != 0 {
++		t.Errorf("read %d bytes, want none", len(read))
++	}
++	requireZlibLimitSizeLimit(t, err)
++}
+
+--- a/lib/go/thrift/header_transport.go
++++ b/lib/go/thrift/header_transport.go
+@@ -503,12 +503,19 @@
+ 
+ 	var transformCount int32
+ 	transformCount, err = hp.readVarint32()
+ 	if err != nil {
+ 		return err
+ 	}
++	// transformCount is an element count read straight off the wire, not a
++	// buffer length, so the frame-size and header-length checks above do not
++	// bound it. Validate it the same way every other wire-supplied container
++	// count (list/set/map sizes) is validated, before it sizes any allocation.
++	if err = checkContainerSizeForProtocol(int64(transformCount), 1, t.cfg); err != nil {
++		return err
++	}
+ 	if transformCount > maxTransforms {
+ 		return NewTProtocolExceptionWithType(
+ 			SIZE_LIMIT,
+ 			fmt.Errorf("frame declares %d transforms; at most %d is supported", transformCount, maxTransforms),
+ 		)
+ 	}
+--- a/lib/go/thrift/header_transport_test.go
++++ b/lib/go/thrift/header_transport_test.go
+@@ -458,6 +458,78 @@
+ 			"Stack depth grew by %d (from %d to %d) over %d reads of the underlying transport, "+
+ 				"which means one empty frame costs one stack frame",
+ 			delta, first, last, len(base.depths),
+ 		)
+ 	}
+ }
++
++// TestTHeaderTransportTransformCountBounded builds a frame by hand where the
++// header declares a transformCount that is not backed by anywhere near that
++// many transform ID entries -- the shape of an element count read straight
++// off the wire, as opposed to a real transform list. It must be rejected by
++// the same size check every other wire-supplied container count goes
++// through, before it is used to size any allocation.
++//
++// The declared count (1000) is intentionally small enough that even without
++// the fix, sizing allocations from it cannot exhaust memory; unpatched code
++// still fails, but only later, via EOF from the transform-ID read loop
++// running out of header bytes. A configured MaxMessageSize well below 1000
++// distinguishes the two: fixed code rejects with SIZE_LIMIT before touching
++// the read loop, unpatched code gets there and fails with EOF instead.
++func TestTHeaderTransportTransformCountBounded(t *testing.T) {
++	headers := NewTMemoryBuffer()
++	hp := NewTCompactProtocol(headers)
++	if _, err := hp.writeVarint32(int32(THeaderProtocolCompact)); err != nil {
++		t.Fatalf("writeVarint32(protoID) returned error: %v", err)
++	}
++	const declaredTransformCount = 1000
++	if _, err := hp.writeVarint32(declaredTransformCount); err != nil {
++		t.Fatalf("writeVarint32(transformCount) returned error: %v", err)
++	}
++	// No transform ID entries follow, unlike a legitimate frame.
++
++	if padding := 4 - headers.Len()%4; padding < 4 {
++		if _, err := headers.Write(make([]byte, padding)); err != nil {
++			t.Fatalf("headers.Write(padding) returned error: %v", err)
++		}
++	}
++
++	meta := headerMeta{
++		MagicFlags:   THeaderHeaderMagic,
++		SequenceID:   0,
++		HeaderLength: uint16(headers.Len() / 4),
++	}
++	frame := NewTMemoryBuffer()
++	if err := binary.Write(frame, binary.BigEndian, meta); err != nil {
++		t.Fatalf("binary.Write(meta) returned error: %v", err)
++	}
++	if _, err := io.Copy(frame, headers); err != nil {
++		t.Fatalf("io.Copy(headers) returned error: %v", err)
++	}
++
++	trans := NewTMemoryBuffer()
++	frameSizeBuf := make([]byte, size32)
++	binary.BigEndian.PutUint32(frameSizeBuf, uint32(frame.Len()))
++	if _, err := trans.Write(frameSizeBuf); err != nil {
++		t.Fatalf("trans.Write(frameSize) returned error: %v", err)
++	}
++	if _, err := io.Copy(trans, frame); err != nil {
++		t.Fatalf("io.Copy(trans, frame) returned error: %v", err)
++	}
++
++	reader := NewTHeaderTransportConf(trans, &TConfiguration{
++		MaxMessageSize: 64,
++	})
++	err := reader.ReadFrame(context.Background())
++	if err == nil {
++		t.Fatal("ReadFrame with an over-limit transformCount unexpectedly succeeded")
++	}
++	terr, ok := err.(TProtocolException)
++	if !ok || terr.TypeId() != SIZE_LIMIT {
++		t.Fatalf(
++			"ReadFrame returned %v, want a TProtocolException with TypeId SIZE_LIMIT (%d); "+
++				"an EOF-shaped error here means transformCount was not bounds-checked "+
++				"before being used to size an allocation",
++			err, SIZE_LIMIT,
++		)
++	}
++}
+
 --- a/lib/go/thrift/binary_protocol.go
 +++ b/lib/go/thrift/binary_protocol.go
 @@ -356,7 +356,7 @@
@@ -334,22 +918,17 @@
 +}
 --- a/lib/go/thrift/header_transport.go
 +++ b/lib/go/thrift/header_transport.go
-@@ -469,6 +469,15 @@
- 	if err != nil {
- 		return err
- 	}
-+	// transformCount is an element count read straight off the wire, not a
-+	// buffer length, so the frame-size and header-length checks above do not
-+	// bound it. Validate it the same way every other wire-supplied container
-+	// count (list/set/map sizes) is validated, before it sizes any allocation.
+@@ -512,7 +512,9 @@
+ 	// count (list/set/map sizes) is validated, before it sizes any allocation.
+-	if err = checkContainerSizeForProtocol(int64(transformCount), 1, t.cfg); err != nil {
 +	if err = checkContainerSizeForProtocol(
 +		int64(transformCount), 1, headerBuf.RemainingBytes(), t.cfg,
 +	); err != nil {
-+		return err
-+	}
- 	if transformCount > 0 {
- 		reader := NewTransformReaderWithCapacity(
- 			t.frameBuffer,
+ 		return err
+ 	}
+ 	if transformCount > maxTransforms {
+ 		return NewTProtocolExceptionWithType(
+ 			SIZE_LIMIT,
 @@ -723,15 +732,24 @@
  	return t.transport.Close()
  }
@@ -521,7 +1100,8 @@
  	}{
 -		{"small", 10, 8, false},
 +		{"small", 10, 8, UnknownRemainingBytes, false},
- 		{"negative", -1, 8, true},
+-		{"negative", -1, 8, true},
++		{"negative", -1, 8, UnknownRemainingBytes, true},
  		// 0x20000000 * 8 == 1<<32, i.e. 0 taken as a signed 32-bit product.
 -		{"int32-product", 0x20000000, 8, true},
 +		{"int32-product", 0x20000000, 8, UnknownRemainingBytes, true},
@@ -862,7 +1442,7 @@
 +	return NewTSimpleJSONProtocolConf(trans, &TConfiguration{MaxMessageSize: maxSize}), trans
 +}
 +
-+func requireSizeLimit(t *testing.T, err error, what string) {
++func requireJSONSizeLimit(t *testing.T, err error, what string) {
 +	t.Helper()
 +	if err == nil {
 +		t.Fatalf("%s: expected a SIZE_LIMIT error, got nil (oversized value accepted)", what)
@@ -892,7 +1472,7 @@
 +func TestSimpleJSONStringExceedsMaxSize(t *testing.T) {
 +	p, _ := jsonProtoReadingMaxSize(t, jsonQuote(strings.Repeat("A", 4096)), 1024)
 +	_, err := p.ReadString(context.Background())
-+	requireSizeLimit(t, err, "ReadString over limit")
++	requireJSONSizeLimit(t, err, "ReadString over limit")
 +}
 +
 +// A JSON numeric literal longer than the configured limit is rejected. Numbers
@@ -900,7 +1480,7 @@
 +func TestSimpleJSONNumberExceedsMaxSize(t *testing.T) {
 +	p, _ := jsonProtoReadingMaxSize(t, strings.Repeat("1", 4096), 1024)
 +	_, err := p.ReadI64(context.Background())
-+	requireSizeLimit(t, err, "ReadI64 over limit")
++	requireJSONSizeLimit(t, err, "ReadI64 over limit")
 +}
 +
 +// A base64-encoded binary field longer than the configured limit is rejected
@@ -908,7 +1488,7 @@
 +func TestSimpleJSONBinaryExceedsMaxSize(t *testing.T) {
 +	p, _ := jsonProtoReadingMaxSize(t, `"`+strings.Repeat("A", 4096)+`"`, 1024)
 +	_, err := p.ReadBinary(context.Background())
-+	requireSizeLimit(t, err, "ReadBinary over limit")
++	requireJSONSizeLimit(t, err, "ReadBinary over limit")
 +}
 +
 +// The decisive test: a huge unbroken run must be rejected as it grows, so the
@@ -921,7 +1501,7 @@
 +	payload := `"` + strings.Repeat("A", 1<<20) + `"` // ~1 MiB, no closing quote until the very end
 +	p, trans := jsonProtoReadingMaxSize(t, payload, maxSize)
 +	_, err := p.ReadString(context.Background())
-+	requireSizeLimit(t, err, "ReadString over limit (bounded)")
++	requireJSONSizeLimit(t, err, "ReadString over limit (bounded)")
 +	if trans.bytesRead > maxSize+64*1024 {
 +		t.Fatalf(
 +			"read %d bytes from the transport for a %d-byte limit; the oversized string was "+
@@ -961,7 +1541,7 @@
 +		t.Fatalf("ParseObjectStart failed: %v", err)
 +	}
 +	err := p.ParseObjectEnd()
-+	requireSizeLimit(t, err, "ParseObjectEnd over limit")
++	requireJSONSizeLimit(t, err, "ParseObjectEnd over limit")
 +	if trans.bytesRead > maxSize+64*1024 {
 +		t.Fatalf(
 +			"read %d bytes closing an object with a %d-byte limit; the run before '}' was buffered in full",
@@ -984,7 +1564,7 @@
 +		t.Fatalf("reading first list element failed: %v", err)
 +	}
 +	err := p.ParseListEnd()
-+	requireSizeLimit(t, err, "ParseListEnd over limit")
++	requireJSONSizeLimit(t, err, "ParseListEnd over limit")
 +	if trans.bytesRead > maxSize+64*1024 {
 +		t.Fatalf(
 +			"read %d bytes closing a list with a %d-byte limit; the run before ']' was buffered in full",
