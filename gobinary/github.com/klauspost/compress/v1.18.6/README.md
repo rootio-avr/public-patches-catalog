@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-63209
+- CVE-2026-116591
 
 ## How to Apply:
 1. Clone or download the source code for github.com/klauspost/compress
