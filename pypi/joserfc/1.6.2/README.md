@@ -7,6 +7,7 @@ unknown
 - CVE-2026-27932
 - CVE-2026-48990
 - CVE-2026-49852
+- CVE-2026-119283
 
 ## How to Apply:
 1. Clone or download the source code for joserfc
