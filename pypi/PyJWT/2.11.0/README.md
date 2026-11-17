@@ -8,6 +8,8 @@ unknown
 - CVE-2026-102267
 - CVE-2026-102268
 - CVE-2026-102271
+- CVE-2026-48522
+- CVE-2026-32597
 
 ## How to Apply:
 1. Clone or download the source code for PyJWT
