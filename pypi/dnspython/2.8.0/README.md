@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-114605
+- AIKIDO-2026-858341
 
 ## How to Apply:
 1. Clone or download the source code for dnspython
