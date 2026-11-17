@@ -4,6 +4,7 @@ This patch is based on Werkzeug version 2.2.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- AIKIDO-2024-10085
 - CVE-2023-46136
 - CVE-2024-34069
 - CVE-2024-49767
