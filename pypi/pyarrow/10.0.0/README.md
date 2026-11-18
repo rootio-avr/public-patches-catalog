@@ -4,6 +4,7 @@ This patch is based on pyarrow version 10.0.0, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2023-47248
 - CVE-2026-111497
 
 ## How to Apply:
