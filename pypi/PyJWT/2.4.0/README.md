@@ -9,6 +9,9 @@ unknown
 - CVE-2026-48524
 - CVE-2026-48526
 - GHSA-pxh4-856f-4h89
+- CVE-2026-102267
+- CVE-2026-102268
+- CVE-2026-102271
 
 ## How to Apply:
 1. Clone or download the source code for PyJWT
