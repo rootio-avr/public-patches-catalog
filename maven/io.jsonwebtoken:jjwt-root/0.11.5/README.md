@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-427603
+- AIKIDO-2026-896627
 
 ## How to Apply:
 1. Clone or download the source code for io.jsonwebtoken:jjwt-root
