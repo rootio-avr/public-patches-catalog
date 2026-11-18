@@ -1,0 +1,1760 @@
+--- a/src/main/java/com/fasterxml/jackson/databind/DatabindContext.java
++++ b/src/main/java/com/fasterxml/jackson/databind/DatabindContext.java
+@@ -283,9 +283,71 @@ public abstract class DatabindContext
+                 return _throwSubtypeClassNotAllowed(baseType, subClass, ptv);
+             }
+         }
++        // [databind#5988]: even when the container class is approved (by name or
++        // by sub-type matcher), the attacker-supplied type parameters must still
++        // be validated -- otherwise a name-based allow-list for a safe container
++        // (e.g. "java.util.ArrayList") can be bypassed by smuggling a gadget
++        // class as a type argument (e.g. "java.util.ArrayList<EvilGadget>").
++        // The container itself was already validated above; walk its parameter
++        // tree (and array component, if any) and validate each node.
++        for (int i = 0, n = subType.containedTypeCount(); i < n; ++i) {
++            _validateTypeParameter(baseType, subType.containedType(i), ptv, config);
++        }
++        if (subType.isArrayType()) {
++            _validateTypeParameter(baseType, subType.getContentType(), ptv, config);
++        }
+         return subType;
+     }
+ 
++    /**
++     * Helper for [databind#5988]: validate a single type parameter against the
++     * given {@link PolymorphicTypeValidator}, then recurse into its own contained
++     * types and array component (for nested generics like
++     * {@code Map<String, List<Evil>>} or {@code List<String[]>}).
++     *<p>
++     * Name-based and class-based allow rules are both consulted (matching the
++     * top-level container check), so a name-prefix configuration like
++     * {@code allowIfSubType("com.example.")} applies to type parameters as well.
++     *<p>
++     * {@code Object} is exempt: it is the canonical resolution of wildcards and
++     * unbound parameters, which cannot themselves carry attacker-controlled types.
++     *
++     * @since 2.18.8
++     */
++    private void _validateTypeParameter(JavaType baseType, JavaType param,
++            PolymorphicTypeValidator ptv, MapperConfig<?> config)
++        throws JsonMappingException
++    {
++        final Class<?> raw = param.getRawClass();
++        if (raw != Object.class) {
++            // First consult the name-based allow rules (mirrors the container
++            // check in _resolveAndValidateGeneric), then fall back to the class-
++            // based check so all configured matchers can approve the parameter.
++            final String rawName = raw.getName();
++            Validity vld = ptv.validateSubClassName(config, baseType, rawName);
++            if (vld == Validity.DENIED) {
++                throw invalidTypeIdException(baseType, rawName,
++                        "Configured `PolymorphicTypeValidator` (of type "
++                                + ClassUtil.classNameOf(ptv)
++                                + ") denied resolution of type parameter");
++            }
++            if (vld != Validity.ALLOWED) {
++                if (ptv.validateSubType(config, baseType, param) != Validity.ALLOWED) {
++                    throw invalidTypeIdException(baseType, rawName,
++                            "Configured `PolymorphicTypeValidator` (of type "
++                                    + ClassUtil.classNameOf(ptv)
++                                    + ") denied resolution of type parameter");
++                }
++            }
++        }
++        for (int i = 0, n = param.containedTypeCount(); i < n; ++i) {
++            _validateTypeParameter(baseType, param.containedType(i), ptv, config);
++        }
++        if (param.isArrayType()) {
++            _validateTypeParameter(baseType, param.getContentType(), ptv, config);
++        }
++    }
++
+     protected <T> T _throwNotASubtype(JavaType baseType, String subType) throws JsonMappingException {
+         throw invalidTypeIdException(baseType, subType, "Not a subtype");
+     }
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/jsontype/vld/BasicPTVGenericParameterBypassTest.java
+@@ -0,0 +1,262 @@
++package com.fasterxml.jackson.databind.jsontype.vld;
++
++import java.util.ArrayList;
++import java.util.HashMap;
++import java.util.List;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++import com.fasterxml.jackson.annotation.JsonTypeInfo.As;
++import com.fasterxml.jackson.annotation.JsonTypeInfo.Id;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import com.fasterxml.jackson.databind.exc.InvalidTypeIdException;
++import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNotNull;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++import static org.junit.jupiter.api.Assertions.assertTrue;
++
++/**
++ * [databind#5988]: generic type IDs must not bypass {@link com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator}.
++ *<p>
++ * {@code DatabindContext._resolveAndValidateGeneric()} historically validated the raw
++ * container class name (before {@code '<'}) only; if approved, it constructed the full
++ * parameterized type and returned it without validating the type parameters. An attacker
++ * could supply a type ID such as {@code "java.util.ArrayList<EvilGadget>"} to smuggle a
++ * non-allow-listed element type past the PTV. The fix recursively validates each non-
++ * trivial type parameter (and array element types appearing as parameters).
++ */
++public class BasicPTVGenericParameterBypassTest extends DatabindTestUtil
++{
++    // Fully-qualified name of this test class -- works as a name-prefix matcher
++    // for every nested helper (SafePayload, EvilGadget, Container) via their
++    // "outer.Name$Nested" form. Used in namePrefixAllowsBothContainerAndParameter.
++    private static final String OWN_CLASS_NAME_PREFIX =
++            BasicPTVGenericParameterBypassTest.class.getName();
++
++    /**
++     * Records every constructor invocation; lets the tests prove that a non-allow-listed
++     * type is not actually instantiated when the validator rejects it.
++     */
++    static final List<String> INSTANTIATIONS = new ArrayList<>();
++
++    /** Stand-in "unsafe" type, never allow-listed. */
++    public static class EvilGadget {
++        public String secret;
++        public EvilGadget() {
++            INSTANTIATIONS.add(EvilGadget.class.getName());
++        }
++    }
++
++    /** Always allow-listed in these tests. */
++    public static class SafePayload {
++        public String data;
++        public SafePayload() {}
++        // String-arg constructor: doubles as Jackson's automatic Map-key
++        // deserializer when SafePayload appears as a Map key type
++        // (used by mapWithAllowedKeyAndValueAccepted).
++        public SafePayload(String d) { this.data = d; }
++    }
++
++    static class Container {
++        @JsonTypeInfo(use = Id.CLASS, include = As.WRAPPER_ARRAY)
++        public Object value;
++
++        public Container() {}
++    }
++
++    // NOTE: only polymorphicTypeValidator() is set (no activateDefaultTyping and no
++    // allowIfBaseType(Object)). validateBaseType returning INDETERMINATE keeps the
++    // original PTV in force; an ALLOWED return value would swap in
++    // LaissezFaireSubTypeValidator and would defeat the per-subtype check.
++    private ObjectMapper mapperWithArrayListAndSafePayload() {
++        BasicPolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
++                .allowIfSubType("java.util.ArrayList")
++                .allowIfSubType("java.util.HashMap")
++                .allowIfSubType(SafePayload.class)
++                .build();
++        return jsonMapperBuilder()
++                .polymorphicTypeValidator(ptv)
++                .build();
++    }
++
++    // (1) Sanity check: ArrayList<SafePayload> -- both container and element are allowed.
++    @Test
++    public void allowedGenericTypeAccepted() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        String json = "{\"value\":[\"java.util.ArrayList<" + SafePayload.class.getName() + ">\","
++                + "[{\"data\":\"hello\"}]]}";
++
++        Container result = mapper.readValue(json, Container.class);
++        assertNotNull(result.value);
++        assertEquals(ArrayList.class, result.value.getClass());
++    }
++
++    // (2) Issue reproduction: ArrayList<EvilGadget> -- container is allowed, element is not.
++    // Pre-fix this slipped past the PTV. Post-fix the element type is validated and denied.
++    @Test
++    public void genericTypeIdBypassesAllowlistDenied() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        final String evilClass = EvilGadget.class.getName();
++        String json = "{\"value\":[\"java.util.ArrayList<" + evilClass + ">\","
++                + "[{\"secret\":\"hacked\"}]]}";
++
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException e = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(json, Container.class),
++                "ArrayList<EvilGadget> must be denied because EvilGadget is not allow-listed");
++        verifyException(e, evilClass);
++        assertEquals(0, INSTANTIATIONS.size(),
++                "EvilGadget must not be instantiated when its element form is denied;"
++                        + " observed=" + INSTANTIATIONS);
++    }
++
++    // (3) Map value position: HashMap<String, EvilGadget> -- container allowed (HashMap),
++    // String key is a benign JDK type but not allow-listed -> denied at the key step.
++    @Test
++    public void mapValueGadgetDenied() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        final String evilClass = EvilGadget.class.getName();
++        String json = "{\"value\":[\"java.util.HashMap<java.lang.String," + evilClass + ">\","
++                + "{\"k\":{\"secret\":\"hacked\"}}]}";
++
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException e = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(json, Container.class),
++                "HashMap<String,EvilGadget> must be denied (neither String nor EvilGadget are allow-listed)");
++        // The PTV walks containedType(i) in order: key (String) is checked first and
++        // denied because String is not on the allow-list; this is still a correct
++        // denial of the overall type id. Either class name in the exception message is
++        // acceptable -- the iteration order is the only thing that picks one over the
++        // other.
++        final String msg = e.getMessage();
++        assertTrue(msg != null
++                        && (msg.contains("java.lang.String") || msg.contains(evilClass)),
++                "Denial message should reference the rejected parameter type;"
++                        + " was: " + msg);
++        assertEquals(0, INSTANTIATIONS.size());
++    }
++
++    // (4) Map key position: HashMap<EvilGadget, String> -- key denied.
++    @Test
++    public void mapKeyGadgetDenied() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        final String evilClass = EvilGadget.class.getName();
++        String json = "{\"value\":[\"java.util.HashMap<" + evilClass + ",java.lang.String>\","
++                + "{}]}";
++
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException e = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(json, Container.class),
++                "HashMap<EvilGadget,String> must be denied: key type EvilGadget is not allow-listed");
++        verifyException(e, evilClass);
++        assertEquals(0, INSTANTIATIONS.size());
++    }
++
++    // (5) Nested generics: ArrayList<ArrayList<EvilGadget>> -- inner element denied.
++    @Test
++    public void nestedGenericGadgetDenied() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        final String evilClass = EvilGadget.class.getName();
++        String json = "{\"value\":[\"java.util.ArrayList<java.util.ArrayList<" + evilClass + ">>\","
++                + "[[{\"secret\":\"hacked\"}]]]}";
++
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException e = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(json, Container.class),
++                "Nested ArrayList<ArrayList<EvilGadget>> must be denied at the innermost element");
++        verifyException(e, evilClass);
++        assertEquals(0, INSTANTIATIONS.size());
++    }
++
++    // (6) Sanity check for Map: HashMap<SafePayload, SafePayload> -- both key+value allowed.
++    @Test
++    public void mapWithAllowedKeyAndValueAccepted() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        String safe = SafePayload.class.getName();
++        String json = "{\"value\":[\"java.util.HashMap<" + safe + "," + safe + ">\",{}]}";
++
++        Container result = mapper.readValue(json, Container.class);
++        assertNotNull(result.value);
++        assertEquals(HashMap.class, result.value.getClass());
++    }
++
++    // (7) Wildcards / Object resolve to Object.class via TypeFactory; that's the
++    // intentional escape hatch and must keep working.
++    @Test
++    public void objectTypeParameterAccepted() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        // Use SafePayload as the element so deserialization itself can complete; the
++        // point of this test is purely that "java.util.ArrayList<java.lang.Object>" as
++        // a *type id* is not rejected by the generic-parameter validation pass.
++        String json = "{\"value\":[\"java.util.ArrayList<java.lang.Object>\",[]]}";
++        Container result = mapper.readValue(json, Container.class);
++        assertNotNull(result.value);
++        assertEquals(ArrayList.class, result.value.getClass());
++    }
++
++    // (8) Array as a generic parameter: ArrayList<EvilGadget[]> must be denied because
++    // the array's element type (EvilGadget) is not allow-listed. Exercises the
++    // isArrayType() recursion branch in _validateTypeParameter.
++    @Test
++    public void gadgetArrayAsGenericParameterDenied() throws Exception
++    {
++        ObjectMapper mapper = mapperWithArrayListAndSafePayload();
++
++        final String evilClass = EvilGadget.class.getName();
++        final String arrayId = "[L" + evilClass + ";";
++        // ArrayList<EvilGadget[]> type id, with an array containing one inner element.
++        String json = "{\"value\":[\"java.util.ArrayList<" + arrayId + ">\","
++                + "[[{\"secret\":\"hacked\"}]]]}";
++
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException e = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(json, Container.class),
++                "ArrayList<EvilGadget[]> must be denied: array element EvilGadget is not allow-listed");
++        verifyException(e, evilClass);
++        assertEquals(0, INSTANTIATIONS.size());
++    }
++
++    // (9) Name-prefix PTV: allowIfSubType(String) registers a name matcher, not a class
++    // matcher. Type parameters should be approved by the same name-prefix rule used
++    // for the container -- otherwise a configuration intended to allow everything
++    // under "com.example." would reject "com.example.Foo" as a type parameter.
++    @Test
++    public void namePrefixAllowsBothContainerAndParameter() throws Exception
++    {
++        BasicPolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
++                .allowIfSubType("java.util.ArrayList")
++                // Allow SafePayload by its enclosing-class name prefix (name matcher
++                // only -- no class matcher is registered for SafePayload).
++                .allowIfSubType(OWN_CLASS_NAME_PREFIX)
++                .build();
++        ObjectMapper mapper = jsonMapperBuilder()
++                .polymorphicTypeValidator(ptv)
++                .build();
++
++        String json = "{\"value\":[\"java.util.ArrayList<" + SafePayload.class.getName() + ">\","
++                + "[{\"data\":\"hello\"}]]}";
++
++        Container result = mapper.readValue(json, Container.class);
++        assertNotNull(result.value);
++        assertEquals(ArrayList.class, result.value.getClass());
++    }
++}
+--- a/pom.xml
++++ b/pom.xml
+@@ -298,10 +298,6 @@
+         <artifactId>build-helper-maven-plugin</artifactId>
+       </plugin>
+
+-      <plugin>
+-        <groupId>org.gradlex</groupId>
+-        <artifactId>gradle-module-metadata-maven-plugin</artifactId>
+-      </plugin>
+
+       <!-- 12-Nov-2022, tatu: [databind#3659] add verification of compatibility
+ 	   wrt Android SDK versions using AnimalSniffer with "gummy bears" signatures.
+
+--- a/src/main/java/com/fasterxml/jackson/databind/jsontype/BasicPolymorphicTypeValidator.java
++++ b/src/main/java/com/fasterxml/jackson/databind/jsontype/BasicPolymorphicTypeValidator.java
+@@ -17,7 +17,18 @@
+  *<br>
+  * For example:
+  *<pre>
+- *  [ADD EXAMPLE HERE]
++ * PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
++ *     // base type that polymorphism is enabled for
++ *     .allowIfBaseType(MyValue.class)
++ *     // accept any subtype of MyValue under our own package
++ *     .allowIfSubType("com.example.values.")
++ *     // and any concrete subtype of this specific safe interface
++ *     .allowIfSubType(SafeMarker.class)
++ *     .build();
++ *
++ *  ObjectMapper mapper = JsonMapper.builder()
++ *          .activateDefaultTyping(ptv, DefaultTyping.NON_FINAL)
++ *          .build();
+  *</pre>
+  *
+  * @since 2.10
+@@ -87,6 +98,15 @@
+          */
+         protected List<TypeMatcher> _subTypeClassMatchers;
+ 
++        /**
++         * [databind#5981]: when true, validateSubType() unwraps arrays (recursively
++         * for nested arrays) and validates the innermost element type against
++         * {@code _subTypeClassMatchers}.
++         *
++         * @since 2.18.8
++         */
++        protected boolean _acceptArrayTypes = false;
++
+         protected Builder() { }
+ 
+         // // Methods for checking solely by base type (before subtype even considered)
+@@ -275,26 +295,43 @@
+         }
+ 
+         /**
+-         * Method for appending matcher that will allow all subtypes that are Java arrays
+-         * (regardless of element type). Note that this does NOT validate element type
+-         * itself as long as Polymorphic Type handling is enabled for element type: this
+-         * is the case with all standard "Default Typing" inclusion criteria as well as for
+-         * annotation ({@code @JsonTypeInfo}) use case (since annotation only applies to element
+-         * types, not container).
++         * Method for enabling validation of Java array sub-types: when called, the
++         * validator unwraps any array (recursively for nested arrays) and validates
++         * the innermost element type against the configured sub-class matchers.
++         * Arrays of primitive element types are accepted without an explicit
++         * allow-list entry, because a primitive cannot carry a gadget chain.
++         * Abstract and interface element types are not exempt: {@code @JsonDeserialize(as=...)},
++         * a factory, or a default implementation can still instantiate a concrete
++         * class, so those components go through the same allow-list as any other
++         * class.
+          *<p>
++         * NOTE: the array-element check runs as part of {@code validateSubType()},
++         * so it only applies when name-based sub-type matchers (see
++         * {@link #allowIfSubType(Pattern)} / {@link #allowIfSubType(String)}) have
++         * NOT already approved the array's class name -- per
++         * {@link com.fasterxml.jackson.databind.DatabindContext#resolveAndValidateSubType},
++         * a {@code validateSubClassName} of {@code ALLOWED} skips the subsequent
++         * {@code validateSubType} call. In practice typical name matchers do not
++         * match array class names (which start with {@code [L} / {@code [I} etc.),
++         * so this is normally not a concern.
++         *<p>
++         * NOTE (behavior change in 2.18.8 for [databind#5981]): prior versions added a
++         * matcher that approved every array regardless of element type, which let
++         * an attacker bypass an explicit sub-class allow-list by wrapping a denied
++         * class as an array (e.g. {@code Evil[]}) -- the array matched, the
++         * component was instantiated via plain bean deserialization without any
++         * further validator invocation. Callers that relied on "allow every array"
++         * must now also allow-list the element types they intend to accept.
++         *<p>
+          * NOTE: not used with other Java collection types ({@link java.util.List}s,
+-         *    {@link java.util.Collection}s), mostly since use of generic types as polymorphic
+-         *    values is not (well) supported.
++         * {@link java.util.Collection}s), mostly since use of generic types as polymorphic
++         * values is not (well) supported.
+          *
+          * @since 2.11
+          */
+         public Builder allowIfSubTypeIsArray() {
+-            return _appendSubClassMatcher(new TypeMatcher() {
+-                @Override
+-                public boolean match(MapperConfig<?> config, Class<?> clazz) {
+-                    return clazz.isArray();
+-                }
+-            });
++            _acceptArrayTypes = true;
++            return this;
+         }
+ 
+         // 18-Nov-2019, tatu: alas, [databind#2539] can not be implemented with 2.x due
+@@ -320,7 +357,8 @@
+             return new BasicPolymorphicTypeValidator(_invalidBaseTypes,
+                     (_baseTypeMatchers == null) ? null : _baseTypeMatchers.toArray(new TypeMatcher[0]),
+                     (_subTypeNameMatchers == null) ? null : _subTypeNameMatchers.toArray(new NameMatcher[0]),
+-                    (_subTypeClassMatchers == null) ? null : _subTypeClassMatchers.toArray(new TypeMatcher[0])
++                    (_subTypeClassMatchers == null) ? null : _subTypeClassMatchers.toArray(new TypeMatcher[0]),
++                    _acceptArrayTypes // [databind#5981]
+             );
+         }
+ 
+@@ -380,13 +418,34 @@
+      */
+     protected final TypeMatcher[] _subClassMatchers;
+ 
++    /**
++     * [databind#5981]: when true, validateSubType() unwraps arrays (recursively
++     * for nested arrays) and validates the innermost element type against the
++     * sub-class matchers.
++     *
++     * @since 2.18.8
++     */
++    protected final boolean _acceptArrayTypes;
++
+     protected BasicPolymorphicTypeValidator(Set<Class<?>> invalidBaseTypes,
+             TypeMatcher[] baseTypeMatchers,
+             NameMatcher[] subTypeNameMatchers, TypeMatcher[] subClassMatchers) {
++        this(invalidBaseTypes, baseTypeMatchers, subTypeNameMatchers, subClassMatchers, false);
++    }
++
++    /**
++     * @since 2.18.8
++     */
++    // [databind#5981]
++    protected BasicPolymorphicTypeValidator(Set<Class<?>> invalidBaseTypes,
++            TypeMatcher[] baseTypeMatchers,
++            NameMatcher[] subTypeNameMatchers, TypeMatcher[] subClassMatchers,
++            boolean acceptArrayTypes) {
+         _invalidBaseTypes = invalidBaseTypes;
+         _baseTypeMatchers = baseTypeMatchers;
+         _subTypeNameMatchers = subTypeNameMatchers;
+         _subClassMatchers = subClassMatchers;
++        _acceptArrayTypes = acceptArrayTypes;
+     }
+ 
+     public static Builder builder() {
+@@ -434,8 +493,24 @@
+             throws JsonMappingException
+     {
+ //System.err.println("validateSubType("+subType+")");
++        Class<?> subClass = subType.getRawClass();
++        // [databind#5981]: if array handling is enabled, unwrap (recursively for
++        // nested arrays) and validate the innermost element type. Only primitive
++        // element types are accepted without an explicit allow-list entry: a
++        // primitive cannot carry a gadget chain. Abstract and interface components
++        // are not exempt, because @JsonDeserialize(as=...), a factory, or a default
++        // implementation can still instantiate a concrete class for them. Those
++        // fall through to the regular sub-class matcher loop with the unwrapped
++        // element type.
++        if (_acceptArrayTypes && subClass.isArray()) {
++            do {
++                subClass = subClass.getComponentType();
++            } while (subClass.isArray());
++            if (subClass.isPrimitive()) {
++                return Validity.ALLOWED;
++            }
++        }
+         if (_subClassMatchers != null)  {
+-            final Class<?> subClass = subType.getRawClass();
+             for (TypeMatcher m : _subClassMatchers) {
+                 if (m.match(ctxt, subClass)) {
+                     return Validity.ALLOWED;
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/jsontype/vld/BasicPTVArrayComponentBypassTest.java
+@@ -0,0 +1,166 @@
++package com.fasterxml.jackson.databind.jsontype.vld;
++
++import java.util.ArrayList;
++import java.util.List;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.ObjectMapper.DefaultTyping;
++import com.fasterxml.jackson.databind.exc.InvalidTypeIdException;
++import com.fasterxml.jackson.databind.jsontype.BasicPolymorphicTypeValidator;
++import com.fasterxml.jackson.databind.jsontype.PolymorphicTypeValidator;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++/**
++ * [databind#5981] {@code BasicPolymorphicTypeValidator.allowIfSubTypeIsArray()} must not
++ * approve arrays whose component type would itself be denied by the configured
++ * sub-class allow-list.
++ */
++public class BasicPTVArrayComponentBypassTest extends DatabindTestUtil
++{
++    /**
++     * Records every constructor invocation; lets the tests prove that an
++     *  un-allow-listed type is not actually instantiated.
++     */
++    static final List<String> INSTANTIATIONS = new ArrayList<>();
++
++    /**
++     * Stand-in "unsafe" type. Completely benign in itself -- only side effect is
++     * recording its own instantiation. {@code final} so default typing emits no
++     * per-element type id, which is the configuration the bypass exploited.
++     */
++    static final class FakeGadget {
++        public String cmd;
++        public FakeGadget() {
++            INSTANTIATIONS.add(FakeGadget.class.getName());
++        }
++    }
++
++    /**
++     * Type that IS in the allow-list, used to verify the positive path through
++     * the unwrap-then-match fall-through.
++     */
++    static final class SafePayload {
++        public int data;
++        public SafePayload() { }
++    }
++
++    static final class ObjectWrapper {
++        public Object value;
++        protected ObjectWrapper() { }
++    }
++
++    // For [databind#5981]: with the validator engaged (no allowIfBaseType escape
++    // hatch into LaissezFaire), a direct FakeGadget value must be denied AND the
++    // same FakeGadget wrapped as FakeGadget[] must also be denied -- the element
++    // type must not bypass the allow-list just because it is wrapped in an array.
++    @Test
++    public void directGadgetAndGadgetArrayBothDenied() throws Exception
++    {
++        ObjectMapper mapper = mapperWithSafePayloadAndArrays();
++
++        // (a) Direct FakeGadget: denied. Sanity check that the validator is actually
++        // engaged with this configuration (i.e. not swapped out for LaissezFaire).
++        final String classId = FakeGadget.class.getName();
++        final String directJson = "{\"value\":[\"" + classId + "\",{\"cmd\":\"x\"}]}";
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException directDenied = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(directJson, ObjectWrapper.class),
++                "Direct FakeGadget must be denied (no array, no SafePayload match)");
++        verifyException(directDenied, classId);
++        assertEquals(0, INSTANTIATIONS.size(),
++                "FakeGadget must not be instantiated when its bare class is denied;"
++                        + " observed=" + INSTANTIATIONS);
++
++        // (b) FakeGadget wrapped as FakeGadget[]: pre-fix this slipped through,
++        // because the array matcher approved every array regardless of element type.
++        // Post-fix the validator unwraps the array and runs the innermost element
++        // type through the same allow-list, which denies FakeGadget.
++        final String arrayId = "[L" + classId + ";";
++        final String arrayJson = "{\"value\":[\"" + arrayId + "\",[{\"cmd\":\"x\"}]]}";
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException arrayDenied = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(arrayJson, ObjectWrapper.class),
++                "FakeGadget[] must be denied because FakeGadget is not allow-listed");
++        verifyException(arrayDenied, arrayId);
++        assertEquals(0, INSTANTIATIONS.size(),
++                "FakeGadget must not be instantiated when its array form is denied;"
++                        + " observed=" + INSTANTIATIONS);
++    }
++
++    // For [databind#5981]: the unwrap loop in validateSubType() must recurse for
++    // nested arrays so that FakeGadget[][] is denied for the same reason
++    // FakeGadget[] is denied -- the innermost element is what matters.
++    @Test
++    public void nestedGadgetArrayAlsoDenied() throws Exception
++    {
++        ObjectMapper mapper = mapperWithSafePayloadAndArrays();
++
++        final String classId = FakeGadget.class.getName();
++        final String nestedArrayId = "[[L" + classId + ";";
++        // FakeGadget[][] with a single inner FakeGadget[] containing one FakeGadget.
++        // If the unwrap stopped at one level (e.g. FakeGadget[]), the outer match
++        // would short-circuit ALLOWED; the recursive unwrap to FakeGadget is what
++        // makes this denial correct.
++        final String json = "{\"value\":[\"" + nestedArrayId + "\","
++                + "[[{\"cmd\":\"x\"}]]]}";
++        INSTANTIATIONS.clear();
++        InvalidTypeIdException denied = assertThrows(InvalidTypeIdException.class,
++                () -> mapper.readValue(json, ObjectWrapper.class),
++                "FakeGadget[][] must be denied: innermost element FakeGadget is not allow-listed");
++        verifyException(denied, nestedArrayId);
++        assertEquals(0, INSTANTIATIONS.size(),
++                "FakeGadget must not be instantiated when its nested-array form is denied;"
++                        + " observed=" + INSTANTIATIONS);
++    }
++
++    // For [databind#5981]: positive path. Confirms the unwrap-then-match fall-through
++    // works for an allow-listed concrete component type -- SafePayload[] is approved
++    // because validateSubType unwraps to SafePayload and the existing allow-list
++    // matcher matches it.
++    @Test
++    public void allowListedConcreteComponentArrayAccepted() throws Exception
++    {
++        ObjectMapper mapper = mapperWithSafePayloadAndArrays();
++
++        final String arrayId = "[L" + SafePayload.class.getName() + ";";
++        final String json = "{\"value\":[\"" + arrayId + "\",[{\"data\":42}]]}";
++
++        ObjectWrapper out = mapper.readValue(json, ObjectWrapper.class);
++        assertNotNull(out);
++        assertNotNull(out.value);
++        assertEquals(SafePayload[].class, out.value.getClass());
++        SafePayload[] arr = (SafePayload[]) out.value;
++        assertEquals(1, arr.length);
++        assertEquals(42, arr[0].data);
++    }
++
++    // For [databind#5981]: primitive-element arrays are accepted via the primitive
++    // exemption (no allow-list entry needed for {@code int}). Primitive arrays
++    // cannot carry gadget chains, so this exemption is safe.
++    @Test
++    public void primitiveComponentArrayAccepted() throws Exception
++    {
++        ObjectMapper mapper = mapperWithSafePayloadAndArrays();
++
++        // JVM internal name for int[] is "[I"
++        final String json = "{\"value\":[\"[I\",[1,2,3]]}";
++        ObjectWrapper out = mapper.readValue(json, ObjectWrapper.class);
++        assertNotNull(out);
++        assertEquals(int[].class, out.value.getClass());
++        assertArrayEquals(new int[] { 1, 2, 3 }, (int[]) out.value);
++    }
++
++    private ObjectMapper mapperWithSafePayloadAndArrays() {
++        PolymorphicTypeValidator ptv = BasicPolymorphicTypeValidator.builder()
++                .allowIfSubType(SafePayload.class)
++                .allowIfSubTypeIsArray()
++                .build();
++        return jsonMapperBuilder()
++                .activateDefaultTyping(ptv, DefaultTyping.NON_FINAL)
++                .build();
++    }
++}
+
+--- a/src/main/java/com/fasterxml/jackson/databind/ext/CoreXMLDeserializers.java
++++ b/src/main/java/com/fasterxml/jackson/databind/ext/CoreXMLDeserializers.java
+@@ -142,10 +142,22 @@
+         {
+             switch (_kind) {
+             case TYPE_DURATION:
++                // [databind#6127] DatatypeFactory.newDuration() parses date/time components
++                // into BigIntegers (and fractional seconds into BigDecimal), using the
++                // O(n^2) BigInteger(String)/BigDecimal(String) constructors. Rather than
++                // isolating individual components we check length of the whole value as a
++                // conservative upper bound: it is never shorter than any single component,
++                // and no valid Duration comes anywhere near the (default 1000) limit.
++                ctxt.getParser().streamReadConstraints().validateIntegerLength(value.length());
+                 return _dataTypeFactory.newDuration(value);
+             case TYPE_QNAME:
+                 return QName.valueOf(value);
+             case TYPE_G_CALENDAR:
++                // [databind#6127] Similar to TYPE_DURATION above: length of the whole value
++                // is checked as a conservative upper bound for numeric components, before
++                // handing value to DatatypeFactory.newXMLGregorianCalendar(), which parses
++                // fractional seconds into a BigDecimal via O(n^2) BigDecimal(String).
++                ctxt.getParser().streamReadConstraints().validateFPLength(value.length());
+                 Date d;
+                 try {
+                     d = _parseDate(value, ctxt);
+--- a/src/test/java/com/fasterxml/jackson/databind/ext/MiscJavaXMLTypesReadWriteTest.java
++++ b/src/test/java/com/fasterxml/jackson/databind/ext/MiscJavaXMLTypesReadWriteTest.java
+@@ -5,8 +5,12 @@
+ import org.junit.jupiter.api.Test;
+ 
+ import com.fasterxml.jackson.annotation.JsonFormat;
++import com.fasterxml.jackson.core.JsonFactory;
++import com.fasterxml.jackson.core.StreamReadConstraints;
++import com.fasterxml.jackson.core.exc.StreamConstraintsException;
+ import com.fasterxml.jackson.databind.*;
+ import com.fasterxml.jackson.databind.exc.MismatchedInputException;
++import com.fasterxml.jackson.databind.json.JsonMapper;
+ import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
+ import com.fasterxml.jackson.databind.testutil.NoCheckSubTypeValidator;
+ import com.fasterxml.jackson.databind.type.TypeFactory;
+@@ -205,5 +209,94 @@
+             fail("Expected a `XMLGregorianCalendar`, got: "+result.getClass());
+         }
+         assertEquals(cal, result);
++    }
++
++    /*
++    /**********************************************************************
++    /* StreamReadConstraints validation tests
++    /**********************************************************************
++     */
++
++    @Test
++    public void testDurationNumberLengthConstraint() throws Exception
++    {
++        JsonFactory jsonFactory = JsonFactory.builder()
++                .streamReadConstraints(StreamReadConstraints.builder().maxNumberLength(100).build())
++                .build();
++        ObjectMapper constrainedMapper = JsonMapper.builder(jsonFactory).build();
++
++        String bigDuration = "\"P" + repeatString("9", 120) + "Y\"";
++        try {
++            constrainedMapper.readValue(bigDuration, Duration.class);
++            fail("Should not pass: expected StreamConstraintsException for oversized Duration numeric component");
++        } catch (StreamConstraintsException e) {
++            verifyException(e, "exceeds the maximum allowed");
++        }
++
++        Duration dur = constrainedMapper.readValue("\"P1Y2M3D\"", Duration.class);
++        assertNotNull(dur);
++        assertEquals(1, dur.getYears());
++        assertEquals(2, dur.getMonths());
++        assertEquals(3, dur.getDays());
++    }
++
++    @Test
++    public void testXMLGregorianCalendarNumberLengthConstraint() throws Exception
++    {
++        JsonFactory jsonFactory = JsonFactory.builder()
++                .streamReadConstraints(StreamReadConstraints.builder().maxNumberLength(100).build())
++                .build();
++        ObjectMapper constrainedMapper = JsonMapper.builder(jsonFactory).build();
++
++        String bigCalendar = "\"00:00:00." + repeatString("9", 120) + "\"";
++        try {
++            constrainedMapper.readValue(bigCalendar, XMLGregorianCalendar.class);
++            fail("Should not pass: expected StreamConstraintsException for oversized XMLGregorianCalendar fractional seconds");
++        } catch (StreamConstraintsException e) {
++            verifyException(e, "exceeds the maximum allowed");
++        }
++
++        XMLGregorianCalendar cal = constrainedMapper.readValue("\"2023-01-01T00:00:00\"", XMLGregorianCalendar.class);
++        assertNotNull(cal);
++        assertEquals(2023, cal.getYear());
++        assertEquals(1, cal.getMonth());
++        assertEquals(1, cal.getDay());
++
++        String bigDateTime = "\"" + repeatString("9", 120) + "-01-01T00:00:00\"";
++        try {
++            constrainedMapper.readValue(bigDateTime, XMLGregorianCalendar.class);
++            fail("Should not pass: expected StreamConstraintsException for oversized date-time value");
++        } catch (StreamConstraintsException e) {
++            verifyException(e, "exceeds the maximum allowed");
++        }
++    }
++
++    @Test
++    public void testDefaultNumberLengthConstraints() throws Exception
++    {
++        final int len = StreamReadConstraints.DEFAULT_MAX_NUM_LEN + 100;
++
++        try {
++            MAPPER.readValue(q("P" + repeatString("9", len) + "Y"), Duration.class);
++            fail("Should not pass: expected StreamConstraintsException for oversized Duration");
++        } catch (StreamConstraintsException e) {
++            verifyException(e, "exceeds the maximum allowed");
++        }
++
++        try {
++            MAPPER.readValue(q("00:00:00." + repeatString("9", len)),
++                    XMLGregorianCalendar.class);
++            fail("Should not pass: expected StreamConstraintsException for oversized XMLGregorianCalendar");
++        } catch (StreamConstraintsException e) {
++            verifyException(e, "exceeds the maximum allowed");
++        }
++    }
++
++    @Test
++    public void testQNameNotConstrainedByNumberLength() throws Exception
++    {
++        String localPart = repeatString("a", StreamReadConstraints.DEFAULT_MAX_NUM_LEN + 100);
++        QName qn = MAPPER.readValue(q(localPart), QName.class);
++        assertEquals(localPart, qn.getLocalPart());
+     }
+ }
+--- a/src/test/java/com/fasterxml/jackson/databind/testutil/DatabindTestUtil.java
++++ b/src/test/java/com/fasterxml/jackson/databind/testutil/DatabindTestUtil.java
+@@ -428,6 +428,14 @@
+         return str.getBytes(StandardCharsets.UTF_8);
+     }
+ 
++    public static String repeatString(String str, int repeatCount) {
++        StringBuilder sb = new StringBuilder();
++        for (int i = 0; i < repeatCount; ++i) {
++            sb.append(str);
++        }
++        return sb.toString();
++    }
++
+     /*
+     /**********************************************************************
+     /* Additional assertion methods
+
+--- a/src/main/java/com/fasterxml/jackson/databind/jsontype/impl/TypeDeserializerBase.java
++++ b/src/main/java/com/fasterxml/jackson/databind/jsontype/impl/TypeDeserializerBase.java
+@@ -23,6 +23,22 @@ public abstract class TypeDeserializerBase
+ {
+     private static final long serialVersionUID = 1;
+ 
++    /**
++     * Maximum number of type id to deserializer mappings to cache (see
++     * {@link #_deserializers}); if exceeded, cache is cleared.
++     *
++     * @since 2.20.2
++     */
++    final static int MAX_CACHED_TYPE_IDS = 1000;
++
++    /**
++     * Maximum length of type ids to cache (see {@link #_deserializers}): longer ones
++     * are resolved every time, as cache size is only limited by number of entries.
++     *
++     * @since 2.20.2
++     */
++    final static int MAX_CACHED_TYPE_ID_LENGTH = 256;
++
+     protected final TypeIdResolver _idResolver;
+ 
+     protected final JavaType _baseType;
+@@ -168,7 +184,22 @@ public abstract class TypeDeserializerBase
+                         return NullifyingDeserializer.instance;
+                     }
+                     // ... would this actually work?
+-                    deser = ctxt.findContextualValueDeserializer(actual, _property);
++                    // 14-Sep-2026, tatu: [databind#6203] Should not cache by type id here:
++                    //   problem handler may map any number of unrecognized ids to a type, and
++                    //   its answer is only valid for readers configured with that handler.
++                    //   NOTE: does NOT cover class name-based ids (`Id.CLASS`, `Id.MINIMAL_CLASS`):
++                    //   their resolver calls problem handlers itself, so the answer comes back
++                    //   as a resolved type and is cached as such (bounded by MAX_CACHED_TYPE_IDS)
++                    return ctxt.findContextualValueDeserializer(actual, _property);
++                }
++                // 14-Sep-2026, tatu: [databind#6203] Should not cache "nullifying" fallback by
++                //   type id, as its use depends on reader configuration (FAIL_ON_INVALID_SUBTYPE).
++                //   But `defaultImpl` deserializer is cached: re-resolving unrecognized ids every
++                //   time (like failing class loading for `Id.CLASS`) is costly; cache is bounded
++                if (deser == NullifyingDeserializer.instance) {
++                    // (not same as return above: here from `_findDefaultImplDeserializer()`,
++                    // mostly due to FAIL_ON_INVALID_SUBTYPE being disabled)
++                    return deser;
+                 }
+             } else {
+                 /* 16-Dec-2010, tatu: Since nominal type we get here has no (generic) type parameters,
+@@ -202,6 +233,17 @@ public abstract class TypeDeserializerBase
+                 }
+                 deser = ctxt.findContextualValueDeserializer(type, _property);
+             }
++            // 14-Sep-2026, tatu: [databind#6203] Must bound the cache: even type ids that
++            //   do resolve (like differently spelled variants of the same id) may come in
++            //   unbounded numbers. If full, clear, so that commonly used ids get re-added.
++            //   And as that only limits number of entries, not their size, do not cache
++            //   overlong ids either: real type ids are short
++            if (typeId.length() > MAX_CACHED_TYPE_ID_LENGTH) {
++                return deser;
++            }
++            if (_deserializers.size() >= MAX_CACHED_TYPE_IDS) {
++                _deserializers.clear();
++            }
+             _deserializers.put(typeId, deser);
+         }
+         return deser;
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/jsontype/UnknownTypeIdCachingTest.java
+@@ -0,0 +1,152 @@
++package com.fasterxml.jackson.databind.jsontype;
++
++import java.util.concurrent.atomic.AtomicInteger;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++
++import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.annotation.JsonTypeIdResolver;
++import com.fasterxml.jackson.databind.jsontype.impl.TypeIdResolverBase;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertNull;
++import static org.junit.jupiter.api.Assertions.assertInstanceOf;
++
++// [databind#6203]
++/**
++ * Verifies caching of type ids in the type id lookup cache of the (long-lived,
++ * shared) {@link TypeDeserializer}: unresolvable ids handled via the "nullifying"
++ * fallback (whose use depends on reader configuration) are not retained, whereas
++ * ones handled via {@code defaultImpl} are, like resolvable type ids (cache being
++ * bounded in size).
++ */
++public class UnknownTypeIdCachingTest extends DatabindTestUtil
++{
++    static final AtomicInteger RESOLVE_COUNT = new AtomicInteger();
++
++    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY,
++            property = "type", defaultImpl = DefaultAnimal.class)
++    @JsonTypeIdResolver(CountingIdResolver.class)
++    static abstract class Animal {
++        public String name;
++    }
++
++    static class Dog extends Animal { }
++
++    static class DefaultAnimal extends Animal { }
++
++    @JsonTypeInfo(use = JsonTypeInfo.Id.NAME, include = JsonTypeInfo.As.PROPERTY,
++            property = "type")
++    @JsonTypeIdResolver(CountingIdResolver.class)
++    static abstract class Animal2 {
++        public String name;
++    }
++
++    static class Dog2 extends Animal2 { }
++
++    static class Wrapper {
++        public Animal animal;
++    }
++
++    static class Wrapper2 {
++        public Animal2 animal;
++    }
++
++    public static class CountingIdResolver extends TypeIdResolverBase
++    {
++        private static final long serialVersionUID = 1L;
++
++        @Override
++        public JsonTypeInfo.Id getMechanism() { return JsonTypeInfo.Id.NAME; }
++
++        @Override
++        public String idFromValue(Object value) {
++            return idFromValueAndType(value, value.getClass());
++        }
++
++        @Override
++        public String idFromValueAndType(Object value, Class<?> type) {
++            return type.getSimpleName();
++        }
++
++        @Override
++        public JavaType typeFromId(DatabindContext ctxt, String id) {
++            RESOLVE_COUNT.incrementAndGet();
++            if ("Dog".equals(id)) {
++                return ctxt.constructType(Dog.class);
++            }
++            if ("Dog2".equals(id)) {
++                return ctxt.constructType(Dog2.class);
++            }
++            return null;
++        }
++    }
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    // Unknown type ids resolved via `defaultImpl` ARE cached (bounded by cache size
++    // limit), as `defaultImpl` does not depend on reader configuration
++    @Test
++    public void cachingOfUnknownIdsWithDefaultImpl() throws Exception
++    {
++        RESOLVE_COUNT.set(0);
++        ObjectReader r = MAPPER.readerFor(Wrapper.class);
++
++        for (int i = 0; i < 10; ++i) {
++            Wrapper w = r.readValue(a2q(
++                    "{'animal':{'type':'bogus-"+i+"','name':'Rex'}}"));
++            assertInstanceOf(DefaultAnimal.class, w.animal);
++        }
++        // Every distinct unknown id has to be resolved once
++        assertEquals(10, RESOLVE_COUNT.get());
++
++        // ... and repeating a single unknown id resolves it just once, too
++        RESOLVE_COUNT.set(0);
++        for (int i = 0; i < 10; ++i) {
++            Wrapper w = r.readValue(a2q("{'animal':{'type':'bogus','name':'Rex'}}"));
++            assertInstanceOf(DefaultAnimal.class, w.animal);
++        }
++        assertEquals(1, RESOLVE_COUNT.get());
++
++        // Whereas known type ids ARE cached: resolved just once
++        RESOLVE_COUNT.set(0);
++        for (int i = 0; i < 10; ++i) {
++            Wrapper w = r.readValue(a2q("{'animal':{'type':'Dog','name':'Rex'}}"));
++            assertInstanceOf(Dog.class, w.animal);
++            assertEquals("Rex", w.animal.name);
++        }
++        assertEquals(1, RESOLVE_COUNT.get());
++    }
++
++    // Unknown type ids must not be cached: `FAIL_ON_INVALID_SUBTYPE` disabled variant
++    @Test
++    public void noCachingOfUnknownIdsWhenNullifying() throws Exception
++    {
++        RESOLVE_COUNT.set(0);
++        ObjectReader r = MAPPER.readerFor(Wrapper2.class)
++                .without(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE);
++
++        for (int i = 0; i < 10; ++i) {
++            Wrapper2 w = r.readValue(a2q(
++                    "{'animal':{'type':'bogus-"+i+"','name':'Rex'}}"));
++            assertNull(w.animal);
++        }
++        assertEquals(10, RESOLVE_COUNT.get());
++
++        RESOLVE_COUNT.set(0);
++        for (int i = 0; i < 10; ++i) {
++            r.readValue(a2q("{'animal':{'type':'bogus','name':'Rex'}}"));
++        }
++        assertEquals(10, RESOLVE_COUNT.get());
++
++        RESOLVE_COUNT.set(0);
++        for (int i = 0; i < 10; ++i) {
++            Wrapper2 w = r.readValue(a2q("{'animal':{'type':'Dog2','name':'Rex'}}"));
++            assertInstanceOf(Dog2.class, w.animal);
++        }
++        assertEquals(1, RESOLVE_COUNT.get());
++    }
++}
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/jsontype/impl/TypeIdCacheGrowthTest.java
+@@ -0,0 +1,206 @@
++package com.fasterxml.jackson.databind.jsontype.impl;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.JsonTypeInfo;
++
++import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.deser.DefaultDeserializationContext;
++import com.fasterxml.jackson.databind.deser.DeserializationProblemHandler;
++import com.fasterxml.jackson.databind.deser.std.NullifyingDeserializer;
++import com.fasterxml.jackson.databind.exc.InvalidTypeIdException;
++import com.fasterxml.jackson.databind.jsontype.TypeIdResolver;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.assertEquals;
++import static org.junit.jupiter.api.Assertions.assertSame;
++import static org.junit.jupiter.api.Assertions.assertThrows;
++
++// [databind#6203]
++/**
++ * Tests to verify that the per-{@link
++ * com.fasterxml.jackson.databind.jsontype.TypeDeserializer} type id to deserializer
++ * lookup cache does not grow without bound: of unrecognized type ids, only ones
++ * handled via {@code defaultImpl} are cached, and cache size is capped.
++ *<p>
++ * Note: in package {@code ...jsontype.impl} to have access to protected
++ * {@code _deserializers} / {@code _findDeserializer()} of {@link TypeDeserializerBase}.
++ */
++public class TypeIdCacheGrowthTest extends DatabindTestUtil
++{
++    static class Base { }
++
++    static class Impl extends Base { public int x; }
++
++    static class DefaultImpl extends Base { }
++
++    // Resolves exactly one id ("impl"), everything else is unknown
++    static class SingleIdResolver extends TypeIdResolverBase
++    {
++        private static final long serialVersionUID = 1L;
++
++        @Override
++        public JsonTypeInfo.Id getMechanism() { return JsonTypeInfo.Id.NAME; }
++
++        @Override
++        public String idFromValue(Object value) {
++            return idFromValueAndType(value, value.getClass());
++        }
++
++        @Override
++        public String idFromValueAndType(Object value, Class<?> type) {
++            return (type == Impl.class) ? "impl" : "?";
++        }
++
++        @Override
++        public JavaType typeFromId(DatabindContext ctxt, String id) {
++            return "impl".equals(id) ? ctxt.constructType(Impl.class) : null;
++        }
++    }
++
++    private final static int UNKNOWN_ID_COUNT = 100;
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    // Unknown type ids resolved via `defaultImpl` ARE cached (to avoid re-resolving
++    // them every time), since `defaultImpl` does not depend on reader configuration;
++    // growth is bounded by `MAX_CACHED_TYPE_IDS`
++    @Test
++    public void unknownTypeIdsWithDefaultImplCached() throws Exception
++    {
++        DeserializationContext ctxt = _context(MAPPER.getDeserializationConfig());
++        AsPropertyTypeDeserializer typeDeser = _typeDeserializer(MAPPER.constructType(DefaultImpl.class));
++
++        JsonDeserializer<Object> defaultDeser = null;
++        for (int i = 0; i < UNKNOWN_ID_COUNT; ++i) {
++            JsonDeserializer<Object> deser = typeDeser._findDeserializer(ctxt, "unknown-"+i);
++            if (defaultDeser == null) {
++                defaultDeser = deser;
++            } else {
++                // ... and all unknown ids share the very same `defaultImpl` deserializer
++                assertSame(defaultDeser, deser);
++            }
++        }
++        assertEquals(UNKNOWN_ID_COUNT, typeDeser._deserializers.size());
++
++        // As are actually resolvable type ids
++        typeDeser._findDeserializer(ctxt, "impl");
++        typeDeser._findDeserializer(ctxt, "impl");
++        assertEquals(UNKNOWN_ID_COUNT + 1, typeDeser._deserializers.size());
++    }
++
++    // Unknown type ids handled by `NullifyingDeserializer` must not be cached, either
++    @Test
++    public void unknownTypeIdsWithoutFailOnInvalidSubtypeNotCached() throws Exception
++    {
++        DeserializationContext ctxt = _context(MAPPER.getDeserializationConfig()
++                .without(DeserializationFeature.FAIL_ON_INVALID_SUBTYPE));
++        AsPropertyTypeDeserializer typeDeser = _typeDeserializer(null);
++
++        for (int i = 0; i < UNKNOWN_ID_COUNT; ++i) {
++            assertSame(NullifyingDeserializer.instance,
++                    typeDeser._findDeserializer(ctxt, "unknown-"+i));
++        }
++        assertEquals(0, typeDeser._deserializers.size());
++
++        typeDeser._findDeserializer(ctxt, "impl");
++        assertEquals(1, typeDeser._deserializers.size());
++    }
++
++    // Unknown type ids resolved by a `DeserializationProblemHandler` must not be cached
++    @Test
++    public void unknownTypeIdsFromProblemHandlerNotCached() throws Exception
++    {
++        DeserializationContext ctxt = _context(MAPPER.getDeserializationConfig()
++                .withHandler(new DeserializationProblemHandler() {
++                    @Override
++                    public JavaType handleUnknownTypeId(DeserializationContext c,
++                            JavaType baseType, String subTypeId, TypeIdResolver idResolver,
++                            String failureMsg) {
++                        return c.constructType(Impl.class);
++                    }
++                }));
++        AsPropertyTypeDeserializer typeDeser = _typeDeserializer(null);
++
++        for (int i = 0; i < UNKNOWN_ID_COUNT; ++i) {
++            typeDeser._findDeserializer(ctxt, "unknown-"+i);
++        }
++        assertEquals(0, typeDeser._deserializers.size());
++
++        // ... nor leak to a reader that has no such handler
++        DeserializationContext plainCtxt = _context(MAPPER.getDeserializationConfig());
++        assertThrows(InvalidTypeIdException.class,
++                () -> typeDeser._findDeserializer(plainCtxt, "unknown-0"));
++
++        typeDeser._findDeserializer(ctxt, "impl");
++        assertEquals(1, typeDeser._deserializers.size());
++    }
++
++    // Even type ids that do resolve (like different spellings of the same type id)
++    // must not grow the cache without bound
++    @SuppressWarnings("serial")
++    @Test
++    public void resolvedTypeIdCacheIsBounded() throws Exception
++    {
++        DeserializationContext ctxt = _context(MAPPER.getDeserializationConfig());
++        JavaType baseType = MAPPER.constructType(Base.class);
++        SingleIdResolver idRes = new SingleIdResolver() {
++            @Override
++            public JavaType typeFromId(DatabindContext c, String id) {
++                return id.startsWith("impl") ? c.constructType(Impl.class) : null;
++            }
++        };
++        idRes.init(baseType);
++        AsPropertyTypeDeserializer typeDeser = new AsPropertyTypeDeserializer(baseType, idRes,
++                "type", false, null, JsonTypeInfo.As.PROPERTY, true);
++
++        final int max = TypeDeserializerBase.MAX_CACHED_TYPE_IDS;
++        for (int i = 0; i < max; ++i) {
++            typeDeser._findDeserializer(ctxt, "impl-"+i);
++        }
++        assertEquals(max, typeDeser._deserializers.size());
++
++        // One more: cache is full, so gets cleared before new entry is added
++        typeDeser._findDeserializer(ctxt, "impl-"+max);
++        assertEquals(1, typeDeser._deserializers.size());
++    }
++
++    // Overlong type ids must not be cached, as cache is only bounded by entry count
++    // (and type ids may be as long as maximum String length allowed)
++    @Test
++    public void overlongTypeIdsNotCached() throws Exception
++    {
++        DeserializationContext ctxt = _context(MAPPER.getDeserializationConfig());
++        AsPropertyTypeDeserializer typeDeser = _typeDeserializer(MAPPER.constructType(DefaultImpl.class));
++
++        final int maxLen = TypeDeserializerBase.MAX_CACHED_TYPE_ID_LENGTH;
++        StringBuilder sb = new StringBuilder("unknown-");
++        while (sb.length() <= maxLen) {
++            sb.append('x');
++        }
++        final String overlongId = sb.toString();
++        assertEquals(maxLen + 1, overlongId.length());
++
++        JsonDeserializer<Object> deser = typeDeser._findDeserializer(ctxt, overlongId);
++        assertSame(deser, typeDeser._findDeserializer(ctxt, overlongId));
++        assertEquals(0, typeDeser._deserializers.size());
++
++        // But one of exactly maximum length is still cached
++        typeDeser._findDeserializer(ctxt, overlongId.substring(0, maxLen));
++        assertEquals(1, typeDeser._deserializers.size());
++    }
++
++    private DeserializationContext _context(DeserializationConfig config) {
++        return ((DefaultDeserializationContext) MAPPER.getDeserializationContext())
++                .createInstance(config, null, null);
++    }
++
++    private AsPropertyTypeDeserializer _typeDeserializer(JavaType defaultImpl)
++    {
++        JavaType baseType = MAPPER.constructType(Base.class);
++        SingleIdResolver idRes = new SingleIdResolver();
++        idRes.init(baseType);
++        return new AsPropertyTypeDeserializer(baseType, idRes, "type", false, defaultImpl,
++                JsonTypeInfo.As.PROPERTY, true);
++    }
++}
+
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/std/CollectionDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/std/CollectionDeserializer.java
+@@ -514,9 +514,28 @@ _containerType,
+         private final Collection<Object> _result;
+ 
+         /**
+-         * A list of {@link CollectionReferring} to maintain ordering.
++         * Values read at or after the first still unresolved reference, in encounter
++         * order: plain values, and {@link CollectionReferring}s for references (resolved
++         * or not). Values are moved to the result collection from the front (starting at
++         * {@link #_pendingStart}) once no unresolved reference precedes them: this retains
++         * ordering while moving each value just once -- instead of merging buffers of
++         * resolved references into preceding ones, which takes O(N^2) time when
++         * references resolve in reverse order (see [databind#6204]).
+          */
+-        private List<CollectionReferring> _accumulator = new ArrayList<CollectionReferring>();
++        private final List<Object> _pending = new ArrayList<>();
++
++        /**
++         * Index of the first entry in {@link #_pending} not yet moved to the result.
++         */
++        private int _pendingStart;
++
++        /**
++         * Lookup from unresolved id to the -- usually single -- {@link CollectionReferring}s
++         * with that id, in encounter order. Without this, resolution would need to scan
++         * all pending references to find the matching one, which makes resolving N
++         * references take O(N^2) time (see [databind#6204]).
++         */
++        private final Map<Object, Deque<CollectionReferring>> _unresolvedById = new HashMap<>();
+ 
+         public CollectionReferringAccumulator(Class<?> elementType, Collection<Object> result) {
+             _elementType = elementType;
+@@ -525,52 +544,73 @@ _containerType,
+ 
+         public void add(Object value)
+         {
+-            if (_accumulator.isEmpty()) {
++            if (_pendingStart == _pending.size()) {
+                 _result.add(value);
+             } else {
+-                CollectionReferring ref = _accumulator.get(_accumulator.size() - 1);
+-                ref.next.add(value);
++                _pending.add(value);
+             }
+         }
+ 
+         public Referring handleUnresolvedReference(UnresolvedForwardReference reference)
+         {
+             CollectionReferring id = new CollectionReferring(this, reference, _elementType);
+-            _accumulator.add(id);
++            _pending.add(id);
++            // Ids are usable as hash keys: `ObjectIdResolver`s already rely on that
++            Deque<CollectionReferring> refs = _unresolvedById.get(reference.getUnresolvedId());
++            if (refs == null) {
++                refs = new ArrayDeque<>(2);
++                _unresolvedById.put(reference.getUnresolvedId(), refs);
++            }
++            refs.add(id);
+             return id;
+         }
+ 
+         public void resolveForwardReference(Object id, Object value) throws IOException
+         {
+-            Iterator<CollectionReferring> iterator = _accumulator.iterator();
+-            // Resolve ordering after resolution of an id. This mean either:
+-            // 1- adding to the result collection in case of the first unresolved id.
+-            // 2- merge the content of the resolved id with its previous unresolved id.
+-            Collection<Object> previous = _result;
+-            while (iterator.hasNext()) {
+-                CollectionReferring ref = iterator.next();
+-                if (ref.hasId(id)) {
+-                    iterator.remove();
+-                    previous.add(value);
+-                    previous.addAll(ref.next);
+-                    return;
++            Deque<CollectionReferring> refs = _unresolvedById.get(id);
++            if (refs == null) {
++                throw new IllegalArgumentException("Trying to resolve a forward reference with id [" + id
++                        + "] that wasn't previously seen as unresolved.");
++            }
++            CollectionReferring ref = refs.removeFirst();
++            if (refs.isEmpty()) {
++                _unresolvedById.remove(id);
++            }
++            ref.resolve(value);
++
++            // Move values no longer preceded by an unresolved reference to the result
++            final int end = _pending.size();
++            int i = _pendingStart;
++            for (; i < end; ++i) {
++                Object pending = _pending.get(i);
++                if (pending instanceof CollectionReferring) {
++                    CollectionReferring pendingRef = (CollectionReferring) pending;
++                    if (!pendingRef.isResolved()) {
++                        break;
++                    }
++                    pending = pendingRef.resolvedValue();
+                 }
+-                previous = ref.next;
++                _result.add(pending);
++                _pending.set(i, null);
++            }
++            if (i == end) {
++                _pending.clear();
++                _pendingStart = 0;
++            } else {
++                _pendingStart = i;
+             }
+-
+-            throw new IllegalArgumentException("Trying to resolve a forward reference with id [" + id
+-                    + "] that wasn't previously seen as unresolved.");
+         }
+     }
+ 
+     /**
+-     * Helper class to maintain processing order of value. The resolved
+-     * object associated with {@code #id} parameter from {@link #handleResolvedForwardReference(Object, Object)} 
+-     * comes before the values in {@link #next}.
++     * Placeholder for a value that is a forward reference, to maintain processing order
++     * of values: holds the resolved value, once the reference has been resolved.
+      */
+     private final static class CollectionReferring extends Referring {
+         private final CollectionReferringAccumulator _parent;
+-        public final List<Object> next = new ArrayList<Object>();
++
++        private boolean _resolved;
++        private Object _value;
+ 
+         CollectionReferring(CollectionReferringAccumulator parent,
+                 UnresolvedForwardReference reference, Class<?> contentType)
+@@ -579,6 +619,15 @@ _containerType,
+             _parent = parent;
+         }
+ 
++        void resolve(Object value) {
++            _value = value;
++            _resolved = true;
++        }
++
++        boolean isResolved() { return _resolved; }
++
++        Object resolvedValue() { return _value; }
++
+         @Override
+         public void handleResolvedForwardReference(Object id, Object value) throws IOException {
+             _parent.resolveForwardReference(id, value);
+--- a/src/main/java/com/fasterxml/jackson/databind/deser/std/MapDeserializer.java
++++ b/src/main/java/com/fasterxml/jackson/databind/deser/std/MapDeserializer.java
+@@ -897,10 +897,30 @@ public class MapDeserializer
+     private final static class MapReferringAccumulator {
+         private final Class<?> _valueType;
+         private final Map<Object,Object> _result;
++
++        /**
++         * Entries read at or after the first still unresolved reference, in encounter
++         * order: {@link Map.Entry}s for plain entries, and {@link MapReferring}s for
++         * references (resolved or not). Entries are moved to the result map from the front
++         * (starting at {@link #_pendingStart}) once no unresolved reference precedes them:
++         * this retains ordering while moving each entry just once -- instead of merging
++         * buffers of resolved references into preceding ones, which takes O(N^2) time when
++         * references resolve in reverse order (see [databind#6204]).
++         */
++        private final List<Object> _pending = new ArrayList<>();
++
++        /**
++         * Index of the first entry in {@link #_pending} not yet moved to the result.
++         */
++        private int _pendingStart;
++
+         /**
+-         * A list of {@link MapReferring} to maintain ordering.
++         * Lookup from unresolved id to the -- usually single -- {@link MapReferring}s with
++         * that id, in encounter order. Without this, resolution would need to scan all
++         * pending references to find the matching one, which makes resolving N references
++         * take O(N^2) time (see [databind#6204]).
+          */
+-        private final List<MapReferring> _accumulator = new ArrayList<MapReferring>();
++        private final Map<Object, Deque<MapReferring>> _unresolvedById = new HashMap<>();
+ 
+         public MapReferringAccumulator(Class<?> valueType, Map<Object, Object> result) {
+             _valueType = valueType;
+@@ -909,55 +929,78 @@ public class MapDeserializer
+ 
+         public void put(Object key, Object value)
+         {
+-            if (_accumulator.isEmpty()) {
++            if (_pendingStart == _pending.size()) {
+                 _result.put(key, value);
+             } else {
+-                MapReferring ref = _accumulator.get(_accumulator.size() - 1);
+-                ref.next.put(key, value);
++                _pending.add(new AbstractMap.SimpleEntry<Object, Object>(key, value));
+             }
+         }
+ 
+         public Referring handleUnresolvedReference(UnresolvedForwardReference reference, Object key)
+         {
+             MapReferring id = new MapReferring(this, reference, _valueType, key);
+-            _accumulator.add(id);
++            _pending.add(id);
++            // Ids are usable as hash keys: `ObjectIdResolver`s already rely on that
++            Deque<MapReferring> refs = _unresolvedById.get(reference.getUnresolvedId());
++            if (refs == null) {
++                refs = new ArrayDeque<MapReferring>(2);
++                _unresolvedById.put(reference.getUnresolvedId(), refs);
++            }
++            refs.add(id);
+             return id;
+         }
+ 
+         public void resolveForwardReference(Object id, Object value) throws IOException
+         {
+-            Iterator<MapReferring> iterator = _accumulator.iterator();
+-            // Resolve ordering after resolution of an id. This means either:
+-            // 1- adding to the result map in case of the first unresolved id.
+-            // 2- merge the content of the resolved id with its previous unresolved id.
+-            Map<Object,Object> previous = _result;
+-            while (iterator.hasNext()) {
+-                MapReferring ref = iterator.next();
+-                if (ref.hasId(id)) {
+-                    iterator.remove();
+-                    previous.put(ref.key, value);
+-                    previous.putAll(ref.next);
+-                    return;
++            Deque<MapReferring> refs = _unresolvedById.get(id);
++            if (refs == null) {
++                throw new IllegalArgumentException("Trying to resolve a forward reference with id [" + id
++                        + "] that wasn't previously seen as unresolved.");
++            }
++            MapReferring ref = refs.removeFirst();
++            if (refs.isEmpty()) {
++                _unresolvedById.remove(id);
++            }
++            ref.resolve(value);
++
++            // Move entries no longer preceded by an unresolved reference to the result
++            final int end = _pending.size();
++            int i = _pendingStart;
++            for (; i < end; ++i) {
++                Object pending = _pending.get(i);
++                if (pending instanceof MapReferring) {
++                    MapReferring pendingRef = (MapReferring) pending;
++                    if (!pendingRef.isResolved()) {
++                        break;
++                    }
++                    _result.put(pendingRef.key, pendingRef.resolvedValue());
++                } else {
++                    Map.Entry<?,?> entry = (Map.Entry<?,?>) pending;
++                    _result.put(entry.getKey(), entry.getValue());
+                 }
+-                previous = ref.next;
++                _pending.set(i, null);
++            }
++            if (i == end) {
++                _pending.clear();
++                _pendingStart = 0;
++            } else {
++                _pendingStart = i;
+             }
+-
+-            throw new IllegalArgumentException("Trying to resolve a forward reference with id [" + id
+-                    + "] that wasn't previously seen as unresolved.");
+         }
+     }
+ 
+     /**
+-     * Helper class to maintain processing order of value.
+-     * The resolved object associated with {@link #key} comes before the values in
+-     * {@link #next}.
++     * Placeholder for a Map value that is a forward reference, to maintain processing
++     * order of entries: holds the resolved value, once the reference has been resolved.
+      */
+     static class MapReferring extends Referring {
+         private final MapReferringAccumulator _parent;
+ 
+-        public final Map<Object, Object> next = new LinkedHashMap<Object, Object>();
+         public final Object key;
+ 
++        private boolean _resolved;
++        private Object _value;
++
+         MapReferring(MapReferringAccumulator parent, UnresolvedForwardReference ref,
+                 Class<?> valueType, Object key)
+         {
+@@ -966,6 +1009,15 @@ public class MapDeserializer
+             this.key = key;
+         }
+ 
++        void resolve(Object value) {
++            _value = value;
++            _resolved = true;
++        }
++
++        boolean isResolved() { return _resolved; }
++
++        Object resolvedValue() { return _value; }
++
+         @Override
+         public void handleResolvedForwardReference(Object id, Object value) throws IOException {
+             _parent.resolveForwardReference(id, value);
+new file mode 100644
+--- /dev/null
++++ b/src/test/java/com/fasterxml/jackson/databind/objectid/ForwardReferenceResolutionOrder6204Test.java
+@@ -0,0 +1,179 @@
++package com.fasterxml.jackson.databind.objectid;
++
++import java.util.*;
++import java.util.concurrent.atomic.AtomicLong;
++
++import org.junit.jupiter.api.Test;
++
++import com.fasterxml.jackson.annotation.*;
++
++import com.fasterxml.jackson.core.type.TypeReference;
++import com.fasterxml.jackson.databind.*;
++import com.fasterxml.jackson.databind.testutil.DatabindTestUtil;
++
++import static org.junit.jupiter.api.Assertions.*;
++
++// [databind#6204]
++/**
++ * Tests for resolution of forward references within Collections and Maps: verifies
++ * that ordering is retained regardless of the order in which references resolve, and
++ * that resolving them does not take time quadratic in the number of pending references.
++ */
++public class ForwardReferenceResolutionOrder6204Test extends DatabindTestUtil
++{
++    /**
++     * Object id type that counts {@code equals()} calls, to measure -- deterministically,
++     * without relying on timing -- how much work resolution of forward references takes.
++     */
++    static class CountingId
++    {
++        public final static AtomicLong EQUALS_CALLS = new AtomicLong();
++
++        private final String _value;
++
++        @JsonCreator
++        public CountingId(String value) { _value = value; }
++
++        @JsonValue
++        public String value() { return _value; }
++
++        @Override
++        public boolean equals(Object o) {
++            EQUALS_CALLS.incrementAndGet();
++            return (o instanceof CountingId) && _value.equals(((CountingId) o)._value);
++        }
++
++        @Override
++        public int hashCode() { return _value.hashCode(); }
++
++        @Override
++        public String toString() { return _value; }
++    }
++
++    @JsonIdentityInfo(generator = ObjectIdGenerators.PropertyGenerator.class, property = "id")
++    static class Node
++    {
++        public CountingId id;
++        public String name;
++    }
++
++    private final static int COUNT = 2000;
++
++    private final ObjectMapper MAPPER = newJsonMapper();
++
++    private final TypeReference<List<Node>> LIST_TYPE = new TypeReference<List<Node>>() { };
++    private final TypeReference<Map<String,Node>> MAP_TYPE = new TypeReference<Map<String,Node>>() { };
++
++    // Collection: N references, then the definitions of the very same ids in reverse
++    // order, so that every resolution matches the most recently added pending reference
++    @Test
++    public void reverseOrderResolutionInCollection() throws Exception
++    {
++        StringBuilder sb = new StringBuilder("[");
++        for (int i = 0; i < COUNT; ++i) {
++            sb.append('\'').append(i).append("',");
++        }
++        for (int i = COUNT; --i >= 0; ) {
++            sb.append("{'id':'").append(i).append("','name':'n").append(i).append("'}");
++            sb.append((i == 0) ? ']' : ',');
++        }
++
++        CountingId.EQUALS_CALLS.set(0);
++        List<Node> result = MAPPER.readValue(a2q(sb.toString()), LIST_TYPE);
++        long comparisons = CountingId.EQUALS_CALLS.get();
++
++        // First half is the references in document order, second half the definitions
++        // in reverse: same instances, mirrored
++        assertEquals(2 * COUNT, result.size());
++        for (int i = 0; i < COUNT; ++i) {
++            assertEquals(String.valueOf(i), result.get(i).id.value(),
++                    "Wrong entry at #"+i);
++            assertSame(result.get(i), result.get(2 * COUNT - 1 - i),
++                    "Entry #"+i+" not same instance as its mirror");
++        }
++
++        _assertNotQuadratic(comparisons);
++    }
++
++    // Same, for Map values
++    @Test
++    public void reverseOrderResolutionInMap() throws Exception
++    {
++        StringBuilder sb = new StringBuilder("{");
++        for (int i = 0; i < COUNT; ++i) {
++            sb.append("'ref").append(i).append("':'").append(i).append("',");
++        }
++        for (int i = COUNT; --i >= 0; ) {
++            sb.append("'def").append(i).append("':");
++            sb.append("{'id':'").append(i).append("','name':'n").append(i).append("'}");
++            sb.append((i == 0) ? '}' : ',');
++        }
++
++        CountingId.EQUALS_CALLS.set(0);
++        Map<String,Node> result = MAPPER.readValue(a2q(sb.toString()), MAP_TYPE);
++        long comparisons = CountingId.EQUALS_CALLS.get();
++
++        assertEquals(2 * COUNT, result.size());
++        for (int i = 0; i < COUNT; ++i) {
++            Node ref = result.get("ref"+i);
++            assertNotNull(ref, "No entry for 'ref"+i+"'");
++            assertSame(ref, result.get("def"+i),
++                    "Entry 'ref"+i+"' not same instance as 'def"+i+"'");
++        }
++        // Insertion order of the result Map must match the document
++        List<String> keys = new ArrayList<>(result.keySet());
++        assertEquals("ref0", keys.get(0));
++        assertEquals("ref"+(COUNT-1), keys.get(COUNT-1));
++        assertEquals("def"+(COUNT-1), keys.get(COUNT));
++        assertEquals("def0", keys.get(2 * COUNT - 1));
++
++        _assertNotQuadratic(comparisons);
++    }
++
++    // Ordering must be retained for the plain, small cases too
++    @Test
++    public void orderRetainedWithInterleavedReferences() throws Exception
++    {
++        // "1" and "0" are forward references, "a"/"b" plain values in between
++        String json = a2q("['1',{'id':'a','name':'A'},'0',"
++                +"{'id':'b','name':'B'},{'id':'1','name':'One'},{'id':'0','name':'Zero'}]");
++        List<Node> result = MAPPER.readValue(json, LIST_TYPE);
++
++        assertEquals(6, result.size());
++        String[] expected = new String[] { "1", "a", "0", "b", "1", "0" };
++        for (int i = 0; i < expected.length; ++i) {
++            assertEquals(expected[i], result.get(i).id.value(), "Wrong entry at #"+i);
++        }
++        assertSame(result.get(0), result.get(4));
++        assertSame(result.get(2), result.get(5));
++    }
++
++    // Repeated references to one and the same id must all resolve, in order
++    @Test
++    public void repeatedReferencesToSameId() throws Exception
++    {
++        String json = a2q("['x','x',{'id':'y','name':'Y'},'x',{'id':'x','name':'X'}]");
++        List<Node> result = MAPPER.readValue(json, LIST_TYPE);
++
++        assertEquals(5, result.size());
++        String[] expected = new String[] { "x", "x", "y", "x", "x" };
++        for (int i = 0; i < expected.length; ++i) {
++            assertEquals(expected[i], result.get(i).id.value(), "Wrong entry at #"+i);
++        }
++        Node x = result.get(4);
++        assertSame(x, result.get(0));
++        assertSame(x, result.get(1));
++        assertSame(x, result.get(3));
++    }
++
++    private void _assertNotQuadratic(long comparisons)
++    {
++        // Quadratic resolution needs ~COUNT * (COUNT+1) / 2 comparisons; linear
++        // resolution a small multiple of COUNT. Bound generously in between.
++        long max = 20L * COUNT;
++        if (comparisons > max) {
++            fail("Resolving "+COUNT+" forward references took "+comparisons
++                    +" id comparisons, expected at most "+max);
++        }
++    }
++}
