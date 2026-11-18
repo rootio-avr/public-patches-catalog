@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2026-96748
 - CVE-2026-96749
+- CVE-2026-106435
 
 ## How to Apply:
 1. Clone or download the source code for pymongo
