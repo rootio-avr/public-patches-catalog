@@ -1,7 +1,7 @@
-# ghostscript : 10.0.0~dfsg-11+deb12u8.aikido.6
+# ghostscript : 10.0.0~dfsg-11+deb12u9.aikido.7
 
-This patch is based on ghostscript version 10.0.0~dfsg-11+deb12u8.aikido.6, which is available at:
-https://sources.debian.org/src/ghostscript/10.0.0~dfsg-11+deb12u8/
+This patch is based on ghostscript version 10.0.0~dfsg-11+deb12u9.aikido.7, which is available at:
+https://sources.debian.org/src/ghostscript/10.0.0~dfsg-11+deb12u9/
 
 ## Affected CVEs:
 - CVE-2025-48708
