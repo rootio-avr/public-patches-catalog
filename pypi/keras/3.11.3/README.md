@@ -18,6 +18,7 @@ unknown
 - CVE-2026-12484
 - GHSA-28jp-44vh-q42h
 - GHSA-xfhx-r7ww-5995
+- AIKIDO-2026-574328
 
 ## How to Apply:
 1. Clone or download the source code for keras
