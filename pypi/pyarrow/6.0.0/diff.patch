@@ -1,0 +1,187 @@
+--- a/python/pyarrow/tests/test_cffi.py
++++ b/python/pyarrow/tests/test_cffi.py
+@@ -26,6 +26,18 @@
+ 
+ import pytest
+ 
++
++@pytest.fixture(autouse=True)
++def enabled_py_extension_type_auto_load():
++    # These tests exercise pickle-based PyExtensionType round-trips, which are
++    # disabled by default (CVE-2023-47248); opt in explicitly.
++    pa.PyExtensionType.set_auto_load(True)
++    try:
++        yield
++    finally:
++        pa.PyExtensionType.set_auto_load(False)
++
++
+ try:
+     import pandas as pd
+     import pandas.testing as tm
+--- a/python/pyarrow/tests/test_extension_type.py
++++ b/python/pyarrow/tests/test_extension_type.py
+@@ -24,6 +24,17 @@
+ import pytest
+ 
+ 
++@pytest.fixture(autouse=True)
++def enabled_py_extension_type_auto_load():
++    # These tests exercise pickle-based PyExtensionType round-trips, which are
++    # disabled by default (CVE-2023-47248); opt in explicitly.
++    pa.PyExtensionType.set_auto_load(True)
++    try:
++        yield
++    finally:
++        pa.PyExtensionType.set_auto_load(False)
++
++
+ class IntegerType(pa.PyExtensionType):
+ 
+     def __init__(self):
+@@ -777,3 +788,50 @@
+     result = empty_arr.take(pa.array([], pa.int32()))
+     assert len(result) == 0
+     assert result.equals(empty_arr)
++
++
++_legacy_loaded = []
++
++
++def _make_legacy_int_type():
++    # Stand-in for an arbitrary pickle payload: unpickling calls this function
++    _legacy_loaded.append(True)
++    return LegacyIntType()
++
++
++class LegacyIntType(pa.PyExtensionType):
++
++    def __init__(self):
++        pa.PyExtensionType.__init__(self, pa.int8())
++
++    def __reduce__(self):
++        return _make_legacy_int_type, ()
++
++
++def test_py_extension_type_auto_load_disabled():
++    # CVE-2023-47248: pickle payloads embedded in IPC metadata must not be
++    # executed unless auto-loading is explicitly enabled.
++    pa.PyExtensionType.set_auto_load(False)
++    batch = pa.RecordBatch.from_arrays(
++        [pa.ExtensionArray.from_storage(
++            LegacyIntType(), pa.array([1, 2, 3], pa.int8()))], ['ext'])
++    buf = ipc_write_batch(batch)
++    del _legacy_loaded[:]
++
++    with pytest.warns(RuntimeWarning, match="set_auto_load"):
++        result = ipc_read_batch(buf)
++    assert _legacy_loaded == []
++    assert isinstance(result.schema.field('ext').type,
++                      pa.UnknownExtensionType)
++
++    # The unknown type can still be round-tripped without being unpickled
++    buf2 = ipc_write_batch(result)
++    with pytest.warns(RuntimeWarning, match="set_auto_load"):
++        result = ipc_read_batch(buf2)
++    assert _legacy_loaded == []
++
++    # Explicitly re-enabling auto-load restores the legacy behavior
++    pa.PyExtensionType.set_auto_load(True)
++    result = ipc_read_batch(buf)
++    assert _legacy_loaded == [True]
++    assert isinstance(result.schema.field('ext').type, LegacyIntType)
+--- a/python/pyarrow/tests/test_pandas.py
++++ b/python/pyarrow/tests/test_pandas.py
+@@ -38,6 +38,17 @@
+ from pyarrow.vendored.version import Version
+ 
+ import pyarrow as pa
++
++
++@pytest.fixture(autouse=True)
++def enabled_py_extension_type_auto_load():
++    # These tests exercise pickle-based PyExtensionType round-trips, which are
++    # disabled by default (CVE-2023-47248); opt in explicitly.
++    pa.PyExtensionType.set_auto_load(True)
++    try:
++        yield
++    finally:
++        pa.PyExtensionType.set_auto_load(False)
+ try:
+     from pyarrow import parquet as pq
+ except ImportError:
+--- a/python/pyarrow/types.pxi
++++ b/python/pyarrow/types.pxi
+@@ -837,11 +837,18 @@
+         return ExtensionArray
+ 
+ 
++_py_extension_type_auto_load = False
++
++
+ cdef class PyExtensionType(ExtensionType):
+     """
+     Concrete base class for Python-defined extension types based on pickle
+     for (de)serialization.
+ 
++    .. warning::
++       This class is deprecated and its deserialization is disabled by default.
++       :class:`ExtensionType` is recommended instead.
++
+     Parameters
+     ----------
+     storage_type : DataType
+@@ -854,6 +861,12 @@
+                             "PyExtensionType")
+ 
+     def __init__(self, DataType storage_type):
++        warnings.warn(
++            "pyarrow.PyExtensionType is deprecated "
++            "and will refuse deserialization by default. "
++            "Instead, please derive from pyarrow.ExtensionType and implement "
++            "your own serialization mechanism.",
++            FutureWarning)
+         ExtensionType.__init__(self, storage_type, "arrow.py_extension_type")
+ 
+     def __reduce__(self):
+@@ -865,6 +878,17 @@
+ 
+     @classmethod
+     def __arrow_ext_deserialize__(cls, storage_type, serialized):
++        if not _py_extension_type_auto_load:
++            warnings.warn(
++                "pickle-based deserialization of pyarrow.PyExtensionType subclasses "
++                "is disabled by default; if you only ingest "
++                "trusted data files, you may re-enable this using "
++                "`pyarrow.PyExtensionType.set_auto_load(True)`.\n"
++                "In the future, Python-defined extension subclasses should "
++                "derive from pyarrow.ExtensionType (not pyarrow.PyExtensionType) "
++                "and implement their own serialization mechanism.\n",
++                RuntimeWarning)
++            return UnknownExtensionType(storage_type, serialized)
+         try:
+             ty = builtin_pickle.loads(serialized)
+         except Exception:
+@@ -879,6 +903,22 @@
+             raise TypeError("Expected storage type {0} but got {1}"
+                             .format(ty.storage_type, storage_type))
+         return ty
++
++    # XXX Cython marks extension types as immutable, so cannot expose this
++    # as a writable class attribute.
++    @classmethod
++    def set_auto_load(cls, value):
++        """
++        Enable or disable auto-loading of serialized PyExtensionType instances.
++
++        Parameters
++        ----------
++        value : bool
++            Whether to enable auto-loading.
++        """
++        global _py_extension_type_auto_load
++        assert isinstance(value, bool)
++        _py_extension_type_auto_load = value
+ 
+ 
+ cdef class UnknownExtensionType(PyExtensionType):
