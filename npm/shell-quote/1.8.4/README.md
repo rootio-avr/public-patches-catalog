@@ -4,6 +4,7 @@ This patch is based on shell-quote version 1.8.4, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2026-13311
 - CVE-2026-102422
 
 ## How to Apply:
