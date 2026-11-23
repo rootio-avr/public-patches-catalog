@@ -6,6 +6,7 @@ unknown
 ## Affected CVEs:
 - CVE-2024-45296
 - CVE-2024-52798
+- CVE-2026-4867
 
 ## How to Apply:
 1. Clone or download the source code for path-to-regexp
