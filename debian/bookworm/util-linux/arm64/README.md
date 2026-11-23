@@ -1,6 +1,6 @@
-# util-linux : 2.38.1-5+deb12u3.aikido.18
+# util-linux : 2.38.1-5+deb12u3.aikido.19
 
-This patch is based on util-linux version 2.38.1-5+deb12u3.aikido.18, which is available at:
+This patch is based on util-linux version 2.38.1-5+deb12u3.aikido.19, which is available at:
 https://sources.debian.org/src/util-linux/2.38.1-5+deb12u3/
 
 ## Affected CVEs:
@@ -14,6 +14,7 @@ https://sources.debian.org/src/util-linux/2.38.1-5+deb12u3/
 - CVE-2026-78408
 - CVE-2026-78409
 - CVE-2026-78410
+- CVE-2026-53613
 
 ## How to Apply:
 1. Obtain the source package: `apt source util-linux`
