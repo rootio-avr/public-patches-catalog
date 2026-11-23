@@ -1,6 +1,6 @@
-# curl : 8.5.0-r00074
+# curl : 8.5.0-r00076
 
-This patch is based on curl version 8.5.0-r00074, which is available at:
+This patch is based on curl version 8.5.0-r00076, which is available at:
 unknown
 
 ## Affected CVEs:
@@ -23,6 +23,19 @@ unknown
 - CVE-2026-18924
 - CVE-2026-80230
 - CVE-2026-12064
+- CVE-2026-87866
+- CVE-2026-86409
+- CVE-2026-92391
+- CVE-2026-87865
+- CVE-2026-92389
+- CVE-2026-94266
+- CVE-2026-92388
+- CVE-2026-92390
+- CVE-2026-86414
+- CVE-2026-87864
+- CVE-2026-86410
+- CVE-2026-107928
+- CVE-2026-87863
 
 ## How to Apply:
 1. Obtain the APKBUILD file and source code: `apk source curl`
