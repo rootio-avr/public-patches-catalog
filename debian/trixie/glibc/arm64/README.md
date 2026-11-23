@@ -1,16 +1,13 @@
-# glibc : 2.41-12+deb13u4.aikido.14
+# glibc : 2.41-12+deb13u5.aikido.15
 
-This patch is based on glibc version 2.41-12+deb13u4.aikido.14, which is available at:
-https://sources.debian.org/src/glibc/2.41-12+deb13u4/
+This patch is based on glibc version 2.41-12+deb13u5.aikido.15, which is available at:
+https://sources.debian.org/src/glibc/2.41-12+deb13u5/
 
 ## Affected CVEs:
 - CVE-2018-20796
 - CVE-2019-1010022
 - CVE-2019-1010023
 - CVE-2019-9192
-- CVE-2026-6238
-- CVE-2026-5435
-- CVE-2026-19499
 - CVE-2026-84243
 
 ## How to Apply:
