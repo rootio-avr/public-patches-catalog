@@ -15,6 +15,8 @@ unknown
 - CVE-2026-44495
 - CVE-2026-42035
 - AIKIDO-2026-291630
+- CVE-2026-40175
+- CVE-2025-62718
 
 ## How to Apply:
 1. Clone or download the source code for axios
