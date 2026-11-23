@@ -19,6 +19,7 @@ unknown
 - CVE-2026-44488
 - CVE-2026-40175
 - GHSA-mmx7-hfxf-jppx
+- CVE-2025-62718
 
 ## How to Apply:
 1. Clone or download the source code for axios
