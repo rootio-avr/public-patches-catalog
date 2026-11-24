@@ -1,6 +1,6 @@
-# krb5 : 1.20.1-2+deb12u5.aikido.13
+# krb5 : 1.20.1-2+deb12u5.aikido.14
 
-This patch is based on krb5 version 1.20.1-2+deb12u5.aikido.13, which is available at:
+This patch is based on krb5 version 1.20.1-2+deb12u5.aikido.14, which is available at:
 https://sources.debian.org/src/krb5/1.20.1-2+deb12u5/
 
 ## Affected CVEs:
@@ -15,6 +15,15 @@ https://sources.debian.org/src/krb5/1.20.1-2+deb12u5/
 - CVE-2026-112323
 - CVE-2026-112321
 - CVE-2026-112314
+- CVE-2026-107364
+- CVE-2026-112315
+- CVE-2026-112316
+- CVE-2026-112317
+- CVE-2026-112318
+- CVE-2026-112319
+- CVE-2026-118380
+- CVE-2026-71199
+- CVE-2026-71200
 
 ## How to Apply:
 1. Obtain the source package: `apt source krb5`
