@@ -894,3 +894,328 @@
      this[kFactory] = factory
      this[kClients] = new Map()
      this[kOrigins] = new Set()
+
+--- a/lib/interceptor/decompress.js
++++ b/lib/interceptor/decompress.js
+@@ -38,6 +38,12 @@
+   #skipStatusCodes
+   /** @type {boolean} */
+   #skipErrorResponses
++  /** @type {Transform[]} */
++  #activeDecompressors = []
++  /** @type {boolean} */
++  #inputEnded = false
++  /** @type {boolean} */
++  #terminated = false
+ 
+   constructor (handler, { skipStatusCodes = defaultSkipStatusCodes, skipErrorResponses = true } = {}) {
+     super(handler)
+@@ -101,21 +107,62 @@
+    */
+   #setupDecompressorEvents (decompressor, controller) {
+     decompressor.on('readable', () => {
++      if (this.#terminated) {
++        return
++      }
++
+       let chunk
+       while ((chunk = decompressor.read()) !== null) {
+-        const result = super.onResponseData(controller, chunk)
+-        if (result === false) {
+-          break
++        try {
++          const result = super.onResponseData(controller, chunk)
++          if (result === false) {
++            break
++          }
++        } catch (err) {
++          // A throw from a downstream handler must not escape from a zlib
++          // event callback as an uncaughtException.
++          this.#fail(controller, err)
++          return
+         }
+       }
+     })
+ 
+     decompressor.on('error', (error) => {
++      if (this.#terminated) {
++        return
++      }
++      this.#terminated = true
+       super.onResponseError(controller, error)
+     })
+   }
+ 
+   /**
++   * Converges an error thrown by a downstream handler into a per-request error
++   * @param {Controller} controller - The controller of the request
++   * @param {Error} error - The error thrown by the downstream handler
++   * @returns {void}
++   */
++  #fail (controller, error) {
++    if (this.#terminated) {
++      return
++    }
++    this.#terminated = true
++
++    for (const decompressor of this.#activeDecompressors) {
++      decompressor.destroy()
++    }
++    this.#activeDecompressors.length = 0
++
++    if (!this.#inputEnded && typeof controller?.abort === 'function') {
++      controller.abort(error)
++    } else {
++      // The request is already marked complete once the compressed input ends,
++      // so controller.abort() can no longer propagate the error.
++      super.onResponseError(controller, error)
++    }
++  }
++
++  /**
+    * Sets up event handling for a single decompressor
+    * @param {Controller} controller - The controller to handle events
+    * @returns {void}
+@@ -125,7 +172,17 @@
+     this.#setupDecompressorEvents(decompressor, controller)
+ 
+     decompressor.on('end', () => {
+-      super.onResponseEnd(controller, this.#trailers)
++      if (this.#terminated) {
++        return
++      }
++
++      try {
++        super.onResponseEnd(controller, this.#trailers)
++      } catch (err) {
++        this.#fail(controller, err)
++        return
++      }
++      this.#terminated = true
+     })
+   }
+ 
+@@ -139,11 +196,23 @@
+     this.#setupDecompressorEvents(lastDecompressor, controller)
+ 
+     pipeline(this.#decompressors, (err) => {
++      if (this.#terminated) {
++        return
++      }
++
+       if (err) {
++        this.#terminated = true
+         super.onResponseError(controller, err)
+         return
+       }
+-      super.onResponseEnd(controller, this.#trailers)
++
++      try {
++        super.onResponseEnd(controller, this.#trailers)
++      } catch (error) {
++        this.#fail(controller, error)
++        return
++      }
++      this.#terminated = true
+     })
+   }
+ 
+@@ -178,6 +247,7 @@
+     }
+ 
+     this.#decompressors = decompressors
++    this.#activeDecompressors = decompressors.slice()
+ 
+     // Remove compression headers since we're decompressing
+     const { 'content-encoding': _, 'content-length': __, ...newHeaders } = headers
+@@ -239,6 +309,7 @@
+   onResponseEnd (controller, trailers) {
+     if (this.#decompressors.length > 0) {
+       this.#trailers = trailers
++      this.#inputEnded = true
+       this.#decompressors[0].end()
+       this.#cleanupDecompressors()
+       return
+@@ -252,6 +323,7 @@
+    * @returns {void}
+    */
+   onResponseError (controller, err) {
++    this.#terminated = true
+     if (this.#decompressors.length > 0) {
+       for (const decompressor of this.#decompressors) {
+         decompressor.destroy(err)
+
+--- a/lib/web/websocket/stream/websocketstream.js
++++ b/lib/web/websocket/stream/websocketstream.js
+@@ -34,9 +34,9 @@ class WebSocketStream {
+   /** @type {ReadableStreamDefaultController} */
+   #readableStreamController
+ 
+-  // Each WebSocketStream object has an associated writable stream , which is a WritableStream .
+-  /** @type {WritableStream} */
+-  #writableStream
++  // Retain the controller so the writable stream can be errored while locked.
++  /** @type {WritableStreamDefaultController} */
++  #writableStreamController
+ 
+   // Each WebSocketStream object has an associated boolean handshake aborted , which is initially false.
+   #handshakeAborted = false
+@@ -300,6 +300,9 @@ class WebSocketStream {
+     // 12. Let writable be a new WritableStream .
+     // 13. Set up writable with writeAlgorithm , closeAlgorithm , and abortAlgorithm .
+     const writable = new WritableStream({
++      start: (controller) => {
++        this.#writableStreamController = controller
++      },
+       write: (chunk) => this.#write(chunk),
+       close: () => closeWebSocketConnection(this.#handler, null, null),
+       abort: (reason) => this.#closeUsingReason(reason)
+@@ -308,9 +311,6 @@ class WebSocketStream {
+     // Set stream ’s readable stream to readable .
+     this.#readableStream = readable
+ 
+-    // Set stream ’s writable stream to writable .
+-    this.#writableStream = writable
+-
+     // Resolve stream ’s opened promise with WebSocketOpenInfo «[ " extensions " → extensions , " protocol " → protocol , " readable " → readable , " writable " → writable ]».
+     this.#openedPromise.resolve({
+       extensions,
+@@ -396,9 +396,7 @@ class WebSocketStream {
+       readableStreamClose(this.#readableStreamController)
+ 
+       // 6.2. Error stream ’s writable stream with an " InvalidStateError " DOMException indicating that a closed WebSocketStream cannot be written to.
+-      if (!this.#writableStream.locked) {
+-        this.#writableStream.abort(new DOMException('A closed WebSocketStream cannot be written to', 'InvalidStateError'))
+-      }
++      this.#writableStreamController.error(new DOMException('A closed WebSocketStream cannot be written to', 'InvalidStateError'))
+ 
+       // 6.3. Resolve stream ’s closed promise with WebSocketCloseInfo «[ " closeCode " → code , " reason " → reason ]».
+       this.#closedPromise.resolve({
+@@ -415,7 +413,7 @@ class WebSocketStream {
+       this.#readableStreamController?.error(error)
+ 
+       // 7.3. Error stream ’s writable stream with error .
+-      this.#writableStream?.abort(error)
++      this.#writableStreamController?.error(error)
+ 
+       // 7.4. Reject stream ’s closed promise with error .
+       this.#closedPromise.reject(error)
+--- /dev/null
++++ b/test/websocket/stream/close-locked-writable.js
+@@ -0,0 +1,116 @@
++'use strict'
++
++const { test } = require('node:test')
++const { spawn } = require('node:child_process')
++const { once } = require('node:events')
++const { join } = require('node:path')
++const { WebSocketServer } = require('ws')
++
++function waitForExit (child, timeout) {
++  return new Promise((resolve, reject) => {
++    const timer = setTimeout(() => {
++      reject(new Error('Child process did not exit after the WebSocket closed'))
++    }, timeout)
++
++    child.once('error', (error) => {
++      clearTimeout(timer)
++      reject(error)
++    })
++
++    child.once('exit', (code, signal) => {
++      clearTimeout(timer)
++      resolve({ code, signal })
++    })
++  })
++}
++
++async function testLockedWritableClose (t, clean) {
++  const server = new WebSocketServer({ port: 0 })
++  await once(server, 'listening')
++
++  const connection = new Promise((resolve) => {
++    server.once('connection', resolve)
++  })
++
++  const undici = join(__dirname, '../../..')
++  const url = `ws://127.0.0.1:${server.address().port}`
++  const child = spawn(process.execPath, ['--unhandled-rejections=strict', '-e', `
++    const assert = require('node:assert')
++    const { WebSocketStream } = require(${JSON.stringify(undici)})
++
++    ;(async () => {
++      const stream = new WebSocketStream(${JSON.stringify(url)})
++      const { writable } = await stream.opened
++      const writer = writable.getWriter()
++      const writerClosed = writer.closed.catch((error) => error)
++      process.stdout.write('locked\\n')
++
++      const closeResult = await stream.closed.then(
++        (value) => ({ value }),
++        (error) => ({ error })
++      )
++      const writerError = await writerClosed
++
++      if (${clean}) {
++        assert.deepStrictEqual(closeResult.value, { closeCode: 1000, reason: '' })
++        assert.strictEqual(writerError.name, 'InvalidStateError')
++      } else {
++        assert.strictEqual(writerError, closeResult.error)
++        assert.strictEqual(closeResult.error.name, 'WebSocketError')
++        assert.strictEqual(closeResult.error.closeCode, 1006)
++      }
++
++      writer.releaseLock()
++      await new Promise((resolve) => setTimeout(resolve, 50))
++      process.stdout.write('survived\\n')
++    })().catch((error) => {
++      console.error(error)
++      process.exitCode = 2
++    })
++  `], {
++    stdio: ['ignore', 'pipe', 'pipe']
++  })
++
++  t.after(() => {
++    child.kill()
++
++    for (const client of server.clients) {
++      client.terminate()
++    }
++
++    server.close()
++  })
++
++  let stdout = ''
++  let stderr = ''
++  let terminated = false
++
++  child.stdout.setEncoding('utf8')
++  child.stdout.on('data', (chunk) => {
++    stdout += chunk
++
++    if (!terminated && stdout.includes('locked\n')) {
++      terminated = true
++      connection.then((socket) => clean ? socket.close(1000) : socket.terminate())
++    }
++  })
++
++  child.stderr.setEncoding('utf8')
++  child.stderr.on('data', (chunk) => {
++    stderr += chunk
++  })
++
++  const { code, signal } = await waitForExit(child, 5000)
++
++  t.assert.strictEqual(code, 0, stderr)
++  t.assert.strictEqual(signal, null)
++  t.assert.strictEqual(stdout, 'locked\nsurvived\n')
++}
++
++test('unclean close errors a locked writable without terminating the process', async (t) => {
++  await testLockedWritableClose(t, false)
++})
++
++test('clean close errors a locked writable without terminating the process', async (t) => {
++  await testLockedWritableClose(t, true)
++})
