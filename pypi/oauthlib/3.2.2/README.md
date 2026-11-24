@@ -5,6 +5,8 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-118669
+- CVE-2026-49265
+- CVE-2026-49264
 
 ## How to Apply:
 1. Clone or download the source code for oauthlib
