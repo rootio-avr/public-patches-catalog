@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-93748
+- CVE-2022-25881
 
 ## How to Apply:
 1. Clone or download the source code for http-cache-semantics
