@@ -4,7 +4,11 @@ This patch is based on org.xerial.snappy:snappy-java version 1.1.8.4, which is a
 unknown
 
 ## Affected CVEs:
+- CVE-2026-93451
 - CVE-2026-108106
+- CVE-2023-43642
+- CVE-2023-34455
+- GHSA-94x4-5g3f-jjxp
 
 ## How to Apply:
 1. Clone or download the source code for org.xerial.snappy:snappy-java
