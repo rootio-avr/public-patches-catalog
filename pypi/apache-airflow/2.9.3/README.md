@@ -4,6 +4,7 @@ This patch is based on apache-airflow version 2.9.3, which is available at:
 unknown
 
 ## Affected CVEs:
+- CVE-2024-45034
 - CVE-2024-56373
 - CVE-2025-54550
 - CVE-2025-68675
