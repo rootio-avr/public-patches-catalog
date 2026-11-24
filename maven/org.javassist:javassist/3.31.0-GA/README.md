@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - AIKIDO-2026-777934
+- AIKIDO-2026-881868
 
 ## How to Apply:
 1. Clone or download the source code for org.javassist:javassist
