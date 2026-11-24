@@ -4,8 +4,10 @@ This patch is based on soupsieve version 2.9, which is available at:
 unknown
 
 ## Affected CVEs:
-- CVE-2026-126190
 - CVE-2026-126191
+- CVE-2026-126190
+- AIKIDO-2026-18287
+- AIKIDO-2026-552858
 
 ## How to Apply:
 1. Clone or download the source code for soupsieve
