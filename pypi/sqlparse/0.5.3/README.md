@@ -7,6 +7,7 @@ unknown
 - CVE-2026-54284
 - CVE-2026-71491
 - GHSA-27jp-wm6q-gp25
+- AIKIDO-2026-576438
 
 ## How to Apply:
 1. Clone or download the source code for sqlparse
