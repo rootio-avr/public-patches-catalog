@@ -10,6 +10,7 @@ unknown
 - CVE-2026-102271
 - CVE-2026-102273
 - CVE-2026-102272
+- CVE-2026-102275
 - GHSA-pxh4-856f-4h89
 
 ## How to Apply:
