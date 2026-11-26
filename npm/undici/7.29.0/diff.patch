@@ -32,6 +32,348 @@
            return
          }
 
+--- a/docs/docs/api/Client.md	1985-10-26 13:45:00
++++ b/docs/docs/api/Client.md	2026-11-26 15:20:52
+@@ -27,6 +27,8 @@
+ * **webSocket** `WebSocketOptions` (optional) - WebSocket-specific configuration options.
+   * **maxFragments** `number` (optional) - Default: `131072` - Maximum number of fragments in a message. Set to 0 to disable the limit.
+   * **maxPayloadSize** `number` (optional) - Default: `134217728` (128 MB) - Maximum allowed payload size in bytes for WebSocket messages. Applied to uncompressed messages, compressed frame payloads, and decompressed (permessage-deflate) messages. Set to 0 to disable the limit.
++* **eventSource** `EventSourceOptions` (optional) - EventSource-specific configuration options.
++  * **maxEventSize** `number` (optional) - The maximum total bytes of data and metadata field values retained for a pending EventSource event. Each unfinished line is separately limited to this value plus seven syntax bytes. The number of `data:` lines per event and input chunks merged for an unfinished line are each limited to `min(131072, max(1024, floor(maxEventSize / 128)))` to bound object overhead. Set to `0` to disable these limits. Default: `buffer.kStringMaxLength`.
+ * **pipelining** `number | null` (optional) - Default: `1` - The amount of concurrent requests to be sent over the single TCP/TLS connection according to [RFC7230](https://tools.ietf.org/html/rfc7230#section-6.3.2). Carefully consider your workload and environment before enabling concurrent requests as pipelining may reduce performance if used incorrectly. Pipelining is sensitive to network stack settings as well as head of line blocking caused by e.g. long running requests. Set to `0` to disable keep-alive connections.
+ * **connect** `ConnectOptions | Function | null` (optional) - Default: `null`.
+ * **strictContentLength** `Boolean` (optional) - Default: `true` - Whether to treat request content length mismatches as errors. If true, an error is thrown when the request content-length header doesn't match the length of the request body. **Security Warning:** Disabling this option can expose your application to HTTP Request Smuggling attacks, where mismatched content-length headers cause servers and proxies to interpret request boundaries differently. This can lead to cache poisoning, credential hijacking, and bypassing security controls. Only disable this in controlled environments where you fully trust the request source.
+--- a/lib/dispatcher/client.js	1985-10-26 13:45:00
++++ b/lib/dispatcher/client.js	2026-11-26 15:20:52
+@@ -115,7 +115,8 @@
+     initialWindowSize,
+     connectionWindowSize,
+     pingInterval,
+-    webSocket
++    webSocket,
++    eventSource
+   } = {}) {
+     if (keepAlive !== undefined) {
+       throw new InvalidArgumentError('unsupported keepAlive, use pipelining=0 instead')
+@@ -223,7 +224,7 @@
+       throw new InvalidArgumentError('pingInterval must be a positive integer, greater or equal to 0')
+     }
+ 
+-    super({ webSocket })
++    super({ webSocket, eventSource })
+ 
+     if (typeof connect !== 'function') {
+       connect = buildConnector({
+--- a/lib/dispatcher/dispatcher-base.js	1985-10-26 13:45:00
++++ b/lib/dispatcher/dispatcher-base.js	2026-11-26 15:20:52
+@@ -1,5 +1,6 @@
+ 'use strict'
+ 
++const buffer = require('node:buffer')
+ const Dispatcher = require('./dispatcher')
+ const UnwrapHandler = require('../handler/unwrap-handler')
+ const {
+@@ -12,6 +13,7 @@
+ const kOnDestroyed = Symbol('onDestroyed')
+ const kOnClosed = Symbol('onClosed')
+ const kWebSocketOptions = Symbol('webSocketOptions')
++const kEventSourceOptions = Symbol('eventSourceOptions')
+ 
+ class DispatcherBase extends Dispatcher {
+   /** @type {boolean} */
+@@ -32,6 +34,7 @@
+   constructor (opts) {
+     super()
+     this[kWebSocketOptions] = opts?.webSocket ?? {}
++    this[kEventSourceOptions] = opts?.eventSource ?? {}
+   }
+ 
+   /**
+@@ -41,6 +44,15 @@
+     return {
+       maxFragments: this[kWebSocketOptions].maxFragments ?? 131072,
+       maxPayloadSize: this[kWebSocketOptions].maxPayloadSize ?? 128 * 1024 * 1024 // 128 MB default
++    }
++  }
++
++  /**
++   * @returns {import('../../types/client').Client.EventSourceOptions}
++   */
++  get eventSourceOptions () {
++    return {
++      maxEventSize: this[kEventSourceOptions].maxEventSize ?? buffer.kStringMaxLength
+     }
+   }
+ 
+--- a/lib/web/eventsource/eventsource-stream.js	1985-10-26 13:45:00
++++ b/lib/web/eventsource/eventsource-stream.js	2026-11-26 15:20:52
+@@ -1,4 +1,5 @@
+ 'use strict'
++const buffer = require('node:buffer')
+ const { Transform } = require('node:stream')
+ const { isASCIINumber, isValidLastEventId } = require('./util')
+ 
+@@ -40,6 +41,20 @@
+  * @property {number} [reconnectionTime] The reconnection time, in milliseconds.
+  */
+ 
++const defaultMaxEventSize = buffer.kStringMaxLength
++
++// Each data field creates a string node. The absolute ceiling protects the
++// large default byte limit.
++const minParserItems = 1024
++const maxParserItems = 131072
++const bytesPerParserItem = 128
++
++function createMaxEventSizeExceededError () {
++  const error = new Error('EventSource message size exceeded')
++  error.aborted = false
++  return error
++}
++
+ class EventSourceStream extends Transform {
+   /**
+    * @type {eventSourceSettings}
+@@ -69,6 +84,18 @@
+ 
+   pos = 0
+ 
++  eventSize = 0
++
++  eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
++
++  dataLineCount = 0
++
++  maxEventSize
++
++  maxDataLines
++
++  bufferedInputChunks = 0
++
+   event = {
+     data: undefined,
+     event: undefined,
+@@ -79,6 +106,7 @@
+   /**
+    * @param {object} options
+    * @param {boolean} [options.readableObjectMode]
++   * @param {number} [options.maxEventSize]
+    * @param {eventSourceSettings} [options.eventSourceSettings]
+    * @param {(chunk: any, encoding?: BufferEncoding | undefined) => boolean} [options.push]
+    */
+@@ -90,6 +118,10 @@
+     super(options)
+ 
+     this.state = options.eventSourceSettings || {}
++    this.maxEventSize = options.maxEventSize ?? defaultMaxEventSize
++    this.maxDataLines = this.maxEventSize > 0
++      ? Math.min(maxParserItems, Math.max(minParserItems, Math.floor(this.maxEventSize / bytesPerParserItem)))
++      : 0
+     if (options.push) {
+       this.push = options.push
+     }
+@@ -107,6 +139,19 @@
+       return
+     }
+ 
++    if (this.maxEventSize > 0 &&
++        this.buffer !== null &&
++        this.pos === this.buffer.length &&
++        this.bufferedInputChunks >= this.maxDataLines &&
++        chunk[0] !== LF && chunk[0] !== CR) {
++      callback(createMaxEventSizeExceededError())
++      return
++    }
++
++    if (this.buffer !== null && this.pos === this.buffer.length) {
++      this.bufferedInputChunks++
++    }
++
+     // Cache the chunk in the buffer, as the data might not be complete while
+     // processing it
+     // TODO: Investigate if there is a more performant way to handle
+@@ -260,12 +305,18 @@
+ 
+         // In any case, we can process the line as we reached an
+         // end-of-line character
+-        this.parseLine(this.buffer.subarray(0, this.pos), this.event)
++        try {
++          this.parseLine(this.buffer.subarray(0, this.pos), this.event)
++        } catch (error) {
++          callback(error)
++          return
++        }
+ 
+         // Remove the processed line from the buffer
+         this.buffer = this.buffer.subarray(this.pos + 1)
+         // Reset the position as we removed the processed line from the buffer
+         this.pos = 0
++        this.bufferedInputChunks = 0
+         // A line was processed and this could be the end of the event. We need
+         // to check if the next line is empty to determine if the event is
+         // finished.
+@@ -273,12 +324,27 @@
+         continue
+       }
+ 
++      // The unfinished line is bounded before its line ending arrives. The
++      // seven extra bytes allow the longest field prefix ("event: " or
++      // "retry: ").
++      if (this.maxEventSize > 0 && this.pos + 1 > this.maxEventSize + 7) {
++        callback(createMaxEventSizeExceededError())
++        return
++      }
++
+       this.pos++
+     }
+ 
+     callback()
+   }
+ 
++  _destroy (error, callback) {
++    this.buffer = null
++    this.pos = 0
++    this.clearEvent()
++    super._destroy(error, callback)
++  }
++
+   /**
+    * @param {Buffer} line
+    * @param {EventSourceStreamEvent} event
+@@ -300,6 +366,7 @@
+ 
+     let field = ''
+     let value = ''
++    let valueBytes = 0
+ 
+     // If the line contains a U+003A COLON character (:)
+     if (colonPosition !== -1) {
+@@ -320,6 +387,7 @@
+       // TODO: Investigate if there is a more performant way to extract the
+       // value
+       // see: https://github.com/nodejs/undici/issues/2630
++      valueBytes = line.length - valueStart
+       value = line.subarray(valueStart).toString('utf8')
+ 
+       // Otherwise, the string is not empty but does not contain a U+003A COLON
+@@ -335,30 +403,47 @@
+     // decoded as UTF-8
+     switch (field) {
+       case 'data':
++        if (this.maxEventSize > 0 && this.dataLineCount >= this.maxDataLines) {
++          throw createMaxEventSizeExceededError()
++        }
++        this.setEventFieldSize(field, this.eventFieldSizes.data + (event.data === undefined ? 0 : 1) + valueBytes)
+         if (event[field] === undefined) {
+           event[field] = value
+         } else {
+           event[field] += `\n${value}`
+         }
++        this.dataLineCount++
+         break
+       case 'retry':
+         if (isASCIINumber(value)) {
++          this.setEventFieldSize(field, valueBytes)
+           event[field] = value
+         }
+         break
+       case 'id':
+         if (isValidLastEventId(value)) {
++          this.setEventFieldSize(field, valueBytes)
+           event[field] = value
+         }
+         break
+       case 'event':
+         if (value.length > 0) {
++          this.setEventFieldSize(field, valueBytes)
+           event[field] = value
+         }
+         break
+     }
+   }
+ 
++  setEventFieldSize (field, size) {
++    const eventSize = this.eventSize - this.eventFieldSizes[field] + size
++    if (this.maxEventSize > 0 && eventSize > this.maxEventSize) {
++      throw createMaxEventSizeExceededError()
++    }
++    this.eventSize = eventSize
++    this.eventFieldSizes[field] = size
++  }
++
+   /**
+    * @param {EventSourceStreamEvent} event
+    */
+@@ -391,6 +476,10 @@
+       id: undefined,
+       retry: undefined
+     }
++    this.eventSize = 0
++    this.dataLineCount = 0
++    this.eventFieldSizes = { data: 0, event: 0, id: 0, retry: 0 }
++    this.bufferedInputChunks = 0
+   }
+ }
+ 
+--- a/lib/web/eventsource/eventsource.js	1985-10-26 13:45:00
++++ b/lib/web/eventsource/eventsource.js	2026-11-26 15:20:52
+@@ -10,6 +10,7 @@
+ const { isNetworkError } = require('../fetch/response')
+ const { kEnumerableProperty } = require('../../core/util')
+ const { environmentSettingsObject } = require('../fetch/util')
++const { getGlobalDispatcher } = require('../../global')
+ 
+ let experimentalWarned = false
+ 
+@@ -292,6 +293,7 @@
+ 
+       const eventSourceStream = new EventSourceStream({
+         eventSourceSettings: this.#state,
++        maxEventSize: this.#dispatcher.eventSourceOptions?.maxEventSize,
+         push: (event) => {
+           this.dispatchEvent(createFastMessageEvent(
+             event.type,
+@@ -476,7 +478,8 @@
+   },
+   {
+     key: 'dispatcher', // undici only
+-    converter: webidl.converters.any
++    converter: webidl.converters.any,
++    defaultValue: () => getGlobalDispatcher()
+   },
+   {
+     key: 'node', // undici only
+--- a/types/client.d.ts	1985-10-26 13:45:00
++++ b/types/client.d.ts	2026-11-26 15:20:52
+@@ -109,6 +109,8 @@
+     pingInterval?: number;
+     /** WebSocket-specific configuration options. */
+     webSocket?: WebSocketOptions;
++    /** EventSource-specific configuration options. */
++    eventSource?: EventSourceOptions;
+   }
+   export interface SocketInfo {
+     localAddress?: string
+@@ -133,6 +135,18 @@
+      * @default 134217728 (128 MB)
+      */
+     maxPayloadSize?: number;
++  }
++  export interface EventSourceOptions {
++    /**
++     * Maximum total bytes of data and metadata field values retained for a
++     * pending EventSource event. Each unfinished line is separately bounded
++     * to this value plus seven syntax bytes. The number of data lines per
++     * event and input chunks merged for an unfinished line are each limited
++     * to min(131072, max(1024, floor(maxEventSize / 128))).
++     * Set to 0 to disable these limits.
++     * @default buffer.kStringMaxLength
++     */
++    maxEventSize?: number;
+   }
+ }
+ 
+
 --- a/lib/handler/cache-handler.js
 +++ b/lib/handler/cache-handler.js
 @@ -207,6 +207,13 @@
