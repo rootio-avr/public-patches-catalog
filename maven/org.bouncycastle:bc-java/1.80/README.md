@@ -26,6 +26,9 @@ unknown
 - AIKIDO-2026-511225
 - AIKIDO-2026-572912
 - AIKIDO-2026-98906
+- AIKIDO-2026-986001
+- AIKIDO-2026-520661
+- AIKIDO-2026-553391
 
 ## How to Apply:
 1. Clone or download the source code for org.bouncycastle:bc-java
