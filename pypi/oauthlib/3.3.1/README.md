@@ -7,6 +7,7 @@ unknown
 - CVE-2026-49272
 - CVE-2026-118669
 - CVE-2026-49264
+- CVE-2026-49265
 
 ## How to Apply:
 1. Clone or download the source code for oauthlib
