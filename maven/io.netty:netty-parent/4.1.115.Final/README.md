@@ -4,11 +4,11 @@ This patch is based on io.netty:netty-parent version 4.1.115.Final, which is ava
 unknown
 
 ## Affected CVEs:
-- CVE-BUILD-FIX
 - CVE-2025-59419
 - CVE-2026-42585
 - CVE-2025-24970
 - CVE-2025-55163
+- CVE-2026-75595
 
 ## How to Apply:
 1. Clone or download the source code for io.netty:netty-parent
