@@ -1,11 +1,10 @@
-# pam : 1.5.2-6+deb12u2.aikido.18
+# pam : 1.5.2-6+deb12u3.aikido.19
 
-This patch is based on pam version 1.5.2-6+deb12u2.aikido.18, which is available at:
-https://sources.debian.org/src/pam/1.5.2-6+deb12u2/
+This patch is based on pam version 1.5.2-6+deb12u3.aikido.19, which is available at:
+https://sources.debian.org/src/pam/1.5.2-6+deb12u3/
 
 ## Affected CVEs:
 - CVE-2024-10041
-- CVE-2025-6020
 - CVE-2026-54411
 
 ## How to Apply:
