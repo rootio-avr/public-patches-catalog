@@ -5,6 +5,7 @@ unknown
 
 ## Affected CVEs:
 - CVE-2026-49875
+- CVE-2026-50645
 
 ## How to Apply:
 1. Clone or download the source code for org.apache.cxf:cxf
