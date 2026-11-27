@@ -473,6 +473,251 @@
 +|               src="1"
 +|             "-->"
 
+--- a/http2/server.go
++++ b/http2/server.go
+@@ -676,7 +676,8 @@
+ 	// immutable:
+ 	sc        *serverConn
+ 	id        uint32
+-	body      *pipe       // non-nil if expecting DATA frames
++	body      *pipe // non-nil if expecting DATA frames
++	reqBody   *requestBody
+ 	cw        closeWaiter // closed wait stream transitions to closed state
+ 	ctx       context.Context
+ 	cancelCtx func()
+@@ -1737,10 +1738,6 @@
+ 		}
+ 	}
+ 	if p := st.body; p != nil {
+-		// Return any buffered unread bytes worth of conn-level flow control.
+-		// See golang.org/issue/16481
+-		sc.sendWindowUpdate(nil, p.Len())
+-
+ 		p.CloseWithError(err)
+ 	}
+ 	if e, ok := err.(StreamError); ok {
+@@ -2095,7 +2092,7 @@
+ 	if st.reqTrailer != nil {
+ 		st.trailer = make(http.Header)
+ 	}
+-	st.body = req.Body.(*requestBody).pipe // may be nil
++	st.body = st.reqBody.pipe // may be nil
+ 	st.declBodyBytes = req.ContentLength
+ 
+ 	handler := sc.handler.ServeHTTP
+@@ -2118,7 +2115,7 @@
+ 		st.readDeadline = sc.srv.afterFunc(sc.hs.ReadTimeout, st.onReadTimeout)
+ 	}
+ 
+-	return sc.scheduleHandler(id, rw, req, handler)
++	return sc.scheduleHandler(st, rw, req, handler)
+ }
+ 
+ func (sc *serverConn) upgradeRequest(req *http.Request) {
+@@ -2292,7 +2289,7 @@
+ 		} else {
+ 			req.ContentLength = -1
+ 		}
+-		req.Body.(*requestBody).pipe = &pipe{
++		st.reqBody.pipe = &pipe{
+ 			b: &dataBuffer{expected: req.ContentLength},
+ 		}
+ 	}
+@@ -2312,7 +2309,7 @@
+ 		return nil, nil, sc.countError(res.InvalidReason, streamError(st.id, ErrCodeProtocol))
+ 	}
+ 
+-	body := &requestBody{
++	st.reqBody = &requestBody{
+ 		conn:          sc,
+ 		stream:        st,
+ 		needsContinue: res.NeedsContinue,
+@@ -2328,7 +2325,7 @@
+ 		ProtoMinor: 0,
+ 		TLS:        tlsState,
+ 		Host:       rp.Authority,
+-		Body:       body,
++		Body:       st.reqBody,
+ 		Trailer:    res.Trailer,
+ 	}).WithContext(st.ctx)
+ 	rw := sc.newResponseWriter(st, req)
+@@ -2352,11 +2349,12 @@
+ 	rw       *responseWriter
+ 	req      *http.Request
+ 	handler  func(http.ResponseWriter, *http.Request)
++	body     *pipe
+ }
+ 
+ // scheduleHandler starts a handler goroutine,
+ // or schedules one to start as soon as an existing handler finishes.
+-func (sc *serverConn) scheduleHandler(streamID uint32, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
++func (sc *serverConn) scheduleHandler(st *stream, rw *responseWriter, req *http.Request, handler func(http.ResponseWriter, *http.Request)) error {
+ 	sc.serveG.check()
+ 	maxHandlers := sc.advMaxStreams
+ 	if sc.curHandlers < maxHandlers {
+@@ -2368,10 +2366,11 @@
+ 		return sc.countError("too_many_early_resets", ConnectionError(ErrCodeEnhanceYourCalm))
+ 	}
+ 	sc.unstartedHandlers = append(sc.unstartedHandlers, unstartedHandler{
+-		streamID: streamID,
++		streamID: st.id,
+ 		rw:       rw,
+ 		req:      req,
+ 		handler:  handler,
++		body:     st.body,
+ 	})
+ 	return nil
+ }
+@@ -2385,6 +2384,10 @@
+ 		u := sc.unstartedHandlers[i]
+ 		if sc.streams[u.streamID] == nil {
+ 			// This stream was reset before its goroutine had a chance to start.
++			if u.body != nil {
++				u.body.BreakWithError(errClosedBody)
++				sc.sendWindowUpdate(nil, u.body.Len())
++			}
+ 			continue
+ 		}
+ 		if sc.curHandlers >= maxHandlers {
+@@ -2407,6 +2410,12 @@
+ 	didPanic := true
+ 	defer func() {
+ 		rw.rws.stream.cancelCtx()
++		if b := rw.rws.stream.reqBody; b != nil {
++			// Closing the body refunds flow control credit for any unconsumed data.
++			// (reqBody is nil for Upgrade: h2c requests, but those do not use flow
++			// control for the request body.)
++			b.Close()
++		}
+ 		if req.MultipartForm != nil {
+ 			req.MultipartForm.RemoveAll()
+ 		}
+@@ -2505,7 +2514,7 @@
+ func (sc *serverConn) noteBodyRead(st *stream, n int) {
+ 	sc.serveG.check()
+ 	sc.sendWindowUpdate(nil, n) // conn-level
+-	if st.state != stateHalfClosedRemote && st.state != stateClosed {
++	if st != nil && st.state != stateHalfClosedRemote && st.state != stateClosed {
+ 		// Don't send this WINDOW_UPDATE if the stream is closed
+ 		// remotely.
+ 		sc.sendWindowUpdate(st, n)
+@@ -2553,6 +2562,9 @@
+ 	b.closeOnce.Do(func() {
+ 		if b.pipe != nil {
+ 			b.pipe.BreakWithError(errClosedBody)
++			if unread := b.pipe.Len(); unread > 0 {
++				b.conn.noteBodyReadFromHandler(nil, unread, errClosedBody)
++			}
+ 		}
+ 	})
+ 	return nil
+--- a/http2/server_test.go
++++ b/http2/server_test.go
+@@ -3649,6 +3649,80 @@
+ 	})
+ }
+ 
++func TestServerResetStreamUnreadBody(t *testing.T) {
++	const size = inflowMinRefresh // enough to trigger flow control return
++
++	// awaitStreamClosed waits for the server to finish processing a RST_STREAM.
++	awaitStreamClosed := func(t *testing.T, st *serverTester, id uint32) {
++		t.Helper()
++		deadline := time.Now().Add(5 * time.Second)
++		for st.stream(id) != nil {
++			if time.Now().After(deadline) {
++				t.Fatalf("timeout waiting for stream %d to close", id)
++			}
++			time.Sleep(time.Millisecond)
++		}
++	}
++
++	t.Run("read_after_reset", func(t *testing.T) {
++		started := make(chan struct{})
++		proceed := make(chan struct{})
++		done := make(chan struct{})
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			close(started)
++			<-proceed
++			// The handler reads the body after the stream has been reset.
++			io.ReadAll(r.Body)
++			close(done)
++		})
++		defer st.Close()
++
++		st.greet()
++		st.writeHeaders(HeadersFrameParam{
++			StreamID:      1,
++			BlockFragment: st.encodeHeader(":method", "POST"),
++			EndHeaders:    true,
++		})
++		<-started
++		st.writeData(1, false, make([]byte, size))
++		st.writeRSTStream(1, ErrCodeCancel)
++		awaitStreamClosed(t, st, 1)
++		close(proceed)
++		<-done
++
++		// Flow control is returned exactly once.
++		st.wantWindowUpdate(0, size)
++		st.wantIdle()
++	})
++
++	t.Run("exit_without_reading", func(t *testing.T) {
++		started := make(chan struct{})
++		proceed := make(chan struct{})
++		st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
++			close(started)
++			<-proceed
++		})
++		defer st.Close()
++
++		st.greet()
++		st.writeHeaders(HeadersFrameParam{
++			StreamID:      1,
++			BlockFragment: st.encodeHeader(":method", "POST"),
++			EndHeaders:    true,
++		})
++		<-started
++		st.writeData(1, false, make([]byte, size))
++		st.writeRSTStream(1, ErrCodeCancel)
++		awaitStreamClosed(t, st, 1)
++
++		// The handler exits without reading the body.
++		// Flow control is returned when the handler exits, and only once.
++		close(proceed)
++		st.wantWindowUpdate(0, size)
++		st.wantIdle()
++	})
++}
++
+ func TestServerIdleTimeout(t *testing.T) {
+ 	if testing.Short() {
+ 		t.Skip("skipping in short mode")
+@@ -4109,9 +4183,21 @@
+ 		}
+ 	}
+ 
++	st.wantHeaders(wantHeader{
++		streamID:  1,
++		endStream: true,
++	})
++
+ 	// Writing data after the stream is reset immediately returns flow control credit.
+ 	st.writeData(1, false, content[windowSize/2:])
+-	st.wantWindowUpdate(0, windowSize/2)
++	st.wantUnorderedFrames(
++		func(f *WindowUpdateFrame) bool {
++			return f.StreamID == 0 && f.Increment == windowSize/2
++		},
++		func(f *RSTStreamFrame) bool {
++			return f.StreamID == 1 && f.ErrCode == ErrCodeStreamClosed
++		},
++	)
+ 
+ 	if err := <-errc; err != nil {
+ 		t.Error(err)
+
 --- a/http2/flow.go
 +++ b/http2/flow.go
 @@ -10,6 +10,9 @@
