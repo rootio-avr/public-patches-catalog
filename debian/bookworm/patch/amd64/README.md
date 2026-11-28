@@ -1,7 +1,7 @@
-# patch : 2.7.6-7.aikido.7
+# patch : 2.7.6-7+deb12u1.aikido.8
 
-This patch is based on patch version 2.7.6-7.aikido.7, which is available at:
-https://sources.debian.org/src/patch/2.7.6-7/
+This patch is based on patch version 2.7.6-7+deb12u1.aikido.8, which is available at:
+https://sources.debian.org/src/patch/2.7.6-7+deb12u1/
 
 ## Affected CVEs:
 - CVE-2010-4651
